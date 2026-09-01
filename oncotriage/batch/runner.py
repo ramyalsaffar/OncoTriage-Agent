@@ -165,6 +165,7 @@ from oncotriage.agent.evaluation import (
     clear_stage5_shutdown,
     request_stage5_shutdown,
 )
+from oncotriage.evaluation import cohort as campaign_cohort
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import (
     RUN_METRICS_FLUSH_FAILURES,
@@ -343,6 +344,15 @@ def _results_path() -> Path:
     return Path(paths.checkpoint_path) / RESULTS_FILENAME
 
 
+CHECKPOINT_COHORT_DIGEST_KEY = "campaign_cohort_digest"
+"""The checkpoint key holding the drawn cohort's membership digest.
+
+A NAMED CONSTANT AND NOT A LITERAL, because the writer and the reader are two
+functions in this file and a typo in either would make every resume refuse
+(reader sees ``<not recorded>``) or every resume pass (writer stores under a key
+nobody reads). ``CHECKPOINT_FILENAME``'s own reason, one key down.
+"""
+
 CORRUPT_CHECKPOINT_SUFFIX = ".corrupt"
 """Suffix a checkpoint that could not be read is COPIED to.
 
@@ -427,7 +437,8 @@ def _refuse_checkpoint(outcome: str, detail: str, cp, recorded=None) -> None:
     raise run_fingerprint.ResumeRefusal("\n".join(lines), outcome=outcome)
 
 
-def load_checkpoint(fingerprint: dict = None) -> set:
+def load_checkpoint(fingerprint: dict = None,
+                    cohort_digest: str = None) -> set:
     """
     Load set of already-completed filename stems from checkpoint file.
 
@@ -520,6 +531,43 @@ def load_checkpoint(fingerprint: dict = None) -> set:
     if outcome != run_fingerprint.FP_MATCH:
         _refuse_checkpoint(outcome, detail, cp, recorded=data.get("fingerprint"))
 
+    # ── THE THIRD INPUT TO COHORT MEMBERSHIP: THE CORPUS ON DISK ──────────
+    #
+    # WHY IT IS HERE AND NOT IN THE SHARED STAMP. Membership is a function of
+    # the seed, the size AND the file list. `run_fingerprint` gates the first
+    # two, because they are config reads; it may not gate the third, because
+    # resolving it means globbing the corpus and `current()` is called by three
+    # harnesses that must answer offline. This is the one place in the project
+    # where the corpus is in scope at resume time, so this is where the third
+    # input is compared -- and it is compared THROUGH `run_fingerprint`'s own
+    # exception and refusal text, so there is one refusal an operator can learn
+    # to read rather than two.
+    #
+    # WHAT IT CATCHES THAT THE STAMP CANNOT: a bundle added to or removed from
+    # the corpus between two runs. At a fixed seed and size that changes WHICH
+    # 300 are drawn -- the ranking is over the whole population -- so a resume
+    # would skip the old cohort's completed patients and run the NEW cohort's
+    # remainder into one table. The two stamps would agree on every field.
+    #
+    # `cohort_digest=None` SKIPS THE CHECK, and that is not a hole. It means
+    # the caller selected no cohort -- a direct call, an embedder, a test -- and
+    # such a caller has no membership to have changed. `main()` always passes
+    # one.
+    if cohort_digest is not None:
+        recorded_digest = data.get(CHECKPOINT_COHORT_DIGEST_KEY,
+                                   run_fingerprint.NOT_RECORDED)
+        if recorded_digest != cohort_digest:
+            _refuse_checkpoint(
+                run_fingerprint.FP_CHANGED,
+                f"{CHECKPOINT_COHORT_DIGEST_KEY}: {recorded_digest!r} -> "
+                f"{cohort_digest!r} -- the campaign cohort's MEMBERSHIP moved. "
+                f"The two configurations agree on the cohort seed and size, so "
+                f"what changed is the corpus this run drew from: a bundle was "
+                f"added, removed or renamed under the patient directory. "
+                f"Continuing would run the remainder of a DIFFERENT cohort "
+                f"into the same table as the first",
+                cp, recorded=data.get("fingerprint"))
+
     completed = set(stems)
     console.out(f"[Checkpoint] Resuming: {len(completed)} patients already completed.")
     console.out(f"[Checkpoint] Configuration matches: {detail}")
@@ -557,7 +605,8 @@ def _unreadable_checkpoint(cp, error: str, counter_key: str) -> None:
         outcome=run_fingerprint.FP_ABSENT)
 
 
-def save_checkpoint(completed_stems: set, fingerprint: dict = None) -> None:
+def save_checkpoint(completed_stems: set, fingerprint: dict = None,
+                    cohort_digest: str = None) -> None:
     """
     Atomically persist completed filename stems to checkpoint file.
 
@@ -593,6 +642,15 @@ def save_checkpoint(completed_stems: set, fingerprint: dict = None) -> None:
                     "fingerprint": (fingerprint if fingerprint is not None
                                     else run_fingerprint.current()),
                     "collection_identity": run_fingerprint.COLLECTION_IDENTITY,
+                    # WHICH 300, AS 16 CHARACTERS. A SIBLING OF `fingerprint`
+                    # AND DELIBERATELY NOT A KEY INSIDE IT: that object is
+                    # `run_fingerprint.current()` verbatim, its shape is the
+                    # contract `compare()` walks, and a checkpoint carrying a
+                    # seventh key inside it would no longer equal the stamp the
+                    # module produced. Written on every checkpoint write, which
+                    # is once per completed patient -- 16 characters, not the
+                    # membership; see cohort.CohortSelection.record().
+                    CHECKPOINT_COHORT_DIGEST_KEY: cohort_digest,
                 },
                 f,
                 indent=2,
@@ -2005,7 +2063,7 @@ class _DriftAnnouncer:
 # ===========================================================================
 
 
-def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None, db_path=None,) -> tuple:
+def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None, db_path=None, cohort_digest=None,) -> tuple:
     """
     Process all patients not already in completed_ids using concurrent threads.
 
@@ -2023,6 +2081,17 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         run_id:        The `runs.id` this pass's writes belong to, forwarded to
                        every worker. None means the writes carry NULL, which is
                        what a caller driving this function outside main() gets.
+        cohort_digest: the drawn cohort's membership digest, stamped onto every
+                       checkpoint write so a later resume can refuse a corpus
+                       that moved. THREADED AS AN ARGUMENT rather than read off
+                       a module global, on `run_id`'s own precedent one line up:
+                       `save_checkpoint` is called from a done-CALLBACK on a
+                       worker thread, and a module-level "current cohort" is one
+                       forgotten `clear()` away from stamping the next run's
+                       checkpoint with this run's membership. None means the
+                       caller selected no cohort, and the key is written NULL --
+                       which `load_checkpoint` then refuses to match against a
+                       run that did select one.
 
     Returns:
         Tuple of (completed_ids, main_pass_complete).
@@ -2139,7 +2208,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         if entry["status"] == "success":
             batch_success += 1
             completed_ids.add(Path(fhir_path).stem)
-            save_checkpoint(completed_ids)
+            save_checkpoint(completed_ids, cohort_digest=cohort_digest)
         else:
             batch_error += 1
 
@@ -2504,7 +2573,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
 # ===========================================================================
 
 
-def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None, db_path=None,) -> None:
+def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None, db_path=None, resample_stems=None,) -> None:
     """
     Re-run a random subset of already-processed patients using concurrent threads.
 
@@ -2529,6 +2598,48 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         nct_ids:       NCT ID list aligned with BM25 index (read-only, shared).
         graph:         Compiled LangGraph StateGraph (read-only, shared).
         results_list:  In-memory results list (mutated via append_result).
+        resample_stems: WHICH patients to re-run, as filename stems. ``None``
+                       -- the shipped behaviour of a direct caller -- keeps
+                       this function's own seeded draw of ``RESAMPLE_COUNT``
+                       from whichever patients completed.
+
+    ═══ ONE PASS, TWO QUESTIONS, AND THE SAMPLE IS WHAT SEPARATES THEM ═══
+
+    THE MECHANISM IS THE SAME AND IS THE ONLY ONE. "Run these patients a second
+    time and write a second ``inferences`` row under the same ``run_id``" is
+    what this pass does, and nothing else in the project does it. Building a
+    second pass for the programme's stability sample would be two thread pools
+    doing one job, two progress bars, two stop-switch integrations and a
+    campaign that paid for BOTH re-runs.
+
+    THE SAMPLE IS NOT THE SAME AND CANNOT BE RECONCILED, in three ways that
+    each matter:
+
+      * WHAT IT DRAWS FROM. This function's own draw is over
+        ``completed_files`` -- the patients that SUCCEEDED -- so which patients
+        are even eligible depends on which ones errored. A stability sample has
+        to be a set somebody can name in advance, so the programme's is drawn
+        from the COHORT and a member that errored in the main pass is REPORTED
+        as unavailable rather than silently replaced by a patient that
+        happened to succeed.
+      * HOW IT DRAWS. ``random.Random(RESAMPLE_SEED).sample`` is deterministic
+        within one interpreter and is an implementation detail of CPython's
+        Mersenne seeding. The programme's draw is sha256 rank-ranking, so a
+        reader can recompute it -- see
+        ``oncotriage/evaluation/cohort.py:DRAW_ALGORITHM``.
+      * HOW MANY. ``RESAMPLE_COUNT`` is 100, ruled when the cohort was 1,000.
+        Against the ruled 300-patient cohort that is a third of the campaign's
+        Stage 5 spend again. The operator re-ruling is 50, and it lives at
+        ``config.CAMPAIGN_STABILITY_SAMPLE_SIZE`` rather than being written
+        over this constant -- which still means what it always meant, for the
+        ``resample_stems=None`` path that still uses it.
+
+    A STEM IN ``resample_stems`` THAT DID NOT COMPLETE IS DROPPED AND COUNTED,
+    never re-run: there is no first observation for it to be a second one of,
+    and a "k=2" sample silently containing k=1 members is the shape that makes
+    a stability rate a number about nothing. The count is printed, so the
+    campaign's own log states how many of the ruled sample actually reached
+    two observations.
     """
     console.out("=" * 80)
     console.out("RESAMPLE PASS")
@@ -2573,15 +2684,39 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         console.out("No completed patients available for resampling. Skipping.")
         return
 
-    actual_resample = min(RESAMPLE_COUNT, len(completed_files))
+    if resample_stems is None:
+        actual_resample = min(RESAMPLE_COUNT, len(completed_files))
 
-    # Local Random instance rather than random.seed(): seeding the
-    # process-wide state would shift the draw of every other consumer of
-    # `random` in the same session.
-    rng = random.Random(RESAMPLE_SEED)
-    resample_files = rng.sample(completed_files, actual_resample)
-
-    console.out(f"Resampling {actual_resample} patients (seed={RESAMPLE_SEED}).")
+        # Local Random instance rather than random.seed(): seeding the
+        # process-wide state would shift the draw of every other consumer of
+        # `random` in the same session.
+        rng = random.Random(RESAMPLE_SEED)
+        resample_files = rng.sample(completed_files, actual_resample)
+        console.out(f"Resampling {actual_resample} patients "
+                    f"(seed={RESAMPLE_SEED}, this pass's own draw).")
+    else:
+        # THE CALLER NAMED THE SAMPLE. Intersect with what completed, in the
+        # caller's own order, and SAY what was lost -- see the docstring: a
+        # requested member with no first observation is not a k=2 member and
+        # substituting another patient would make "the 50" a set nobody can
+        # recompute.
+        wanted = list(resample_stems)
+        by_stem = {Path(f).stem: f for f in completed_files}
+        resample_files = [by_stem[s] for s in wanted if s in by_stem]
+        actual_resample = len(resample_files)
+        unavailable = len(wanted) - actual_resample
+        console.out(f"Re-running the campaign's stability sample: "
+                    f"{actual_resample} of {len(wanted)} requested patients.")
+        if unavailable:
+            console.out(f"  {unavailable} requested patient(s) did not complete "
+                        f"the main pass and have no first observation to pair "
+                        f"with; they are NOT replaced, so this run yields "
+                        f"{actual_resample} patients at k=2 and {unavailable} "
+                        f"at k=1.")
+        if not resample_files:
+            console.out("No requested patient completed the main pass. "
+                        "Skipping.")
+            return
     console.out(f"Concurrent workers: {MAX_WORKERS}")
     console.out()
 
@@ -3521,6 +3656,34 @@ def main():
 
         console.out(f"[Setup] Found {len(fhir_files)} FHIR patient files.\n")
 
+        # ------------------------------------------------------------------
+        # 2b. Draw the campaign cohort and the two programme samples
+        # ------------------------------------------------------------------
+        # THIS RUNNER IS COHORT-BLIND AND STAYS THAT WAY. It hands the whole
+        # file list to `oncotriage/evaluation/cohort.py` and gets a subset back;
+        # the three sizes and the three seeds of the ruled programme live in
+        # `oncotriage/config.py` and are READ ONLY BY THAT MODULE. No number of
+        # the programme -- not 300, not 50, not 100 -- appears in this file.
+        #
+        # HERE, BEFORE THE CHECKPOINT AND BEFORE THE RUN ROW, for two reasons.
+        # `load_checkpoint` needs the membership digest to refuse a resume whose
+        # corpus moved, and `start_run_record` needs the record to write the
+        # eight cohort columns; both of those happen below. It is also above the
+        # first billed call, so a cohort that cannot be drawn -- a duplicate
+        # stem, which `draw()` raises on -- costs nothing.
+        #
+        # IT REPLACES `fhir_files`. Everything below this line sees the cohort
+        # and only the cohort, so `run_batch`'s "Total patient files" is the
+        # cohort's size and its progress bar is sized to the campaign rather
+        # than to the corpus. A corpus smaller than the configured cohort
+        # selects all of it, which is what keeps a 40-patient smoke corpus
+        # runnable, and `describe()` says so on its own line.
+        _cohort = campaign_cohort.select(fhir_files)
+        for _line in _cohort.describe():
+            console.out(_line)
+        console.out()
+        fhir_files = _cohort.files
+
         # THE BASELINE ROW COUNT, read BEFORE the first write and never after
         # it -- File 19's ordering, and for its reason: read after the first
         # POST and it measures nothing. It resolves through the same function
@@ -3603,7 +3766,8 @@ def main():
         # this run may not continue stops the process with no money spent, no
         # tracking run opened and -- above all -- nothing deleted.
         try:
-            completed_ids = load_checkpoint(fingerprint=_fingerprint)
+            completed_ids = load_checkpoint(fingerprint=_fingerprint,
+                                            cohort_digest=_cohort.digest)
         except run_fingerprint.ResumeRefusal as exc:
             console.out()
             console.out(str(exc))
@@ -3676,6 +3840,12 @@ def main():
             db_path=_reconcile_db,
             fingerprint=_fingerprint,
             resumed=_resumed,
+            # WHICH PATIENTS THIS CAMPAIGN COVERS, as the eight scalars that
+            # make the membership recomputable: the seed, what was asked for,
+            # what was selected, the digest of the answer, and the seed and
+            # size of each programme sample. The MEMBERSHIP is not stored --
+            # see cohort.CohortSelection.record().
+            cohort=_cohort.record(),
         )
 
         # ------------------------------------------------------------------
@@ -3758,9 +3928,19 @@ def main():
             tracking.start_run(
                 kind="batch",
                 params={
+                    # THE COHORT'S SIZE, NOT THE CORPUS'S, AND NOT
+                    # `RESAMPLE_COUNT`. `tracking.CONFIGURATION_PARAM_NAMES`'
+                    # own rule is that a value the run did not use is a FALSE
+                    # RECORD and worse than no record, because it is
+                    # indistinguishable from a true one. `fhir_files` IS the
+                    # cohort by this line, so `patient_count` is what the
+                    # campaign covered; and the re-run pass is driven by the
+                    # programme's stability sample, so logging
+                    # RESAMPLE_COUNT/RESAMPLE_SEED here would name a constant
+                    # and a seed this run never consulted.
                     "patient_count": len(fhir_files),
-                    "resample_count": RESAMPLE_COUNT,
-                    "resample_seed": RESAMPLE_SEED,
+                    "resample_count": _cohort.stability_size,
+                    "resample_seed": _cohort.stability_seed,
                 },
                 # THE SAME BOOLEAN THE `runs.resumed` COLUMN WAS WRITTEN
                 # FROM. `completed_ids` is still untouched at this line, so a
@@ -3820,6 +4000,7 @@ def main():
                 results_list=results_list,
                 run_id=_run_record_id,
                 db_path=_reconcile_db,
+                cohort_digest=_cohort.digest,
             )
 
             # ------------------------------------------------------------------
@@ -3854,6 +4035,11 @@ def main():
                     results_list=results_list,
                     run_id=_run_record_id,
                     db_path=_reconcile_db,
+                    # THE PROGRAMME'S k=2 STABILITY SAMPLE, NOT THIS PASS'S OWN
+                    # DRAW. See run_resample's docstring for the reconciliation:
+                    # one mechanism, two questions, and the sample is what makes
+                    # them different questions.
+                    resample_stems=_cohort.stability_stems,
                 )
             else:
                 console.out("[Resample] Skipped: no successfully completed patients.")

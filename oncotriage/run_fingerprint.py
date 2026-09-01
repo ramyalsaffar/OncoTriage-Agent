@@ -72,6 +72,20 @@ WHAT IS IN THE STAMP, AND WHY EACH FIELD IS THERE
                                     decides which trials survive to be judged.
                                     Two eras of this constant are two different
                                     cohorts wearing one cohort's name.
+    campaign_cohort_size            WHICH PATIENTS the batch campaign covers,
+    campaign_cohort_seed            as the two configured facts that decide the
+                                    draw. A campaign runs a seeded subset of
+                                    the corpus, so two campaigns at different
+                                    seeds or sizes cover different patients and
+                                    their rows must not be summed. These two
+                                    are the CONFIGURATION; the third input to
+                                    membership -- the corpus on disk -- is
+                                    gated by the batch runner's own checkpoint
+                                    guard, because resolving it needs the
+                                    corpus and ``current()`` must answer
+                                    offline. See FINGERPRINT_VERSION 3 -> 4 for
+                                    that split and for the over-gating it
+                                    accepts.
 
 WHAT IS DELIBERATELY NOT IN IT, each with its reason. ``collection_alias``: an
 alias may be repointed at the SAME backing collection, in which case the two
@@ -162,8 +176,56 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 3
+FINGERPRINT_VERSION = 4
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    3 -> 4  added ``campaign_cohort_size`` and ``campaign_cohort_seed``. EVERY
+            ARTIFACT STAMPED AT 3 THEREFORE ANSWERS FP_VERSION UNTIL AN
+            OPERATOR CLEARS IT ONCE, for the reason spelled out under 1 -> 2
+            below; the remediation is identical and is printed on the refusal.
+
+            WHAT IT CLOSES. ``oncotriage/batch/runner.py`` used to run every
+            bundle on disk, so "which patients does this campaign cover" was
+            not a configuration at all -- it was whatever the corpus happened
+            to hold. The ruled programme draws a SUBSET
+            (``config.CAMPAIGN_COHORT_SIZE`` at
+            ``config.CAMPAIGN_COHORT_SEED``), and two campaigns drawn at
+            different seeds or different sizes cover different patients. A
+            checkpoint from one resumed under the other would skip the first
+            cohort's completed patients, run the second cohort's remainder, and
+            put both into one ``inferences`` table with nothing in it saying
+            so -- every rate over that artifact computed across two cohorts
+            presented as one. This is that module's own defect, arrived at from
+            the corpus side rather than the configuration side.
+
+            WHAT THESE TWO FIELDS DO **NOT** CLOSE, and where the rest is.
+            Membership is a function of THREE things -- the seed, the size and
+            the corpus on disk -- and only the first two are here. A bundle
+            added to or removed from the corpus changes the drawn 300 at a
+            FIXED seed and size, and this stamp cannot see it: resolving the
+            membership means globbing the corpus, and ``current()`` is called
+            by three harnesses that must be able to answer offline. The third
+            input is gated by the batch runner's own checkpoint guard, which
+            compares the recorded ``campaign_cohort_digest`` and refuses through
+            THIS module's ``ResumeRefusal`` and ``refusal_lines`` -- one
+            exception type and one refusal text, with the corpus-dependent
+            comparison sited where the corpus is in scope. See
+            ``load_checkpoint`` there.
+
+            THE OVER-GATING IS STATED RATHER THAN GLOSSED, on
+            ``COLLECTION_IDENTITY``'s doctrine that a gate which says what it
+            is is a gate. These two fields describe the BATCH CAMPAIGN's
+            cohort, and the other two consumers of this stamp draw their own
+            populations: ``oncotriage/ablation/study.py`` stratifies over
+            ``load_all_patients()`` and
+            ``oncotriage/evaluation/run_harness.py`` selects for diversity over
+            its own scan. Neither reads either constant. So an operator who
+            edits the campaign cohort while an ablation study is in flight gets
+            ONE refusal naming a field that study does not use. That cost is
+            accepted because the alternative -- a second gating mechanism owned
+            by the runner -- is the two-copies shape this module exists to
+            remove, and because the refusal NAMES the field, so the operator
+            reads what happened rather than guessing.
 
     2 -> 3  added ``matching_call_mode``. EVERY ARTIFACT STAMPED AT 2 THEREFORE
             ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE, for the reason
@@ -397,6 +459,8 @@ FINGERPRINT_FIELDS = (
     "qdrant_collection",
     "collection_points",
     "data_snapshot_date",
+    "campaign_cohort_size",
+    "campaign_cohort_seed",
 )
 
 # How compare() answered. A CLOSED set, for the reason
@@ -751,6 +815,26 @@ def current(refresh: bool = False) -> dict:
                 "qdrant_collection": name,
                 "collection_points": points,
                 "data_snapshot_date": config.DATA_SNAPSHOT_DATE,
+                # WHICH PATIENTS THE CAMPAIGN COVERS, as the two configured
+                # facts that decide it. Read STRAIGHT OFF `config` rather than
+                # through `oncotriage/evaluation/cohort.py`, and the difference
+                # is not stylistic: that module RESOLVES a membership, which
+                # needs the corpus, and this function's contract is that it
+                # answers offline for three harnesses. What is here is the
+                # CONFIGURATION; the membership those two values produce is
+                # gated by the runner's own checkpoint guard, which has the
+                # corpus in scope. See FINGERPRINT_VERSION 3 -> 4.
+                #
+                # NO `_cohort()` HELPER AND NO try/except, unlike `_wire_model`
+                # and `_call_mode` above. Those two call FUNCTIONS that can grow
+                # a lookup or a validation; these are two module-level int
+                # constants of a module `config` has already imported by the
+                # time this line runs, so an exception here is an ImportError
+                # that already happened. A guard around an attribute read that
+                # cannot fail would be untested code standing between this run
+                # and its own stamp.
+                "campaign_cohort_size": config.CAMPAIGN_COHORT_SIZE,
+                "campaign_cohort_seed": config.CAMPAIGN_COHORT_SEED,
             }
         # A COPY. The consumers put this straight into a JSON payload they then
         # mutate around, and a shared dict would let one consumer's edit reach
@@ -786,7 +870,9 @@ def summary(fingerprint: dict) -> str:
             f"({get('matching_call_mode', NOT_RECORDED)}), "
             f"collection {get('qdrant_collection', NOT_RECORDED)} "
             f"({get('collection_points', NOT_RECORDED)} points), "
-            f"snapshot {get('data_snapshot_date', NOT_RECORDED)}")
+            f"snapshot {get('data_snapshot_date', NOT_RECORDED)}, "
+            f"cohort {get('campaign_cohort_size', NOT_RECORDED)}"
+            f"@{get('campaign_cohort_seed', NOT_RECORDED)}")
 
 
 def is_resolved(fingerprint: dict) -> bool:

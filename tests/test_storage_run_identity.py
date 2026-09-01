@@ -515,6 +515,13 @@ _STAMP_VALUES = {
     "qdrant_collection": "trial_criteria_test_0001",
     "collection_points": 12345,
     "data_snapshot_date": "2026-01-31",
+    # REAL INTEGERS, not placeholders, and for `matching_call_mode`'s reason
+    # one line up: both land in INTEGER-affinity columns through
+    # RUN_FINGERPRINT_INTEGER_COLUMNS, which NULLs anything that is not a plain
+    # int -- so `test-campaign_cohort_size` would have exercised the NULL arm
+    # in every check below rather than the round trip they are about.
+    "campaign_cohort_size": 300,
+    "campaign_cohort_seed": 42,
 }
 # A FIELD WITH NO LITERAL ABOVE GETS A GENERATED ONE RATHER THAN A KeyError, and
 # that is a repair rather than a convenience. The comment above this dict has
@@ -555,10 +562,11 @@ check("RUN_FINGERPRINT_COLUMNS is exactly the stamp's keys, in order",
       list(_dl.RUN_FINGERPRINT_COLUMNS),
       ["fingerprint_version"] + list(_rf.FINGERPRINT_FIELDS))
 
-check("...and the stamp really has seven gated fields (non-degenerate: a check "
+check("...and the stamp really has nine gated fields (non-degenerate: a check "
       "against an empty tuple would pass for free). SIX until the call-mode "
-      "pass gated `matching_call_mode`",
-      len(_rf.FINGERPRINT_FIELDS), 7)
+      "pass gated `matching_call_mode`, SEVEN until the cohort pass gated "
+      "`campaign_cohort_size` and `campaign_cohort_seed`",
+      len(_rf.FINGERPRINT_FIELDS), 9)
 
 check("every gated field has a real literal in this file's stamp, so no check "
       "below is exercising a generated placeholder",
@@ -649,7 +657,7 @@ check("...and the de-duplication is really doing work here (non-degeneracy: "
       "with no overlap the two rules give the same answer and the check above "
       "cannot distinguish them)",
       sorted(set(_dl.RUN_FINGERPRINT_COLUMNS) & set(_dl.RUN_COLUMN_ADDITIONS)),
-      ["matching_call_mode"])
+      ["campaign_cohort_seed", "campaign_cohort_size", "matching_call_mode"])
 # DERIVED, NOT `RUN_COLUMNS[-1] == "matching_call_mode"`. That form pinned the
 # overlapping column to the LAST position, which is only where ALTER TABLE puts
 # it for as long as it is the last entry in RUN_COLUMN_ADDITIONS -- so the

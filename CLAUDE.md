@@ -146,6 +146,7 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/ablation/figures.py` | File 27's **nine figures** — the one module-scope `matplotlib` import on the ablation side (pass 20f-4) | `ablation.common` |
 | `oncotriage/ablation/analysis.py` | File 27's statistics — the comparison table, the BH-FDR Wilcoxon family, the MDE, two reports, `main`. READS the database, never writes it. No matplotlib | `ablation.{common,figures}`, `config` |
 | `oncotriage/evaluation/sampling.py` | File 28 whole — the seeded 10/10/10 draw into a second database | `paths` |
+| `oncotriage/evaluation/cohort.py` | **WHICH patients a campaign runs** — the ruled 300-patient cohort, the 50-patient k=2 stability sample and the 100-patient judge sample, drawn by sha256 rank over the filename stem. `DRAW_ALGORITHM`, `draw`, `digest`, `CohortSelection`, `select`. The ONE reader of the six `CAMPAIGN_*` constants, which is what keeps the batch runner cohort-blind. Resolves no path and opens no file | `config` |
 | `oncotriage/evaluation/cohort_diff.py` | File 34 whole — LEGACY vs CURRENT cohort selector, read only | `paths`, `config`, `fhir.{clean,parser}`, `registries.cancer_code_registry` |
 | `oncotriage/fixtures/capture.py` | File 45 whole — the schema, the sink, the four proxies, `build_deterministic_prefix`, the fixture I/O, the three recipes, the cohort scan | `paths`, `config`, `agent.*`, `extraction.stage`, `fhir.parser`, `storage.database_logger`, `utils` |
 | `oncotriage/fixtures/replay.py` | File 46 whole — the replay stand-ins, the OpenAI tripwire, the field diff, the five refusals | `config`, `paths`, `agent.{deps,graph,patient}`, `fhir.parser`, `fixtures.capture`, `utils` |
@@ -778,7 +779,7 @@ python tests/test_storage_run_metrics_flush.py                      # 124 (was 1
 # neither of the suite's two writers. It EXECS NOTHING: every control is a
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
-python tests/test_storage_run_identity.py                           # 155 (was 142; the duplicated-derivation pass added F7's checks -- one derivation of the terminal status, read by BOTH the row and the console line, and the declared MLflow mapping -- and had to widen the status walk past ast.Constant, which would otherwise have passed VACUOUSLY over a main() that writes no status at all. Before that 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
+python tests/test_storage_run_identity.py                           # 159 (was 155; the cohort-selection pass gated `campaign_cohort_size` and `campaign_cohort_seed`, and four of this file's section-1 and section-4 checks are PER-STAMP-FIELD loops, so two more fields is four more checks. It also caught the pass's own defect: RUN_FINGERPRINT_COLUMNS had not been widened with the stamp, so two gated fields would never have reached a run row. Before that 142; the duplicated-derivation pass added F7's checks -- one derivation of the terminal status, read by BOTH the row and the console line, and the declared MLflow mapping -- and had to widen the status walk past ast.Constant, which would otherwise have passed VACUOUSLY over a main() that writes no status at all. Before that 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
 
 # The schema-guards pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, no live
@@ -4919,7 +4920,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 460 (was 446; the pre-migration pass drove the future-era stamp both directions)
+python tests/test_resume_configuration_fingerprint.py            # 473 (was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -12841,6 +12842,314 @@ not been run. The cache-absent column is what that probe settles.
    the run lock forbids two batch runners on one checkpoint directory, but the
    API writes into the same file with a NULL `run_id` and is therefore outside
    the chain by construction. Stated rather than closed.
+
+
+### A campaign runs a drawn cohort, not the corpus (the cohort-selection pass)
+
+**THE RULED EVALUATION PROGRAMME HAD NO MECHANISM AND THE RUNNER RAN EVERY
+BUNDLE ON DISK.** `oncotriage/batch/runner.py:main` did
+`sorted(glob.glob(paths.data_fhir_path + "*.json"))` and processed all of it, so
+"the campaign runs 300 patients" could previously only be expressed by DELETING
+bundles — which is what `oncotriage/fhir/clean.py`'s `COHORT_CAP` does, in
+place and irreversibly. `oncotriage/evaluation/cohort.py` is the selection layer
+that was missing: a 300-patient campaign cohort, a 50-patient k=2 stability
+sample and a 100-patient judge sample, all three seeded, recorded and
+recomputable, with nothing deleted and the 1,000 bundles untouched on disk.
+
+**NO BILLED CALL, NO INPUT CHANGE, AND THE SECOND HALF IS PROVED RATHER THAN
+ASSERTED.** Selection changes WHICH patients run, not what any patient's call
+contains. Measured against a `git worktree` at HEAD: `python fixture_replay.py`
+produces **133 differing-field lines in both trees, in the IDENTICAL SEQUENCE**
+(the 0/12 is the standing recapture item the de-identification and
+pre-diagnosis-ECOG passes left; this pass adds nothing to it). Structurally,
+`oncotriage/fixtures/` names neither the cohort module nor any campaign
+constant. The production `inferences.db` was never opened.
+
+**WHY HASH-RANKING AND NOT `random.Random(seed).sample`.** This project holds
+both precedents and `oncotriage/evaluation/rater.py:select_retest_decisions`
+already argued the choice in as many words: "`random.Random(seed).sample` is
+deterministic within one interpreter but its stream is an implementation detail
+of CPython's Mersenne seeding, and this selection has to reproduce from a
+recorded seed on another machine and another Python." That argument decides this
+one **more strongly**, because the artefact is larger: the retest subsample
+decides which decisions are asked twice, and this decides which patients every
+published number is computed over. `DRAW_ALGORITHM` states it in one line that
+every artefact records — `sha256(seed|stem)` ascending, lowest k, tie-break on
+the stem — and section 3 of the test **recomputes all three draws from that
+string alone**, with a reader's own implementation written out rather than by
+calling `draw()`, which would agree with itself by construction.
+
+**WHY THE DRAW IS SIMPLE RANDOM AND NOT STRATIFIED BY CANCER GROUP**, against
+the default expectation set by the project's two existing samplers, which both
+stratify:
+
+1. **STRATIFICATION DESTROYS THE RECOMPUTABILITY THE RULING ASKS FOR.** A group
+   key needs `CancerCodeRegistry` — SNOMED, then ICD-10-CM 2024 through the
+   `icd10-cm` package, then a display-term morphology fallback — and
+   `run_fingerprint.RENDERER_COVERAGE` states that the registry's DATA "is
+   outside the repository entirely and could not be hashed from source at any
+   granularity". A reader on another machine with a different release computes
+   different STRATA from the same seed, so the ranking would be reproducible and
+   the buckets it ranked within would not.
+2. **THE POPULATION IS ALREADY A SIMPLE RANDOM DRAW.** `clean.py` step 3 caps
+   with `rng.sample(remaining_files, COHORT_CAP)` — unstratified. Stratifying
+   the second stage fixes the cohort's marginals to the CORPUS's, which are
+   themselves one random realisation, rather than to the population's.
+3. **IT COSTS A FULL PARSE BEFORE THE FIRST PATIENT** — MEASURED at **170.9 s**
+   for 1,000 bundles plus the ICD-10-CM build, work this runner otherwise does
+   lazily inside the pool.
+4. **WHAT THE PAPER CLAIMS.** "A seeded simple random sample of size N, drawn by
+   sha256 rank over the filename stem" is verifiable with the file list and ten
+   lines of Python. "Proportionally stratified" is not, by (1).
+
+**WHAT THE 300 INHERITS, MEASURED OVER THE REAL CORPUS** (all 1,000 bundles
+parsed and grouped with the ablation study's own `_get_patient_group`,
+2026-09-01):
+
+| group | corpus | | cohort (300) | | expected |
+|---|---:|---:|---:|---:|---:|
+| colorectal | 405 | 40.5% | 118 | 39.3% | 121.5 |
+| breast | 290 | 29.0% | 86 | 28.7% | 87.0 |
+| prostate | 237 | 23.7% | 77 | 25.7% | 71.1 |
+| hematologic | 52 | 5.2% | 15 | 5.0% | 15.6 |
+| lung | 16 | 1.6% | 4 | 1.3% | 4.8 |
+
+Worst absolute deviation **0.0263**. The test's own check is the interesting
+direction rather than the obvious one: it requires the deviations to be
+**NON-ZERO**, because a proportionally stratified draw matches every share
+EXACTLY and a zero would mean the check had been passing about a sampler this
+pass deliberately did not build. `2i` is the control that a one-group draw fails
+the same tolerance.
+
+**THE TWO SAMPLES ARE INDEPENDENT AND THAT REQUIRES THREE DISTINCT SEEDS, WHICH
+IS GUARDED AT IMPORT.** `rank_key` is a pure function of `(seed, stem)`, so two
+draws from ONE population under ONE seed give the SAME ranking and the smaller
+is a strict PREFIX of the larger — the 50 would be a SUBSET of the 100, every
+time, 100% overlap where independence expects `50 x 100 / 300 = 16.7`, and every
+judged patient would also be a re-run patient. `oncotriage/evaluation/cohort.py`
+raises a `RuntimeError` at import (not an `assert`; `python -O` deletes those) if
+`CAMPAIGN_STABILITY_SEED == CAMPAIGN_JUDGE_SEED`. **MEASURED at the shipped
+seeds 43 and 44: overlap 16 against an expectation of 16.7**, and the test drives
+the same-seed case as a control to show the nesting is real.
+
+**THE STEM IS THE IDENTITY, WHICH COSTS NO PARSE AND MATCHES THE CHECKPOINT.**
+`load_checkpoint`'s own docstring says the checkpoint key "is always the FHIR
+filename stem ... avoiding UUID vs. stem mismatch bugs", so the cohort, the
+checkpoint and the resample pass speak about patients the same way with no
+mapping to get wrong. Not the full path (machine-dependent), not the
+`patient_id` (needs a parse; the corpus's stems do end in it, but that is a
+Synthea filename convention rather than a contract and nothing relies on it).
+
+**THE RUNNER IS COHORT-BLIND AND STAYS THAT WAY.** It hands the whole file list
+to `cohort.select()` and gets a subset back; **no number of the ruled programme
+— not 300, not 50, not 100 — appears anywhere outside `oncotriage/config.py`
+and that module**. `run_batch` and `run_resample` receive the already-filtered
+list, so `run_batch`'s "Total patient files" is the cohort's size and its
+progress bar is sized to the campaign rather than to the corpus. A corpus
+smaller than the configured cohort selects all of it and the console SAYS SO,
+which is what keeps a 40-patient smoke corpus runnable.
+
+**HOW THE FINGERPRINT CHANGES, AND WHAT HAPPENS TO AN IN-FLIGHT CHECKPOINT.**
+`FINGERPRINT_VERSION` is **3 → 4**, gaining `campaign_cohort_size` and
+`campaign_cohort_seed`. **Every artifact stamped at 3 answers FP_VERSION once**
+— that constant's designed semantics for a shape change, with the refusal's own
+clause saying a shape change is not necessarily a configuration change, and the
+consumer's remediation (`--fresh`, `--fresh-start`, a new `--output-dir`)
+printed underneath it. The two fields are **pure `config` reads**, so `current()`
+opens nothing new and still answers offline.
+
+**MEMBERSHIP IS THREE INPUTS AND THE STAMP GATES TWO OF THEM.** The third is the
+CORPUS ON DISK: at a fixed seed and size, a bundle added or removed changes which
+300 are drawn, because the ranking is over the whole population — and the two
+stamps agree on every field. Resolving that means globbing the corpus, and
+`current()` is called by three harnesses that must answer offline, so the third
+input is gated by the batch runner's own checkpoint guard, which compares a
+recorded `campaign_cohort_digest` and refuses **through
+`run_fingerprint.ResumeRefusal` and `refusal_lines`** — one exception type and
+one refusal text, with the corpus-dependent comparison sited where the corpus is
+in scope. The digest is a SIBLING of the `fingerprint` key rather than a key
+inside it, because that object is `current()` verbatim and its shape is the
+contract `compare()` walks.
+
+**THE OVER-GATING IS STATED RATHER THAN GLOSSED**, on `COLLECTION_IDENTITY`'s
+doctrine. The two new fields describe the BATCH CAMPAIGN's cohort;
+`oncotriage/ablation/study.py` stratifies over `load_all_patients()` and
+`oncotriage/evaluation/run_harness.py` selects for diversity over its own scan,
+and neither reads either constant. So an operator who edits the campaign cohort
+while an ablation study is in flight gets ONE refusal naming a field that study
+does not use. That is accepted because the alternative — a second gating
+mechanism owned by the runner — is the two-copies shape `run_fingerprint` exists
+to remove, and because the refusal NAMES the field.
+
+**THE RUN ROW IS SELF-DESCRIBING: SCHEMA ERA 7 → 8, EIGHT COLUMNS.**
+`campaign_cohort_size` and `campaign_cohort_seed` (also stamp columns, so a
+resume gates on them), `cohort_size` (what the corpus could actually supply,
+beside what was asked for), `cohort_digest`, and the seed and size of each
+programme sample. **The MEMBERSHIP itself is not stored** — 300 Synthea stems is
+~15 kB in a run row and in every checkpoint write, once per completed patient,
+and it would still not be authoritative: what a reader checks is whether the
+recorded membership matches what the recorded ALGORITHM produces, which
+`cohort_digest` answers in 16 characters. NULL on all eight means "this run
+selected no cohort", which is a VALUE — every pre-era-8 row and every future
+caller with no cohort concept.
+
+**THE JUDGE SAMPLE'S SEED AND SIZE ARE ON THE CAMPAIGN ROW ON PURPOSE.** It is a
+deterministic function of THIS campaign's cohort plus its own seed, so the row
+that defines the cohort is the one place from which it can be recomputed. What
+the column records is the CONFIGURED value at the moment the campaign opened;
+whether a judge pass ever ran, and over what, is the judge's own artefact.
+
+**═══ THE RESAMPLE RECONCILIATION: ONE MECHANISM, TWO QUESTIONS, AND THE
+SAMPLE IS WHAT SEPARATES THEM ═══**
+
+`run_resample`'s docstring says what its own draw simulates — "real-world repeat
+submissions" — and the ruled programme asks for something else: a k=2 STABILITY
+measurement over a named, recorded, reproducible sample. Answered from the code
+rather than from preference:
+
+* **THE MECHANISM IS THE SAME AND IS THE ONLY ONE.** "Run these patients a second
+  time and write a second `inferences` row under the same `run_id`" is what that
+  pass does and nothing else in the project does it. A second pass would be two
+  thread pools doing one job, two progress bars, two stop-switch integrations,
+  and a campaign paying for BOTH re-runs. **So the pass is kept and its
+  SELECTION becomes the caller's**: `run_resample(..., resample_stems=...)`.
+* **THE COUNT NEEDED AN OPERATOR RE-RULING AND GOT ONE.** `RESAMPLE_COUNT` is
+  100, ruled when the cohort was 1,000 — 10%. Against a 300-patient cohort that
+  is **33%, a third of the campaign's Stage 5 spend again**. The ruling is 50
+  (16.7%), and it lives at `config.CAMPAIGN_STABILITY_SAMPLE_SIZE` rather than
+  being written over the old constant.
+* **`RESAMPLE_COUNT` AND `RESAMPLE_SEED` ARE NEITHER DELETED NOR SILENTLY
+  REPURPOSED.** They are the FALLBACK for a caller that names no sample — a
+  direct call, an embedder, a test — which is the behaviour that shipped,
+  unchanged. `tests/test_campaign_cohort_selection.py` 8k-8m pins by AST that
+  the `resample_stems is None` branch exists AND still READS both constants,
+  because "not repurposed" satisfied by a branch that had stopped using them is
+  the dead-tunable shape this project deletes.
+* **THE DOMAIN DIFFERS AND THAT IS THE SUBSTANTIVE PART.** The old draw is over
+  the patients that SUCCEEDED, so which are eligible depends on which errored;
+  a stability sample must be nameable in advance. A requested member that did
+  not complete the main pass is **DROPPED, COUNTED AND PRINTED** — never
+  replaced by a patient that happened to succeed, which would make "the 50" a
+  set nobody can recompute — and the console states how many members reached
+  two observations and how many are at k=1.
+
+**AND `tracking.start_run` STOPPED MAKING A FALSE RECORD.** It logged
+`patient_count=len(fhir_files)` (now the cohort, correctly, because the runner
+has rebound it) and `resample_count=RESAMPLE_COUNT` / `resample_seed=
+RESAMPLE_SEED` — a constant and a seed a campaign no longer consults, which is
+exactly what `CONFIGURATION_PARAM_NAMES`' own docstring calls "a false record,
+and worse than no record, because it is indistinguishable from a true one". All
+three are the values the run actually used. The six new constants join
+`CONFIGURATION_PARAM_NAMES` under that tuple's rule: nothing at the command line
+overrides any of them.
+
+**k=2 IS STORED DISTINGUISHABLY AT TWO LAYERS AND ONLY ONE IS NEW.** In the
+results list and `batch_runner_results.json` the re-run entry carries
+`is_resample`, written by the real `_on_done` and the real `append_result`. In
+the DATABASE the two observations are two `inferences` rows and the FIRST is
+`MIN(id)` per patient — which is what "each judged patient's FIRST-run verdicts"
+resolves to, and what `oncotriage/evaluation/sampling.py` already uses. That is
+demonstrated against the real schema rather than asserted. **There is no
+`inferences.is_resample` COLUMN and this pass did not add one**: it would be a
+column on an 85-column positional INSERT with a fixture and provenance blast
+radius, for a fact that is derivable. Named as a follow-up with the derivation's
+one limit written down — across a RESUMED campaign the first observation is the
+global `MIN(id)` for that patient over the stitched run chain, not per run.
+
+```bash
+# The cohort-selection pass. Same shape, same directory. No network, no keys,
+# NO SPEND, no live Qdrant, NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above
+# the imports; torch and transformers asserted absent), no git history, NO
+# CORPUS -- every population is fabricated, and the one live-corpus section is
+# GATED and reports a SKIP rather than failing.
+# run_fingerprint._resolve_collection is replaced so no index probe is
+# attempted; process_patient and the graph are stand-ins and THE GRAPH IS NEVER
+# INVOKED. It DRIVES THE REAL main(), run_batch, run_resample, load_checkpoint,
+# save_checkpoint and start_run_record. NOT in the collision matrix -- it writes
+# only inside a tempfile.mkdtemp it removes and asserts gone, paths._RESOLVED is
+# seeded and restored, and the three repository files it reads are
+# sha256-compared at the end. It EXECS NOTHING. Bucket A, ~4 s.
+python tests/test_campaign_cohort_selection.py   # 117 here; 115 passed / 0 failed / 1 SKIPPED against ONLY the CI skeleton
+```
+
+**TEN REVERTS, TEN CAUGHT**, each planted into a `copytree`'d copy with
+`PYTHONPATH` pointed at it, a `sitecustomize` stripping the editable install's
+MetaPathFinder (which otherwise beats `PYTHONPATH`), and
+`PYTHONDONTWRITEBYTECODE=1`; every plant asserts its own occurrence count, so a
+plant that matched nothing is a named PLANT-FAILED rather than a working check
+reported as broken. An alphabetical draw (9 recorded failures), one seed for
+both samples (3), an unsorted digest (1), the import guard removed (2), the
+cohort filter removed from `main()` (4), the membership guard removed (6), the
+named sample ignored (7), the two fields ungated (7 here plus 4 in
+`test_storage_run_identity.py` and 4 in
+`test_resume_configuration_fingerprint.py`), the cohort columns unwritten (4),
+and the tracking record reverted to `RESAMPLE_COUNT` (1).
+
+**THE MEMBERSHIP-DRIFT PLANT IS IN THE CORPUS, NOT IN THE CODE**, and it is the
+one case the shared stamp provably cannot see: section 6 builds a 400-bundle
+corpus, draws a cohort, then removes one bundle and adds another — same size,
+same seed, same configured cohort, and the stamp still answers FP_MATCH. The
+membership moves, the digest moves, and the resume is refused; the CLEAN CONTROL
+(the undrifted digest) resumes, so the check is about the swap rather than about
+a guard that refuses everything.
+
+**THREE DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY READING,
+AND TWO OF THEM BY THE REVERT MATRIX.**
+
+* **THE ABORT SHAPE, SEVENTEENTH TIME.** A revert that removed the membership
+  guard made `load_checkpoint` return the completed SET, and the refusal-text
+  checks did `value.get("__raised__", "")` on it — `AttributeError` inside a
+  `check(...)` argument, one traceback where the file owed a summary and 110
+  results. `raise_text()` is the fix, and the checks that fire on that defect
+  are exactly the ones that must not raise on it.
+* **A CONSTANT LEAKED BETWEEN SECTIONS AND THE CHECK THAT SHOULD HAVE CAUGHT IT
+  AGREED WITH THE LEAK.** `oncotriage/evaluation/cohort.py` binds its six
+  constants with `from oncotriage.config import ...`, which copies the VALUE at
+  import — so section 9's `finally` restoring `config.X` alone reached nothing,
+  and section 10's live-corpus check then drew a **12-patient** cohort and
+  passed, because it compared the module's leaked 12 against the config's leaked
+  12. The restore reads a dict captured at import now, and 10d pins the ruled
+  values as LITERALS rather than reading them off the module being checked.
+* **`RUN_FINGERPRINT_COLUMNS` WAS NOT WIDENED WITH THE STAMP**, and
+  `tests/test_storage_run_identity.py` caught it — two gated fields that would
+  never have reached a run row. Its sibling `test_storage_schema_guards.py` 1a
+  then caught the consequence one layer on: `campaign_summary`'s stitch
+  predicate is GENERATED from that tuple, so the two new columns are named in
+  its SQL and had to be declared in `requires_columns` or `report()` would have
+  died on any pre-era-8 database — item 38's own defect, reached through a tuple
+  widened three modules away.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE JUDGE SAMPLE IS DRAWN AND RECORDED AND IS WIRED TO NOTHING.** The rater
+   consumes an EVALUATION RUN DIRECTORY (`evaluation_run.py`'s per-patient JSON
+   records), not the batch database, so feeding it the 100 means
+   `evaluation_run.py --only <100 patient ids>` — and this module deals in
+   STEMS while that flag takes patient ids. The corpus's stems end in the id,
+   which is a Synthea filename convention this module deliberately does not
+   rely on, so the honest bridge is a parse of the 100 selected bundles. That
+   is the top follow-up.
+2. **"FIRST-RUN VERDICTS" IS DERIVABLE AND NOT ENFORCED.** No consumer today
+   restricts a judged patient to `MIN(id)`; the query is written down (above and
+   at the code) and nothing runs it.
+3. **THE ABLATION STUDY AND THE EVALUATION HARNESS STILL DRAW FROM THE WHOLE
+   CORPUS**, not from the campaign cohort — so an ablation number is measured on
+   patients the campaign may never have run. That is a scientific question the
+   ruling did not answer and this pass did not decide; it is what the over-gating
+   note above is really about.
+4. **`CAMPAIGN_STABILITY_SAMPLE_SIZE` AND `CAMPAIGN_JUDGE_SAMPLE_SIZE` ARE
+   UNCALIBRATED**, labelled so at the constants and for
+   `ABLATION_SAMPLE_SIZE_DEFAULT`'s reason: neither was solved for the precision
+   of the statistic it feeds, and nothing in this project computes the interval
+   a flip rate or an agreement rate carries at a given n.
+5. **THE SPEND DERIVATION AT `config.SPEND_CAP_USD` STILL PRICES THE RE-RUN PASS
+   AT 100 PATIENTS.** The ruled 50 makes the campaign budget's programme
+   **cheaper** than the table states — the resample row halves — so the cap is
+   more conservative than its own arithmetic claims, not less. Reported rather
+   than silently re-derived, because that table is an operator ruling's working.
+6. **NOTHING EXPOSES THE COHORT OVER HTTP.** `GET /pipeline/info` does not report
+   which cohort a deployment would run, and the API writes no `runs` row, so its
+   eight cohort columns are NULL by construction.
 
 
 Data and keys live outside this folder. Never write an

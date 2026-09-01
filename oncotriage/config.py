@@ -3539,10 +3539,57 @@ ECOG_UNAVAILABLE_RATE_THRESHOLD = 0.20
 # reader and no exemption was NOT reported, because that sentence looked like
 # its reader. This block is a COMMENT, which no AST walk sees.
 
-# Number of already-processed patients to re-run after the main pass
+# Number of already-processed patients to re-run after the main pass.
+#
+# ═══ THIS NO LONGER GOVERNS A CAMPAIGN, AND THE RECONCILIATION IS THE POINT ═══
+#
+# WHAT IT WAS FOR. `run_resample` re-runs a random subset of the patients the
+# main pass completed, and its docstring says what that simulates: "real-world
+# repeat submissions where the same patient may be evaluated more than once".
+# The draw was `random.Random(RESAMPLE_SEED).sample(completed_files, 100)` --
+# taken from whichever patients happened to SUCCEED, not from a named set, and
+# not reproducible outside one CPython.
+#
+# WHAT THE RULED PROGRAMME ASKS FOR INSTEAD. A 50-patient STABILITY sample at
+# k=2: the same named patients, one additional full run, two observations each,
+# so verdict flips and score drift can be measured over a population a reader
+# can recompute. `CAMPAIGN_STABILITY_SAMPLE_SIZE` and `CAMPAIGN_STABILITY_SEED`
+# are that sample.
+#
+# WHETHER ONE PASS CAN SERVE BOTH, ANSWERED FROM THE CODE. The MECHANISM is
+# identical -- "run these patients a second time, write a second `inferences`
+# row under the same `run_id`" -- and it is the only thing in this project that
+# does that, so building a second pass would be two thread pools doing one job
+# and would double a campaign's re-run spend silently. The SAMPLE is not
+# identical and cannot be reconciled:
+#
+#   * SIZE. 100 against a 1,000-patient cohort is 10%. Against the ruled
+#     300-patient cohort it is 33% -- a third of the campaign's Stage 5 spend
+#     again -- for a constant last ruled when the cohort was ten times larger.
+#     THE OPERATOR RE-RULING IS 50, and it is recorded at
+#     CAMPAIGN_STABILITY_SAMPLE_SIZE rather than by editing this number.
+#   * DOMAIN. This draws from the patients that SUCCEEDED, so which patients are
+#     eligible depends on which ones errored -- a stability sample must be fixed
+#     in advance or "the 50" is not a set anybody can name. The programme sample
+#     is drawn from the COHORT, and a member that errored in the main pass is
+#     reported as having one observation rather than quietly replaced.
+#   * REPRODUCIBILITY. `random.Random` is an implementation detail of CPython's
+#     Mersenne seeding; the programme draw is sha256 rank-ranking, for the
+#     reason `oncotriage/evaluation/rater.py:select_retest_decisions` states.
+#
+# SO THE PASS IS KEPT AND ITS SELECTION IS THE CALLER'S.
+# `run_resample(..., resample_files=...)` takes the sample to re-run, and
+# `oncotriage/batch/runner.py:main` passes the programme's stability sample. The
+# two constants below are the FALLBACK for a caller that passes nothing -- a
+# direct call, an embedder, a test -- which is the behaviour that shipped,
+# unchanged, and they are still what `tracking` logs when that fallback is the
+# one that ran. NOT DELETED AND NOT SILENTLY REPURPOSED: they mean exactly what
+# they always meant, for exactly the path that still uses them.
 RESAMPLE_COUNT = 100
 
-# Random seed for reproducible resampling
+# Random seed for reproducible resampling. See RESAMPLE_COUNT: this seeds the
+# FALLBACK draw only. The campaign's re-run sample is seeded by
+# CAMPAIGN_STABILITY_SEED and drawn by a different, cross-interpreter algorithm.
 RESAMPLE_SEED = 42
 
 # Checkpoint file: tracks completed filename stems for crash recovery
@@ -4078,6 +4125,121 @@ COHORT_CAP = 1000
 # which is why it, and COHORT_CAP, are in tracking.CONFIGURATION_PARAM_NAMES
 # while the two sample sizes below are not.
 COHORT_SELECTION_SEED = 42
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE EVALUATION PROGRAMME: THE CAMPAIGN COHORT AND ITS TWO SAMPLES
+# ===========================================================================
+#
+# THE OPERATOR'S RULING, AS THREE SIZES AND THREE SEEDS. The programme is a
+# 300-patient campaign drawn from the corpus on disk, a 50-patient stability
+# sample re-run once so each member has two observations, and a 100-patient
+# sample rated by the independent judge. Every draw is seeded, and the seed and
+# the size of each are recorded in the run row, in the checkpoint and in the
+# tracking index, so any reader can recompute the membership.
+#
+# THESE ARE NOT `COHORT_CAP`. That constant is what "05- FHIR Clean Data.py"
+# DELETES down to -- an irreversible unlink of the bundles beyond it -- and it
+# is the size of the CORPUS. These four sizes are SELECTION over that corpus:
+# nothing is deleted, the 1,000 bundles stay on disk, and a cohort can be
+# redrawn, widened or reproduced from a seed without regenerating anything.
+# Before them, "run fewer patients than the corpus holds" had no expression
+# other than deleting patients.
+#
+# THE DRAW ITSELF IS `oncotriage/evaluation/cohort.py`, which argues why it is
+# sha256 rank-ranking rather than `random.Random(seed).sample` (a recorded seed
+# must reproduce on another machine and another Python) and why it is simple
+# random rather than stratified by cancer group (a group key needs the ICD-10-CM
+# registry, whose DATA is outside this repository and cannot be pinned, so a
+# stratified membership is not recomputable by a reader).
+#
+# ALL SIX ARE IN tracking.CONFIGURATION_PARAM_NAMES, under that tuple's own
+# rule: a constant belongs there if and only if nothing at the command line can
+# override it, and no entry point takes a flag for any of these.
+#
+# TWO OF THEM ARE ALSO GATED BY THE RESUME FINGERPRINT -- CAMPAIGN_COHORT_SIZE
+# and CAMPAIGN_COHORT_SEED -- so a checkpoint written under one cohort cannot be
+# continued under another. The membership DIGEST is gated too, by the batch
+# runner's own checkpoint guard rather than by the shared stamp; see
+# `oncotriage/run_fingerprint.py`'s FINGERPRINT_VERSION 3 -> 4 note for what is
+# gated where and why.
+
+# How many of the corpus's patients one campaign runs.
+#
+# PROVENANCE: AN OPERATOR RULING, like COHORT_CAP above and for the same reason
+# -- it is a decision about how much money one campaign spends, not a number
+# derived from a power calculation. At the derivation in SPEND_CAP_USD's
+# docstring this is $53.79 of Stage 5 with the prompt cache working and $123.25
+# without it.
+#
+# IT IS NOT REQUIRED TO BE <= THE CORPUS SIZE. A configured cohort larger than
+# the corpus selects every patient there is and the run SAYS SO, on the console
+# and in the `runs` row's `cohort_size` (what was selected) beside
+# `cohort_requested` (what was asked for). Refusing instead would make a
+# 40-patient smoke corpus unrunnable for a reason that has nothing to do with
+# the smoke test.
+CAMPAIGN_COHORT_SIZE = 300
+
+# The seed the campaign cohort is drawn with.
+#
+# 42 IS THIS PROJECT'S CONVENTION FOR A PRIMARY DRAW (COHORT_SELECTION_SEED,
+# RESAMPLE_SEED, ABLATION_SEED and rater.DEFAULT_RETEST_SEED are all 42) and it
+# is kept here so that a reader meeting a 42 in this project is meeting the same
+# convention rather than a coincidence. It is NOT the same draw as any of them:
+# COHORT_SELECTION_SEED decides which patients SURVIVE the cap, this decides
+# which survivors a campaign RUNS, and the two operate on different populations
+# with different algorithms.
+CAMPAIGN_COHORT_SEED = 42
+
+# How many cohort patients are re-run once, so each has two observations.
+#
+# WHAT IT MEASURES AND WHAT IT REPLACED. RESAMPLE_COUNT (100) is the batch
+# runner's own resample draw, whose docstring says it "simulates real-world
+# repeat submissions"; this is a MEASUREMENT of pipeline stability at k=2 over a
+# named, recorded, reproducible sample. The two questions share one MECHANISM --
+# "run these patients a second time" -- and they do not share a SAMPLE, so the
+# runner's pass is now driven by this selection and RESAMPLE_COUNT no longer
+# governs a campaign. See the reconciliation at RESAMPLE_COUNT itself.
+#
+# 50 IS THE RULING AND IT IS ALSO A COST DECISION: at 300 patients this is a
+# further 16.7% of the campaign's Stage 5 spend, where RESAMPLE_COUNT's 100
+# against a 300-patient cohort would have been 33% -- a third of the campaign
+# again, for a constant last ruled when the cohort was 1,000 and 100 was 10%.
+# That is the re-ruling this constant records.
+#
+# UNCALIBRATED AS A SAMPLE SIZE, and stated so on ABLATION_SAMPLE_SIZE_DEFAULT's
+# footing: 50 was not solved for the precision of any stability statistic. A
+# flip rate estimated over 50 patients carries a confidence interval nothing in
+# this project computes, and the instrument that would size it is a precision
+# calculation on a proportion rather than the ablation study's paired MDE block.
+CAMPAIGN_STABILITY_SAMPLE_SIZE = 50
+
+# The seed the stability sample is drawn with. MUST DIFFER FROM
+# CAMPAIGN_JUDGE_SEED and oncotriage/evaluation/cohort.py RAISES AT IMPORT if it
+# does not: both samples are drawn from ONE population by one rank function, so
+# a shared seed makes the smaller a strict subset of the larger -- 100% overlap
+# where independence expects 50 * 100 / 300 = 16.7, and every judged patient
+# also a re-run patient.
+CAMPAIGN_STABILITY_SEED = 43
+
+# How many cohort patients the independent judge rates.
+#
+# UNCALIBRATED, on EVALUATION_SELECTION_SIZE_DEFAULT's footing and against the
+# same missing instrument: the judge produces an agreement RATE over criterion
+# decisions, and nothing in this project computes the interval that rate carries
+# at a given number of patients. 100 is the ruling.
+#
+# IT IS A SAMPLE OF PATIENTS AND NOT OF DECISIONS. The rater bills one request
+# per criterion decision, and the 10-patient run recorded in rater_run.py's
+# docstring holds 2,212 of them -- so this number does not price the judge pass
+# on its own and RATER_SPEND_CAP_USD is what bounds it.
+CAMPAIGN_JUDGE_SAMPLE_SIZE = 100
+
+# The seed the judge sample is drawn with. See CAMPAIGN_STABILITY_SEED.
+CAMPAIGN_JUDGE_SEED = 44
 
 
 #------------------------------------------------------------------------------

@@ -362,6 +362,21 @@ CONFIGURATION_PARAM_NAMES = (
     # CLI-overridable: "05- FHIR Clean Data.py" takes only --dry-run.
     "COHORT_CAP",
     "COHORT_SELECTION_SEED",
+    # --- the evaluation programme's cohort and its two samples -------------
+    # WHICH of the corpus's patients a campaign actually RUNS, and which of
+    # those the k=2 stability re-run and the judge pass are taken over. The two
+    # above decide which patients EXIST; these decide which ones a number is
+    # computed over, and two campaigns at different seeds or sizes cover
+    # different patients. None is CLI-overridable -- "25- Batch Runner.py"
+    # takes --fresh and --clear-stop and nothing else -- which is what puts
+    # them here rather than in CALLER_PARAM_KEYS. If a flag is ever added for
+    # one, it leaves this tuple in the same commit; see the rule below.
+    "CAMPAIGN_COHORT_SIZE",
+    "CAMPAIGN_COHORT_SEED",
+    "CAMPAIGN_STABILITY_SAMPLE_SIZE",
+    "CAMPAIGN_STABILITY_SEED",
+    "CAMPAIGN_JUDGE_SAMPLE_SIZE",
+    "CAMPAIGN_JUDGE_SEED",
     # --- the two ablation seeds --------------------------------------------
     # ABLATION_SEED draws the study's stratified sample;
     # ABLATION_BOOTSTRAP_SEED is why two runs of File 27 over one database

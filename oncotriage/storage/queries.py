@@ -2313,7 +2313,20 @@ QUERIES = (
         # predicate is generated from RUN_FINGERPRINT_COLUMNS, so this column is
         # named in the `edge` CTE's WHERE clause and its absence makes the SQL
         # unparseable exactly as `resumed`'s does.
+        # `runs.campaign_cohort_size` and `runs.campaign_cohort_seed` join
+        # them at era 8, for the SAME reason `matching_call_mode` did: they
+        # are RUN_FINGERPRINT_COLUMNS members, the stitch predicate is
+        # GENERATED from that tuple, so both are named in the `edge` CTE's
+        # WHERE clause and their absence makes the SQL unparseable rather than
+        # merely NULL. A gated field added to the stamp and NOT declared here
+        # would take report() down on any database written before it -- which
+        # is item 38's own defect, reached through a tuple somebody widened
+        # three modules away. THAT IS WHY THIS DECLARATION IS DERIVED-CHECKED
+        # RATHER THAN TRUSTED: tests/test_storage_schema_guards.py section 1a
+        # reads the rendered SQL, and it is what caught this pair.
         requires_columns=(("inferences", "run_id"),
+                          ("runs", "campaign_cohort_seed"),
+                          ("runs", "campaign_cohort_size"),
                           ("runs", "matching_call_mode"), ("runs", "resumed")),
         notes=(
             "One row per CAMPAIGN, not per run. A campaign that never crashed",

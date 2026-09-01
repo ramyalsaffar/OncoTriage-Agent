@@ -229,6 +229,20 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 8: THE EIGHT `runs` COHORT COLUMNS, added together with
+#        RUN_COLUMN_ADDITIONS and its migration loop -- one era, eight columns,
+#        on era 5's precedent: the number counts schema changes, not columns,
+#        and a seed without its size and a size without its digest are each
+#        uninterpretable, so the set is one change. They record WHICH PATIENTS
+#        the campaign covered: the cohort's seed and configured size (which are
+#        also two new STAMP fields, so a resume across a cohort change is
+#        refused), what it actually selected, a digest of the membership, and
+#        the seed and size of each of the two programme samples. Before them a
+#        campaign ran every bundle on disk, so the question had no answer in the
+#        schema at all and "how large was this campaign" was answered by
+#        counting rows -- which the resample pass makes wrong. All seven are
+#        additive, NULL on every existing row and on every run that selected no
+#        cohort (which is what an API request is), and none is backfilled.
 # ERA 7: `runs.stop_reason`, added with RUN_COLUMN_ADDITIONS and its migration
 #        loop. A run stopped by the spend gate and a run stopped by an operator
 #        are both STOPPED -- the campaign covers a prefix of the cohort, the
@@ -270,7 +284,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 7
+SCHEMA_USER_VERSION = 8
 
 
 #------------------------------------------------------------------------------
@@ -1595,6 +1609,78 @@ RUN_COLUMN_ADDITIONS = {
     # See RUN_STOP_REASONS below for the members and for why this is a column
     # beside `status` rather than two more members OF `status`.
     "stop_reason": "TEXT",
+    # ── WHICH PATIENTS THIS CAMPAIGN COVERED (era 8) ──────────────────────
+    #
+    # THE QUESTION THEY ANSWER, AND WHY COUNTING ROWS DOES NOT. A campaign
+    # draws a seeded subset of the corpus, so "how many patients did this run
+    # cover" is not `COUNT(*)` over its `inferences` rows -- the resample pass
+    # writes a SECOND row for each of the re-run patients, and a resumed
+    # campaign's rows are split across a chain of `runs`. `campaign_summary`
+    # already had to introduce `COUNT(DISTINCT patient_id)` for exactly that.
+    # These columns record what the campaign was ASKED to cover and what it
+    # SELECTED, as configuration rather than as an aggregate over its output.
+    #
+    # NULL MEANS "THIS RUN SELECTED NO COHORT", WHICH IS A VALUE. Every row
+    # written before era 8 is in that class, and so is every future row written
+    # by a caller that runs one patient on request rather than a campaign --
+    # `17- FastAPI Server.py` writes no `runs` row at all today, and any caller
+    # that does and has no cohort concept passes nothing and gets NULL. It is
+    # NOT "the cohort is unknown": `start_run_record` writes these only from a
+    # cohort record its caller resolved, so a NULL is the absence of a
+    # selection rather than a failure to record one.
+    #
+    # THE MEMBERSHIP ITSELF IS NOT STORED, and that is a size decision with a
+    # correctness argument behind it. Three hundred Synthea stems is ~15 kB;
+    # putting them in a run row (and in every checkpoint write, once per
+    # completed patient) would make the artifact large and would still not be
+    # authoritative, because the thing a reader checks is whether the recorded
+    # membership matches what the recorded ALGORITHM produces. `cohort_digest`
+    # is that check in 16 characters, and `oncotriage/evaluation/cohort.py`
+    # publishes the algorithm that regenerates the list.
+    #
+    # SEVEN COLUMNS RATHER THAN ONE JSON BLOB, on RUN_FINGERPRINT_COLUMNS' own
+    # argument one block down: the questions are "every campaign at seed X",
+    # "every campaign that selected fewer than it asked for", "which campaigns
+    # share a cohort digest", and `json_extract` answers those only for a reader
+    # who knows the blob's shape.
+    #
+    # INTEGER FOR THE SIZES AND THE SEEDS. A seed is stringified into the rank
+    # key by `cohort.rank_key`, so a non-integer seed is legal there -- and it
+    # would land in an INTEGER-affinity column as TEXT, which SQLite orders
+    # ABOVE every integer. `start_run_record` coerces, and a value that will not
+    # coerce is stored as NULL rather than as a plausible-looking lie; see
+    # RUN_FINGERPRINT_INTEGER_COLUMNS for the same trap one block down.
+    # THE TWO STAMP COLUMNS, which are also the cohort's SEED and its REQUESTED
+    # SIZE. They are here for the reason `matching_call_mode` is -- this dict
+    # says WHEN a column arrived and therefore what migrates an existing
+    # database, while RUN_FINGERPRINT_COLUMNS says what it MEANS and what fills
+    # it at the INSERT -- and they are deliberately NOT restated in the cohort
+    # group below: the seed a campaign drew with and the size it asked for are
+    # exactly `config.CAMPAIGN_COHORT_SEED` and `config.CAMPAIGN_COHORT_SIZE`,
+    # which the stamp already carries and which the resume gate already
+    # compares. A second pair of columns holding the same two values in every
+    # campaign is the two-copies shape, and the copy that could drift is the
+    # one nothing gates.
+    "campaign_cohort_size": "INTEGER",
+    "campaign_cohort_seed": "INTEGER",
+    # WHAT THE CORPUS COULD ACTUALLY SUPPLY, beside `campaign_cohort_size`
+    # (what the configuration asked for). They differ exactly when the corpus
+    # is smaller than the ruled cohort, and a row where they differ is a row
+    # whose rates are NOT over the ruled cohort -- a fact a reviewer needs and
+    # one that storing only the realised number would delete.
+    "cohort_size": "INTEGER",
+    "cohort_digest": "TEXT",
+    "stability_sample_seed": "INTEGER",
+    "stability_sample_size": "INTEGER",
+    # THE JUDGE SAMPLE IS DRAWN AT CAMPAIGN TIME AND RATED LATER, BY ANOTHER
+    # PROGRAMME STAGE. It is recorded on this row because it is a deterministic
+    # function of THIS campaign's cohort plus its own seed, so the row that
+    # defines the cohort is the one place from which the judge sample can be
+    # recomputed. The value is the CONFIGURED seed and size at the moment the
+    # campaign opened; whether a judge pass was ever run, and over what, is the
+    # judge's own artifact to record.
+    "judge_sample_seed": "INTEGER",
+    "judge_sample_size": "INTEGER",
 }
 
 
@@ -2200,6 +2286,8 @@ RUN_FINGERPRINT_COLUMNS = (
     "qdrant_collection",
     "collection_points",
     "data_snapshot_date",
+    "campaign_cohort_size",
+    "campaign_cohort_seed",
 )
 """The configuration stamp, as columns, in ``run_fingerprint``'s own order.
 
@@ -2227,6 +2315,18 @@ being recorded in the stamp and silently absent from every run row.
 RUN_FINGERPRINT_INTEGER_COLUMNS = frozenset({
     "fingerprint_version",
     "collection_points",
+    # THE COHORT'S CONFIGURED SIZE AND SEED. Both are ints in
+    # `oncotriage/config.py` and both are compared numerically by any reader
+    # asking "which campaigns ran the 300-patient cohort". A seed an operator
+    # set to a string is legal at the DRAW -- `cohort.rank_key` stringifies it
+    # -- and lands here as NULL rather than as TEXT, for the reason this
+    # frozenset exists: SQLite orders every TEXT above every INTEGER whatever
+    # the declared affinity, so one string seed would rank above every real one
+    # in `ORDER BY campaign_cohort_seed`. The DRAW still used it and the
+    # checkpoint still records it; what is refused is a numeric column
+    # pretending to hold a number.
+    "campaign_cohort_size",
+    "campaign_cohort_seed",
 })
 """Which stamp fields are stored as numbers, and therefore NULLed when unknown.
 
@@ -3611,6 +3711,74 @@ def _ensure_database(db_path):
 # ===========================================================================
 
 
+RUN_COHORT_COLUMNS = {
+    "cohort_size":           "cohort_size",
+    "cohort_digest":         "cohort_digest",
+    "stability_sample_seed": "stability_seed",
+    "stability_sample_size": "stability_size",
+    "judge_sample_seed":     "judge_seed",
+    "judge_sample_size":     "judge_size",
+}
+"""``runs`` column -> the key it is read from in a cohort record.
+
+WHY A MAPPING AND NOT MATCHING NAMES. The record is
+``oncotriage/evaluation/cohort.py:CohortSelection.record()``, whose keys are
+about a COHORT (``stability_seed``) and whose column names are about a
+``runs`` ROW, where ``seed`` alone would be ambiguous against ``cohort_seed``
+two columns up. Two vocabularies, one declared translation, rather than one
+vocabulary bent to serve both -- and the translation is DATA, so
+``start_run_record`` writes every column by walking it and a column added to
+``RUN_COLUMN_ADDITIONS`` without an entry here fails the "every declared column
+has a value" guard by name.
+
+THE STORAGE LAYER MAY NOT IMPORT THE COHORT MODULE, which is why this is a dict
+of strings and not a reference to it: ``oncotriage.evaluation.cohort`` imports
+``oncotriage.config``, and a storage module reaching into ``oncotriage.evaluation``
+inverts the layering the same way importing ``run_fingerprint`` would. The round
+trip is closed by a test, exactly as ``RUN_FINGERPRINT_COLUMNS``' is.
+"""
+
+RUN_COHORT_INTEGER_COLUMNS = frozenset(
+    c for c in RUN_COHORT_COLUMNS if c != "cohort_digest")
+"""Which cohort columns are numbers, and therefore NULLed when the value is not
+one. ``RUN_FINGERPRINT_INTEGER_COLUMNS``' argument, applied to a second group:
+SQLite keeps a non-numeric string as TEXT whatever the declared affinity and
+orders every TEXT above every INTEGER, so a seed an operator set to a string
+would make ``ORDER BY cohort_seed`` rank it above every real one. DERIVED as
+"everything but the digest" rather than listed, so a numeric column added to
+the mapping above is covered without a second edit; the digest is the only
+member that is text by nature."""
+
+
+def _run_cohort_value(column, cohort):
+    """One cohort field, coerced for the column it is going into.
+
+    ``cohort`` of ``None`` -- a caller with no cohort concept, which is every
+    caller but the batch runner -- leaves all eight columns NULL, which is the
+    "this run selected no cohort" state.
+
+    A value that will not coerce to ``int`` for a numeric column is stored as
+    NULL rather than as text, for ``RUN_COHORT_INTEGER_COLUMNS``' reason. It is
+    ``int(...)`` inside a try rather than ``isinstance(raw, int)`` because a
+    seed legitimately reaches here as ``"42"`` from a JSON round trip and 42 is
+    the honest storage of it -- unlike ``collection_points``, whose only
+    non-integer value is the literal sentinel ``"unknown"``.
+    """
+    if not isinstance(cohort, dict):
+        return None
+    raw = cohort.get(RUN_COHORT_COLUMNS[column])
+    if raw is None:
+        return None
+    if column in RUN_COHORT_INTEGER_COLUMNS:
+        if isinstance(raw, bool):
+            return None
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return str(raw)
+
+
 def _run_fingerprint_value(column, fingerprint):
     """One stamp field, coerced for the column it is going into.
 
@@ -3637,7 +3805,7 @@ def _run_fingerprint_value(column, fingerprint):
 
 
 def start_run_record(invocation_source, db_path=None, fingerprint=None,
-                     resumed=None):
+                     resumed=None, cohort=None):
     """Open a run row at db_path and return its ``runs.id``.
 
     Args:
@@ -3669,6 +3837,20 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
             first across an alias swap -- the defect
             ``oncotriage/tracking.py:configuration_params`` records finding by
             running.
+        resumed: whether this run continues an earlier one's checkpoint.
+            ``None`` writes NULL, which means "nobody measured this" and is a
+            different fact from a measured 0.
+        cohort: which patients this campaign covers, as
+            ``oncotriage/evaluation/cohort.py:CohortSelection.record()``
+            produces it. ``None`` -- what every caller that runs no cohort
+            passes, which is all of them but the batch runner -- writes NULL to
+            all eight cohort columns.
+
+            A DICT AND NOT A ``CohortSelection``, so this module keeps its
+            layering: it reads declared keys out of a plain mapping through
+            ``RUN_COHORT_COLUMNS`` and imports nothing from
+            ``oncotriage.evaluation``. The same shape ``fingerprint`` takes one
+            argument up, for the same reason.
 
     Returns:
         The integer ``runs.id``. Never ``None``.
@@ -3740,6 +3922,14 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     # ``stop_reason IS NULL`` mean "this run was not stopped" on every row of
     # every era rather than only on the ones written before era 7.
     values["stop_reason"] = None
+
+    # WHICH PATIENTS THIS CAMPAIGN COVERED. `cohort` is None for every caller
+    # that runs no cohort, and all eight columns are then NULL -- see
+    # RUN_COLUMN_ADDITIONS' era-8 block for why that is a value rather than an
+    # absence to be explained. Written by walking the declared mapping, so a
+    # column added there is written here without a second edit.
+    for _column in RUN_COHORT_COLUMNS:
+        values[_column] = _run_cohort_value(_column, cohort)
 
     # EVERY DECLARED COLUMN HAS A VALUE, CHECKED BEFORE THE INSERT.
     #

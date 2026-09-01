@@ -519,11 +519,12 @@ check("...and it is NOT the UNKNOWN sentinel (non-degeneracy: an unreadable "
       "module answers UNKNOWN, and every check below would then be comparing "
       "one sentinel with another)",
       at(_now) == _fp.UNKNOWN, False)
-check("the stamp's version says this field set is version 3. It was 2 until "
-      "`matching_call_mode` was gated; the bump is what makes every v2 "
-      "artifact answer FP_VERSION once rather than have its missing field "
-      "compared against a live value",
-      _fp.FINGERPRINT_VERSION, 3)
+check("the stamp's version says this field set is version 4. It was 2 until "
+      "`matching_call_mode` was gated and 3 until the cohort pass gated "
+      "`campaign_cohort_size` and `campaign_cohort_seed`; each bump is what "
+      "makes every older artifact answer FP_VERSION once rather than have its "
+      "missing field compared against a live value",
+      _fp.FINGERPRINT_VERSION, 4)
 
 # --- (b) the module set is DERIVED, not trusted ---------------------------
 # A static closure from the two render entry points over every module-level
@@ -1318,8 +1319,21 @@ try:
           _stored["collection_identity"], _fp.COLLECTION_IDENTITY)
     check("...and the three pre-pass keys are unchanged",
           sorted(k for k in _stored if k not in
-                 ("fingerprint", "collection_identity")),
+                 ("fingerprint", "collection_identity",
+                  _runner.CHECKPOINT_COHORT_DIGEST_KEY)),
           ["completed_stems", "count", "last_updated"])
+    # THE COHORT DIGEST IS A SIBLING OF `fingerprint`, NOT A KEY INSIDE IT, and
+    # the check above is what pins that: the stamp compared one line up is
+    # `_fp.current()` VERBATIM, so a seventh key smuggled into it would make the
+    # checkpoint's stamp stop equalling the one the module produces. It is None
+    # here because `save_checkpoint` was called with no cohort -- which is the
+    # "this caller selected no cohort" state `load_checkpoint` skips the
+    # membership comparison for.
+    check("...and the cohort digest is written as its own key, defaulting to "
+          "None for a caller that selected no cohort",
+          (_runner.CHECKPOINT_COHORT_DIGEST_KEY in _stored,
+           _stored.get(_runner.CHECKPOINT_COHORT_DIGEST_KEY)),
+          (True, None))
     check("an unchanged configuration resumes exactly as before",
           _runner.load_checkpoint(), {"patient-a", "patient-b"})
 
@@ -1395,6 +1409,13 @@ try:
         ("qdrant_collection", "trial_criteria_20260101_000000", _fp.FP_CHANGED),
         ("collection_points", 1, _fp.FP_CHANGED),
         ("data_snapshot_date", "2019-05-05", _fp.FP_CHANGED),
+        # THE COHORT, DRIVEN THROUGH THE REAL GATE. The concrete harm: a
+        # checkpoint drawn at one seed or one size resumed under another skips
+        # the FIRST cohort's completed patients and runs the SECOND cohort's
+        # remainder into the same table, so every rate over the artifact is
+        # computed across two cohorts presented as one.
+        ("campaign_cohort_size", 7, _fp.FP_CHANGED),
+        ("campaign_cohort_seed", 999999, _fp.FP_CHANGED),
     )
     # EVERY GATED FIELD IS EITHER IN THIS TABLE OR HAS ITS OWN SECTION, and the
     # round trip is closed here so a field gated in a later pass cannot be added

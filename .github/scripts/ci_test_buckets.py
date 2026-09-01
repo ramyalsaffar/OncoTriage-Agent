@@ -1306,6 +1306,26 @@ BUCKETS = {
         "needs NO network even so: every copied fixture is made unreadable, so "
         "the real fixture_replay.py returns at 'No fixture could be loaded' "
         "ABOVE the dependency-seam probe and the pinned-collection gate."),
+    "test_campaign_cohort_selection.py": (
+        _A, None,
+        "ran green in ~4s against ONLY the directory skeleton -- 115 passed, "
+        "0 failed, 1 SKIPPED (the live-corpus draw in section 10, which needs "
+        "a FHIR corpus no runner has and which is GATED rather than assumed; "
+        "the draw itself is exercised against fabricated populations in "
+        "sections 1-3, and the skip is counted and printed rather than added "
+        "to the pass count). No network, no keys, NO SPEND, no live Qdrant, no "
+        "model load (asserted: torch and transformers never enter sys.modules) "
+        "and no git history. run_fingerprint._resolve_collection is replaced so "
+        "no index probe is attempted; process_patient and the graph are "
+        "stand-ins and THE GRAPH IS NEVER INVOKED, so no billed call is "
+        "reachable. It drives the REAL main(), the REAL run_batch, the REAL "
+        "run_resample, the REAL load_checkpoint / save_checkpoint and the REAL "
+        "start_run_record. Every database, corpus and checkpoint is inside a "
+        "tempfile.mkdtemp it removes and asserts gone; paths._RESOLVED is "
+        "seeded and restored. NOT in the collision matrix: the three "
+        "repository files it reads (evaluation/cohort.py, batch/runner.py, "
+        "run_fingerprint.py) are written by neither of the suite's two writers "
+        "and are sha256-compared at the end. It EXECS NOTHING."),
     "test_storage_run_metrics_flush.py": (
         _A, None,
         "ran green in ~10s, 109 checks, against ONLY the directory skeleton: "
