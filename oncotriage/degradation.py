@@ -304,6 +304,16 @@ _REGISTRY_SPEC = (
     ("MALFORMED_EVALUATION_ENTRIES", _agent_evaluation.MALFORMED_EVALUATION_ENTRIES,
      "Stage 5 returned a top-level entry that was not an object; it was "
      "dropped and reached no verdict"),
+    ("NOT_EVALUABLE_REASON_ANOMALIES",
+     _agent_evaluation.NOT_EVALUABLE_REASON_ANOMALIES,
+     "the not_evaluable_reason record disagreed with itself. 'forged:' is a "
+     "model-returned entry that arrived carrying the pipeline-owned key, which "
+     "a conforming response cannot do -- it was dropped, and a non-zero count "
+     "means the provider did not enforce the response schema. 'missing:' is a "
+     "trial recorded as not evaluable with NO reason, which is a defect in "
+     "oncotriage/agent/evaluation.py rather than in the model or the data: "
+     "NULL in that stored column is supposed to mean only that the row "
+     "predates it"),
     ("ASSESSMENT_COMPOSITION_ANOMALIES",
      _agent_evaluation.ASSESSMENT_COMPOSITION_ANOMALIES,
      "the stored assessment was composed from a verdict the normalizer should "

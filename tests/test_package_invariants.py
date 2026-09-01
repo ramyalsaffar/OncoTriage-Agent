@@ -1415,6 +1415,20 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # fall-through is the only thing preventing that, and no blob
                    # expresses "this branch absent, everything else at HEAD".
                    "tests/test_agent_remap_no_survivor.py",
+                   # Plants into in-memory copies of agent/evaluation.py
+                   # and agent/response_schema.py for the not_evaluable_reason
+                   # vocabulary: every path that records a non-evaluation must
+                   # state why, and no value it writes may be emittable by the
+                   # model. `git show` can supply none of its five controls.
+                   # Three move ONE decision while leaving the rest of the node
+                   # correct -- one branch's stamp dropped, the run-end
+                   # tripwire's CALL removed, the forgery strip removed -- and
+                   # a fourth removes TWO at once, which is the only way to
+                   # reach the fabricated-assessment state at all and is
+                   # therefore a state no commit has ever had. The fifth opens
+                   # the response schema, which is a shape that has never
+                   # shipped and must not.
+                   "tests/test_agent_not_evaluable_reason_coverage.py",
                    # Plants into an in-memory copy of agent/evaluation.py for
                    # the Stage 5 temporal-conflict detector -- the RULE 4 flag
                    # that is COUNTED and never applied. `git show` can supply

@@ -29,6 +29,7 @@ from oncotriage.agent.state import (
     MESH_FILTER_SKIP_NO_FILTER,
     TRIAL_VERDICT_ELIGIBLE,
     TRIAL_VERDICT_NOT_EVALUABLE,
+    UNEVALUABLE_STAGE6_UNRESOLVED,
     TrialMatchState,
     normalize_trial_verdict,
 )
@@ -520,6 +521,19 @@ def node_finalize(state: TrialMatchState) -> dict:
         if verdict is None:
             _unresolved_verdicts.append(type(raw).__name__)
             verdict = TRIAL_VERDICT_NOT_EVALUABLE
+            # AND THE ROW SAYS WHY. Before this line the branch wrote the
+            # verdict and nothing else, so a trial that reached Stage 6 with an
+            # unreadable label was stored as `not_evaluable` with
+            # `not_evaluable_reason` NULL -- indistinguishable in SQL from a
+            # model-DECLARED non-evaluation and from a row written before the
+            # column existed. The log line above records the TYPE and is not a
+            # column; the campaign question is asked of the table.
+            #
+            # ASSIGNED, NOT setdefault. This node is deciding the verdict here,
+            # so it owns the reason for it: a reason carried in from a caller
+            # describes some other decision about some other label, and leaving
+            # it in place would attach it to the one this line just made.
+            e["not_evaluable_reason"] = UNEVALUABLE_STAGE6_UNRESOLVED
         e["eligible"] = verdict
 
     if _unresolved_verdicts:

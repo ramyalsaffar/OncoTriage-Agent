@@ -175,6 +175,31 @@ VERDICT_SOURCES = (
     VERDICT_SOURCE_UNRECOGNIZED,
 )
 
+# WHY A TRIAL THAT REACHED STAGE 6 WITH AN UNREADABLE LABEL WAS RECORDED AS NOT
+# EVALUATED. A value of `trial_matches.not_evaluable_reason`, and the only
+# member of that vocabulary written outside oncotriage/agent/evaluation.py.
+#
+# IT LIVES HERE AND NOT WITH THE OTHER NINE, and the reason is layering rather
+# than taste. node_finalize writes it; terminal.py imports this module and
+# `oncotriage/registries/primary_cancer.py` and `oncotriage/utils.py`, and
+# nothing else. Importing evaluation.py for one string would put a 7,700-line
+# module carrying two AWS adapter imports into Stage 6's import graph -- the
+# shape pass 20c-2c moved `_resolve_primary_cancer` out of the storage layer to
+# remove. This module is the leaf both stages already import, and
+# evaluation.py's NOT_EVALUABLE_REASONS tuple imports the name from here, so
+# the vocabulary still has exactly one owner per member and exactly one place
+# that enumerates all ten.
+#
+# UNREACHABLE ON EVERY PATH THE PIPELINE TAKES, AND STAMPED ANYWAY. Stage 5's
+# Step 0 resolves every label into TRIAL_VERDICTS, so an evaluation that has
+# been through it cannot arrive here unresolvable; the branch exists for a
+# caller that builds `evaluations` without Stage 5 -- which the API, the MCP
+# server and every test harness are free to do. A verdict written on that path
+# with no reason is exactly the row a campaign cannot explain, and the cost of
+# closing it is one assignment.
+UNEVALUABLE_STAGE6_UNRESOLVED = (
+    "trial-level verdict label unresolvable at finalization")
+
 # The recovery vocabulary, and it is deliberately SMALL. Case-folding and
 # whitespace are parsing, not guessing: "Eligible " and "eligible" are the same
 # token. The four synonyms below are the JSON spellings of a yes/no answer, and

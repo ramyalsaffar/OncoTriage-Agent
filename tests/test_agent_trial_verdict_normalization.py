@@ -923,20 +923,35 @@ _control(
 #     Step 2 carries a near-identical if-block whose elif tests `!=
 #     TRIAL_VERDICT_NOT_EVALUABLE`, and `str.replace(..., 1)` would otherwise
 #     take that one instead.
-_ELSE_APPEND = """            if verdict_unrecognized:
-                unevaluable_trials.append({
+#     RE-ANCHORED AGAIN, and for the same reason as last time: the arm gained
+#     a line. It now stamps the SAME reason onto the entry as well as into the
+#     audit list, so the anchor carries both statements and the replacement
+#     KEEPS THE STAMP -- otherwise this control would be demonstrating two
+#     deletions at once and could not say which of them the assertion caught.
+#     The `if False: pass` form is no longer needed either: with the stamp left
+#     in place the arm still has a body.
+#     RE-ANCHORED A SECOND TIME, and the anchor SHRANK rather than grew. The
+#     arm now stamps `not_evaluable_reason` as well as appending to the audit
+#     list, and the stamp is separated from the append by this file's own
+#     argument for it -- eleven lines of prose that an anchor must not carry,
+#     because then a comment edit breaks a control. So the target is the append
+#     plus ONE line of that comment, which is the shortest string unique to this
+#     arm: Step 2 carries a byte-identical append and no such comment. The
+#     replacement keeps the stamp, so what is deleted is the audit append and
+#     nothing else.
+_ELSE_APPEND = """                unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
                     "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
                 })
-            elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE:"""
+                # THE MARKER, on the same footing as the two below and added in"""
 _control(
     "7c. dropping the audit append leaves the trial unreported -- CAUGHT",
     _EVAL_SRC,
     [(_ELSE_APPEND,
-      "            if False:  # PLANTED: the audit append, dropped\n"
-      "                pass\n"
-      '            elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE:')],
+      "                pass  # PLANTED: the audit append, dropped\n"
+      "                # THE MARKER, on the same footing as the two below "
+      "and added in")],
     lambda m: len(log_records(run_stage5(
         [entry("NCT00000001", "elligible", inclusion=[crit("met")])],
         node=m.node_llm_classifier_evaluation)[1], "not_evaluable")),
@@ -945,12 +960,20 @@ _control(
 
 # 7d. The zero-criteria append, deleted: the pre-fix behaviour, where the
 #     rescued trial was recorded under a label the model never wrote.
+#     RE-ANCHORED for 7c's reason: the arm stamps the entry as well now, and
+#     the replacement keeps that stamp so the deletion under test is the audit
+#     append and nothing else.
+#     RE-ANCHORED: the arm gained a stamp line, so the anchor carries it. The
+#     replacement removes the whole unrecognised arm exactly as before -- the
+#     pre-fix shape had neither the append nor the stamp -- so the subject is
+#     unchanged.
 _ZERO_CRIT = """            if verdict_unrecognized:
                 unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
                     "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
                 })
+                eval_result["not_evaluable_reason"] = UNEVALUABLE_UNRECOGNIZED_VERDICT
             elif eval_result["eligible"] != TRIAL_VERDICT_NOT_EVALUABLE:"""
 _control(
     "7d. losing the zero-criteria label reason is CAUGHT",
@@ -1015,17 +1038,21 @@ _control(
 )
 
 # 7h. Stage 6's fall-through, restored.
+#     RE-ANCHORED: the branch now stamps `not_evaluable_reason` as well as the
+#     verdict, so the anchor carries that line too. The plant keeps the append
+#     and DROPS the stamp with the verdict, which is what restoring the
+#     fall-through actually means -- there is no non-evaluation to explain when
+#     the label is left as the model wrote it.
 _control(
     "7h. Stage 6's 'leave as-is' fall-through to near_misses is CAUGHT",
     _TERMINAL_SRC,
     [("        if verdict is None:\n"
       "            _unresolved_verdicts.append(type(raw).__name__)\n"
-      "            verdict = TRIAL_VERDICT_NOT_EVALUABLE\n"
-      "        e[\"eligible\"] = verdict",
+      "            verdict = TRIAL_VERDICT_NOT_EVALUABLE\n",
       "        if verdict is None:\n"
       "            _unresolved_verdicts.append(type(raw).__name__)\n"
       "            verdict = raw\n"
-      "        e[\"eligible\"] = verdict")],
+      "            e.pop(\"not_evaluable_reason\", None)  # PLANTED\n")],
     lambda m: bucket_of(run_stage6(
         [{"nct_id": "NCT00000001", "eligible": "elligible",
           "match_score": 0.5}], node=m.node_finalize)[0]),

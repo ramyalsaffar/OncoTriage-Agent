@@ -60,6 +60,7 @@ from oncotriage.agent.state import (
     TRIAL_VERDICT_ELIGIBLE,
     TRIAL_VERDICT_NOT_ELIGIBLE,
     TRIAL_VERDICT_NOT_EVALUABLE,
+    UNEVALUABLE_STAGE6_UNRESOLVED,
     VERDICT_SOURCE_CANONICAL,
     VERDICT_SOURCE_UNRECOGNIZED,
     TrialMatchState,
@@ -2036,6 +2037,266 @@ UNEVALUABLE_REJECTION_UNSUPPORTED = (
 # the misclassification the paragraph above rules out.
 UNEVALUABLE_REMAP_NO_SURVIVOR = (
     "no disqualifying row survived label normalisation")
+
+# THE MODEL ANSWERED FOR THIS TRIAL AND SENT NO CRITERIA AT ALL. Step 2's own
+# audit string, PROMOTED TO A CONSTANT AND NOW STAMPED ON THE ENTRY.
+#
+# THE VALUE IS UNCHANGED, DELIBERATELY. It was a bare literal in the
+# `unevaluable_trials` append below; the append still writes this name, so the
+# log line's `reason` field is byte-identical to what it has always emitted and
+# the audit list and the stored column cannot disagree about the same trial.
+# The old spelling was a literal in one file with one writer, which is why this
+# is a promotion rather than a rename: the moment a SECOND writer exists -- the
+# entry stamp -- a literal in two places is a literal that drifts.
+#
+# WHAT IT IS NOT. Not NOT_EVALUABLE_MODEL_OMITTED: that means the response
+# carried no ENTRY for this trial, so the model never named it, and the
+# reconciliation is the only thing that noticed. This one means the model DID
+# return an entry, with a readable trial-level label, and left both criteria
+# arrays empty -- a statement the prompt's Section 1 permits only for a verdict
+# of `not_evaluable`, which this population's label was not. The two have
+# different owners: one is a missing entry, the other is a malformed one.
+UNEVALUABLE_NO_CRITERIA_RETURNED = "model returned no criteria"
+
+# THE MODEL ITSELF DECLARED THIS TRIAL NOT EVALUABLE, and nothing corrected it.
+#
+# THIS IS THE `verdict_source = 'canonical'` OF THIS COLUMN, and it is here for
+# that constant's exact argument. `canonical` is written on a label that needed
+# no recovery because "the normalizer read this and found nothing to fix" and
+# "no normalizer ran" are different findings that an absence cannot separate.
+# The same held here and was NOT recorded: a model-declared non-evaluation and
+# a Step 2 defect and a row written before the column existed all stored NULL,
+# and `TRIAL_MATCH_COLUMN_ADDITIONS` had to offer a four-term SQL predicate to
+# tell the first two apart -- a predicate whose last term
+# (`criterion_details = '{"inclusion": [], "exclusion": []}'`) is TRUE of the
+# model-declared population as well, because the prompt's Section 1 requires a
+# not_evaluable trial's arrays to be EMPTY. So that predicate did not in fact
+# separate them, and the note saying it did rested on the arrays being
+# non-empty. Measured against the shipped prompt: they are empty by contract.
+#
+# WITH THIS STAMPED, EVERY not_evaluable ROW THIS PIPELINE WRITES CARRIES A
+# REASON, and NULL in that column means exactly one thing: the row predates the
+# column. That is an invariant a query can check, which a three-term predicate
+# over three columns is not.
+#
+# NOT A CORRECTION, AND THE FAMILY SAYS SO. The pipeline changed nothing about
+# this verdict; it is recording whose decision it was. `not_evaluable_reason`
+# answers "why was this trial recorded as not evaluated", and "the model said
+# so" is an answer to that question.
+UNEVALUABLE_MODEL_DECLARED = "model declared this trial not evaluable"
+
+
+# ---------------------------------------------------------------------------
+# The closed not_evaluable_reason vocabulary, in three writer classes
+# ---------------------------------------------------------------------------
+#
+# EVERY VALUE `trial_matches.not_evaluable_reason` CAN CARRY, partitioned by
+# WHO decided the trial was not evaluable. The three tuples are disjoint and
+# their union is the whole vocabulary; the guard below enforces both, at import,
+# with a RuntimeError rather than an `assert` (python -O deletes those).
+#
+# EVERY MEMBER IS PIPELINE-STAMPED AND NOT ONE IS MODEL-EMITTED. That is a
+# property of two things together, and both are checked rather than assumed:
+# `oncotriage/agent/response_schema.py` sets `additionalProperties: false` with
+# a complete `required` list at every level and `not_evaluable_reason` is in
+# neither TRIAL_FIELDS nor CRITERION_FIELDS, so a conforming response cannot
+# carry the key; and `_strip_forged_provenance` below removes it from every
+# model-returned entry before any branch reads it, so the guarantee does not
+# rest on a remote schema enforcer. See that function for why the second half
+# is not belt-and-braces.
+NOT_EVALUABLE_REASONS_CONSTRUCTED = _NOT_EVALUABLE_REASONS
+"""The model never answered for this trial. Built by `_unevaluable_entry`.
+
+An alias, not a second tuple: the members index that function's fixed
+explanation table, so a value here that is not a key there is a KeyError
+waiting for its first caller, and two tuples would be two places to forget.
+"""
+
+NOT_EVALUABLE_REASONS_CORRECTED = (
+    UNEVALUABLE_UNRECOGNIZED_VERDICT,
+    UNEVALUABLE_NO_CRITERIA_RETURNED,
+    UNEVALUABLE_REJECTION_UNSUPPORTED,
+    UNEVALUABLE_REMAP_NO_SURVIVOR,
+    UNEVALUABLE_STAGE6_UNRESOLVED,
+)
+"""The model answered and the pipeline could not use the answer as written.
+
+Four are Stage 5's; the fifth is Stage 6's, whose constant lives in
+`oncotriage/agent/state.py` for the layering reason recorded there. All five
+say the stored verdict is NOT the one the model's own words carried.
+"""
+
+NOT_EVALUABLE_REASONS_DECLARED = (
+    UNEVALUABLE_MODEL_DECLARED,
+)
+"""The model declared the non-evaluation itself and the pipeline agreed.
+
+One member, and it is a tuple rather than a bare constant so the three classes
+are read the same way and a second member can join without a consumer changing
+shape.
+"""
+
+NOT_EVALUABLE_REASONS = (NOT_EVALUABLE_REASONS_CONSTRUCTED
+                         + NOT_EVALUABLE_REASONS_CORRECTED
+                         + NOT_EVALUABLE_REASONS_DECLARED)
+"""Every value this pipeline writes to `trial_matches.not_evaluable_reason`.
+
+CLOSED. A consumer may branch on it exhaustively, and
+`oncotriage/storage/queries.py` restates the three classes -- it may not import
+the agent -- with a test requiring the restatement to equal these.
+"""
+
+if len(set(NOT_EVALUABLE_REASONS)) != len(NOT_EVALUABLE_REASONS):
+    _dupes = sorted({r for r in NOT_EVALUABLE_REASONS
+                     if NOT_EVALUABLE_REASONS.count(r) > 1})
+    raise RuntimeError(
+        "the not_evaluable_reason writer classes are not disjoint: "
+        f"{_dupes} appears in more than one of "
+        "NOT_EVALUABLE_REASONS_CONSTRUCTED / _CORRECTED / _DECLARED. A value "
+        "in two classes has two answers to 'who decided', which is the one "
+        "question this vocabulary exists to answer.")
+
+
+NOT_EVALUABLE_REASON_ANOMALIES = Counter()
+"""The `not_evaluable_reason` record disagreed with itself. Two key families.
+
+``forged:`` -- a MODEL-RETURNED entry arrived carrying the key, which a
+conforming response cannot do. The value is dropped before any branch reads it
+and this counter is the only trace. Keyed ``forged:vocabulary_member`` when the
+model wrote one of OUR strings and ``forged:foreign_value`` otherwise, which is
+the operationally decisive half: the first is an entry that would have selected
+a composed assessment asserting a correction this node never made, and the
+second is an entry that would have stored a reason from nowhere. NEITHER KEY
+CARRIES THE MODEL'S TEXT -- a reason is free-written model output of unbounded
+content, this counter reaches the run-end console block, and a criterion-shaped
+sentence about a patient does not belong there. The text is durable where model
+output belongs, in ``inferences.llm_classifier_raw_response``.
+
+``missing:`` -- an entry left this node with ``eligible = 'not_evaluable'`` and
+NO reason, which is the row a campaign cannot explain and the state this
+vocabulary exists to make impossible. Keyed by the entry's ``verdict_source``,
+or ``constructed`` when it has none, because that names which half of the node
+lost the stamp. A NON-ZERO TOTAL HERE IS A DEFECT IN THIS FILE, not in the
+model and not in the data -- which is why it is a tripwire rather than a rate.
+
+MODULE-LEVEL, NOT A KEY IN THE STAGE 5 RESULT, on AGE_PARSE_FAILURES' footing:
+the twelve characterization fixtures diff that dict field by field, so a new key
+there costs a re-capture at live model prices for a number no stage reads.
+Registered in ``oncotriage/degradation.py`` so it reaches the run-end report.
+
+INCREMENTED ON THE NODE THREAD ONLY, like PER_TRIAL_CALL_FAILURES: both writers
+run in the normalizer and the reconciliation scan, below the merge, on the
+thread that owns the node.
+"""
+
+NOT_EVALUABLE_REASON_FIELD = "not_evaluable_reason"
+"""The entry key. Named for the two functions below that must not misspell it.
+
+DELIBERATELY NOT ADOPTED AT THE SEVEN ASSIGNMENT SITES IN THE NORMALIZER, and
+that is a measured decision rather than an oversight. Two committed test files
+plant defects by replacing the exact source text
+``eval_result["not_evaluable_reason"] = ...`` -- a control that anchors on a
+literal spelling stops finding its target the moment the spelling moves, and a
+plant that matches nothing reports a WORKING check as broken. The literal is
+load-bearing at those sites until those plants are re-anchored, which is a
+change to two test files rather than to this one.
+"""
+
+
+def _strip_forged_provenance(entry: Dict) -> None:
+    """Remove a model-supplied `not_evaluable_reason` from one returned entry.
+
+    WHY THIS IS NOT BELT-AND-BRACES. Every claim in this file that a provenance
+    marker cannot be forged rests on ONE premise: that the provider enforces
+    `additionalProperties: false`. That premise is VERIFIED for the shipped
+    OpenAI branch and is an OPEN GO-LIVE QUESTION on both Bedrock branches --
+    `oncotriage/agent/bedrock_adapter.py` item (3) records that no AWS page
+    states whether `text.format` is honoured on the Responses surface, and
+    names "accepted, no error, silently not enforced" as the dangerous outcome;
+    the Converse branch's A1 asks the same thing of `outputConfig`. So on two
+    of the three arms this module can be configured into, the forgery-proof
+    property is a hypothesis about somebody else's service.
+
+    WHAT A FORGED VALUE BUYS, stated at two strengths because the two are not
+    the same. ON ITS OWN, today, it reaches an entry NO BRANCH STAMPS -- one
+    that ends `eligible` or `not_eligible` -- and lands in the stored column
+    beside a verdict saying the trial WAS evaluated. Every not_evaluable branch
+    writes its own reason, so on that population this strip and those stamps
+    are two independent barriers and removing either alone changes nothing.
+    REMOVE BOTH and the expensive case opens: `assessment_composition_case`
+    BRANCHES on this key, so an entry carrying
+    `UNEVALUABLE_REJECTION_UNSUPPORTED` has its stored assessment REPLACED by
+    fixed text stating that this pipeline corrected a rejection it never saw --
+    a sentence about the pipeline's own behaviour, written by the model, into
+    the column a clinician reads. Losing a branch's stamp is a one-line edit;
+    this is what makes that edit cost a NULL column rather than a fabrication.
+
+    DROPPED AND COUNTED, NOT RAISED. Item 11a's line: a missing file or package
+    is configuration and raises, third-party DATA counts. This is model output.
+    Raising would turn one malformed entry into a failed patient and three more
+    billed attempts, for a value the node is about to overwrite on every branch
+    that has an opinion about it.
+
+    CALLED ONCE PER MODEL-RETURNED ENTRY, at the top of the normalizer loop and
+    before Step 0 reads anything, so no branch below can be reached with a
+    forged value in scope. The entries this node CONSTRUCTS never pass through
+    here -- they are built by `_unevaluable_entry` after the loop and their
+    reason is written by this file.
+    """
+    if NOT_EVALUABLE_REASON_FIELD not in entry:
+        return
+    forged = entry.pop(NOT_EVALUABLE_REASON_FIELD)
+    NOT_EVALUABLE_REASON_ANOMALIES[
+        "forged:vocabulary_member" if forged in NOT_EVALUABLE_REASONS
+        else "forged:foreign_value"] += 1
+    log.warning(
+        "a model-returned Stage 5 entry carried the pipeline-owned "
+        "not_evaluable_reason key; dropping it. The response schema forbids "
+        "the key, so this means the provider did not enforce it",
+        stage=5, event="forged_provenance_marker",
+        nct_id=entry.get("nct_id"),
+        # The TYPE, never the value: the value is free-written model output of
+        # unbounded content and `original_label` is already off LOGGABLE_FIELDS
+        # for that reason. Whether it was one of OUR strings is the fact that
+        # decides how bad this is, and it is in the counter key.
+        error_type=type(forged).__name__)
+
+
+def _account_missing_not_evaluable_reason(evaluations) -> int:
+    """Count entries that end `not_evaluable` with no reason. Returns the total.
+
+    THE TRIPWIRE FOR THIS FILE'S OWN INVARIANT: every trial this node records as
+    not evaluated states why. It is checked at run time and not only in a test
+    because the test can only drive the shapes somebody thought of, and the
+    thing being guarded is a stored column a campaign is later asked to explain.
+
+    IT ONLY LOOKS. A missing reason is a defect in this module, discovered after
+    the patient's calls have been paid for; raising would discard a completed
+    evaluation to report a bookkeeping fault, and returning the patient as an
+    error would spend MAX_LLM_CLASSIFIER_RETRIES more calls reproducing it. The
+    verdict is still correct and still stored; what is missing is its label.
+    """
+    missing = 0
+    for entry in evaluations:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("eligible") != TRIAL_VERDICT_NOT_EVALUABLE:
+            continue
+        if entry.get(NOT_EVALUABLE_REASON_FIELD):
+            continue
+        missing += 1
+        # `verdict_source` is present on every entry the MODEL returned and
+        # absent on the four this node constructs, so this key says which half
+        # of the node lost the stamp without a second field having to.
+        NOT_EVALUABLE_REASON_ANOMALIES[
+            f"missing:{entry.get(VERDICT_SOURCE_FIELD) or 'constructed'}"] += 1
+    if missing:
+        log.warning(
+            "trials were recorded as not evaluable with no reason; the stored "
+            "row cannot say why and NULL in that column is supposed to mean "
+            "only that the row predates it",
+            stage=5, event="not_evaluable_reason_missing", count=missing)
+    return missing
 
 
 # ---------------------------------------------------------------------------
@@ -6900,6 +7161,14 @@ CLINICAL TRIALS:
     for eval_result in evaluations:
         nct_id = eval_result.get("nct_id", "")
 
+        # ── Step -1: the provenance key belongs to this file ────────────────
+        # ABOVE STEP 0, so no branch below can be reached with a model-supplied
+        # `not_evaluable_reason` in scope -- including the two that stamp it and
+        # the composition case that BRANCHES on it. See
+        # _strip_forged_provenance for why the response schema alone is not the
+        # guarantee on two of the three provider arms.
+        _strip_forged_provenance(eval_result)
+
         # ── Step 0: the trial-level verdict ─────────────────────────────────
         #
         # THIS LINE USED TO READ `eligible = "not_eligible"` FOR ANYTHING
@@ -6998,18 +7267,43 @@ CLINICAL TRIALS:
             # the label the model actually wrote. Step 0 has already set the
             # value to not_evaluable, so the `!=` guard below would see nothing
             # to report and this trial's real defect would go unnamed.
+            #
+            # ALL THREE ARMS STAMP THE ENTRY, and until this pass none of them
+            # did. The audit list below feeds ONE log line and is discarded, so
+            # this whole population reached `trial_matches` with
+            # `not_evaluable_reason` NULL -- the state the column's own note
+            # described as "identifiable from the columns beside it" through a
+            # four-term SQL predicate whose last term is TRUE of the third arm
+            # as well, because the prompt requires a not_evaluable trial's
+            # arrays to be empty. So the predicate did not separate what it said
+            # it separated. A reason on the row does.
+            #
+            # THREE ARMS, THREE REASONS, AND THE THIRD IS NOT A CORRECTION. The
+            # first two are the pipeline overriding an answer it could not use;
+            # the third is the model declaring the non-evaluation itself and
+            # this node agreeing. Folding them together would make the column
+            # report a correction that never happened, which is the failure the
+            # two sibling markers below are written to avoid.
             if verdict_unrecognized:
                 unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
                     "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
                 })
+                eval_result["not_evaluable_reason"] = UNEVALUABLE_UNRECOGNIZED_VERDICT
             elif eval_result["eligible"] != TRIAL_VERDICT_NOT_EVALUABLE:
                 unevaluable_trials.append({
                     "nct_id": nct_id,
                     "original_label": eval_result["eligible"],
-                    "reason": "model returned no criteria",
+                    "reason": UNEVALUABLE_NO_CRITERIA_RETURNED,
                 })
+                eval_result["not_evaluable_reason"] = UNEVALUABLE_NO_CRITERIA_RETURNED
+            else:
+                # NO AUDIT ENTRY, AND THAT IS UNCHANGED. `unevaluable_trials`
+                # feeds a log line reading "these are not rejections", which is
+                # a report about verdicts this node MOVED; a model-declared
+                # non-evaluation was never a rejection and was never moved.
+                eval_result["not_evaluable_reason"] = UNEVALUABLE_MODEL_DECLARED
             eval_result["eligible"] = TRIAL_VERDICT_NOT_EVALUABLE
             _record_zero_score(eval_result, inc, exc)
             continue
@@ -7064,7 +7358,9 @@ CLINICAL TRIALS:
             # is deliberately NOT in _NOT_EVALUABLE_REASONS, whose members
             # index _unevaluable_entry's fixed explanation table, and the
             # strict response schema cannot emit the key, so an entry carrying
-            # it was written here.
+            # it was written here -- with `_strip_forged_provenance` at the top
+            # of this loop as the half of that guarantee that does not depend
+            # on a provider enforcing the schema.
             eval_result["not_evaluable_reason"] = UNEVALUABLE_REMAP_NO_SURVIVOR
             _record_zero_score(eval_result, inc, exc)
 
@@ -7072,6 +7368,11 @@ CLINICAL TRIALS:
             # Model-declared "not_eligible" with no surviving disqualifier and
             # no remap, or model-declared "not_evaluable" with criteria present,
             # or an UNRECOGNISED label whose criteria disqualify nobody.
+            #
+            # ALL THREE STAMP A REASON NOW, and only the middle one did before.
+            # The other two ended not_evaluable -- the first because this branch
+            # corrects it, the third because Step 0 already had -- and neither
+            # said so on the row. See the three arms below.
             #
             # The third was the fabricated rejection this branch used to receive
             # as a settled "not_eligible" from Step 0 and pass through untouched
@@ -7095,6 +7396,17 @@ CLINICAL TRIALS:
                     "original_label": repr(raw_verdict)[:_MALFORMED_ENTRY_PREVIEW_LEN],
                     "reason": UNEVALUABLE_UNRECOGNIZED_VERDICT,
                 })
+                # THE MARKER, on the same footing as the two below and added in
+                # the same pass that closed Step 2. An unreadable label over
+                # criteria that disqualify nobody is a verdict this node WROTE
+                # -- Step 0 resolved it to not_evaluable -- and it left no trace
+                # on the row. It is deliberately the SAME constant the audit
+                # list carries, so the log line and the column cannot disagree
+                # about one trial, and deliberately NOT a composed-assessment
+                # marker: `assessment_composition_case` matches only the two
+                # corrected-rejection reasons, so this entry keeps the model's
+                # draft, which is the behaviour that was already correct for it.
+                eval_result["not_evaluable_reason"] = UNEVALUABLE_UNRECOGNIZED_VERDICT
             elif eval_result["eligible"] == TRIAL_VERDICT_NOT_ELIGIBLE:
                 # `original_label` is the CANONICAL constant, not `raw_verdict`,
                 # and that matches the out-of-vocabulary branch above rather
@@ -7123,15 +7435,37 @@ CLINICAL TRIALS:
                 # _NOT_EVALUABLE_REASONS, whose members index
                 # _unevaluable_entry's fixed explanation table.
                 #
-                # THE ONLY WRITER OF THIS KEY ON A MODEL-RETURNED ENTRY. The
-                # model cannot supply it: the response schema is strict with
-                # `additionalProperties: false` and this key is not among its
-                # six properties, so an entry that carries it was written here.
-                # tests/test_agent_unsupported_rejection.py asserts that
-                # property of the schema rather than assuming it, because it is
-                # what makes the marker trustworthy.
+                # THIS WAS ONCE "THE ONLY WRITER OF THIS KEY ON A
+                # MODEL-RETURNED ENTRY" AND IT IS NOW ONE OF FIVE. The pass
+                # that closed Step 2's gap made every not_evaluable branch
+                # stamp, so what is still true -- and is the part that matters
+                # -- is that the value on any model-returned entry was written
+                # by THIS FILE and never by the model. Two things make that so
+                # and both are checked rather than assumed: the response schema
+                # is strict with `additionalProperties: false` and this key is
+                # not among its six properties, and `_strip_forged_provenance`
+                # removes it at the top of this loop for the provider arms
+                # whose enforcement of that schema is an open question.
+                # tests/test_agent_not_evaluable_reason_coverage.py sections 1
+                # and 5 drive both halves;
+                # tests/test_agent_unsupported_rejection.py asserts the schema
+                # property for this marker in particular.
                 eval_result["not_evaluable_reason"] = (
                     UNEVALUABLE_REJECTION_UNSUPPORTED)
+            elif eval_result["eligible"] == TRIAL_VERDICT_NOT_EVALUABLE:
+                # THE MODEL DECLARED IT, WITH CRITERIA PRESENT. The sibling of
+                # Step 2's third arm: same decision, same owner, same reason,
+                # reached with non-empty arrays instead of empty ones. Stamping
+                # it is what makes NULL in the stored column mean exactly one
+                # thing -- the row predates the column -- rather than three.
+                #
+                # THE CONDITION IS WRITTEN OUT RATHER THAN LEFT AS A BARE ELSE.
+                # In this chain `eligible` can only be not_eligible or
+                # not_evaluable by the time control reaches here, so a bare else
+                # would be equivalent today and would silently start stamping a
+                # model-declared reason onto some other verdict the day a branch
+                # above it moves.
+                eval_result["not_evaluable_reason"] = UNEVALUABLE_MODEL_DECLARED
             _record_zero_score(eval_result, inc, exc)
 
     if label_remaps:
@@ -7414,6 +7748,20 @@ CLINICAL TRIALS:
         evaluations.extend(
             _unevaluable_entry(t, NOT_EVALUABLE_MODEL_OMITTED) for t in _omitted
         )
+
+    # ── Every non-evaluation states why ─────────────────────────────────────
+    #
+    # HERE, AND THE POSITION IS THE WHOLE OF THE GUARANTEE. Every writer of the
+    # verdict has finished: the normalizer's three steps, the absent-data
+    # validator (which can only move a verdict TO eligible), and the
+    # reconciliation immediately above, which appends the last entries this node
+    # will ever produce. Scanning earlier would pass over trials that do not
+    # exist yet and would flag ones a later pass was about to stamp.
+    #
+    # ABOVE THE COMPOSITION, so what it measures is what the composition is
+    # about to read: `assessment_composition_case` branches on this key, and a
+    # missing reason there silently selects the kept-draft case.
+    _account_missing_not_evaluable_reason(evaluations)
 
     # ── The stored assessment is composed from the arrays ───────────────────
     #

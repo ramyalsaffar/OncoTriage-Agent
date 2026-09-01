@@ -98,6 +98,7 @@ from oncotriage.agent.evaluation import (
     ASSESSMENT_REMAP_NO_SURVIVOR_TEXT,
     ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
     NOT_EVALUABLE_MODEL_OMITTED,
+    UNEVALUABLE_MODEL_DECLARED,
     UNEVALUABLE_REJECTION_UNSUPPORTED,
     UNEVALUABLE_REMAP_NO_SURVIVOR,
     UNEVALUABLE_UNRECOGNIZED_VERDICT,
@@ -641,7 +642,16 @@ _ne, _ne_err = run_stage5(
            assessment="Not evaluable: the criteria text was unreadable.")])
 check("a model-declared not_evaluable with empty arrays stays not_evaluable",
       verdict_of(_ne), TRIAL_VERDICT_NOT_EVALUABLE)
-check("...and carries no marker", marker_of(_ne), "<no key>")
+# IT USED TO REQUIRE NO MARKER. What this section is about -- that THIS
+# branch's marker is not written outside THIS population -- is unchanged and is
+# the second half of the check below. The absence itself was pinning a gap: a
+# model-declared non-evaluation stored NULL, and so did a row written before
+# the column and so did Step 2's no-criteria defect.
+check("...and carries the DECLARED marker, neither corrected-rejection one",
+      (marker_of(_ne),
+       marker_of(_ne) in (UNEVALUABLE_REMAP_NO_SURVIVOR,
+                          UNEVALUABLE_REJECTION_UNSUPPORTED)),
+      (UNEVALUABLE_MODEL_DECLARED, False))
 check("...and keeps its own draft",
       (assessment_composition_case(eval_of(_ne)),
        eval_of(_ne).get("assessment")),
@@ -667,13 +677,29 @@ check("non-degeneracy: the sibling payload registered NO remap, which is what "
       len(log_records(_sib_err, "label_remap")), 0)
 
 # (e) An UNRECOGNISED label with non-disqualifying criteria keeps its own
-# reason and gets NO marker: the fall-through branch's two arms are disjoint.
+# reason, and that reason is now ON THE ROW as well as in the log. The
+# fall-through branch's two arms are still disjoint, which is what this checks:
+# the marker it gets is the label reason and NOT either corrected-rejection
+# marker, so it composes neither of their sentences.
+#
+# IT USED TO ASSERT NO MARKER AT ALL. That was pinning a gap: Step 0 had
+# already written not_evaluable for this entry, so the verdict was the node's
+# and the row said nothing about why. The disjointness this line is about is
+# unchanged and is asserted directly below.
 _unk, _unk_err = run_stage5(
     [entry("NCT00000001", "elligible", inclusion=[crit("met")])])
 check("an unrecognised label keeps the label reason",
       field(log_records(_unk_err, "not_evaluable"), "reason"),
       [UNEVALUABLE_UNRECOGNIZED_VERDICT])
-check("...and gets no marker at all", marker_of(_unk), "<no key>")
+check("...and the row now carries that same reason, not a correction marker",
+      (marker_of(_unk),
+       marker_of(_unk) in (UNEVALUABLE_REMAP_NO_SURVIVOR,
+                           UNEVALUABLE_REJECTION_UNSUPPORTED)),
+      (UNEVALUABLE_UNRECOGNIZED_VERDICT, False))
+check("...so it composes neither corrected-rejection sentence and keeps its "
+      "draft",
+      assessment_composition_case(eval_of(_unk)),
+      ASSESSMENT_KEPT_NOT_EVALUABLE)
 
 # (f) An eligible trial, and a CONSTRUCTED non-evaluation, for completeness.
 _elig, _ = run_stage5([entry("NCT00000001", "eligible",
@@ -996,12 +1022,31 @@ check("C4 non-degeneracy: the SHIPPED module composes the weaker text for "
 _control(
     "C5. writing the marker outside the branch reaches entries it must not -- "
     "CAUGHT",
-    [("    for eval_result in evaluations:\n"
-      '        nct_id = eval_result.get("nct_id", "")',
-      "    for eval_result in evaluations:\n"
-      '        eval_result["not_evaluable_reason"] = '
-      "UNEVALUABLE_REMAP_NO_SURVIVOR  # PLANTED\n"
-      '        nct_id = eval_result.get("nct_id", "")')],
+    # THE PLANT MOVED AND THE MOVE IS THE FINDING RATHER THAN BOOKKEEPING. It
+    # used to be the loop's FIRST statement, on the reasoning that a marker
+    # written for every entry reaches entries this branch does not describe.
+    # That defect is no longer expressible from there, for two independent
+    # reasons, and neither is a weakening: `_strip_forged_provenance` now runs
+    # at the top of the loop and removes any marker present before the
+    # pipeline's own writes, and -- more decisively -- EVERY not_evaluable
+    # branch stamps its own reason now, so a top-of-loop write is overwritten
+    # on every path that could carry it. Measured: the old plant produces the
+    # SHIPPED answer.
+    #
+    # So the plant is sited in the one branch whose population must not carry
+    # this marker: Step 2's model-DECLARED arm. Same subject -- this sentence
+    # reaching a trial whose evidence does not support it -- planted where it
+    # can still happen. The anchor carries the comment above the assignment
+    # because the assignment line alone is not unique: the sibling arm in
+    # Step 3 writes the identical text.
+    [("                # non-evaluation was never a rejection and was never "
+      "moved.\n"
+      '                eval_result["not_evaluable_reason"] = '
+      "UNEVALUABLE_MODEL_DECLARED\n",
+      "                # non-evaluation was never a rejection and was never "
+      "moved.\n"
+      '                eval_result["not_evaluable_reason"] = '
+      "UNEVALUABLE_REMAP_NO_SURVIVOR  # PLANTED\n")],
     lambda m: _stored(m, [entry(
         "NCT00000001", "not_evaluable",
         assessment="Not evaluable: the criteria text was unreadable.")]),

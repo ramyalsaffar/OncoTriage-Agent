@@ -1009,10 +1009,37 @@ check("nor the criterion marker", CRITERION_MARKER in _PREFIX_STRINGS, False)
 # is exactly why this pass persists it without widening where it is WRITTEN.
 check("not_evaluable_reason IS projected, so its VALUES must not move",
       "not_evaluable_reason" in _PREFIX_STRINGS, True)
-check("...and the pipeline still writes it at exactly two sites in the "
-      "normalizer, the two corrections, unchanged by this pass",
-      Path(_EV_PY).read_text(encoding="utf-8").count(
-          'eval_result["not_evaluable_reason"] = '), 2)
+# THIS WAS A SUBSTRING COUNT PINNED AT 2 AND IT HAD TWO PROBLEMS, one of which
+# only appeared when the count legitimately moved. The count is 7 now -- the
+# provenance pass wrote the two corrections, and the pass that closed the Step 2
+# gap added five more so that every not_evaluable population states why -- and
+# raising the literal would have left the second problem in place: the string
+# also matches PROSE, and evaluation.py's own argument for the field quotes the
+# assignment it describes, so the substring count read 8 against 7 real writes.
+# The check is over ASSIGNMENTS now, by AST, and it asserts the thing that
+# actually matters: WHICH reasons the normalizer can write, as a set.
+_ASSIGNED_REASONS = set()
+for _n in ast.walk(ast.parse(Path(_EV_PY).read_text(encoding="utf-8"))):
+    if not isinstance(_n, ast.Assign) or len(_n.targets) != 1:
+        continue
+    _t = _n.targets[0]
+    if not (isinstance(_t, ast.Subscript)
+            and isinstance(_t.value, ast.Name) and _t.value.id == "eval_result"
+            and isinstance(_t.slice, ast.Constant)
+            and _t.slice.value == "not_evaluable_reason"):
+        continue
+    _ASSIGNED_REASONS.add(
+        _n.value.id if isinstance(_n.value, ast.Name) else ast.unparse(_n.value))
+check("...and the reasons the normalizer can write are exactly the CORRECTED "
+      "and DECLARED classes, by the constant NAME at every site",
+      sorted(_ASSIGNED_REASONS),
+      sorted({"UNEVALUABLE_UNRECOGNIZED_VERDICT",
+              "UNEVALUABLE_NO_CRITERIA_RETURNED",
+              "UNEVALUABLE_REJECTION_UNSUPPORTED",
+              "UNEVALUABLE_REMAP_NO_SURVIVOR",
+              "UNEVALUABLE_MODEL_DECLARED"}))
+check("non-degeneracy: the walk found real assignments, not an empty set",
+      len(_ASSIGNED_REASONS) > 1, True)
 
 # The composed assessment IS compared. It must not read a key this pass added.
 _compose_src = ""
@@ -1070,8 +1097,16 @@ try:
         FROM trial_matches WHERE eligible = 'not_evaluable'
         GROUP BY not_evaluable_reason ORDER BY reason
     """)
-    check("Q1 -- the one not_evaluable trial of this run is grouped by reason",
-          [(r["reason"], r["n"]) for r in _q1], [("(not reported)", 1)])
+    # IT USED TO EXPECT '(not reported)', AND THAT WAS THE GAP RATHER THAN THE
+    # PROPERTY. The trial in this run is a model-returned entry whose label the
+    # normalizer could not read; Step 0 wrote not_evaluable for it and nothing
+    # recorded why, so the campaign question "why was this not evaluated"
+    # answered "(not reported)" for a trial the pipeline itself had classified.
+    # The reason is on the row now, and it is the same string the audit log
+    # carries for that trial.
+    check("Q1 -- the one not_evaluable trial of this run names its reason",
+          [(r["reason"], r["n"]) for r in _q1],
+          [(_ev.UNEVALUABLE_UNRECOGNIZED_VERDICT, 1)])
 
     # Q2: how many verdicts were normalized, and from what original types.
     _q2 = rows(_IDB, """

@@ -4782,6 +4782,81 @@ check("8c-o: the restated omission reason is byte-identical to the constant "
       "zero omissions in every arm, forever, and look clean doing it",
       queries.CALL_MODE_OMISSION_REASON, NOT_EVALUABLE_MODEL_OMITTED)
 
+# --- AND SO ARE THE THREE WRITER CLASSES ----------------------------------
+#
+# THE SAME TRADE ONE TUPLE WIDER, AND IT HAD ALREADY GONE WRONG ONCE. The
+# family CASE in `not_evaluable_reasons` used to be four literals written out
+# by hand; the per-trial pass added a fifth CONSTRUCTED reason
+# (`per_trial_call_failed`) and the CASE was never widened, so a trial whose own
+# REQUEST failed was reported under "corrected from a model verdict" -- a family
+# that asserts the model answered -- and on the SHIPPED per-trial arm that is
+# the constructed reason most likely to occur. The CASE is generated from these
+# tuples now, and these three checks are what keep the restatement honest.
+from oncotriage.agent.evaluation import (            # noqa: E402
+    NOT_EVALUABLE_REASONS_CONSTRUCTED as _AGENT_CONSTRUCTED,
+    NOT_EVALUABLE_REASONS_CORRECTED as _AGENT_CORRECTED,
+    NOT_EVALUABLE_REASONS_DECLARED as _AGENT_DECLARED,
+)
+for _label, _restated, _owner in (
+        ("CONSTRUCTED", queries.NOT_EVALUABLE_REASONS_CONSTRUCTED,
+         _AGENT_CONSTRUCTED),
+        ("CORRECTED", queries.NOT_EVALUABLE_REASONS_CORRECTED, _AGENT_CORRECTED),
+        ("DECLARED", queries.NOT_EVALUABLE_REASONS_DECLARED, _AGENT_DECLARED)):
+    check(f"8c-o-{_label.lower()}: the restated {_label} class equals the "
+          "agent's, so the family CASE cannot report a reason under the wrong "
+          "writer",
+          sorted(_restated), sorted(_owner))
+check("8c-o-vocab: and the union is the whole closed vocabulary, so a reason "
+      "added to the agent and not to queries.py falls to the ELSE arm that "
+      "NAMES itself rather than being silently called a correction",
+      sorted(set(queries.NOT_EVALUABLE_REASONS_CONSTRUCTED)
+             | set(queries.NOT_EVALUABLE_REASONS_CORRECTED)
+             | set(queries.NOT_EVALUABLE_REASONS_DECLARED)),
+      sorted(_ev_all := set(_AGENT_CONSTRUCTED) | set(_AGENT_CORRECTED)
+             | set(_AGENT_DECLARED)))
+check("non-degeneracy: the vocabulary compared is non-empty and plural",
+      len(_ev_all) >= 11, True)
+check("8c-o-sql: every member is interpolated into the rendered family CASE, "
+      "which is the thing a reader's GROUP BY actually meets",
+      [r for r in _ev_all
+       if f"'{r}'" not in queries.QUERIES_BY_KEY['not_evaluable_reasons'].sql],
+      [])
+
+# --- AND THE CASE IS DRIVEN, NOT JUST READ --------------------------------
+#
+# THE INTERPOLATION CHECK ABOVE CANNOT SEE A MEMBER IN THE WRONG ARM: every
+# reason appears in the SQL either way, and putting `per_trial_call_failed` in
+# the CORRECTED list would satisfy it while reporting a transport failure as a
+# model verdict -- which is the exact defect this replaced. So the CASE is
+# EXECUTED, over a scratch in-memory table, once per member plus NULL plus a
+# value from outside the vocabulary. Nothing here touches the seeded database
+# beside it.
+_fam = sqlite3.connect(":memory:")
+_fam.execute("CREATE TABLE trial_matches (not_evaluable_reason TEXT)")
+_fam.executemany("INSERT INTO trial_matches VALUES (?)",
+                 [(r,) for r in sorted(_ev_all)]
+                 + [(None,), ("a value from nowhere",)])
+_families = dict(_fam.execute(
+    f"SELECT COALESCE(tm.not_evaluable_reason, '<null>'), "
+    f"{queries._NOT_EVALUABLE_FAMILY_SQL} FROM trial_matches tm").fetchall())
+_fam.close()
+check("8c-o-drive: every CONSTRUCTED reason is reported as constructed",
+      sorted({_families.get(r) for r in _AGENT_CONSTRUCTED}),
+      ["constructed by the pipeline"])
+check("8c-o-drive: every CORRECTED reason is reported as corrected",
+      sorted({_families.get(r) for r in _AGENT_CORRECTED}),
+      ["corrected from a model verdict"])
+check("8c-o-drive: every DECLARED reason is reported as declared, and NOT as "
+      "a correction the pipeline never made",
+      sorted({_families.get(r) for r in _AGENT_DECLARED}),
+      ["declared by the model"])
+check("8c-o-drive: NULL is reported as not reported, and a value from outside "
+      "the vocabulary NAMES itself rather than falling into a real family",
+      (_families.get("<null>"), _families.get("a value from nowhere")),
+      ("(not reported)", "(not a value this pipeline writes)"))
+check("8c-o-drive: non-degeneracy -- the drive really classified every row",
+      len(_families), len(_ev_all) + 2)
+
 # --- EVERY INFERENCE ROW IS ACCOUNTED FOR ---------------------------------
 check("8c-o-arm: the omission is attributed to the GROUPED arm, which is the "
       "only arm that can produce one -- a per-trial request carrying one trial "

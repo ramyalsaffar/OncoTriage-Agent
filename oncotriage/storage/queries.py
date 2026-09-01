@@ -1055,10 +1055,88 @@ there is a finding about the reconciliation rather than about the model. Both
 readings need the arm beside the number, which is what this query exists to put
 there.
 
-``not_evaluable_reasons`` next door still writes this string as one of four
-literals in a family CASE. It is deliberately not switched to this constant in
-the same commit: that query's rendered output is pinned, and a text change to a
-pinned query is a change to what a pin means."""
+``not_evaluable_reasons`` next door NO LONGER writes this string as one of four
+literals in a family CASE, and the paragraph that stood here said it did. That
+CASE is now interpolated from the three tuples below -- which is what closed the
+defect the hand-written list had already acquired: it named four reasons and the
+per-trial pass had added a fifth (``per_trial_call_failed``), so a trial whose
+own REQUEST failed was reported under "corrected from a model verdict", a
+family that asserts the model answered. On the SHIPPED per-trial arm that is the
+constructed reason most likely to occur."""
+
+# ---------------------------------------------------------------------------
+# The not_evaluable_reason vocabulary, by writer class
+# ---------------------------------------------------------------------------
+#
+# RESTATED, NOT IMPORTED, for CALL_MODE_OMISSION_REASON's reason one screen up:
+# the owner is ``oncotriage/agent/evaluation.py`` and a storage module importing
+# the agent is the edge pass 20c-2c removed. Same trade, same mitigation --
+# ``tests/test_storage_query_layer.py`` imports both sides and requires each
+# tuple to equal its owner, which is what stops a restated constant drifting the
+# way the hand-written CASE above already had.
+NOT_EVALUABLE_REASONS_CONSTRUCTED = (
+    "truncation_floor",
+    "truncation_split_budget_exhausted",
+    "omitted_from_model_response",
+    "conflicting_duplicate_answers",
+    "per_trial_call_failed",
+)
+"""The model never answered for this trial; the pipeline built the entry."""
+
+NOT_EVALUABLE_REASONS_CORRECTED = (
+    "trial-level verdict label not recognised",
+    "model returned no criteria",
+    "model rejection unsupported by its own criteria arrays",
+    "no disqualifying row survived label normalisation",
+    "trial-level verdict label unresolvable at finalization",
+)
+"""The model answered and the pipeline could not use the answer as written."""
+
+NOT_EVALUABLE_REASONS_DECLARED = (
+    "model declared this trial not evaluable",
+)
+"""The model declared the non-evaluation itself; nothing was corrected."""
+
+
+def _sql_string_list(values) -> str:
+    """``'a', 'b'`` -- a SQL IN-list literal, single quotes doubled.
+
+    Every value this is handed today is a constant of this project with no
+    apostrophe in it, so the escape changes nothing and is here for the day one
+    of them gains a possessive. A reason is not user input and is never a
+    parameter, because it is interpolated into a CASE rather than compared
+    against a bound value.
+    """
+    return ", ".join("'" + str(v).replace("'", "''") + "'" for v in values)
+
+
+# ONE CASE, THREE FAMILIES, GENERATED. A reader asks "who decided this trial was
+# not evaluable" and gets an answer that cannot disagree with the code that
+# decided it. The DECLARED family is the one a hand-written CASE gets wrong by
+# omission rather than by staleness: without it a model-declared non-evaluation
+# falls to the ELSE and is reported as a correction the pipeline never made.
+_NOT_EVALUABLE_FAMILY_SQL = f"""        CASE
+            WHEN tm.not_evaluable_reason IS NULL THEN '(not reported)'
+            WHEN tm.not_evaluable_reason
+                 IN ({_sql_string_list(NOT_EVALUABLE_REASONS_CONSTRUCTED)})
+                 THEN 'constructed by the pipeline'
+            WHEN tm.not_evaluable_reason
+                 IN ({_sql_string_list(NOT_EVALUABLE_REASONS_CORRECTED)})
+                 THEN 'corrected from a model verdict'
+            WHEN tm.not_evaluable_reason
+                 IN ({_sql_string_list(NOT_EVALUABLE_REASONS_DECLARED)})
+                 THEN 'declared by the model'
+            ELSE '(not a value this pipeline writes)'
+        END"""
+"""The family classifier, interpolated into ``not_evaluable_reasons``.
+
+THE NULL ARM IS FIRST AND THE ELSE ARM NAMES ITSELF. Before this pass the NULL
+arm sat SECOND, under a membership test -- harmless, because ``x IN (...)`` is
+NULL rather than true for a NULL x, but it read as though a NULL could be
+classified. And the ELSE was ``'corrected from a model verdict'``, so a value
+from outside the vocabulary -- a hand-written row, a future writer, a restated
+tuple that fell behind its owner -- was reported as a correction. It now says
+that it is not a value this pipeline writes, which is the finding."""
 
 CAMPAIGN_STAMP_COLUMN = "fingerprint_version"
 """The `runs` column whose presence says a configuration stamp was recorded.
@@ -1904,27 +1982,21 @@ QUERIES = (
         render='to_string',
         blank_after=True,
         notes=(
-            "NULL reason on a not_evaluable row is not 'no reason'. It is a",
-            "trial the model returned with no criteria (Stage 5 Step 2, whose",
-            "reason reaches the log and not the row), a model-DECLARED",
-            "not_evaluable, or a row written before the column existed --",
-            "separated by verdict_source and by whether criterion_details is",
-            "empty. See TRIAL_MATCH_COLUMN_ADDITIONS.",
+            "NULL reason on a not_evaluable row means ONE thing now: the row",
+            "predates the column. Every path that records a non-evaluation",
+            "stamps a reason -- including the three that did not (Stage 5",
+            "Step 2's no-criteria arms, an unreadable label over criteria",
+            "that disqualify nobody, and a model-DECLARED non-evaluation).",
+            "The three families below say WHO decided; 'declared by the",
+            "model' is not a correction. See TRIAL_MATCH_COLUMN_ADDITIONS.",
         ),
         requires_columns=(("trial_matches", "not_evaluable_reason"),
                           ("trial_matches", "verdict_source"),),
-        sql="""
+        sql=f"""
     SELECT
         COALESCE(tm.not_evaluable_reason, '(not reported)') AS not_evaluable_reason,
-        CASE
-            WHEN tm.not_evaluable_reason IN ('truncation_floor',
-                                             'truncation_split_budget_exhausted',
-                                             'omitted_from_model_response',
-                                             'conflicting_duplicate_answers')
-                 THEN 'constructed by the pipeline'
-            WHEN tm.not_evaluable_reason IS NULL THEN '(not reported)'
-            ELSE 'corrected from a model verdict'
-        END                                                 AS family,
+{_NOT_EVALUABLE_FAMILY_SQL}
+                                                    AS family,
         COUNT(*)                                            AS trials,
         COUNT(DISTINCT tm.inference_id)                     AS runs,
         SUM(CASE WHEN tm.verdict_source IS NULL THEN 1 ELSE 0 END)

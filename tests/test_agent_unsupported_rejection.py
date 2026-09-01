@@ -98,6 +98,7 @@ from oncotriage.agent.evaluation import (
     ASSESSMENT_NOT_EVALUABLE_OPENING,
     ASSESSMENT_UNSUPPORTED_REJECTION_TEXT,
     NOT_EVALUABLE_MODEL_OMITTED,
+    UNEVALUABLE_MODEL_DECLARED,
     UNEVALUABLE_REJECTION_UNSUPPORTED,
     UNEVALUABLE_REMAP_NO_SURVIVOR,
     UNEVALUABLE_UNRECOGNIZED_VERDICT,
@@ -777,8 +778,18 @@ check("a model-declared not_evaluable keeps its draft",
       (assessment_composition_case(_declared), _declared.get("assessment")),
       (ASSESSMENT_KEPT_NOT_EVALUABLE,
        "Not evaluable: the criteria text was unreadable."))
-check("...and carries no marker",
-      _declared.get("not_evaluable_reason", "<no key>"), "<no key>")
+# THIS CHECK USED TO REQUIRE NO MARKER AT ALL, and it was pinning a gap rather
+# than a property: a model-declared non-evaluation stored NULL, which is what a
+# row written before the column stores and what Step 2's no-criteria defect
+# stored, so three populations shared one bucket. It carries its own DECLARED
+# reason now. What this file is actually about is unchanged and is asserted on
+# the line below it and on the composition case above: the marker is NOT one of
+# the two corrected-rejection markers, so the draft still survives.
+check("...and carries the DECLARED marker, which is not a correction",
+      (_declared.get("not_evaluable_reason", "<no key>"),
+       _declared.get("not_evaluable_reason") in (
+           UNEVALUABLE_REJECTION_UNSUPPORTED, UNEVALUABLE_REMAP_NO_SURVIVOR)),
+      (UNEVALUABLE_MODEL_DECLARED, False))
 check("a CONSTRUCTED not_evaluable keeps its purpose-written text",
       (assessment_composition_case(_constructed),
        "no entry for this trial" in _constructed.get("assessment", "")),

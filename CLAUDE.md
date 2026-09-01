@@ -11847,6 +11847,256 @@ is labelled as both, deliberately.
    this pass's; it is reported rather than fixed because the manifest is
    another item's subject.
 
+### Every non-evaluation states why (the reason-coverage pass)
+
+**ELEVEN CODE PATHS CAN RECORD A TRIAL AS `not_evaluable` AND SIX OF THEM LEFT
+THE COLUMN NULL.** `trial_matches.not_evaluable_reason` is what a campaign is
+asked when a trial was not evaluated, and the enumeration was done from source
+before anything was edited:
+
+| # | path | reason | was it stamped |
+|---|---|---|---|
+| 1 | Stage 5, one trial sent alone still over the ceiling | `truncation_floor` | yes |
+| 2 | Stage 5, split budget exhausted | `truncation_split_budget_exhausted` | yes |
+| 3 | Stage 5 reconciliation, no entry came back | `omitted_from_model_response` | yes |
+| 4 | Stage 5, the model answered twice and disagreed | `conflicting_duplicate_answers` | yes |
+| 5 | Stage 5 per-trial, the request raised | `per_trial_call_failed` | yes |
+| 6 | Step 3, a rejection citing no disqualifying row | `model rejection unsupported by its own criteria arrays` | yes |
+| 7 | Step 3, a rejection whose disqualifiers did not survive normalisation | `no disqualifying row survived label normalisation` | yes |
+| 8 | **Step 2, an unreadable label with no criteria** | `trial-level verdict label not recognised` | **NO -- audit list only** |
+| 9 | **Step 2, a readable label with no criteria** | `model returned no criteria` | **NO -- and it was a bare literal, not a constant** |
+| 10 | **Step 2, a model-DECLARED not_evaluable with no criteria** | -- | **NO -- nothing recorded at all** |
+| 11 | **Step 3, an unreadable label over criteria that disqualify nobody** | `trial-level verdict label not recognised` | **NO -- audit list only** |
+| 12 | **Step 3, a model-DECLARED not_evaluable with criteria present** | -- | **NO** |
+| 13 | **Stage 6, a label `normalize_trial_verdict` could not resolve** | -- | **NO** |
+
+Rows 10 and 12 are one population and rows 8 and 11 are another, so the eleven
+DISTINCT reasons below cover thirteen sites. **All six are stamped now**, and
+every one is driven end to end in the new test.
+
+**THE DEFERRAL WAS FOUND WHERE IT WAS RECORDED, and it named ONE of the six.**
+`oncotriage/storage/database_logger.py`'s `not_evaluable_reason` column note
+said Stage 5's **Step 2** put its reason in the audit list only, that this was
+"deliberately NOT closed by the provenance pass" because the field is one of
+the per-verdict keys the twelve fixtures compare, and that the population was
+still identifiable through
+
+    eligible = 'not_evaluable' AND verdict_source IS NOT NULL
+    AND not_evaluable_reason IS NULL
+    AND criterion_details = '{"inclusion": [], "exclusion": []}'
+
+**THAT PREDICATE DID NOT SEPARATE WHAT IT SAID IT SEPARATED, and finding that
+out is what turned "close the deferral" into "close the class".** Its last term
+was justified in the note by the model-DECLARED population having non-empty
+arrays. The prompt's Section 1 requires a `not_evaluable` trial's arrays to be
+EMPTY -- `compose_assessment`'s own block says so, one module over -- so a
+model-declared non-evaluation satisfies all four terms and was reported as the
+Step 2 defect. Two populations, one bucket, and no column able to tell them
+apart. The note is rewritten rather than edited, with the old predicate quoted
+and the correction beside it.
+
+**THREE WRITER CLASSES, DISJOINT, GUARDED AT IMPORT.**
+`NOT_EVALUABLE_REASONS_CONSTRUCTED` (the model never answered -- an alias for
+the tuple that indexes `_unevaluable_entry`'s explanation table, not a second
+copy of it), `NOT_EVALUABLE_REASONS_CORRECTED` (the model answered and the
+answer could not be used) and `NOT_EVALUABLE_REASONS_DECLARED` (the model
+declared the non-evaluation itself). `NOT_EVALUABLE_REASONS` is their
+concatenation and a `RuntimeError` at import -- not an `assert`; `python -O`
+deletes those -- refuses a value in two classes, because a value with two
+answers to "who decided" is the one question the vocabulary exists to answer.
+
+**THE DECLARED MARKER IS THE `verdict_source = 'canonical'` OF THIS COLUMN**,
+and it is here for that constant's own argument rather than for symmetry.
+`canonical` is written on a label that needed no recovery because "the
+normalizer read this and found nothing to fix" and "no normalizer ran" are
+different findings an absence cannot separate. With it, **NULL in this column
+now means exactly one thing: the row predates the column** -- an invariant a
+query can check, which a three-term predicate over three columns is not.
+
+**THE STAGE 6 CONSTANT LIVES IN `oncotriage/agent/state.py`, AND THE SPLIT IS
+LAYERING RATHER THAN TASTE.** `terminal.py` imports `state`,
+`registries/primary_cancer` and `utils` and nothing else; importing
+`evaluation.py` for one string would put a 7,700-line module carrying two AWS
+adapter imports into Stage 6's import graph -- the shape pass 20c-2c moved
+`_resolve_primary_cancer` out of the storage layer to remove. `state` is the
+leaf both stages already import, and `NOT_EVALUABLE_REASONS` imports the name
+from there, so every member still has one owner and one tuple still enumerates
+all eleven. Stage 6's branch is **unreachable after Stage 5** (Step 0 resolves
+every label into `TRIAL_VERDICTS`) and is stamped anyway, because the API, the
+MCP server and every harness may build `evaluations` without Stage 5.
+
+**THE FORGERY-PROOF CLAIM RESTED ON A REMOTE SCHEMA ENFORCER, AND ON TWO OF THE
+THREE PROVIDER ARMS THAT IS AN OPEN GO-LIVE QUESTION.** Every "the model cannot
+forge this" argument in `evaluation.py` rests on
+`additionalProperties: false` being honoured. `bedrock_adapter.py` item (3)
+records that no AWS page states whether `text.format` is enforced on the
+Responses surface and names "accepted, no error, silently not enforced" as the
+dangerous outcome; the Converse branch's A1 asks the same of `outputConfig`. So
+`_strip_forged_provenance` removes the key from every model-returned entry at
+the TOP of the normalizer loop, above Step 0, and counts what it took.
+
+**WHAT THE STRIP BUYS IS STATED AT TWO STRENGTHS BECAUSE THEY ARE NOT THE
+SAME.** On its own, today, it reaches the population NO branch stamps -- an
+entry that ends `eligible` or `not_eligible` -- where a forged value lands in
+the stored column beside a verdict saying the trial WAS evaluated (control 5a).
+On a `not_evaluable` entry the branch's own stamp overwrites it, so the strip
+and the stamping are two independent barriers and removing either ALONE changes
+nothing there. Remove BOTH and the expensive case opens:
+`assessment_composition_case` BRANCHES on this key, so the model selects the
+corrected-rejection case and the pipeline stores fixed text asserting it
+corrected a rejection it never saw (control 5b). **The first draft of this note
+and of the function's docstring claimed the composition hazard was live on its
+own; the control measured otherwise and both were corrected.**
+
+**`NOT_EVALUABLE_REASON_ANOMALIES` IS THE 36th MEMBER OF
+`oncotriage/degradation.py`'s RUN-END REGISTRY** (measured, 35 before this
+pass; the counter-reader test's count does not move, because that file's
+section 1 derives its subjects from the registry rather than listing them),
+keyed
+`forged:vocabulary_member` / `forged:foreign_value` (never the model's text --
+a reason is free-written output of unbounded content and this counter reaches
+the run-end console block) and `missing:{verdict_source or 'constructed'}`.
+`_account_missing_not_evaluable_reason` runs after the reconciliation and above
+the composition, so what it measures is what the composition is about to read.
+**It only looks**: a missing reason is a defect in that module discovered after
+the patient's calls are paid for, and raising would discard a completed
+evaluation to report a bookkeeping fault.
+
+**A PRE-EXISTING DEFECT IN THE READER WAS FOUND AND FIXED, AND IT WAS THE SAME
+CLASS OF DRIFT.** `queries.not_evaluable_reasons` classified a reason into a
+family with FOUR hand-written literals; the per-trial pass had added a fifth
+CONSTRUCTED reason (`per_trial_call_failed`) and the CASE was never widened, so
+**a trial whose own REQUEST failed was reported under "corrected from a model
+verdict" -- a family that asserts the model answered -- and on the SHIPPED
+per-trial arm that is the constructed reason most likely to occur.** Measured
+by executing the pre-fix CASE over every member. The CASE is generated from
+three tuples restated in `queries.py` (which may not import the agent -- the
+`CALL_MODE_OMISSION_REASON` precedent, with the same mitigation: the test
+imports both and requires equality), it gained a third family
+`'declared by the model'`, its NULL arm moved to the TOP, and its `ELSE` now
+reads `'(not a value this pipeline writes)'` instead of silently calling an
+unknown value a correction.
+
+**THE FIXTURE COST WAS MEASURED BEFORE IT WAS PAID AND IT IS ZERO.** Across all
+twelve recorded fixtures there are **103 verdicts, of which exactly ONE is
+`not_evaluable`** -- `mcode_genomic_variant` / `NCT05949983`, already carrying
+`model rejection unsupported by its own criteria arrays` from a branch this
+pass does not touch. `not_evaluable_reason` is projected into the deterministic
+prefix, so the field IS fixture-compared; the VALUES that move are on
+`not_evaluable` entries only, and there is one. Verified by running rather than
+by that argument alone: `python fixture_replay.py` was run against a `git
+worktree` at HEAD and against this tree, and **the set of differing fields is
+IDENTICAL -- 26 fields, zero introduced, zero removed**, with the same
+per-fixture counts. The twelve were already 0/12 (the de-identification and
+pre-diagnosis-ECOG passes invalidated them and did not recapture); this pass
+adds nothing to the standing recapture.
+
+**THE DEVELOPMENT DATABASES HAVE NO ROWS TO REPORT, AND THAT IS THE ANSWER
+RATHER THAN A GAP.** Every `.db` under the project root was queried read-only:
+**62 files carrying `trial_matches` and 158,827 rows between them; 0 of those
+files have a `not_evaluable_reason` column, 0 have a `verdict_source` column,
+and 0 rows in any of them carry the `not_evaluable` verdict** -- the production
+file's 12,862 are all `eligible` or `not_eligible`. Every stored row predates both the column AND the verdict: they
+were written before the trial-verdict pass, when Step 0 clobbered an
+unrecognised label to `not_eligible`. So the requested distribution is empty in
+both directions, the "predates the column" split is 100%, and no database was
+modified.
+
+**TWO PINS MOVED IN THE EXISTING SUITE AND BOTH WERE THE CHECK WORKING.**
+`tests/test_storage_provenance_persistence.py` pinned the SUBSTRING
+`eval_result["not_evaluable_reason"] = ` at 2 under a label reading "unchanged
+by this pass" -- the provenance pass's own statement that it had not widened
+the write. This pass does widen it, to seven; and raising the literal would
+have left the other half of that check's problem in place, because **the
+substring also matches PROSE and `evaluation.py`'s own argument for the field
+quotes the assignment it describes, so the count read 8 against 7 real
+writes.** It is an AST walk over ASSIGNMENTS now and asserts the SET of reasons
+the normalizer can write. And three plants in
+`tests/test_agent_trial_verdict_normalization.py` plus one in each of the two
+marker tests were re-anchored; **one of them, `test_agent_remap_no_survivor`'s
+C5, had to be re-SITED rather than re-anchored**, because the defect it models
+(the marker written at the top of the loop) is no longer expressible from there
+-- the strip removes it and, more decisively, every branch overwrites it. It
+plants into the DECLARED arm now, which is a population that must not carry the
+remap marker.
+
+```bash
+# The reason-coverage pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS is set
+# above the imports), no corpus, no database, no git history, no live server --
+# every model response is a literal served by a stub installed through
+# oncotriage/agent/deps.py and the one raising stub raises a plain
+# RuntimeError. It writes NOTHING anywhere, not even a temp directory. NOT in
+# the collision matrix: the three files it reads (agent/evaluation.py,
+# agent/terminal.py, agent/response_schema.py) are written by neither of the
+# suite's two writers and are sha256-compared at the end, with a
+# non-degeneracy probe that the three hashes differ. It DOES exec: five
+# in-memory copies, argued at _EXEC_ALLOWLIST. Bucket A, ~2.5 s.
+python tests/test_agent_not_evaluable_reason_coverage.py            #  86
+```
+
+**EIGHT TREE-LEVEL REVERTS, EIGHT CAUGHT**, each applied to a `copytree`'d copy
+with `PYTHONPATH` pointed at it, a realpath preflight asserting the COPY is what
+imports, and every plant asserting its own occurrence count so a plant that
+matched nothing is a named PLANT-FAILED rather than a working check reported as
+broken. **Seven produce recorded failures and a summary; none aborts.**
+
+| revert | caught |
+|---|---|
+| Step 2's three stamps dropped | 13 failures |
+| Step 3's unrecognised stamp dropped | 5 |
+| Step 3's declared stamp dropped | 5 |
+| Stage 6's stamp dropped | 3 |
+| the forgery strip removed | 7 |
+| the missing-reason tripwire's CALL removed | 3 |
+| the family CASE reverted to its four hand-written literals | 9, in `test_storage_query_layer.py` |
+| a member put in TWO writer classes | an import-time `RuntimeError` NAMING the value -- the module is unimportable, so there is no process in which a check could run, which is that guard working rather than a gap |
+
+**VERIFIED BY RUNNING.** CI bucket A **87 files, 0 failed, 0 not run** (a first
+run reported one failure in `test_ablation_stop_and_lock.py`, which is green
+alone twice and green on a second full run -- the load flake that file's own
+real-subprocess/real-signal design already carries);
+`tests/run_serial_tests.py` **5/5 in 399.6 s** with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` confirmed byte-identical
+afterwards; `tests/test_package_invariants.py` **260/0/0**, unchanged;
+`.github/scripts/ci_test_buckets.py --check` consistent at 106 files;
+`static_checks.py` compiles 255; every bucket B/C/E file reachable on this
+machine green at its documented count; `python fixture_replay.py` differing
+fields identical to HEAD's; and the production `inferences.db`
+(`ab1403e3...`, 90,185,728 bytes), `ablation_results.db` (`f2bc23c6...`) and
+all twelve fixture files byte-unchanged. **No money was spent and no migration
+was run.** Counts that moved, each argued in place:
+`test_storage_query_layer.py` 487 -> **498**,
+`test_storage_provenance_persistence.py` 126 -> **127**,
+`test_agent_remap_no_survivor.py` 122 -> **123**. Every other file reports
+exactly what it reported before.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE TWELVE FIXTURES ARE STILL 0/12 AND THIS PASS DID NOT RECAPTURE.** That
+   is the standing item, owed since the de-identification pass; this change is
+   provably not part of what it owes.
+2. **`node_finalize` DOES NOT SCAN.** The tripwire runs inside Stage 5, so an
+   entry an OUTSIDE caller hands Stage 6 already carrying `not_evaluable` and
+   no reason is bucketed without being counted. Stage 6 stamps only what IT
+   decides. Closing it means a second scan in a second module and a decision
+   about what a caller's own entry means.
+3. **THE STRIP IS NOT APPLIED TO `TEMPORAL_CONFLICT_FIELD`, `LABEL_REMAP_FIELD`
+   OR THE THREE `verdict_*` MARKERS.** They carry the identical forgery-proof
+   argument and the identical dependency on a remote schema enforcer. Only the
+   one this pass is about is closed; the general fix is one call site that pops
+   every pipeline-owned key, and it belongs to a pass that can measure the
+   effect on each.
+4. **`per_trial_call_failed` HAS NEVER BEEN OBSERVED IN A STORED ROW**, because
+   no database has the column. The family fix above is verified against the
+   CASE rather than against data.
+5. **THE MCP AND API SURFACES WERE NOT RE-RUN.** Neither module names
+   `not_evaluable_reason` or enumerates an entry's keys -- both return `result`
+   whole -- so the new key flows through untouched; that was established by
+   reading, and `tests/test_mcp_server_stdio_contract.py` is bucket C and needs
+   a live Qdrant this pass did not use.
+
+
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is
 argued in place: FALLBACK_MAIN_PATH in oncotriage/settings.py.

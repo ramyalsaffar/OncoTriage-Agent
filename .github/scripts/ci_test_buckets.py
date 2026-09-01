@@ -443,6 +443,20 @@ BUCKETS = {
         "-- which is what a run overlapping tests/test_config_snapshot_date_"
         "rot.py's in-place rewrite now produces instead of sixteen fabricated "
         "findings; see that file's Section 3b for why it stays in A"),
+    "test_agent_not_evaluable_reason_coverage.py": (
+        _A, None,
+        "ran green in 2.5s, 86 checks, against ONLY the directory skeleton: "
+        "every one of the eleven code paths that can record a trial as "
+        "not_evaluable, driven end to end and required to state WHY. No "
+        "network, no keys, no spend, no live Qdrant, no model load "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports), no corpus, "
+        "no database, no git history, no live server -- every model response "
+        "is a literal served by a stub installed through agent/deps.py and the "
+        "one raising stub raises a plain RuntimeError. It writes NOTHING "
+        "anywhere, not even a temp directory; the three files it reads "
+        "(agent/evaluation.py, agent/terminal.py, agent/response_schema.py) "
+        "are sha256-compared at the end. An _EXEC_ALLOWLIST member, argued "
+        "there"),
     "test_agent_remap_no_survivor.py": (
         _A, None,
         "ran green in 1.6s, 121 checks, against ONLY the directory skeleton, "

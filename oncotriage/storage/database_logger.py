@@ -1792,48 +1792,55 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
     # it does now, and that paragraph's warning about what `criterion_details`
     # does NOT contain still holds -- this is a column, not a JSON key.
     #
-    # SIX VALUES ARE REACHABLE, in two families that a reader must not conflate:
+    # ELEVEN VALUES ARE REACHABLE, in THREE families a reader must not conflate.
+    # The vocabulary is closed and its owner is
+    # `oncotriage/agent/evaluation.py:NOT_EVALUABLE_REASONS`, which enumerates
+    # all eleven and partitions them by WHO decided:
     #   CONSTRUCTED by the pipeline, the trial never having been answered --
     #     'truncation_floor', 'truncation_split_budget_exhausted',
-    #     'omitted_from_model_response', 'conflicting_duplicate_answers'
-    #   CORRECTED from a rejection the model DID write --
+    #     'omitted_from_model_response', 'conflicting_duplicate_answers',
+    #     'per_trial_call_failed'
+    #   CORRECTED -- the model answered and the answer could not be used --
+    #     'trial-level verdict label not recognised'
+    #     'model returned no criteria'
     #     'model rejection unsupported by its own criteria arrays'
     #     'no disqualifying row survived label normalisation'
-    #   The two families are separable without reading the strings, by
-    #   verdict_source below: a constructed entry never carried a model-written
-    #   label, so its verdict_source is NULL.
+    #     'trial-level verdict label unresolvable at finalization'  (Stage 6)
+    #   DECLARED by the model, nothing corrected --
+    #     'model declared this trial not evaluable'
+    #   The CONSTRUCTED family is separable without reading the strings, by
+    #   verdict_source below: such an entry never carried a model-written label,
+    #   so its verdict_source is NULL. The other two are not separable that way
+    #   -- both answered -- which is why each has its own reason rather than
+    #   sharing one.
     #
-    # NULL means the entry carried no such key, which is three populations and
-    # each is separable from the columns beside it:
-    #   an ordinary verdict              eligible <> 'not_evaluable'
-    #   a model-DECLARED not_evaluable   eligible  = 'not_evaluable'
-    #                                    AND verdict_source IS NOT NULL
-    #   a row predating this column      verdict_source IS NULL, and dated
-    # NEVER '' -- an empty string would be a reason of zero characters, which is
-    # not a reading of anything.
+    # NULL NOW MEANS EXACTLY ONE THING: the row predates this column. That is
+    # the whole of the change; it used to mean three, and one of the three was
+    # invisible. NEVER '' -- an empty string would be a reason of zero
+    # characters, which is not a reading of anything.
     #
-    # ONE not_evaluable POPULATION HAS A REASON THAT THIS COLUMN DOES NOT CARRY,
-    # AND IT IS STATED RATHER THAN DISCOVERED. Stage 5's Step 2 -- a trial the
-    # model returned with NO criteria at all -- records its reason
-    # ('trial-level verdict label not recognised', or 'model returned no
-    # criteria') into the `unevaluable_trials` AUDIT LIST only. It does not
-    # stamp the entry, so the column is NULL for those rows. That is a
-    # pre-existing asymmetry between Step 2 and the two corrections, and it was
-    # deliberately NOT closed by the provenance pass: `not_evaluable_reason` is
-    # one of the ten per-verdict keys the twelve characterization fixtures
-    # compare, so writing it where it was not written before is a change to a
-    # fixture-compared field and costs a re-capture at live model prices.
-    #
-    # The population is still IDENTIFIABLE from the columns beside it without
-    # reading prose, which is why the gap is tolerable rather than fatal:
-    #     eligible = 'not_evaluable'
-    #     AND verdict_source IS NOT NULL          -- the model answered for it
+    # WHAT THE PARAGRAPH HERE USED TO SAY, AND WHY IT IS GONE RATHER THAN
+    # EDITED. It recorded a DELIBERATE GAP: Stage 5's Step 2 -- a trial the
+    # model returned with no criteria -- put its reason in an audit list and did
+    # not stamp the entry, left open because `not_evaluable_reason` is one of
+    # the per-verdict keys the twelve characterization fixtures compare and
+    # writing it where it had not been written costs a re-capture. It also
+    # offered a four-term predicate that made the population "IDENTIFIABLE
+    # without reading prose":
+    #     eligible = 'not_evaluable' AND verdict_source IS NOT NULL
     #     AND not_evaluable_reason IS NULL
     #     AND criterion_details = '{"inclusion": [], "exclusion": []}'
-    # and `verdict_source` then separates its two sub-cases: 'unrecognized' is
-    # the unreadable-label one, 'canonical' / 'normalized' the no-criteria one.
-    # Dropping the last term instead selects that population plus the
-    # model-DECLARED not_evaluable trials, whose arrays are non-empty.
+    # THAT PREDICATE DID NOT SEPARATE WHAT IT SAID IT SEPARATED. Its last term
+    # was justified by the model-DECLARED population having non-empty arrays;
+    # the prompt's Section 1 requires a not_evaluable trial's arrays to be
+    # EMPTY, so a model-declared non-evaluation satisfies all four terms and was
+    # reported as the Step 2 defect. Two populations, one bucket, no column able
+    # to tell them apart. Both are stamped now and the predicate is unnecessary.
+    #
+    # THE FIXTURE COST WAS MEASURED RATHER THAN ESTIMATED BEFORE IT WAS PAID:
+    # across all twelve recorded fixtures there is exactly ONE not_evaluable
+    # verdict and it already carried a reason from a branch this change does not
+    # touch, so no fixture-compared value moves.
     "not_evaluable_reason":    "TEXT",
     # --- verdict_source / verdict_original_label / verdict_original_type ---
     #
