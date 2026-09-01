@@ -1031,6 +1031,22 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # any plant and compared at the end against a baseline, with a non-degeneracy
 # probe so that comparison cannot be a tautology.
 #
+# tests/test_extraction_stage_observation_sort.py (the stage-observation sort
+# item) execs a PATCHED COPY of oncotriage/extraction/stage.py in five shapes:
+# the whole Tier-0 sort reverted to the raw-string form it shipped with, the
+# tuple key's day term reverted to the raw stamp, the placeholder mapping
+# dropped from _date_sort_key, the position term left un-negated, and the
+# raw-stamp term dropped. `git show` can supply none of them. Three revert a
+# fix that is AT HEAD, where a git blob would compare the fixed module with
+# itself; the un-negated position is a state NO revision has ever been in --
+# the shipped sort had no position term at all and relied on stability, so
+# "the ECOG direction" exists nowhere in history; and the dropped raw-stamp
+# term is likewise novel. Nothing execs a file in the working tree: the source
+# is hashed before any plant and compared at the end, with a non-degeneracy
+# probe against a second file so that comparison cannot be a tautology, and
+# each plant asserts its own occurrence count so a plant that matched nothing
+# is a named failure rather than a working check reported as broken.
+#
 # tests/test_agent_trial_verdict_normalization.py (the trial-verdict item) is
 # the eighth, and it execs a PATCHED COPY of three modules:
 # oncotriage/agent/evaluation.py with the fabricated-rejection clobber restored,
@@ -1138,6 +1154,7 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_agent_age_units_and_sex_filter.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
+                   "tests/test_extraction_stage_observation_sort.py",
                    "tests/test_agent_trial_verdict_normalization.py",
                    # SEVENTEEN execs, each an in-memory copy of
                    # oncotriage/agent/evaluation.py with one part of Stage 5's

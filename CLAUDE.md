@@ -11403,9 +11403,18 @@ DIFFER with the temporal doors shut.
    sort by their local text rather than by their instant. Pre-existing and
    unchanged here -- it decides which observation answers, which this pass did
    not touch -- but it is now VISIBLE, because the date it picked is printed.
-2. **An undated stage-group observation sorts as the OLDEST** under that same
-   key, so it can only answer when nothing else parses. That is a choice
-   nothing states; it is stated here.
+   **CLOSED by the observation-sort pass**, which replaced that key; the
+   residual it could not close (same-instant stamps sharing a local day) is
+   named there.
+2. ~~**An undated stage-group observation sorts as the OLDEST** under that same
+   key, so it can only answer when nothing else parses.~~ **THIS WAS WRONG AND
+   THE OBSERVATION-SORT PASS MEASURED IT.** It is true only of a FALSY date,
+   and `_parse_mcode_stage_observation` never produces one -- it emits the
+   LITERAL STRING `'unknown'`, which is truthy, so the `or '0000-00-00'`
+   fallback never fired and `'u'` outranked every digit. An undated observation
+   sorted as the NEWEST and answered for the patient. Left struck through
+   rather than deleted, because the claim was load-bearing: it is why nobody
+   looked.
 3. **`staging date not recorded` fires ZERO times on this corpus.** Every one of
    the 295 observation-backed patients carries a date, so that branch is covered
    by constructed records only.
@@ -11611,6 +11620,232 @@ was a literal beside the fixture rather than derived from it.
    and therefore bucket E, which is a real trade against a ~1.2 s bucket-A
    file; `tests/test_agent_patient_hash_coverage.py` already carries the
    corpus sections that would host such a check if it is wanted.
+
+### Tier 0 stopped picking the winner by spelling (the observation-sort pass)
+
+**ONE MEASURED CHANGE, AND IT MOVES NOTHING ON THIS CORPUS.** Tier 0 of
+`extract_patient_stage_with_source` walks a patient's stage-group Observations
+most-recent-first and answers on the first whose display parses; which one that
+is decides the ordinal Stage 4 filters on and, since the staging-date pass, the
+date printed into the Stage 5 prompt. It sorted on the RAW STRING --
+`key=lambda o: o.get('date') or '0000-00-00', reverse=True` -- and that is
+wrong in three ways.
+
+**THE LIVE ONE IS THE PLACEHOLDER, AND THE PARSER IS WHY.**
+`oncotriage/fhir/parser.py:_parse_mcode_stage_observation` emits the **literal
+string `'unknown'`** when an Observation carries neither `effectiveDateTime`
+nor `effectivePeriod.start` -- never `None`, never `''` -- so the
+`or '0000-00-00'` fallback never fired for it, and `'u'` is greater than every
+digit. **An UNDATED observation therefore outranked every dated one**, answered
+for the patient, and rendered as "staging date not recorded" while a real dated
+staging sat unused below it. Nothing raised: `_stage_date_clause` guards
+`'unknown'` at the render site, so the only symptom was a stage read off the
+wrong record and a date the prompt declined to state.
+
+**SAY WHAT THAT IS AND IS NOT, because the two halves are different claims.**
+The arm is REACHABLE BY ORDINARY INPUT -- the parser produces that exact value
+and nothing between it and the sort guards it -- and it is UNEXERCISED BY THIS
+CORPUS: measured over all 1,000 bundles, **0 of 585 stage-group Observations
+carry it and 0 carry a falsy date**. The fix moves nothing today and removes a
+defect that fires the first time a bundle omits a staging effective date, which
+is a shape a real EHR extract produces and Synthea does not.
+
+**CLAUDE.md'S OWN NOTE ON THIS WAS WRONG, in the direction that hides the
+defect.** The staging-date pass recorded "An undated stage-group observation
+sorts as the OLDEST under that same key, so it can only answer when nothing
+else parses." That is true only of a FALSY date, and the parser never produces
+one. Corrected in the follow-up list below.
+
+**THE OTHER TWO.** A full ISO datetime carrying an offset was compared as local
+TEXT with no stated semantic -- every one of this corpus's 585 stamps is such a
+datetime and not one is a bare `YYYY-MM-DD`. And it disagreed with the
+project's own convention: `OncologyLabRegistry._date_sort_key`, which orders
+the labs, genomic variants and procedures of the SAME rendered summary, slices
+to the day prefix and maps BOTH missing and `'unknown'` to oldest.
+
+**WHAT THE `[:10]` SLICE DOES AND DOES NOT FIX, stated because it is easy to
+overclaim.** It makes the PRIMARY comparison a question with a defined answer
+-- the LOCAL CALENDAR DAY the staging was recorded on, which is the unit a
+restaging criterion is written in and the unit the renderer prints. It does NOT
+make two same-instant stamps in different offsets compare EQUAL, and nothing at
+day granularity could: they can fall on different local days. **And for
+well-formed ISO stamps it changes NO ordering at all** -- day-prefix and
+whole-string comparison agree whenever two stamps differ inside their first ten
+characters and tie together whenever they do not -- so the slice's entire
+behavioural content is the placeholder mapping plus agreement with the
+convention. Section 2 of the test MEASURES that rather than asserting it.
+
+**A LOCAL TWIN OF `_date_sort_key`, NOT AN IMPORT, AND IT IS A LAYERING RULING.**
+`oncotriage/extraction/` is a leaf -- `stage.py` imports `oncotriage.constants`
+and `extraction.negation` and nothing else -- and it is read by the INDEXER as
+well as by the agent, because the same module extracts a TRIAL's stage
+requirements. Importing `registries.cancer_code_registry` here would invert the
+direction (a registry is built on top of extracted facts, not underneath them),
+put a 1,400-line patient-side cancer registry in the import graph of every
+trial-side stage extraction, and reach across a package boundary for a name the
+registry declares PRIVATE -- making it public by use while leaving it named
+private. Promoting it to a neutral module is a RELOCATION with its own
+equivalence proof, and folding a relocation into a fix is what makes an
+equivalence proof stop meaning anything. **The drift that buys is closed by
+measurement**: section 3 pins the two as answering identically over a shared
+corpus of inputs, with a check that they are two different function objects so
+the pin is not one function compared with itself.
+
+**THE TIE-BREAK IS THE ECOG KEY'S SHAPE WITH ONE TERM DELIBERATELY REVERSED,
+AND THE CORPUS IS WHAT DECIDED IT.** The key is `(day, raw stamp, -index)`,
+sorted descending. The raw stamp participates as a DETERMINISM DEVICE rather
+than a chronology claim: two stamps sharing a day differ only in time-of-day
+and offset, and comparing them as text puts the later wall-clock time first
+when the offsets agree, which is every stamp here. It is preferred over going
+straight to the position because the raw stamp is a property of the RECORD
+while the position is a property of how the parser walked the bundle -- with
+it, re-ordering a bundle whose contents are unchanged yields the same winner.
+
+**THE POSITION IS NEGATED, WHICH IS THE OPPOSITE OF `_select_ecog_performance_
+status`'s, AND THAT WAS MEASURED RATHER THAN CHOSEN.** The first
+implementation used the plain index, i.e. ECOG's "last in the bundle wins" --
+and the corpus run reported **290 patients' winning observation changing** with
+0 ordinals, 0 dates and 0 rendered clauses moving. The cause: **290 of 1,000
+patients carry exactly TWO stage-group Observations with BYTE-IDENTICAL
+stamps** -- Synthea emits one staging event twice, as "American Joint Committee
+on Cancer stage IA (qualifier value)" and as "Stage 1 (qualifier value)" -- so
+day and raw stamp both tie and the position decides for 29% of the cohort. The
+raw-string sort this replaces put the FIRST one first, because Python's sort is
+stable. Both records resolve to the same ordinal and carry the same date, so
+nothing observable moved either way, **which is exactly why flipping them would
+be gratuitous**: a fix moves what the defect moved and nothing else. The
+negation preserves the shipped answer. `-index` also makes every key unique, so
+the ordering is TOTAL and the determinism is a property of the key rather than
+of sort stability -- a library guarantee a reader has to go and look up.
+
+**MEASURED OVER ALL 1,000 BUNDLES, BEFORE AND AFTER, THROUGH A `git worktree`
+AT HEAD rather than through a re-derivation:**
+
+| | |
+|---|---|
+| winning observation changed | **0** |
+| ordinal changed | **0** |
+| source changed | **0** |
+| observation_date changed | **0** |
+| rendered stage clause changed | **0** |
+| full sorted order changed | **0** |
+
+The harness reports the ANSWERING OBSERVATION INDEX, which the shipped function
+does not return, through a replica of each arm's Tier-0 walk -- and the replica
+is trusted only after being shown to reproduce the SHIPPED function's
+`(ordinal, source, date)` for **all 1,000 patients in both arms, 0
+disagreements**.
+
+**AND THE PROMPT AND THE HASH WERE COMPARED DIRECTLY, not inferred from the
+clause.** 120 patients re-parsed and re-rendered in each arm -- 70 of them from
+the duplicate-stamp class, plus all 5 single-observation patients and 45 with
+none: **0 summaries differ by sha256, 0 `patient_data_hash` differ, 0 Cancer
+Stage lines differ**, against 120 distinct summaries and 120 distinct hashes.
+The hash was additionally proved unreachable STRUCTURALLY: `compute_patient_
+hash` calls no stage extractor at all (AST over its call set), and it emits
+stage observations through `_emit`, which SORTS -- so observation order cannot
+reach it by construction.
+
+**NO FIXTURE IS AFFECTED, established from each fixture's own stored
+`identity.source_bundle` rather than by a corpus proxy.** All twelve resolve to
+a cohort bundle; **eleven carry exactly the duplicate-stamp pair** and
+`unknown_stage` carries none; **0 moved**. None of the four constructed
+fixtures appends a stage Observation (each `construction.what_was_changed` was
+read). Had the plain index shipped, eleven of the twelve would have had their
+answering record flipped -- to no output change, but perturbing the very
+records the fixture gate characterizes. `PROMPT_VERSION` is unchanged at 1.9.0
+and `FINGERPRINT_VERSION` at 3; `extraction/stage.py` is in `RENDERER_MODULES`,
+so `llm_classifier_renderer_digest` moves and a v3-stamped artifact answers
+FP_CHANGED naming that field -- correct, since the renderer's input derivation
+genuinely changed, even though no rendered byte does on this corpus.
+
+**THE M TIER WAS EXAMINED AND NOT TOUCHED, as instructed, and the examination
+is recorded as a check rather than as a sentence.** It does not SORT -- its
+rule is "any cM1 anywhere answers" -- so no ordering exists there for a
+placeholder to corrupt; what `'unknown'` can reach is the returned DATE, which
+the render site guards. Checks 6e-6g pin both halves, so adding a sort to that
+tier has to be a decision rather than an oversight.
+
+```bash
+# The observation-sort pass. Same shape, same directory. No network, no keys,
+# NO SPEND, no live Qdrant, no model load, no database, no git history, no live
+# server, no corpus -- every fixture is a literal dict. It is the FASTEST file
+# in the suite because it imports neither oncotriage.paths nor any heavy
+# library: the two modules it needs (extraction.stage,
+# registries.cancer_code_registry) reach only constants and settings, so no
+# glob fires and no registry is built. It writes NOTHING anywhere, not even a
+# temp directory. NOT in the collision matrix: the two repository files it
+# reads are written by neither of the suite's two writers and are
+# sha256-compared at the end, with a non-degeneracy probe so that comparison
+# cannot be one file hashed twice. It DOES exec: in-memory copies of stage.py,
+# one plant each, argued at _EXEC_ALLOWLIST. Bucket A, ~0.05 s (MEASURED
+# against ONLY the provisioned CI skeleton).
+python tests/test_extraction_stage_observation_sort.py              #  57
+```
+
+**FIVE TREE-LEVEL REVERTS, FIVE CAUGHT**, each into a `copytree`'d copy with
+`PYTHONPATH` pointed at it, a `sitecustomize` stripping the editable install's
+MetaPathFinder (which otherwise beats `PYTHONPATH`), a realpath preflight
+asserting the COPY is what imports, and `PYTHONDONTWRITEBYTECODE=1`: the whole
+Tier-0 sort reverted to HEAD's raw-string form (7 recorded failures), the day
+term reverted to the raw stamp (10), the placeholder mapping dropped (16), the
+position left un-negated (9) and the raw-stamp term dropped (7). Both files
+byte-identical afterwards.
+
+**AND THE HARNESS FOUND THE ABORT SHAPE IN THIS PASS'S OWN TEST, WHICH READING
+DID NOT.** The placeholder revert made `_date_sort_key(None)` raise inside a
+`check()` ARGUMENT LIST, so the file reported **one traceback where it owed a
+summary and 57 results**. **The sixteenth time this project has shipped that
+shape.** The file already carried a `guarded()` helper and used it only inside
+`_control`; every raise-capable expression in every section goes through it
+now, and the same revert reports 41 passed / 16 failed and runs to its summary.
+
+**TWO MORE DEFECTS IN THIS PASS'S OWN TEST, found by re-reading it after it was
+green.** Check 4k's label claimed "a newer unreadable observation is skipped"
+while its fixture put a READABLE newest record first, so it passed on a
+condition it never created; it drives three observations now, the newest
+unreadable, and asserts the middle one answers. And check 6b was labelled a
+pure non-degeneracy probe while being an exact-equality pin on the COMPLETE set
+of a leaf module's intra-package imports -- which fails on any added edge; it
+is labelled as both, deliberately.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE DUPLICATE-STAMP WINNER IS STILL BUNDLE-ORDER DEPENDENT**, and this
+   pass chose which arbitrary answer to keep rather than removing the
+   arbitrariness. Two Observations carrying byte-identical stamps and different
+   stage displays have no principled winner; 5b/5c pin that the first in the
+   list answers and that reversing the list reverses the answer. Nothing in
+   this pipeline re-orders a bundle, so it is deterministic where it matters.
+   The principled fix is upstream -- the parser emitting one record per staging
+   EVENT rather than one per coding -- and is a parser change with its own
+   fixture impact.
+2. **SAME-INSTANT STAMPS IN DIFFERENT OFFSETS STILL ORDER BY SPELLING** when
+   they share a local day. Resolving that needs a second, finer date convention
+   than the `[:10]` day this project compares everywhere else, and introducing
+   one here would make this collection order differently from every other
+   section of the same summary. Argued at the key rather than left to be found.
+3. **`_date_sort_key` NOW EXISTS TWICE**, in `oncotriage/extraction/stage.py`
+   and on `OncologyLabRegistry`. That is the layering ruling's price, and it is
+   PINNED rather than merely duplicated (section 3). The end state is one owner
+   in a neutral module -- `oncotriage/constants.py` imports nothing at all and
+   is the obvious candidate, though it holds facts rather than functions
+   today -- reached by a relocation pass with its own equivalence proof.
+4. **NEITHER COPY COERCES A NON-STRING DATE**, so both raise on one. That is
+   deliberate and symmetric -- making one tolerant of a shape the other rejects
+   is the drift the twin exists to avoid -- and no parser in this project
+   produces one. Check 3e pins the shared limit as shared.
+5. **THE STALE CLAIM IN THIS FILE IS CORRECTED ABOVE BUT ITS SOURCE IS NOT
+   PINNED.** Nothing would catch the next prose claim about this ordering going
+   stale; the checks pin the CODE, and the note that was wrong was prose.
+6. **`tests/test_staging_exclusions.py` CHECK 7a FAILS, AND IT IS
+   PRE-EXISTING** -- reproduced identically in a clean `git worktree` at HEAD
+   with none of this pass's changes. `oncotriage/staging/exclusions.py:250`
+   does `e["path"] for e in manifest["staged"]` and the SHIPPED manifest's
+   `staged` list holds STRINGS, so it raises `TypeError: string indices must be
+   integers`. That is the one bucket-A failure on this machine and it is not
+   this pass's; it is reported rather than fixed because the manifest is
+   another item's subject.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

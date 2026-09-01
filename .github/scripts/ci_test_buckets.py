@@ -774,6 +774,27 @@ BUCKETS = {
         _A, None, "ran green in 2.8s; every fixture is a literal dict"),
     "test_extraction_stage_non_oncology_guard.py": (
         _A, None, "ran green in 2.6s; no corpus, no git"),
+    "test_extraction_stage_observation_sort.py": (
+        _A, None,
+        "ran green in 0.05s, 57 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED with ONCOTRIAGE_MAIN_PATH pointed at a "
+        "provision_ci_paths.py root, not assumed): Tier 0 of "
+        "extract_patient_stage_with_source picks the winning stage-group "
+        "Observation on a normalized day key with deterministic ties, and the "
+        "literal 'unknown' the FHIR parser emits for an undated staging no "
+        "longer sorts as the newest record. No network, no keys, NO SPEND, no "
+        "live Qdrant, no model load, no database, no git history, no live "
+        "server, no corpus -- every fixture is a literal dict. It is the "
+        "fastest file in the suite because it imports neither oncotriage.paths "
+        "nor any heavy library: the two modules it needs (extraction.stage, "
+        "registries.cancer_code_registry) reach only constants and settings, "
+        "so no glob fires and no registry is built. It writes NOTHING "
+        "anywhere, not even a temp directory. NOT in the collision matrix: the "
+        "two repository files it reads (extraction/stage.py, "
+        "registries/cancer_code_registry.py) are written by neither of the "
+        "suite's two writers and are sha256-compared at the end. It DOES exec: "
+        "in-memory copies of stage.py, one plant each, argued at "
+        "_EXEC_ALLOWLIST"),
     "test_ecog_pre_diagnosis_suppression.py": (
         _A, None,
         "ran green in 2.5s, 94 checks, against ONLY the provisioned CI "

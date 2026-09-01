@@ -738,6 +738,172 @@ if not (set(STAGE_SOURCES_OBSERVATION_BACKED) < set(STAGE_SOURCES)):
     )
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# WHICH STAGE-GROUP OBSERVATION IS THE MOST RECENT
+# ═══════════════════════════════════════════════════════════════════════════════
+# Tier 0 of extract_patient_stage_with_source() walks a patient's stage-group
+# Observations most-recent-first, and a restaged patient has several. Which one
+# it reaches first decides the ordinal Stage 4 filters on AND, since the
+# staging-date item, the date printed into the Stage 5 prompt -- so this
+# ordering is visible input, not an internal detail.
+#
+# IT USED TO BE ``key=lambda o: o.get('date') or '0000-00-00', reverse=True``,
+# a raw-string comparison, and that was wrong in three ways at once:
+#
+#   1. "unknown" SORTED AS THE NEWEST OBSERVATION. parser.py's
+#      _parse_mcode_stage_observation() emits the LITERAL STRING 'unknown' for
+#      an Observation carrying neither effectiveDateTime nor
+#      effectivePeriod.start -- never None and never '' -- so the
+#      ``or '0000-00-00'`` fallback never fired for it. 'u' is greater than
+#      every digit, so an UNDATED observation outranked every dated one,
+#      answered for the patient, and then rendered as "staging date not
+#      recorded" while a real dated staging sat unused below it. Nothing
+#      raised: _stage_date_clause() guards 'unknown' at the render site, so the
+#      only symptom was a stage read off the wrong record and a date the prompt
+#      declined to state.
+#
+#      SAY WHAT THAT IS AND IS NOT, because the two halves are different
+#      claims. The arm is REACHABLE BY ORDINARY INPUT -- the parser produces
+#      that exact value and nothing between it and the sort guards it -- and it
+#      is UNEXERCISED BY THIS CORPUS: measured over all 1,000 bundles, 0 of 585
+#      stage-group Observations carry it and 0 carry a falsy date. So the fix
+#      moves nothing today and removes a defect that fires the first time a
+#      bundle omits a staging effective date, which is a shape a real EHR
+#      extract produces and Synthea does not.
+#   2. A FULL ISO DATETIME CARRYING A UTC OFFSET WAS COMPARED AS LOCAL TEXT,
+#      with no stated semantic at all -- two Observations recorded at the same
+#      instant in different offsets ordered by their spelling. Every one of
+#      this corpus's 585 stage-group stamps is such a datetime
+#      ("2019-05-28T11:05:53-07:00"); not one is a bare YYYY-MM-DD.
+#
+#      WHAT THE [:10] SLICE DOES AND DOES NOT FIX, stated precisely because the
+#      difference is easy to overclaim. It makes the PRIMARY comparison a
+#      question with a defined answer -- the LOCAL CALENDAR DAY the staging was
+#      recorded on, which is the unit a restaging criterion is written in and
+#      the unit the renderer prints. It does NOT make two same-instant stamps
+#      in different offsets compare EQUAL, and nothing at day granularity
+#      could: they can fall on different local days. Sub-day ordering then
+#      falls to the raw-stamp tiebreak, which is a determinism device rather
+#      than a chronology claim -- see _stage_observation_sort_key.
+#
+#      AND FOR WELL-FORMED ISO STAMPS THE SLICE CHANGES NO ORDERING, which is
+#      worth knowing rather than discovering: day-prefix comparison and
+#      whole-string comparison agree whenever the two stamps differ inside
+#      their first ten characters, and tie together whenever they do not. The
+#      slice's entire behavioural content is therefore item 1's placeholder
+#      mapping plus agreement with the convention in item 3.
+#      tests/test_extraction_stage_observation_sort.py section 2 measures that
+#      agreement rather than asserting it.
+#   3. IT DISAGREED WITH THE PROJECT'S OWN CONVENTION.
+#      OncologyLabRegistry._date_sort_key -- which orders labs, genomic
+#      variants and procedures for the same summary -- slices to the day prefix
+#      and maps BOTH missing and 'unknown' to oldest. Two date orderings in one
+#      rendered patient record is a disagreement nothing would notice.
+#
+# WHY A LOCAL TWIN OF _date_sort_key RATHER THAN AN IMPORT, and it is a
+# layering ruling rather than a preference. oncotriage/extraction/ is a leaf:
+# stage.py imports oncotriage.constants and extraction.negation and nothing
+# else, and it is read by the INDEXER as well as by the agent, because the same
+# module extracts a TRIAL's stage requirements. Importing
+# oncotriage.registries.cancer_code_registry here would (a) invert the
+# direction -- a registry is built on top of extracted facts, not underneath
+# them -- (b) put a 1,400-line patient-side cancer registry in the import graph
+# of every trial-side stage extraction, and (c) reach across a package boundary
+# for a name the registry declares PRIVATE, making it public by use while
+# leaving it named private. Promoting it to a neutral module instead is a
+# RELOCATION with its own equivalence proof, and folding a relocation into a
+# fix is what makes an equivalence proof stop meaning anything.
+#
+# THE DRIFT THAT BUYS IS CLOSED BY MEASUREMENT, NOT BY HOPE.
+# tests/test_extraction_stage_observation_sort.py section 3 pins the two
+# functions as answering identically over a shared corpus of inputs -- the
+# corpus-shaped stamps, both placeholder spellings and the odd shapes -- so
+# they cannot separate silently. If that pin ever fails, the two copies have
+# come apart and one of them is wrong.
+def _date_sort_key(date_str: Optional[str]) -> str:
+    """Day-precision sort key for an ISO 8601 date string. Descending sort =
+    most recent first. Missing and 'unknown' both sort OLDEST.
+
+    A DELIBERATE TWIN of ``OncologyLabRegistry._date_sort_key``, byte-for-byte
+    in behaviour, for the layering reason argued above; the equivalence is
+    pinned by a test rather than asserted here.
+
+    THE [:10] SLICE IS THE SEMANTIC, not a shortcut. It makes the comparison a
+    question about the LOCAL CALENDAR DAY the staging was recorded on, which is
+    what a restaging criterion is written in ("restaged within the last six
+    months") and what the renderer prints. A staging stamped 23:00 on the 1st
+    is a staging on the 1st, whatever offset the stamp carries.
+
+    NOT COERCED, and that is deliberate: a non-string ``date`` raises here
+    exactly as it raises in the registry twin, because making one of the two
+    tolerant of a shape the other rejects is the drift the twin exists to
+    avoid. No parser in this project produces one.
+    """
+    if not date_str or date_str == "unknown":
+        return "0000-00-00"
+    return date_str[:10]   # YYYY-MM-DD prefix — lexicographic sort is correct for ISO dates
+
+
+def _stage_observation_sort_key(index: int, obs: Dict) -> Tuple[str, str, int]:
+    """The total ordering Tier 0 walks: day first, then the raw stamp, then the
+    observation's position in the list NEGATED. Meant to be sorted DESCENDING,
+    which is the direction Tier 0 wants -- most recent first.
+
+    THE ECOG PRECEDENT, adopted rather than invented --
+    ``_select_ecog_performance_status`` keys on ``(parsed day, raw string,
+    index)`` for the same reason: day-precision comparison creates ties that a
+    record CAN break, and a tie broken differently on two runs of the same
+    bundle is a reproducibility defect in a pipeline that stamps a hash on its
+    own input.
+
+    THE RAW STRING PARTICIPATES DELIBERATELY, AND IT IS A DETERMINISM DEVICE
+    RATHER THAN A CHRONOLOGY CLAIM. Two stamps sharing a day differ only in
+    time-of-day and offset; comparing them as text puts the later wall-clock
+    time first WHEN THE OFFSETS AGREE -- which is every stamp in this corpus --
+    and puts them in *some* stable order when they do not. It is preferred over
+    going straight to the index because the raw stamp is a property of the
+    RECORD while the index is a property of how the parser happened to walk the
+    bundle: with it, re-ordering a bundle whose contents are unchanged yields
+    the same winner. What it is NOT is a statement that the earlier-sorting
+    stamp is the earlier instant across differing offsets -- resolving that
+    needs a second, finer date convention than the [:10] day this project
+    compares everywhere else, and introducing one here would make this
+    collection order differently from every other section of the same summary.
+
+    THE INDEX IS NEGATED, WHICH IS THE OPPOSITE DIRECTION FROM THE ECOG KEY'S,
+    AND THAT IS A MEASUREMENT RATHER THAN A STYLE CHOICE. Under a descending
+    sort a plain ``index`` puts the LAST such record first -- which is what the
+    ECOG selection means by carrying it -- and the raw-string sort this
+    replaces put the FIRST one first, because Python's sort is stable and equal
+    keys keep their original order. On the 1,000-bundle corpus that difference
+    is not a corner case: **290 patients carry exactly two stage-group
+    Observations with BYTE-IDENTICAL stamps** (Synthea emits the same staging
+    event twice, once as "American Joint Committee on Cancer stage IA
+    (qualifier value)" and once as "Stage 1 (qualifier value)"), so day and raw
+    stamp both tie and this term decides for 29% of the cohort. Both records
+    resolve to the same ordinal and carry the same date, so nothing observable
+    moves either way -- which is exactly why flipping them would be
+    gratuitous. A fix moves what the defect moved and nothing else, so the
+    negation preserves the shipped answer and the measured blast radius of this
+    change is confined to the placeholder defect it exists to fix.
+
+    Keying on ``stage_display`` instead of the position was rejected: it would
+    make the winner depend on alphabetical text -- "Stage III" beating
+    "Stage II" for no clinical reason -- which is worse than deferring to the
+    record's own order. Two Observations carrying byte-identical dates and
+    different stage displays have no principled winner; what they need is one
+    that does not change between two runs of the same bundle.
+
+    EVERY KEY IS UNIQUE because the index is, so the ordering is TOTAL and the
+    determinism is a property of this key rather than of sort stability -- a
+    library guarantee a reader has to go and look up. It also means
+    ``reverse=True`` is the exact reverse of the ascending order, with no equal
+    keys for stability to have an opinion about.
+    """
+    raw = obs.get('date')
+    return (_date_sort_key(raw), str(raw or ''), -index)
+
+
 class PatientStage(NamedTuple):
     """What ``extract_patient_stage_with_source`` answers: the ordinal, the tier
     that produced it, and — when that tier read an Observation — that
@@ -889,12 +1055,18 @@ def extract_patient_stage_with_source(
     """
     # Tier 0: mCODE TNM stage group Observations — structured, highest priority
     if cancer_stage_observations:
-        # Sort most recent first; multiple staging events may exist (restaging)
-        sorted_obs = sorted(
-            cancer_stage_observations,
-            key=lambda o: o.get('date') or '0000-00-00',
-            reverse=True
+        # Sort most recent first; multiple staging events may exist
+        # (restaging). The key is _stage_observation_sort_key -- day, then the
+        # raw stamp, then position -- and the block above it argues every term
+        # and records what the raw-string sort this replaced got wrong.
+        # enumerate() supplies the position BEFORE the sort, so the tiebreak
+        # names each record's place in the list the parser produced.
+        _indexed = list(enumerate(cancer_stage_observations))
+        _indexed.sort(
+            key=lambda pair: _stage_observation_sort_key(pair[0], pair[1]),
+            reverse=True,
         )
+        sorted_obs = [obs for _, obs in _indexed]
         for obs in sorted_obs:
             display = obs.get('stage_display') or ''
             # Try display text regex first (e.g. "Stage IIIA", "IV")
