@@ -597,6 +597,19 @@ LOGGABLE_FIELDS = frozenset({
     # it reports which tier answered without returning the secret.
     "model_cache_source",
     "model", "tokens_in", "tokens_out", "tokens_estimated", "tokens_actual",
+    # THE MODEL ID A PROVIDER ECHOED BACK, when it differs from the one that
+    # was requested. `model` beside it is what this pipeline ASKED FOR and is
+    # what it is billed and priced on; this is what the service SAID answered.
+    # MEASURED 2026-09-01: Converse answers a request for the inference profile
+    # `us.anthropic.claude-sonnet-4-6` with the base id `claude-sonnet-4-6`, so
+    # the two are legitimately different strings for one model and a reader of
+    # a `bedrock_converse_model_echo_alias` record needs both to see which
+    # normalisation was applied. A MODEL ID, exactly like `model`: it is a
+    # vendor's catalogue name and cannot carry a patient, a trial or a
+    # diagnosis. It is a field rather than message text because 6c of
+    # tests/test_observability_logging.py forbids interpolating data into a
+    # message inside oncotriage/agent/.
+    "model_echoed",
     "finish_reason", "retry", "max_retries", "truncations", "cost_usd",
     "tokens_reasoning", "estimate_ratio", "calls",
     # THE TWO CACHE COUNTS, AND THEY ARE WHAT SAYS WHETHER PER-TRIAL MODE'S

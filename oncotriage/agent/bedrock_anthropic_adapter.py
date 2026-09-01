@@ -735,6 +735,7 @@ BEDROCK_ANTHROPIC_DEGRADATIONS = Counter()
 DEGRADATION_SEED_DROPPED = "seed_not_expressible"
 DEGRADATION_EFFORT_DROPPED = "reasoning_effort_not_expressible"
 DEGRADATION_NO_MODEL_ECHO = "model_echo_unavailable"
+DEGRADATION_MODEL_ECHO_ALIAS = "model_echo_normalised_from_alias"
 DEGRADATION_MALFORMED_OUTPUT = "model_output_malformed"
 DEGRADATION_UNKNOWN_STOP_REASON = "stop_reason_unrecognised"
 DEGRADATION_NO_USAGE = "response_carried_no_usage"
@@ -745,6 +746,7 @@ DEGRADATION_KEYS = (
     DEGRADATION_SEED_DROPPED,
     DEGRADATION_EFFORT_DROPPED,
     DEGRADATION_NO_MODEL_ECHO,
+    DEGRADATION_MODEL_ECHO_ALIAS,
     DEGRADATION_MALFORMED_OUTPUT,
     DEGRADATION_UNKNOWN_STOP_REASON,
     DEGRADATION_NO_USAGE,
@@ -1249,6 +1251,56 @@ def _usage_block(usage) -> Dict:
     return block
 
 
+def _raw_model_echo(response: Dict) -> Optional[str]:
+    """The echoed model string exactly as it arrived, or None. PURE.
+
+    Split out of ``_model_echo`` so the RAW value survives normalisation: the
+    caller needs it to record that a substitution happened, and a normaliser
+    that has already replaced the value cannot report what it replaced.
+    """
+    extra = _as_dict(response.get("additionalModelResponseFields"))
+    for key in (MODEL_ECHO_FIELD, MODEL_ECHO_POINTER):
+        value = extra.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _echo_is_alias_of(echo: str, requested: str) -> bool:
+    """Is ``echo`` the same model as ``requested``, named more briefly? PURE.
+
+    **MEASURED 2026-09-01 AGAINST THE LIVE SERVICE, AND IT REFUTED THE SHIPPED
+    ASSUMPTION.** ``bedrock_probe.py --provider bedrock_anthropic`` asked for
+    the echo and got one -- so (A3) is CONFIRMED and
+    ``MatchingModelMismatchError`` is live on this branch -- but the value that
+    came back is not the value that was sent. With
+    ``modelId="us.anthropic.claude-sonnet-4-6"`` the response carried
+    ``additionalModelResponseFields == {"model": "claude-sonnet-4-6"}``: the
+    BASE model name, not the inference-profile id. Both name the same model and
+    only one of them is the string Stage 5 compares, so before this function
+    existed EVERY Stage 5 call on this branch raised
+    ``MatchingModelMismatchError`` -- after being billed. That is a campaign
+    that cannot start, and it is exactly the class of failure the probe exists
+    to convert from documentation into observation.
+
+    **THE RULE IS A DOT-BOUNDARY SUFFIX, AND THE BOUNDARY IS THE WHOLE OF IT.**
+    An inference-profile id is the base id with dotted scope segments prepended
+    (``us.`` + ``anthropic.`` + ``claude-sonnet-4-6``), so every legitimate
+    shortening drops WHOLE segments and every whole-segment drop leaves a '.'
+    immediately before what remains. Requiring that dot is what keeps the
+    guarantee this must not lose: ``claude-haiku-4-5`` is not a suffix of
+    ``us.anthropic.claude-sonnet-4-6`` and still raises, and neither is
+    ``4-6``, whose preceding character is a hyphen rather than a dot.
+
+    **IT IS DELIBERATELY ONE-DIRECTIONAL.** A requested BASE id answered by a
+    longer PROFILE id is not accepted, because that direction has never been
+    observed and inventing tolerance for an unobserved shape is how a check
+    stops checking. If it is ever seen, it is one edit here with its own
+    measurement beside it.
+    """
+    return echo == requested or requested.endswith("." + echo)
+
+
 def _model_echo(response: Dict) -> Tuple[str, bool]:
     """``(model, echoed)`` -- the answering model, and whether it was attested.
 
@@ -1258,13 +1310,30 @@ def _model_echo(response: Dict) -> Tuple[str, bool]:
     the response as "a JSON Pointer object" without giving its key shape for a
     one-segment pointer. When nothing arrives, the REQUESTED id is returned and
     ``echoed`` is False -- which the caller records rather than swallowing.
+
+    **AN ECHO THAT IS AN ALIAS OF THE REQUESTED ID RESOLVES TO THE REQUESTED
+    ID**, per ``_echo_is_alias_of`` and the measurement recorded there. Two
+    consequences worth stating rather than leaving to be discovered:
+
+      * ``inferences.matching_model`` keeps holding the id the request NAMED,
+        which is also the id Bedrock BILLS and the id ``get_model_cost()`` is
+        keyed on -- so the stored identity and the priced identity stay one
+        value, as they are on every other provider.
+      * an echo that is NOT an alias is returned VERBATIM, so Stage 5's
+        equality fails and ``MatchingModelMismatchError`` fires. The guarantee
+        is intact; what was removed is a false positive that fired on every
+        call.
+
+    PURE, AND IT COUNTS NOTHING -- the substitution is recorded by
+    ``translate_response``, which is also where the no-echo case is recorded.
+    Keeping the count out of here is what lets the standing test drive this
+    function without a counter moving underneath it.
     """
-    extra = _as_dict(response.get("additionalModelResponseFields"))
-    for key in (MODEL_ECHO_FIELD, MODEL_ECHO_POINTER):
-        value = extra.get(key)
-        if isinstance(value, str) and value:
-            return value, True
-    return config.matching_wire_model(), False
+    requested = config.matching_wire_model()
+    value = _raw_model_echo(response)
+    if value is not None:
+        return (requested if _echo_is_alias_of(value, requested) else value), True
+    return requested, False
 
 
 def translate_response(response):
@@ -1293,6 +1362,16 @@ def translate_response(response):
     model, echoed = _model_echo(r)
     if not echoed:
         _warn_model_echo_once()
+    else:
+        # THE SUBSTITUTION IS NEVER SILENT. `_model_echo` resolves an alias to
+        # the requested id so Stage 5's equality can pass; a reader of
+        # `inferences.matching_model` is entitled to know that the string in
+        # that column was reached by a normalisation rather than returned by
+        # the service verbatim. Compared against the RAW echo, which is why
+        # `_raw_model_echo` is a separate function.
+        _raw = _raw_model_echo(r)
+        if _raw is not None and _raw != model:
+            _warn_model_echo_alias_once(_raw, model)
 
     return ChatCompletion.model_validate({
         # THE BOTOCORE REQUEST ID, which is a real value AWS support can trace,
@@ -1444,6 +1523,7 @@ def classify_error(exc: BaseException) -> str:
 
 _DROPPED_WARNED = False
 _MODEL_ECHO_WARNED = False
+_MODEL_ECHO_ALIAS_WARNED = False
 
 
 def _warn_dropped_parameters_once() -> None:
@@ -1508,6 +1588,38 @@ def _warn_model_echo_once() -> None:
         stage=5, event="bedrock_converse_model_echo_unavailable",
         degraded=True, provider=config.MATCHING_PROVIDER,
         model=config.matching_wire_model())
+
+
+def _warn_model_echo_alias_once(raw: str, resolved: str) -> None:
+    """One WARNING and one counter bump per process for a normalised echo.
+
+    Per process rather than per call, on ``_warn_model_echo_once``'s argument:
+    this is a property of the CONFIGURATION -- which model id was requested and
+    what shape this service echoes back -- so it is the same fact on every call
+    of a run, and counting it per call would put a five-figure number in the
+    run-end degradation report and make that report's "all counters are zero"
+    signal mean nothing.
+
+    IT IS A DEGRADATION RATHER THAN AN INFO LINE because something WAS given up:
+    the attestation is now that the answering model is *an* alias of the one
+    requested, not that it is the exact string requested. That is weaker than
+    the guarantee the other two providers give, and the run-end report is where
+    a difference in guarantee belongs.
+    """
+    global _MODEL_ECHO_ALIAS_WARNED
+    if _MODEL_ECHO_ALIAS_WARNED:
+        return
+    _MODEL_ECHO_ALIAS_WARNED = True
+    BEDROCK_ANTHROPIC_DEGRADATIONS[DEGRADATION_MODEL_ECHO_ALIAS] += 1
+    log.warning(
+        "Converse echoed a model id that is an ALIAS of the one requested, not "
+        "the same string: the attestation is that an alias answered rather "
+        "than that the exact requested id did. inferences.matching_model "
+        "records the REQUESTED id, which is also the id Bedrock bills and the "
+        "id get_model_cost() is keyed on.",
+        stage=5, event="bedrock_converse_model_echo_alias",
+        degraded=True, provider=config.MATCHING_PROVIDER,
+        model=resolved, model_echoed=raw)
 
 
 def call_matching_model_bedrock_anthropic(system_prompt: str, user_prompt: str):

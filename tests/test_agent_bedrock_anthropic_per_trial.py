@@ -682,37 +682,59 @@ check("...and NONE of them is in `messages`, which would cache the per-trial "
 # --- 2c. WHAT DIFFERS, AND IT IS EXACTLY TWO FIELDS ------------------------
 _diff = sorted(k for k in set(_warm_kw) | set(_trial_kw)
                if _warm_kw.get(k) != _trial_kw.get(k))
-# THREE KEYS, NOT TWO, AND THE FIRST DRAFT OF THIS CHECK SAID TWO. The
-# `outputConfig` DROP is itself a difference -- present on a trial call, absent
-# on the warmup -- so the honest statement is three, and it is enumerated
-# EXACTLY rather than as a floor: a fourth key appearing here would be a
-# difference nobody argued for, and `system` appearing here at all would be the
-# defect 2a exists to catch.
-check("the warmup differs from a trial call in exactly three keys, every one "
-      "of them AFTER the cached prefix and none of them `system`",
-      _diff, ["inferenceConfig", "messages", "outputConfig"])
+# TWO KEYS, AND THIS CHECK HAS NOW SAID TWO, THEN THREE, THEN TWO AGAIN --
+# each time for a reason, and the last one is a live measurement rather than a
+# reading of a documentation page. It said two, then three when the
+# `outputConfig` DROP was counted as a difference, and it is two again because
+# `BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG` now ships True: the warmup
+# carries the structured-output block, so that key no longer differs at all.
+# WHY IT SHIPS TRUE IS A MEASUREMENT, recorded in full at the constant: a
+# warmup without the block writes a DIFFERENT cache prefix from the wave
+# (11,749 tokens against the wave's 12,416, on a byte-identical `system`), so
+# the warmup warmed a prefix no trial call ever read and trial 1 paid a second
+# full write. Enumerated EXACTLY rather than as a floor: a third key here would
+# be a difference nobody argued for, and `system` appearing here at all would
+# be the defect 2a exists to catch.
+check("the warmup differs from a trial call in exactly two keys, both of them "
+      "AFTER the cached prefix and neither of them `system`",
+      _diff, ["inferenceConfig", "messages"])
 check("...the ceiling is the configured minimum",
       _warm_kw["inferenceConfig"]["maxTokens"],
       config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS)
 check("...the user message is the configured placeholder",
       _warm_kw["messages"][0]["content"][0]["text"],
       config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE)
-check("outputConfig is DROPPED by default -- it is in none of Converse's three "
-      "checkpoint sections, so dropping it cannot change the cached prefix",
-      "outputConfig" in _warm_kw, False)
-check("...and a trial call still carries it",
+# THIS PIN WAS INVERTED BY A LIVE MEASUREMENT, and the sentence it used to
+# carry -- "it is in none of Converse's three checkpoint sections, so dropping
+# it cannot change the cached prefix" -- is the inference the probe refuted.
+# The citation behind it is accurate; what does not follow is that a section
+# absent from the documented checkpoint LIST is absent from the cached PREFIX.
+# Measured 2026-09-01: the block takes part in it, almost certainly as the
+# `tools` entry that structured output compiles to, which is FIRST in the very
+# ordering that sentence quoted.
+check("outputConfig is CARRIED by the warmup by default, because a warmup "
+      "without it warms a different prefix from the one the wave reads",
+      "outputConfig" in _warm_kw, True)
+check("...and a trial call carries it too, which is the point -- the two "
+      "requests must present the same prefix",
       "outputConfig" in _trial_kw, True)
+check("...and they are the SAME block, not merely both present: a warmup "
+      "carrying a different schema would cache separately for a reason no "
+      "usage field would name",
+      json.dumps(_warm_kw["outputConfig"], sort_keys=True),
+      json.dumps(_trial_kw["outputConfig"], sort_keys=True))
 
 with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC,
-              BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG=True):
-    _warm_with = bac.build_converse_request(
+              BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG=False):
+    _warm_without = bac.build_converse_request(
         "SYSTEM-PREFIX", config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE,
         warmup=True)
-check("the knob turns the structured-output block back on in one edit, which "
-      "is what makes (A1)'s grammar-compile question answerable without a "
-      "source change", "outputConfig" in _warm_with, True)
-check("...and the prefix is STILL byte-identical with it on",
-      json.dumps(_warm_with["system"]), json.dumps(_trial_kw["system"]))
+check("the knob still turns the structured-output block OFF in one edit, so "
+      "the pre-2026-09-01 behaviour is reproducible without a source change",
+      "outputConfig" in _warm_without, False)
+check("...and the prefix is byte-identical either way, which is what makes "
+      "the cache split attributable to `outputConfig` and to nothing else",
+      json.dumps(_warm_without["system"]), json.dumps(_trial_kw["system"]))
 
 # --- 2d. No seed, no routing hint, on either shape -------------------------
 for _label, _kw2 in (("warmup", _warm_kw), ("trial", _trial_kw)):

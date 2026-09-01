@@ -109,6 +109,140 @@ CONFIRM_FLAG = "--i-understand-this-bills"
 
 
 # ===========================================================================
+# PACING, AND WHY A PROBE NEEDS IT
+# ===========================================================================
+#
+# MEASURED IN THE AWS CONSOLE 2026-08-30, not inferred: this account's APPLIED
+# requests-per-minute quota for Claude Sonnet 4.6 cross-region inference is
+# **10**, and the increase request to 10,000 was DENIED. Tokens per minute is
+# 6,000,000; tokens per day is 10,800,000 and is not adjustable.
+#
+# WHY A PACER AND NOT A RETRY. botocore's standard retry mode would absorb a
+# self-inflicted 429 and the probe would still finish -- having measured its
+# own retry loop rather than the thing it was pointed at. The cache readings
+# (A2, A12) are statements about a SEQUENCE of requests, and a request whose
+# position in that sequence was decided by a backoff is a request whose reading
+# cannot be attributed. A probe that throttles itself has spent money to
+# produce a number nobody can use.
+#
+# THE MARGIN IS A FACTOR RATHER THAN A SUBTRACTION, so it stays correct if the
+# ceiling is ever raised. At the shipped defaults (ceiling 10, margin 1.5) the
+# effective rate is 6.7 requests per minute -- a third of headroom against a
+# limit whose enforcement window AWS does not document as a clean 60-second
+# bucket, so "exactly 10 in any 60 seconds" is not a safe reading of it.
+#
+# IT IS NOT APPLIED TO --probe-throttle, which exists to exceed the ceiling on
+# purpose and builds its own unpaced, unretried client to do it.
+
+
+class _Pacer:
+    """Hold each billed call at least `gap` seconds after the previous one."""
+
+    def __init__(self, max_rpm, margin):
+        self.max_rpm = max_rpm
+        self.margin = margin
+        self.gap = 0.0 if max_rpm <= 0 else (60.0 / max_rpm) * margin
+        self._last = None
+        self.slept = 0.0
+        self.waits = 0
+
+    def wait(self, label=""):
+        if self.gap <= 0:
+            self._last = time.monotonic()
+            return
+        now = time.monotonic()
+        if self._last is not None and now < self._last + self.gap:
+            delay = self._last + self.gap - now
+            self.waits += 1
+            self.slept += delay
+            print(f"  [pace] holding {delay:.1f}s"
+                  f"{(' before ' + label) if label else ''} "
+                  f"(ceiling {self.max_rpm}/min x margin {self.margin} "
+                  f"-> {self.gap:.1f}s between calls)")
+            time.sleep(delay)
+            now = time.monotonic()
+        self._last = now
+
+
+# Replaced in main() once the flags are parsed. A zero-rate pacer never sleeps,
+# which is what keeps `--max-rpm 0` an honest way to say "do not pace me".
+_PACER = _Pacer(0, 1.0)
+
+
+def aws_error_evidence(exc):
+    """Everything about a failed AWS call that an AWS support case needs.
+
+    THE REQUEST ID IS THE POINT, AND `str(exc)` LOSES IT. A throttled Converse
+    call arrives as a botocore ``ClientError`` whose string form names the
+    operation and the message and NOT the request id; the id lives at
+    ``exc.response["ResponseMetadata"]["RequestId"]``. That is the value an AWS
+    support case asks for, so a probe that prints only the exception has spent
+    a call and thrown away the evidence it was issued to collect.
+
+    Returns a dict, possibly empty. Every value is copied VERBATIM out of the
+    response and is never reformatted or paraphrased.
+    """
+    resp = getattr(exc, "response", None)
+    if not isinstance(resp, dict):
+        return {}
+    meta = resp.get("ResponseMetadata") or {}
+    err = resp.get("Error") or {}
+    headers = meta.get("HTTPHeaders") or {}
+    out = {
+        "RequestId": meta.get("RequestId"),
+        "HTTPStatusCode": meta.get("HTTPStatusCode"),
+        "RetryAttempts": meta.get("RetryAttempts"),
+        "ErrorCode": err.get("Code"),
+        "ErrorMessage": err.get("Message"),
+        "x-amzn-requestid": headers.get("x-amzn-requestid"),
+        "x-amzn-errortype": headers.get("x-amzn-errortype"),
+        "retry-after": headers.get("retry-after"),
+        "date": headers.get("date"),
+    }
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def print_aws_error(exc, indent="          "):
+    """Print the evidence block. Returns it so a caller can also collect it."""
+    ev = aws_error_evidence(exc)
+    if not ev:
+        print(f"{indent}(no botocore response payload on this exception -- "
+              f"nothing to quote for a support case)")
+        return ev
+    print(f"{indent}--- AWS error evidence, verbatim ---")
+    for k, v in ev.items():
+        print(f"{indent}  {k}: {v}")
+    return ev
+
+
+def guarded_build(build, what):
+    """Build a client, or return a NAMED refusal instead of a traceback.
+
+    FOUND BY RUNNING THIS FILE, NOT BY READING IT. The Responses branch already
+    guards its credential resolution, on the argument written there that "a
+    traceback out of main() is the shape this project has shipped nine times"
+    -- and then constructs its client on the very next line UNGUARDED. The
+    Converse branch did the same. On a machine with boto3 absent, or with no
+    credential boto3 can see, `bedrock_probe.py --i-understand-this-bills
+    --provider bedrock_anthropic` printed a ModuleNotFoundError chained into a
+    RuntimeError and died from an uncaught exception -- reporting a traceback
+    where it owed the message that names the one-line fix, to the one operator
+    guaranteed to hit it: the one running this on day one.
+
+    Returns (client, None) or (None, exc). Nothing has been called or billed at
+    the point this can fail.
+    """
+    try:
+        return build(), None
+    except Exception as exc:                           # noqa: BLE001
+        print(f"\n  REFUSED before any call -- {what} could not be built:")
+        for line in str(exc).splitlines():
+            print(f"    {line}")
+        print("\n  Nothing was called. Nothing was billed.")
+        return None, exc
+
+
+# ===========================================================================
 # A self-contained structural validator
 # ===========================================================================
 #
@@ -281,6 +415,35 @@ def main(argv=None):
              "Render a real one and point this at it before drawing any "
              "conclusion about A12.")
     parser.add_argument(
+        "--max-rpm", type=float, default=10.0,
+        help="Requests-per-minute ceiling this probe holds itself under. "
+             "DEFAULT 10, WHICH IS THIS ACCOUNT'S MEASURED APPLIED QUOTA for "
+             "Claude Sonnet 4.6 cross-region (AWS console, 2026-08-30; the "
+             "increase to 10,000 was DENIED). 0 disables pacing entirely. "
+             "Ignored by --probe-throttle, which exceeds the ceiling on "
+             "purpose.")
+    parser.add_argument(
+        "--rpm-margin", type=float, default=1.5,
+        help="Multiplier on the inter-call gap (default 1.5, i.e. 6.7/min "
+             "against a ceiling of 10). A FACTOR rather than a subtraction so "
+             "it stays correct if the ceiling is raised. AWS does not document "
+             "the enforcement window as a clean 60-second bucket, so pacing "
+             "at exactly the ceiling is not a safe reading of it.")
+    parser.add_argument(
+        "--probe-throttle", action="store_true",
+        help="bedrock_anthropic only, and it RUNS LAST: deliberately exceed "
+             "the requests-per-minute ceiling to settle A14 -- whether the "
+             "429s are BURSTY or SUSTAINED, what retry-after they carry, and "
+             "WHAT THE REQUEST ID IS. Builds its own client with retries OFF, "
+             "because botocore's standard mode absorbs a 429 and an absorbed "
+             "429 is one that cannot be counted, timed or quoted to AWS "
+             "support. Two waves separated by a recovery pause; cheap (tiny "
+             "prompt, tiny ceiling) but it takes wall time.")
+    parser.add_argument(
+        "--throttle-burst", type=int, default=14,
+        help="How many requests the first throttle wave issues at once "
+             "(default 14, i.e. 1.4x a ceiling of 10).")
+    parser.add_argument(
         "--calls", type=int, default=2,
         help="How many identical calls to issue (default 2; the second is what "
              "proves the prompt cache warms). Minimum 1.")
@@ -296,6 +459,55 @@ def main(argv=None):
     if args.calls < 1:
         print("REFUSED: --calls must be at least 1.")
         return 2
+
+    if args.max_rpm < 0 or args.rpm_margin <= 0:
+        print("REFUSED: --max-rpm must be >= 0 and --rpm-margin must be > 0.")
+        return 2
+
+    if args.throttle_burst < 1:
+        print("REFUSED: --throttle-burst must be at least 1.")
+        return 2
+
+    # A FLAG THAT SILENTLY DOES NOTHING IS WORSE THAN ONE THAT REFUSES, and
+    # three of these had that shape: `--probe-truncation`, `--probe-per-trial`
+    # and `--probe-throttle` are all read only inside the Converse branch, and
+    # their help text saying "bedrock_anthropic only" is not enforcement. An
+    # operator who typed `--provider bedrock --probe-per-trial` got a run that
+    # answered none of A11/A12 and said so nowhere -- and on this branch the
+    # whole point of the flag is that it is the one command that settles them
+    # before a campaign's money rests on the answer.
+    _CONVERSE_ONLY = (("--probe-truncation", args.probe_truncation),
+                      ("--probe-per-trial", args.probe_per_trial),
+                      ("--per-trial-prefix-file", args.per_trial_prefix_file),
+                      ("--probe-throttle", args.probe_throttle))
+    if args.provider != "bedrock_anthropic":
+        _misused = [name for name, given in _CONVERSE_ONLY if given]
+        if _misused:
+            print(f"REFUSED: {', '.join(_misused)} "
+                  f"{'is' if len(_misused) == 1 else 'are'} implemented on the "
+                  f"Converse branch only, and --provider is "
+                  f"{args.provider!r}. Re-run with "
+                  f"--provider bedrock_anthropic, or drop the flag"
+                  f"{'' if len(_misused) == 1 else 's'}.")
+            print("         Nothing was called. Nothing was billed.")
+            return 2
+    if args.per_trial_prefix_file and not args.probe_per_trial:
+        print("REFUSED: --per-trial-prefix-file only has an effect with "
+              "--probe-per-trial, which is the phase that reads it.")
+        print("         Nothing was called. Nothing was billed.")
+        return 2
+
+    global _PACER
+    _PACER = _Pacer(args.max_rpm, args.rpm_margin)
+    if _PACER.gap > 0:
+        print(f"[pace] every billed call is held {_PACER.gap:.1f}s after the "
+              f"previous one: ceiling {args.max_rpm}/min x margin "
+              f"{args.rpm_margin} -> an effective "
+              f"{60.0 / _PACER.gap:.1f} requests/min.")
+    else:
+        print("[pace] PACING DISABLED (--max-rpm 0). A self-inflicted 429 "
+              "will be absorbed by botocore's retry and every cache reading "
+              "below becomes unattributable.")
 
     # THE DISPATCH SITS ABOVE EVERY LINE OF THE RESPONSES PROBE, so that branch
     # is byte-identical to the one that shipped: same imports, same order, same
@@ -361,7 +573,10 @@ def main(argv=None):
           "seed" in kwargs or "seed" in (kwargs.get("extra_body") or {}),
           config.BEDROCK_SEND_SEED_IN_EXTRA_BODY)
 
-    client = deps.get_bedrock_client()
+    client, _exc = guarded_build(deps.get_bedrock_client,
+                                 "the Bedrock Responses client")
+    if client is None:
+        return 1
     schema = build_response_schema()
 
     raw_responses = []
@@ -369,11 +584,13 @@ def main(argv=None):
     for i in range(args.calls):
         print(f"\n  --- call {i + 1} of {args.calls} ---")
         try:
+            _PACER.wait(f"call {i + 1}")
             raw = client.responses.create(**kwargs)
         except Exception as exc:                       # noqa: BLE001
             category = bedrock_adapter.classify_error(exc)
             print(f"  RAISED  {type(exc).__name__} [{category}]")
             print(f"          {exc}")
+            print_aws_error(exc)
             print("\n  The adapter's VERIFY-AT-GO-LIVE list names what to edit "
                   "for each category.")
             _RESULTS["failed"] += 1
@@ -462,6 +679,7 @@ def main(argv=None):
         seeded["extra_body"] = dict(seeded.get("extra_body") or {})
         seeded["extra_body"]["seed"] = config.MATCHING_SEED
         try:
+            _PACER.wait("the seed call")
             client.responses.create(**seeded)
             print("  ACCEPTED. Set config.BEDROCK_SEND_SEED_IN_EXTRA_BODY = "
                   "True and re-read the adapter's `seed` row.")
@@ -576,7 +794,10 @@ def _probe_bedrock_anthropic(args):
                any("cachePoint" in b for b in kwargs["system"]))
     print(f"\n  serialized schema, in full:\n    {_schema_str}")
 
-    client = deps.get_bedrock_anthropic_client()
+    client, _exc = guarded_build(deps.get_bedrock_anthropic_client,
+                                 "the Bedrock Converse client")
+    if client is None:
+        return 1
     schema = build_response_schema()
 
     raw_responses = []
@@ -584,6 +805,7 @@ def _probe_bedrock_anthropic(args):
     section(f"CALLS — {args.calls} identical, live and billed")
     for i in range(args.calls):
         print(f"\n  --- call {i + 1} of {args.calls} ---")
+        _PACER.wait(f"call {i + 1}")
         _t0 = time.monotonic()
         try:
             raw = client.converse(**kwargs)
@@ -591,6 +813,7 @@ def _probe_bedrock_anthropic(args):
             category = adapter.classify_error(exc)
             print(f"  RAISED  {type(exc).__name__} [{category}]")
             print(f"          {exc}")
+            print_aws_error(exc)
             print("\n  The adapter's A1..A10 list names what to edit for each "
                   "category. A ValidationException naming outputConfig is A1; "
                   "one naming additionalModelRequestFields is A4.")
@@ -710,12 +933,14 @@ def _probe_bedrock_anthropic(args):
         truncated = json.loads(json.dumps(kwargs))
         truncated["inferenceConfig"]["maxTokens"] = 16
         try:
+            _PACER.wait("the truncation call")
             t_raw = client.converse(**truncated)
             print(f"  stopReason: {t_raw.get('stopReason')!r}")
             check("a deliberate truncation reports 'max_tokens', which is what "
                   "arms the split", t_raw.get("stopReason"), "max_tokens")
         except Exception as exc:                       # noqa: BLE001
             print(f"  RAISED ({type(exc).__name__}: {exc})")
+            print_aws_error(exc, indent="  ")
             print("  A maxTokens below the model's minimum is itself a "
                   "possibility; this does not settle A7 either way.")
 
@@ -770,10 +995,12 @@ def _probe_bedrock_anthropic(args):
               bool(config.BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG))
 
         pt_usages = []
+        pt_latencies = []
         for label, kw in (("warmup", warm_kwargs),
                           ("trial 1", trial_kwargs),
                           ("trial 2", trial_kwargs)):
             print(f"\n  --- {label} ---")
+            _PACER.wait(label)
             _t0 = time.monotonic()
             try:
                 raw = client.converse(**kw)
@@ -781,6 +1008,7 @@ def _probe_bedrock_anthropic(args):
                 category = adapter.classify_error(exc)
                 print(f"  RAISED  {type(exc).__name__} [{category}]")
                 print(f"          {exc}")
+                print_aws_error(exc)
                 if label == "warmup":
                     print("\n  THIS IS (A11). If the message names maxTokens, "
                           "the shipped code CLASSIFIES it -- "
@@ -795,7 +1023,8 @@ def _probe_bedrock_anthropic(args):
                 break
             u = raw.get("usage") or {}
             pt_usages.append((label, u))
-            print(f"  elapsed {time.monotonic() - _t0:.1f}s   "
+            pt_latencies.append(time.monotonic() - _t0)
+            print(f"  elapsed {pt_latencies[-1]:.1f}s   "
                   f"stopReason {raw.get('stopReason')!r}")
             dump("usage", u)
             _cd = u.get("cacheDetails")
@@ -858,6 +1087,10 @@ def _probe_bedrock_anthropic(args):
                       f"formula inputTokens + cacheRead + cacheWrite",
                       _derived, _stated)
 
+            _report_cache_economics(
+                pt_usages, len(_pt_system) // config.CHARS_PER_TOKEN,
+                pt_latencies + elapsed, config, adapter)
+
     # ---- A6 -------------------------------------------------------------
     section("(A6) COST — priced from PRICING_CONFIG's Sonnet 4.6 rows")
     total_in = total_out = 0
@@ -898,7 +1131,367 @@ def _probe_bedrock_anthropic(args):
           "Stage 5 run records those on its first call; what the probe checks "
           "instead is stronger and is above — that no seed is on the wire.")
 
+    # THE THROTTLE PHASE RUNS LAST AND THAT IS A CORRECTNESS PROPERTY, not an
+    # ordering preference. It is the one phase that provokes 429s on purpose,
+    # and botocore's standard retry mode charges a 500-token bucket 5 tokens
+    # per throttling retry and stops retrying when it drains -- so any cache
+    # reading taken after it could have been taken through a request that never
+    # reached the service.
+    if args.probe_throttle:
+        _probe_throttle_ceiling(args, config, adapter)
+
     return _summary()
+
+
+# ===========================================================================
+# (A14) THE THROTTLE CEILING, AND A REQUEST ID FOR THE SUPPORT CASE
+# ===========================================================================
+
+# THE DOCUMENTED CACHE RATES. Read 2026-08-30 from the AWS Marketplace listing
+# the Claude Sonnet 4.6 model card names (prod-ffvjxvh4ltq64), in US dollars
+# per MILLION tokens. THESE ARE GLOBAL DIMENSIONS; that listing publishes no
+# geo rows, so a `us.`/`eu.`/`au.`/`jp.` profile is priced here by the SAME
+# +10% premium PRICING_CONFIG already infers for those rows -- INFERRED, not
+# measured, and labelled as such everywhere it is used.
+#
+# THEY ARE NOT IN PRICING_CONFIG AND THAT IS DELIBERATE (A13): that table is an
+# {input, output} pair shared with every historical row, and introducing a
+# cached term re-bases the whole series. So the cache arithmetic lives here,
+# where it is a report rather than a stored figure.
+_CACHE_RATES_GLOBAL_USD_PER_1M = {
+    "input": 3.00,
+    "output": 15.00,
+    "cache_read": 0.30,
+    "cache_write_5m": 3.75,
+    "cache_write_1h": 6.00,
+}
+_GEO_PREMIUM = 1.10
+
+
+def _cache_rates_for(wire_model):
+    """The documented rates, with the geo premium applied when it applies."""
+    inferred = not wire_model.startswith("global.")
+    factor = _GEO_PREMIUM if inferred else 1.0
+    return ({k: v * factor for k, v in _CACHE_RATES_GLOBAL_USD_PER_1M.items()},
+            inferred)
+
+
+def _probe_throttle_ceiling(args, config, adapter):
+    """Exceed the ceiling on purpose, and come back with evidence.
+
+    IT RUNS LAST, AND THAT IS A CORRECTNESS PROPERTY RATHER THAN TIDINESS.
+    botocore's standard retry mode charges a 500-token bucket 5 tokens per
+    throttling retry and, in AWS's own words, "when the available tokens are
+    exhausted" it stops retrying altogether. A phase that provokes throttling
+    before the cache measurements would leave those measurements taken through
+    a drained quota, and a cache reading whose request never actually reached
+    the service is worse than no reading.
+
+    IT BUILDS ITS OWN CLIENT WITH RETRIES OFF, and that is a deliberate
+    departure from `config.get_bedrock_anthropic_client()` rather than an
+    oversight. That client sets `max_attempts = OPENAI_SDK_MAX_RETRIES + 1`
+    precisely so a transient 429 is absorbed -- correct for a campaign, and
+    useless here: an absorbed 429 is one this probe cannot count, cannot time,
+    and cannot quote a request id for. `max_attempts=1` is one attempt and no
+    retry, so every throttle surfaces with its own response metadata.
+
+    TWO WAVES, AND THE SECOND IS WHAT ANSWERS THE QUESTION. A single burst
+    tells you the ceiling binds; it cannot tell you whether it RECOVERS. Wave 2
+    is issued after a recovery pause, and the two together separate BURSTY
+    (wave 1 throttles, wave 2 is clean -- raise the retry budget and ride it
+    out) from SUSTAINED (both throttle -- lower the parallel bound, because
+    botocore's retry quota drains and a bigger budget does nothing).
+
+    THE REQUESTS ARE THE CHEAPEST VALID ONES THIS ADAPTER CAN BUILD: the
+    warmup shape over the probe's tiny system prompt, `maxTokens = 1` and no
+    structured-output block. Throttling is a property of the request COUNT, not
+    of its size, so paying for content here would buy nothing.
+    """
+    import concurrent.futures as _cf
+
+    try:
+        import boto3
+        from botocore.config import Config as _BotoConfig
+    except ImportError as exc:
+        print(f"  REFUSED: --probe-throttle needs boto3 ({exc}).")
+        return None
+
+    section("(A14) THROTTLE CEILING — deliberately over the limit, UNPACED")
+    print(f"  This account's APPLIED requests-per-minute quota for this model "
+          f"was measured at {args.max_rpm:.0f} in the AWS console "
+          f"(2026-08-30). Everything above this section held itself under it; "
+          f"this section does not.")
+    print(f"  Retries are OFF for this phase only (max_attempts=1), so every "
+          f"429 surfaces instead of being absorbed.")
+
+    throttle_client = boto3.client(
+        "bedrock-runtime",
+        region_name=config.BEDROCK_REGION,
+        config=_BotoConfig(
+            connect_timeout=config.BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS,
+            read_timeout=config.MATCHING_REQUEST_TIMEOUT_SECONDS,
+            retries={"max_attempts": 1, "mode": "standard"}),
+    )
+    kw = adapter.build_converse_request(
+        PROBE_SYSTEM, config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE,
+        warmup=True)
+
+    def _one(idx):
+        t0 = time.monotonic()
+        try:
+            raw = throttle_client.converse(**kw)
+            return {"i": idx, "ok": True, "s": t0,
+                    "e": time.monotonic(),
+                    "rid": (raw.get("ResponseMetadata") or {}).get("RequestId"),
+                    "usage": raw.get("usage") or {}}
+        except Exception as exc:                       # noqa: BLE001
+            return {"i": idx, "ok": False, "s": t0, "e": time.monotonic(),
+                    "cls": type(exc).__name__,
+                    "cat": adapter.classify_error(exc),
+                    "msg": str(exc),
+                    "ev": aws_error_evidence(exc)}
+
+    waves = []
+    plan = [("wave 1", args.throttle_burst),
+            ("wave 2", max(4, args.throttle_burst // 2))]
+    for wi, (label, n) in enumerate(plan):
+        if wi:
+            pause = 65.0
+            print(f"\n  --- recovery pause {pause:.0f}s before {label} "
+                  f"(one enforcement window plus margin) ---")
+            time.sleep(pause)
+        print(f"\n  --- {label}: {n} requests submitted at once, unpaced ---")
+        w0 = time.monotonic()
+        with _cf.ThreadPoolExecutor(max_workers=n) as pool:
+            res = sorted(pool.map(_one, range(n)), key=lambda r: r["i"])
+        span = time.monotonic() - w0
+        ok = [r for r in res if r["ok"]]
+        bad = [r for r in res if not r["ok"]]
+        thr = [r for r in bad if r.get("cat") == "throttling"
+               or (r.get("ev") or {}).get("ErrorCode") == "ThrottlingException"]
+        print(f"  {len(ok)}/{n} accepted, {len(thr)} throttled, "
+              f"{len(bad) - len(thr)} failed otherwise, over {span:.1f}s")
+        # A RATE NEEDS A WINDOW. The burst is submitted at once, so its span
+        # can be a fraction of a second -- and `accepted / span * 60` then
+        # reports a five-figure requests-per-minute figure that LOOKS like a
+        # measurement of the ceiling and is an artefact of dividing by nearly
+        # zero. The primary evidence is the COUNT accepted out of a burst
+        # issued inside one enforcement window; the rate is printed only when
+        # the window is wide enough to carry one.
+        if span >= 1.0:
+            print(f"  observed ACCEPTED rate: "
+                  f"{len(ok) / span * 60:.1f} requests/min over {span:.1f}s")
+        else:
+            print(f"  (the burst completed in {span:.2f}s -- too short to "
+                  f"support a per-minute rate; the ACCEPTED COUNT above is "
+                  f"the measurement)")
+        waves.append({"label": label, "n": n, "span": span, "ok": ok,
+                      "thr": thr, "other": [r for r in bad if r not in thr]})
+
+        for r in res:
+            tag = ("OK " if r["ok"] else
+                   ("429" if r in thr else "ERR"))
+            rid = r.get("rid") or (r.get("ev") or {}).get("RequestId")
+            print(f"    [{tag}] #{r['i']:>2}  "
+                  f"+{r['e'] - w0:5.1f}s  RequestId={rid}")
+
+        for r in thr[:3]:
+            print(f"\n  --- VERBATIM throttled response #{r['i']} ---")
+            print(f"    exception: {r['cls']}: {r['msg']}")
+            for k, v in (r.get("ev") or {}).items():
+                print(f"    {k}: {v}")
+
+    # ---- the reading -----------------------------------------------------
+    w1, w2 = waves[0], waves[1]
+    print()
+    check_true("(A14) at least one 429 was produced, so the ceiling was "
+               "actually reached and this section measured something",
+               bool(w1["thr"] or w2["thr"]))
+    ids = [(r.get("ev") or {}).get("RequestId")
+           for r in (w1["thr"] + w2["thr"])]
+    ids = [i for i in ids if i]
+    check_true("(A14) a throttled response carried a RequestId, which is the "
+               "value an AWS support case asks for", bool(ids))
+
+    if w1["thr"] and not w2["thr"]:
+        verdict = ("BURSTY — wave 1 throttled and wave 2, after a recovery "
+                   "pause, did not. The limit refills. Raising "
+                   "BEDROCK_ANTHROPIC_MAX_ATTEMPTS lets a campaign ride these "
+                   "out.")
+    elif w1["thr"] and w2["thr"]:
+        verdict = ("SUSTAINED — both waves throttled. botocore's retry quota "
+                   "drains under sustained throttling and stops retrying, so a "
+                   "bigger BEDROCK_ANTHROPIC_MAX_ATTEMPTS does nothing: the "
+                   "remedy is a smaller BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS.")
+    elif not w1["thr"]:
+        verdict = ("NOT REACHED — no 429 at this burst size. Either the "
+                   "applied quota is higher than the console reported, or the "
+                   "enforcement window is wider than one minute. Re-run with a "
+                   "larger --throttle-burst before concluding the quota is "
+                   "not binding.")
+    else:
+        verdict = "MIXED — read the per-request timeline above."
+    print(f"\n  A14 VERDICT: {verdict}")
+
+    # THE HEADLINE IS A COUNT, NOT A RATE, and that is the honest form of it:
+    # wave 1 submits `n` requests inside one enforcement window, so "how many
+    # were accepted" IS the ceiling as the service applied it. A rate is
+    # derived only when the wave lasted long enough to divide by.
+    accepted = len(w1["ok"])
+    accepted_rate = ((accepted / w1["span"] * 60)
+                     if w1["span"] >= 1.0 else None)
+    print(f"  MEASURED CEILING: {accepted} of {w1['n']} requests accepted in "
+          f"a single unpaced burst ({w1['span']:.2f}s), "
+          f"{len(w1['thr'])} throttled.")
+    if accepted_rate is not None:
+        print(f"  ...i.e. {accepted_rate:.1f} accepted requests/min over that "
+              f"window.")
+    print(f"  The console-reported APPLIED quota was {args.max_rpm:.0f}/min. "
+          f"An accepted count at or near that is the quota confirming itself; "
+          f"a much larger one means the enforcement window is wider than this "
+          f"burst and the ceiling was not really reached.")
+    print(f"  Compare against config.per_trial_parallel_bound() = "
+          f"{config.per_trial_parallel_bound()}: a per-trial wave issues that "
+          f"many at once and repeats "
+          f"ceil({config.MAX_TRIALS_FOR_EVALUATION}/"
+          f"{config.per_trial_parallel_bound()}) = "
+          f"{-(-config.MAX_TRIALS_FOR_EVALUATION // config.per_trial_parallel_bound())} "
+          f"times per patient, plus one warmup.")
+    return {"waves": waves, "request_ids": ids, "verdict": verdict,
+            "accepted_rate_per_min": accepted_rate}
+
+
+def _report_cache_economics(pt_usages, prefix_tokens, latencies, config,
+                            adapter):
+    """(A2)(A13) What the cache measured, and what it is worth. ARITHMETIC.
+
+    EVERY TOKEN COUNT HERE IS MEASURED from a real usage block. Every PRICE is
+    DOCUMENTED (the Marketplace listing) and, off `global.`, carries an
+    INFERRED +10% geo premium. The two are kept apart in the printout, because
+    a figure that mixes a measured quantity with an inferred rate is only as
+    good as the rate and must say so.
+    """
+    section("(A2)(A13)(item 6) CACHE ECONOMICS — measured tokens, documented "
+            "rates")
+    wire = config.matching_wire_model()
+    rates, inferred = _cache_rates_for(wire)
+    print(f"  rates for {wire!r} (USD per 1M): "
+          f"input {rates['input']:.2f}, output {rates['output']:.2f}, "
+          f"cache read {rates['cache_read']:.2f}, "
+          f"cache write 5m {rates['cache_write_5m']:.2f}, "
+          f"cache write 1h {rates['cache_write_1h']:.2f}")
+    if inferred:
+        print("  *** THE +10% GEO PREMIUM ON THESE IS INFERRED, NOT MEASURED. "
+              "The Marketplace listing publishes GLOBAL dimensions only. "
+              "Reconcile against the console bill. ***")
+
+    if len(pt_usages) < 3:
+        print("  (no per-trial sequence was captured; nothing to price)")
+        return None
+
+    def _u(u, k):
+        return u.get(k) or 0
+
+    warm = pt_usages[0][1]
+    trials = [u for _, u in pt_usages[1:]]
+    wrote = _u(warm, "cacheWriteInputTokens")
+    reads = [_u(u, "cacheReadInputTokens") for u in trials]
+    fresh = [_u(u, "inputTokens") for u in trials]
+    outs = [_u(u, "outputTokens") for u in trials]
+
+    print(f"\n  MEASURED: warmup wrote {wrote} cached tokens; "
+          f"trial reads {reads}; non-cached input per trial {fresh}; "
+          f"output per trial {outs}")
+
+    ttl_key = ("cache_write_1h" if config.BEDROCK_ANTHROPIC_CACHE_TTL == "1h"
+               else "cache_write_5m")
+    per = 1_000_000.0
+    cached_cost = (wrote * rates[ttl_key] / per
+                   + sum(reads) * rates["cache_read"] / per
+                   + sum(fresh) * rates["input"] / per
+                   + sum(outs) * rates["output"] / per)
+    # The same three calls with the cache doing nothing: every token that was
+    # read from cache would instead be fresh input at the full rate.
+    uncached_cost = ((wrote + sum(fresh) + sum(reads)) * rates["input"] / per
+                     + sum(outs) * rates["output"] / per)
+    print(f"  these 3 calls WITH the cache   : ${cached_cost:.6f}")
+    print(f"  the same 3 calls WITHOUT it    : ${uncached_cost:.6f}")
+    if uncached_cost > 0:
+        print(f"  saving on this sequence        : "
+              f"{(1 - cached_cost / uncached_cost) * 100:.1f}%")
+
+    # ---- extrapolated to a real patient ---------------------------------
+    n = config.MAX_TRIALS_FOR_EVALUATION
+    per_trial_fresh = (sum(fresh) / len(fresh)) if fresh else 0
+    per_trial_out = (sum(outs) / len(outs)) if outs else 0
+    read_each = (sum(reads) / len(reads)) if reads else 0
+    real = (wrote * rates[ttl_key] / per
+            + n * read_each * rates["cache_read"] / per
+            + n * per_trial_fresh * rates["input"] / per
+            + n * per_trial_out * rates["output"] / per)
+    flat = ((wrote + n * (read_each + per_trial_fresh)) * rates["input"] / per
+            + n * per_trial_out * rates["output"] / per)
+    print(f"\n  EXTRAPOLATED to one {n}-trial patient at this prefix size "
+          f"(~{prefix_tokens} prefix tokens), 1 warmup + {n} trial calls:")
+    print(f"    with the cache    : ${real:.4f} / patient")
+    print(f"    without the cache : ${flat:.4f} / patient")
+    if real > 0:
+        print(f"    per-trial mode is affordable at "
+              f"{flat / real:.1f}x cheaper than the uncached same-shape run")
+    print(f"    over 1,000 patients: ${real * 1000:.2f} vs ${flat * 1000:.2f}")
+
+    # ---- 5m versus 1h ----------------------------------------------------
+    d5 = wrote * rates["cache_write_5m"] / per
+    d1 = wrote * rates["cache_write_1h"] / per
+    print(f"\n  TTL: the write is billed once per patient. At the measured "
+          f"{wrote} written tokens that is ${d5:.6f} at 5m and ${d1:.6f} at "
+          f"1h — a difference of ${(d1 - d5) * 1000:.2f} over 1,000 patients.")
+    print(f"  BEDROCK_ANTHROPIC_CACHE_TTL is "
+          f"{config.BEDROCK_ANTHROPIC_CACHE_TTL!r}.")
+
+    # ---- the TTL / read-budget collision, on measured latency ------------
+    if latencies:
+        worst = max(latencies)
+        ttl_seconds = 3600 if config.BEDROCK_ANTHROPIC_CACHE_TTL == "1h" else 300
+        bound = config.per_trial_parallel_bound()
+        print(f"\n  THE 300s-READ-BUDGET vs {ttl_seconds}s-TTL COLLISION, on "
+              f"MEASURED latency rather than on the timeout:")
+        print(f"    slowest call observed here : {worst:.1f}s")
+        print(f"    MATCHING_REQUEST_TIMEOUT_SECONDS : "
+              f"{config.MATCHING_REQUEST_TIMEOUT_SECONDS}s")
+        print(f"    the TTL resets on every hit, so what must stay under it is "
+              f"the GAP between two consecutive prefix-sharing requests, not "
+              f"the whole wave.")
+        print(f"    at parallel bound {bound} the wave submits every request "
+              f"up front, so the largest gap is ~one call's latency "
+              f"({worst:.1f}s observed) — "
+              f"{'INSIDE' if worst < ttl_seconds else 'OUTSIDE'} the "
+              f"{ttl_seconds}s window with "
+              f"{ttl_seconds - worst:.0f}s to spare.")
+        _margin = ttl_seconds - config.MATCHING_REQUEST_TIMEOUT_SECONDS
+        print(f"    THE COLLISION IS REAL ONLY IN THE WORST CASE: a call that "
+              f"runs to the full {config.MATCHING_REQUEST_TIMEOUT_SECONDS}s "
+              f"read budget leaves {_margin}s of margin at "
+              f"{config.BEDROCK_ANTHROPIC_CACHE_TTL} -- "
+              f"{'none' if _margin <= 0 else 'thin'}.")
+        # GUARDED. A ratio against a latency of ~0 is not a headroom figure,
+        # it is a division by nearly zero wearing one -- and it would print
+        # with a straight face on a stub, on a cached instant reply, or on any
+        # sample fast enough to round to zero. Below a tenth of a second the
+        # honest statement is that the sample is too fast to derive a ratio
+        # from.
+        if worst >= 0.1:
+            print(f"    Observed latency is "
+                  f"{config.MATCHING_REQUEST_TIMEOUT_SECONDS / worst:.0f}x "
+                  f"under that budget, so it does not bind in practice at "
+                  f"this prefix size; '1h' is the one-edit remedy if it ever "
+                  f"does.")
+        else:
+            print(f"    (the slowest observed call was {worst:.3f}s -- too "
+                  f"fast to derive a headroom ratio from; re-read against a "
+                  f"real run before concluding the budget does not bind)")
+    return {"cached_usd_3calls": cached_cost, "per_patient_usd": real,
+            "per_patient_uncached_usd": flat, "rates_inferred": inferred}
 
 
 def _summary():

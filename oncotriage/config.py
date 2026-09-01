@@ -1409,29 +1409,65 @@ source change."""
 # ALL FOUR DEFAULT TO "WHAT THE SHIPPED PATH ALREADY DOES", so importing this
 # file changes nothing for anybody until an operator sets one.
 
-BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG = False
+BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG = True
 """Whether the per-trial cache warmup carries `outputConfig`.
 
-FALSE, AND THE ARGUMENT IS THE CACHED CHAIN RATHER THAN TASTE. Converse's cache
-checkpoints are processed `tools` -> `system` -> `messages`
-(`prompt-caching.html`, read 2026-08-30), and `outputConfig` is in NONE of
-those three -- so dropping the structured-output block from the warmup cannot
-change the prefix the warmup writes. That is a stronger statement than the
-OpenAI warmup can make about `response_format`, which is why that one carries a
-VERIFY-AT-GO-LIVE and this one carries a citation.
+**TRUE, AND IT WAS FALSE UNTIL A LIVE PROBE REFUTED THE ARGUMENT FOR FALSE.**
+That argument is kept here verbatim, because a reader is entitled to see what
+was believed and why it was wrong: "Converse's cache checkpoints are processed
+`tools` -> `system` -> `messages` (`prompt-caching.html`, read 2026-08-30), and
+`outputConfig` is in NONE of those three -- so dropping the structured-output
+block from the warmup cannot change the prefix the warmup writes."
 
-WHAT IT COSTS, STATED RATHER THAN GLOSSED. `structured-output.html` warns that
-a first-time schema "compiles the grammar, which may take up to a few minutes".
-With the warmup not carrying the schema, the WAVE pays that compile -- and the
-wave is N requests dispatched at once, so a first-ever schema version could
-meet N simultaneous cold compiles rather than one. Set this True if the probe's
-(A1) timing says the compile is real and expensive; it is one edit, and it is a
-knob rather than a decision precisely because nothing here can settle it.
+**THE CITATION IS ACCURATE AND THE INFERENCE FROM IT IS FALSE.** Measured
+2026-09-01 with `bedrock_probe.py --provider bedrock_anthropic
+--probe-per-trial --per-trial-prefix-file <a real rendered Stage 5 prompt>`
+against `us.anthropic.claude-sonnet-4-6`, with the warmup and the trial calls
+carrying a system block asserted byte-identical:
 
-THE REASON IT IS NOT True BY DEFAULT: every constraint the warmup drops is one
-fewer reason for a provider to refuse its request SHAPE and degrade the whole
-schedule -- the argument `call_matching_model_warmup` already makes -- and a
-json_schema demand against `maxTokens = 1` is a plausible thing to be refused."""
+    warmup WITHOUT outputConfig (the old default)
+        warmup   cacheWrite = 11,749   cacheRead = 0
+        trial 1  cacheWrite = 12,416   cacheRead = 0       <- wrote AGAIN
+        trial 2  cacheWrite = 0        cacheRead = 12,416
+
+    warmup WITH outputConfig (this default), on a second, unseen prefix
+        warmup   cacheWrite = 11,328   cacheRead = 0
+        trial 1  cacheWrite = 0        cacheRead = 11,328  <- reads the warmup
+        trial 2  cacheWrite = 0        cacheRead = 11,328
+
+So the structured-output block DOES take part in the cached prefix -- almost
+certainly as a `tools` entry, which is FIRST in the very ordering the old
+argument quoted. The two shapes cache separately, and under the old default the
+warmup warmed a prefix no trial call ever used.
+
+**WHAT IT COST WAS MONEY, NOT CORRECTNESS.** Nothing raised and no verdict
+changed: `classify_cache_write` saw the warmup's write, answered `wrote` and
+released the wave; trial 1 then paid a full cache WRITE instead of a read and
+was counted in `PER_TRIAL_CACHE_READ_MISSES`; trials 2..N read normally. Per
+15-trial patient that is one wasted warmup write plus one write-instead-of-read
+-- about $0.05 at the documented cache dimensions, or roughly $54 per
+1,000-patient campaign, invisible except in a counter nobody had read yet.
+
+**THE OLD DEFAULT'S OTHER ARGUMENT SURVIVES AND IS NOW A MEASUREMENT.** It ran:
+"every constraint the warmup drops is one fewer reason for a provider to refuse
+its request SHAPE ... a json_schema demand against `maxTokens = 1` is a
+plausible thing to be refused." Plausible, and it does not happen: the warmup
+above carried the full Stage 5 schema at `maxTokens = 1`, was ACCEPTED, and
+returned `stopReason "max_tokens"` in 1.5s. (A11) is confirmed for BOTH warmup
+shapes.
+
+**AND THE COMPILE COST IT WORRIED ABOUT POINTS THE OTHER WAY.**
+`structured-output.html` warns that a first-time schema "compiles the grammar,
+which may take up to a few minutes". With the warmup carrying the schema the
+WARMUP pays that compile once, alone and awaited, instead of N wave requests
+meeting it at once. Measured first-call latency with the schema was 6.6s against
+a 300s read budget, so at this schema's size the compile is not the multi-minute
+event the page allows for -- and carrying it in the warmup is the safe side of
+that either way.
+
+IT REMAINS A KNOB. Set it False to reproduce the old behaviour; the split prefix
+is the only thing that changes, and `PER_TRIAL_CACHE_READ_MISSES` is where it
+shows up."""
 
 BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = None
 """Per-trial parallelism for THIS provider, or None to follow the shared bound.

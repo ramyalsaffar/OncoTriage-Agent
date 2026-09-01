@@ -821,11 +821,56 @@ check("'length' is the string Stage 5's reactive split is armed by, and it is "
 
 # --- the model echo, both directions ---------------------------------------
 with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC), counters_zeroed() as _ctr:
+    # THIS PIN WAS MOVED BY A LIVE MEASUREMENT AND THE OLD EXPECTATION IS
+    # NAMED RATHER THAN DELETED. It required the echo back VERBATIM
+    # ("anthropic.claude-sonnet-4-6"), which is what the function did until
+    # 2026-09-01 -- and Stage 5 compares that string against
+    # config.matching_wire_model() with `!=`, so a shorter-but-equivalent id
+    # raised MatchingModelMismatchError on EVERY call, after being billed.
+    # Measured against the live service: a request naming the inference profile
+    # `us.anthropic.claude-sonnet-4-6` comes back with
+    # additionalModelResponseFields == {"model": "claude-sonnet-4-6"}. So the
+    # branch was unusable, and the check that would have caught it was pinning
+    # the defect.
     _echoed, _was = bac._model_echo(
         {"additionalModelResponseFields": {"model": "anthropic.claude-sonnet-4-6"}})
-    check("an echo under the bare key is used", _echoed,
-          "anthropic.claude-sonnet-4-6")
+    check("an echo that is a dot-boundary ALIAS of the requested id resolves "
+          "TO the requested id, so Stage 5's equality passes and the stored "
+          "identity stays the one that is billed and priced",
+          _echoed, config.BEDROCK_ANTHROPIC_MATCHING_MODEL)
     check("...and reported as attested", _was, True)
+    # THE SHAPE THE SERVICE ACTUALLY RETURNS, pinned as its own case so a
+    # future change cannot satisfy the alias rule on a hypothetical spelling
+    # while failing the observed one.
+    _echoed_base, _was_base = bac._model_echo(
+        {"additionalModelResponseFields": {"model": "claude-sonnet-4-6"}})
+    check("the BASE id the live service echoes -- measured 2026-09-01 -- "
+          "resolves to the requested profile id",
+          _echoed_base, config.BEDROCK_ANTHROPIC_MATCHING_MODEL)
+    check("...and is attested", _was_base, True)
+    # THE GUARANTEE THAT MUST NOT BE LOST. A different model is returned
+    # VERBATIM so Stage 5 raises. Without this the alias rule would be a way of
+    # switching the mismatch check off.
+    _echoed_bad, _was_bad = bac._model_echo(
+        {"additionalModelResponseFields": {"model": "claude-haiku-4-5"}})
+    check("an echo naming a DIFFERENT model is returned verbatim, so Stage 5's "
+          "equality fails and MatchingModelMismatchError still fires",
+          _echoed_bad, "claude-haiku-4-5")
+    check("...and it is still reported as attested -- the service did answer; "
+          "what it answered is the problem", _was_bad, True)
+    # AND THE BOUNDARY IS THE DOT. A suffix at a hyphen is not a scope segment
+    # and must not match, or the rule would accept any model whose name merely
+    # ends the same way.
+    check("a suffix that is not at a dot boundary is NOT an alias",
+          bac._echo_is_alias_of("4-6",
+                                config.BEDROCK_ANTHROPIC_MATCHING_MODEL), False)
+    check("...while a whole dropped scope segment IS",
+          bac._echo_is_alias_of("claude-sonnet-4-6",
+                                config.BEDROCK_ANTHROPIC_MATCHING_MODEL), True)
+    check("...and the rule is one-directional: a LONGER echo than the "
+          "requested id has never been observed and is not accepted",
+          bac._echo_is_alias_of("us.anthropic.claude-sonnet-4-6",
+                                "claude-sonnet-4-6"), False)
     _echoed2, _was2 = bac._model_echo(
         {"additionalModelResponseFields": {"/model": "us.anthropic.claude-sonnet-4-6"}})
     check("an echo under the POINTER spelling is used too -- AWS does not "
