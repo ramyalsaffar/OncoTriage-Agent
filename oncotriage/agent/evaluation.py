@@ -83,6 +83,7 @@ from oncotriage.config import (
     RETRY_BASE_DELAY,
 )
 from oncotriage.observability import console, get_logger
+from oncotriage import spend
 
 
 log = get_logger(__name__)
@@ -1131,11 +1132,25 @@ WARMUP_SOURCE_FALLBACK_WRITER = "fallback_writer"
 # warmup failed when nothing was sent.
 WARMUP_SOURCE_SHUTDOWN = "operator_shutdown"
 
-# The closed set, so a reader can branch on it exhaustively and a fourth member
+# ...and the fourth, which is the third one's shape reached for the other
+# reason: the RUN SPEND GATE declined the warmup, so no cache writer was ever
+# attempted and this patient sent nothing at all.
+#
+# IT IS A MEMBER OF ITS OWN RATHER THAN REUSING `operator_shutdown`, and the
+# reason is the sentence the floor prints. That branch reads "a shutdown was
+# requested before this patient's wave was dispatched" -- true of a Ctrl-C, a
+# SIGTERM and nothing else. Reusing it for a budget stop tells an operator that
+# somebody interrupted a run nobody touched, and sends them looking for a signal
+# instead of at config.SPEND_CAP_USD. That is the exact misdiagnosis
+# WARMUP_SOURCE_SHUTDOWN's own note gives as the reason IT is not folded into
+# `warmup`.
+WARMUP_SOURCE_SPEND_LIMIT = "spend_limit"
+
+# The closed set, so a reader can branch on it exhaustively and a fifth member
 # added without a floor branch fails a check rather than falling through to the
 # `warmup` wording.
 WARMUP_SOURCES = (WARMUP_SOURCE_WARMUP, WARMUP_SOURCE_FALLBACK_WRITER,
-                  WARMUP_SOURCE_SHUTDOWN)
+                  WARMUP_SOURCE_SHUTDOWN, WARMUP_SOURCE_SPEND_LIMIT)
 
 
 # ---------------------------------------------------------------------------
@@ -1420,6 +1435,145 @@ class Stage5ShutdownRequested(RuntimeError):
     forever. The whole cohort would then carry a silent hole shaped like
     whenever somebody pressed Ctrl-C.
     """
+
+
+class Stage5SpendStopped(Stage5ShutdownRequested):
+    """A Stage 5 request was NOT issued because a spend limit was reached.
+
+    A SUBCLASS OF ``Stage5ShutdownRequested``, AND THAT IS THE WHOLE
+    INTEGRATION RATHER THAN A CONVENIENCE. Two places in this file already
+    single that class out, and both of them are exactly right about this one
+    too, so the subclassing means neither had to be edited and neither can
+    drift away from covering it:
+
+      * THE SEND LOOP'S ``except``. Every other exception in per-trial mode is
+        isolated to its trial and the patient completes; a shutdown is not,
+        because ``_on_done`` CHECKPOINTS a completed patient and a resume would
+        then skip it forever with most of its trials never judged. A spend stop
+        is a statement about the RUN in the identical way -- the remaining
+        trials were not judged badly, they were not judged at all -- so it must
+        fall through to the API-error return and fail the patient. Isolating it
+        would produce exactly the silent hole ``Stage5ShutdownRequested``'s
+        docstring describes, with "whenever the budget ran out" in place of
+        "whenever somebody pressed Ctrl-C".
+      * ``_account_unconsumed``'s ``abandoned:`` skip. A request the gate
+        declined was never issued, so it is neither paid for nor read, and
+        counting it as abandoned would inflate a transport-failure counter with
+        the consequences of a budget working.
+
+    THE DIAGNOSIS IS NOT LOST TO THE SUBCLASSING. ``spend.SPEND_GATE_SKIPS`` is
+    a separate counter from ``STAGE5_SHUTDOWN_SKIPS`` and is keyed by phase and
+    by which limit fired, so "we stopped for money" and "we stopped because an
+    orchestrator sent SIGTERM" are never one number -- which is the thing the
+    two counters exist to keep apart. What is shared is the HANDLING, which is
+    identical, and the alternative was two exception classes with two identical
+    handling branches kept in step by hand.
+    """
+
+
+def _spend_gate(phase, counter, *, where, count=None):
+    """May a billed Stage 5 request be issued? Returns None, or the refusal.
+
+    THE ONE OWNER OF THE PRE-CALL CHECK, CALLED FROM ALL THREE BILLED CALL
+    SITES. It returns the exception rather than raising it because one of those
+    three -- ``_issue`` -- runs on a worker thread and must hand its outcome
+    back as a tagged pair; a raise there would surface at ``future.result()`` in
+    an order the executor decides. The other two raise what this returns.
+
+    Args:
+        phase: a ``spend.SPEND_SKIP_KEY_PREFIXES`` member.
+        counter: this invocation's ``spend.Stage5CallCounter``. Its ``take()``
+            is the CLAIM: a request that passes this gate has already been
+            counted against the ceiling, so the ceiling bounds what is SENT
+            rather than what came back.
+        where: free text for the log line.
+        count: how many trials the declined request carried, for the log line.
+
+    THE CAP IS TESTED BEFORE THE CEILING AND THE ORDER IS A DECISION. Both stop
+    the run, so the order changes only WHICH reason is recorded -- and the cap
+    is the operator's own ruling while the ceiling is a defect report. A run
+    that has genuinely spent its budget must not be reported as a pipeline
+    defect because a ceiling happened to be reached in the same instant.
+
+    A CAP-DECLINED REQUEST DOES **NOT** CONSUME A CEILING CLAIM, because the cap
+    returns above ``take()``. That is the right way round and this paragraph
+    said the opposite in its first draft: the ceiling bounds what ONE invocation
+    SENDS, and a request the budget declined was never sent -- charging it
+    against the ceiling would make a patient stopped by money look like a
+    patient that had looped.
+
+    A CEILING TRIP LATCHES THE **RUN**, not just the patient, and that is a
+    decision rather than a side effect of sharing the latch. A defect that
+    re-issues calls will do it again on the next patient, so continuing burns
+    money on a fault that is already known; the run records ``call_ceiling``,
+    which is a defect report rather than a budget event, and an operator reading
+    it is sent to the traceback rather than to ``config.SPEND_CAP_USD``.
+    """
+    if spend.cap_exceeded():
+        spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_CAP}"] += 1
+        spend.SPEND_STOP.poll(where=where)
+        log.warning("a Stage 5 request was not issued because the campaign "
+                    "has reached its spend cap", stage=5, status="stopped",
+                    event="stage5_spend_cap_declined", phase=phase,
+                    reason=spend.SPEND_LIMIT_CAP,
+                    cost_usd=round(spend.SPEND_LEDGER.total, 6),
+                    count=count, degraded=True)
+        return Stage5SpendStopped(
+            f"the request was not issued: the campaign has spent "
+            f"${spend.SPEND_LEDGER.total:.2f} and config.SPEND_CAP_USD is the "
+            f"limit")
+    _granted, _first = counter.take()
+    if not _granted:
+        spend.SPEND_GATE_SKIPS[
+            f"{phase}{spend.SPEND_LIMIT_CALL_CEILING}"] += 1
+        # ONCE PER INVOCATION, NOT ONCE PER DECLINED REQUEST. The skip counter
+        # beside it already counts requests; a second counter reporting the same
+        # number would be two names for one finding, which is what
+        # `degradation.register` refuses a duplicate NAME for one function up.
+        # What this answers is how many PATIENTS hit a ceiling, and `_first` is
+        # decided inside the counter's own lock because deriving it out here
+        # would race with the wave's other workers.
+        if _first:
+            spend.SPEND_CEILING_TRIPS[
+                f"{counter.call_mode}:{counter.ceiling}"] += 1
+        spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CALL_CEILING, where)
+        log.error("a Stage 5 invocation asked for more billed calls than its "
+                  "configuration can produce; the request was not issued",
+                  stage=5, status="stopped",
+                  event="stage5_call_ceiling_declined", phase=phase,
+                  reason=spend.SPEND_LIMIT_CALL_CEILING,
+                  calls=counter.issued, total=counter.ceiling,
+                  count=count, degraded=True)
+        return Stage5SpendStopped(
+            f"the request was not issued: this Stage 5 invocation has already "
+            f"issued {counter.issued} billed calls, which is the ceiling "
+            f"call mode {counter.call_mode!r} permits")
+    return None
+
+
+def _charge_spend(response):
+    """Charge one billed response to the run ledger. NEVER RAISES.
+
+    CALLED IMMEDIATELY AFTER EVERY BILLED RESPONSE, AT ALL THREE SITES, AND
+    THAT PLACEMENT IS WHAT BOUNDS THE OVERSHOOT. The gate reads a number that is
+    current to within the requests actually in flight; charging where the node
+    folds its accumulators instead would leave a whole patient's wave
+    unaccounted, because per-trial mode dispatches every request before the node
+    reads any of them. See ``config.SPEND_CAP_USD``'s overshoot block.
+
+    IT IS NOT THE SAME ARITHMETIC AS ``_billed_so_far()`` AND MUST NOT BE
+    FOLDED INTO IT. Those accumulators are per INVOCATION and reset on every
+    retry, which is the under-count ``run_harness.price_result`` documents; this
+    is per PROCESS and counts every attempt. Two ledgers, two questions.
+
+    IT PRICES ON THE ECHOED MODEL, which is what the provider bills and what
+    ``inferences.matching_model`` stores.
+    """
+    usage = getattr(response, "usage", None)
+    spend.SPEND_LEDGER.charge(getattr(response, "model", None),
+                              getattr(usage, "prompt_tokens", None),
+                              getattr(usage, "completion_tokens", None))
+
 
 
 STAGE5_SHUTDOWN_SKIPS = Counter()
@@ -4533,8 +4687,14 @@ CLINICAL TRIALS:
     #
     # The bound is read live for the same reason and at the same moment, so a
     # patient's partition and its dispatch are decided from one reading.
-    _per_trial_calls = (config.matching_call_mode()
-                        == MATCHING_CALL_MODE_PER_TRIAL)
+    # ONE READING, THREE CONSUMERS. The partition below, the billed-call
+    # ceiling's derivation and the counter key that reports a ceiling trip all
+    # read THIS name rather than calling the owner again: the value can move
+    # within a process (a pin sets it), and three independent calls could
+    # straddle that move and produce a patient whose partition, whose ceiling
+    # and whose diagnosis disagree about which arm it ran in.
+    _call_mode = config.matching_call_mode()
+    _per_trial_calls = (_call_mode == MATCHING_CALL_MODE_PER_TRIAL)
     # READ THROUGH THE OWNER, NOT OFF THE CONSTANT. `per_trial_parallel_bound()`
     # resolves the PROVIDER override before the shared bound, which is what
     # lets an account whose requests-per-minute allowance is applied far below
@@ -4882,6 +5042,20 @@ CLINICAL TRIALS:
     # BEFORE the parse, so a call whose response was unusable is still recorded
     # as having been made and billed.
     call_details: List[Dict] = []
+    # THE PER-INVOCATION BILLED-CALL CEILING. One counter per invocation of this
+    # node, so it needs no reset and cannot describe the wrong patient -- and
+    # the grain is deliberate: a retry re-enters this function with fresh state
+    # and is already bounded at MAX_LLM_CLASSIFIER_RETRIES by the router, so
+    # what this catches is a LOOP INSIDE one invocation. See
+    # spend.stage5_call_ceiling() for the derivation and
+    # config.SPEND_CALL_CEILING_ENFORCED for why it is a call ceiling rather
+    # than the calls-per-minute detector the obvious design reaches for.
+    #
+    # IT IS BOUND HERE, BESIDE THE TOKEN ACCUMULATORS, because the three billed
+    # call sites that consume it are three different closures over this frame
+    # and one of them runs on a worker thread.
+    _call_counter = spend.Stage5CallCounter(
+        spend.stage5_call_ceiling(_call_mode), _call_mode)
     # The model string the API ANSWERED with, as opposed to MATCHING_MODEL,
     # which is what was asked for. They differ whenever an alias resolves to a
     # dated snapshot (gpt-4o-2024-08-06 is one). Last writer wins across a split
@@ -5132,11 +5306,35 @@ CLINICAL TRIALS:
                     f"{_SHUTDOWN_REASON or 'unspecified'}"] += 1
                 return ("error", Stage5ShutdownRequested(
                     f"the request was not issued: {_SHUTDOWN_REASON}"))
+            # THE SPEND GATE, IMMEDIATELY BESIDE THE SHUTDOWN GATE AND FOR ITS
+            # REASON. Both answer "should this request go out at all", both are
+            # decided by state another thread may have moved since this task was
+            # submitted, and both must be read AT THE MOMENT THE WORK WOULD
+            # START rather than at submit time -- which is what makes the
+            # overshoot one in-flight round rather than the whole queue.
+            #
+            # THE REFUSAL IS RETURNED, NOT RAISED, exactly as the shutdown's is:
+            # this runs on a worker and every outcome of this function is a
+            # tagged pair the send loop interprets in trial order on the node
+            # thread. Stage5SpendStopped subclasses Stage5ShutdownRequested, so
+            # the loop's non-isolation branch covers it with no edit.
+            _refusal = _spend_gate(spend.SPEND_SKIP_WAVE_KEY_PREFIX,
+                                   _call_counter, where="a Stage 5 wave",
+                                   count=len(chunk_))
+            if _refusal is not None:
+                return ("error", _refusal)
             try:
-                return ("ok", call_matching_model(
-                    system_prompt, prompt_, prompt_cache_key=cache_key_))
+                _response = call_matching_model(
+                    system_prompt, prompt_, prompt_cache_key=cache_key_)
             except Exception as exc:              # noqa: BLE001 -- see above
                 return ("error", exc)
+            # CHARGED HERE AND NOT WHERE THE SEND LOOP READS IT. A response in
+            # hand has been billed whether or not this node ever consumes it --
+            # `_account_unconsumed` exists precisely because per-trial mode
+            # abandons some of them -- and the gate's whole value is that the
+            # number it reads is current.
+            _charge_spend(_response)
+            return ("ok", _response)
 
         # THE ALIGNMENT IS ASSERTED, NOT ASSUMED, and `zip` is exactly why: it
         # truncates silently, so a `_dispatch_order` that had stopped being
@@ -5424,6 +5622,34 @@ CLINICAL TRIALS:
                     event="per_trial_shutdown_before_warmup",
                     retry=retry_count + 1, count=len(_dispatch_pairs),
                     reason=_SHUTDOWN_REASON, degraded=True)
+            elif _spend_gate(spend.SPEND_SKIP_WARMUP_KEY_PREFIX,
+                             _call_counter,
+                             where="a Stage 5 cache warmup") is not None:
+                # THE GATE FIRED BEFORE THE CACHE WRITER, SO THIS PATIENT SENDS
+                # NOTHING AND COSTS NOTHING. It is the shutdown branch above,
+                # reached for the other reason and handled identically:
+                # `_warmup_error` plus `pending.clear()` is what stops the send
+                # loop issuing a single uncached trial call, and the zero-success
+                # floor below turns the empty run into the API-error result the
+                # retry router and the checkpoint already know how to handle.
+                #
+                # `pending.clear()` IS NOT OPTIONAL HERE. `_obtain`'s live-call
+                # path is real, and a send loop left holding chunks would send
+                # every one of them -- at full price, against a cache nothing
+                # wrote, after the budget was declared spent.
+                _warmup_error = Stage5SpendStopped(
+                    f"no Stage 5 request was issued for this patient: the "
+                    f"campaign has spent ${spend.SPEND_LEDGER.total:.2f}")
+                _warmup_error_source = WARMUP_SOURCE_SPEND_LIMIT
+                pending.clear()
+                log.warning(
+                    "a spend limit was reached before this patient's Stage 5 "
+                    "wave was dispatched, so no request was issued at all; "
+                    "the patient is failed deliberately so the checkpoint "
+                    "does not record it as done", stage=5, status="stopped",
+                    event="per_trial_spend_before_warmup",
+                    retry=retry_count + 1, count=len(_dispatch_pairs),
+                    cost_usd=round(spend.SPEND_LEDGER.total, 6), degraded=True)
             else:
                 try:
                     _warmup_response = call_matching_model_warmup(
@@ -5482,6 +5708,12 @@ CLINICAL TRIALS:
                     # `_billed_so_far()` is what the floor below returns, and a
                     # warmup whose cache could not be confirmed must still show
                     # up as the one billed call it was.
+                    # CHARGED BEFORE IT IS ACCOUNTED, so the ledger carries
+                    # the warmup even on the paths where `_confirm_cache_write`
+                    # then fails the patient: a refused warmup is still a billed
+                    # request, and a gate that only counted the ones that
+                    # succeeded would under-enforce by exactly the failures.
+                    _charge_spend(_warmup_response)
                     _account_warmup(_warmup_response)
                     _confirm_cache_write(_warmup_response,
                                          WARMUP_SOURCE_WARMUP)
@@ -5750,7 +5982,19 @@ CLINICAL TRIALS:
                         degraded=True)
             raise Stage5ShutdownRequested(
                 f"the request was not issued: {_SHUTDOWN_REASON}")
-        return call_matching_model(system_prompt, _user_prompt_for(chunk))
+        # THE SPEND GATE, BESIDE THE SHUTDOWN GATE AND BELOW THE PREFETCHED
+        # BRANCH FOR THE SAME REASON: a response already paid for and sitting in
+        # `_prefetched` must be READ, not thrown away, so only a call that would
+        # really reach the provider is declined. In grouped mode `_prefetched`
+        # is None and every call comes through this line, so the gate is total
+        # there.
+        _refusal = _spend_gate(spend.SPEND_SKIP_SEND_KEY_PREFIX, _call_counter,
+                               where="a Stage 5 send loop", count=len(chunk))
+        if _refusal is not None:
+            raise _refusal
+        _live = call_matching_model(system_prompt, _user_prompt_for(chunk))
+        _charge_spend(_live)
+        return _live
 
     def _account_unconsumed() -> int:
         """Fold prefetched calls the send loop never reached into the record.
@@ -6849,6 +7093,13 @@ CLINICAL TRIALS:
                 # endpoint fault that never happened.
                 _what = ("a shutdown was requested before this patient's wave "
                          "was dispatched, so no request was issued at all")
+            elif _warmup_error_source == WARMUP_SOURCE_SPEND_LIMIT:
+                # NOT A FAILURE OF ANYTHING EITHER, and not a shutdown. The
+                # branch above would have told an operator that somebody
+                # interrupted a run nobody touched; this names the budget,
+                # which is where the remedy is.
+                _what = ("a spend limit was reached before this patient's "
+                         "wave was dispatched, so no request was issued at all")
             elif _warmup_error_source == WARMUP_SOURCE_FALLBACK_WRITER:
                 _what = ("the provider refused the dedicated warmup's shape "
                          "and the fallback's cache writer then failed, so the "

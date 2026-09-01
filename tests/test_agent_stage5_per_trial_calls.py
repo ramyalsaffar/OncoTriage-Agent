@@ -2935,8 +2935,13 @@ check("7h  ...and a grouped run whose provider reports nothing is still NULL, "
 
 section("SECTION 8 -- the grouped arm is byte-equivalent to the pre-pass node")
 
-_NEEDLE_FLAG = """    _per_trial_calls = (config.matching_call_mode()
-                        == MATCHING_CALL_MODE_PER_TRIAL)"""
+# THE NEEDLE MOVED WITH THE SPEND GATE, WHICH GAVE THE NODE ONE READING OF THE
+# CALL MODE INSTEAD OF ONE CALL. The mode is bound to `_call_mode` and the
+# partition is derived from THAT, because the ceiling and the counter key need
+# the same reading -- so the needle is the derivation rather than the call. What
+# it forces is unchanged: `_per_trial_calls` False, every per-trial branch dead.
+_NEEDLE_FLAG = (
+    "    _per_trial_calls = (_call_mode == MATCHING_CALL_MODE_PER_TRIAL)")
 _NEEDLE_OBTAIN = "            response = _obtain(chunk)"
 
 check("8a  both needles are present in the shipped source exactly once (a "
@@ -3255,22 +3260,49 @@ check("8b-o a request that was never issued is NOT counted as an abandoned "
 
 # ── the closed vocabulary, and the limit this pass did NOT close ───────────
 
-check("8b-p WARMUP_SOURCES is closed and holds exactly the three the floor "
-      "branches on, so a fourth member added without a branch falls through "
+# THE FOURTH MEMBER IS THE SPEND GATE'S, ADDED WITH ITS OWN FLOOR BRANCH.
+# This check read "exactly the three" and is extended rather than relaxed: what
+# it holds is that every member has a branch, and 8b-q below is what says so by
+# AST. Reusing `operator_shutdown` for a budget stop would have printed "a
+# shutdown was requested" on a row nobody interrupted.
+check("8b-p WARMUP_SOURCES is closed and holds exactly the four the floor "
+      "branches on, so a fifth member added without a branch falls through "
       "to the `warmup` wording and is caught here",
       (_evaluation.WARMUP_SOURCES,
        len(set(_evaluation.WARMUP_SOURCES))),
       ((_evaluation.WARMUP_SOURCE_WARMUP,
         _evaluation.WARMUP_SOURCE_FALLBACK_WRITER,
-        _evaluation.WARMUP_SOURCE_SHUTDOWN), 3))
-check("8b-q ...and every member is named in the floor, by AST rather than by "
-      "grep, so a branch deleted while the constant survives fails here",
-      sorted({n.id for n in ast.walk(ast.parse(_EVAL_SRC))
-              if isinstance(n, ast.Name) and n.id in
-              {"WARMUP_SOURCE_WARMUP", "WARMUP_SOURCE_FALLBACK_WRITER",
-               "WARMUP_SOURCE_SHUTDOWN"}}),
-      ["WARMUP_SOURCE_FALLBACK_WRITER", "WARMUP_SOURCE_SHUTDOWN",
-       "WARMUP_SOURCE_WARMUP"])
+        _evaluation.WARMUP_SOURCE_SHUTDOWN,
+        _evaluation.WARMUP_SOURCE_SPEND_LIMIT), 4))
+# THE NAME SET IS DERIVED FROM THE MODULE RATHER THAN TYPED, and the walk is
+# SCOPED TO THE NODE. Both were literals before the spend gate added a fourth
+# member, and both were weaker than they read: a hand-written set goes stale on
+# the next member (which is what this pass met), and a whole-file walk finds the
+# DECLARATIONS -- so it passed on the constants existing rather than on the
+# floor naming them.
+_WARMUP_SOURCE_NAMES = sorted(
+    n for n in vars(_evaluation)
+    if n.startswith("WARMUP_SOURCE_"))
+_NODE_DEF = next(n for n in ast.walk(ast.parse(_EVAL_SRC))
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name == "node_llm_classifier_evaluation")
+check("8b-q ...and every member is named INSIDE THE NODE, by AST rather than "
+      "by grep and scoped past the declarations, so a branch deleted while "
+      "the constant survives fails here",
+      sorted({n.id for n in ast.walk(_NODE_DEF)
+              if isinstance(n, ast.Name) and n.id in set(_WARMUP_SOURCE_NAMES)}),
+      _WARMUP_SOURCE_NAMES)
+check("8b-q-i ...and the floor really BRANCHES on them: every member but the "
+      "`else` default appears in a `_warmup_error_source ==` comparison, "
+      "which an assignment alone would not satisfy",
+      sorted({ast.unparse(c).split("== ")[-1]
+              for cmp in ast.walk(_NODE_DEF)
+              if isinstance(cmp, ast.Compare)
+              and isinstance(cmp.left, ast.Name)
+              and cmp.left.id == "_warmup_error_source"
+              for c in [cmp]}),
+      sorted(n for n in _WARMUP_SOURCE_NAMES
+             if n != "WARMUP_SOURCE_WARMUP"))
 
 # ── GROUPED MODE IS GATED TOO (the operator-control pass) ──────────────────
 #
@@ -3643,8 +3675,7 @@ control(
 # --- c12: the OFF arm takes the per-trial branch ----------------------------
 control(
     "c12 a switch that is not consulted is CAUGHT [8c/1e]",
-    [("    _per_trial_calls = (config.matching_call_mode()\n"
-      "                        == MATCHING_CALL_MODE_PER_TRIAL)",
+    [("    _per_trial_calls = (_call_mode == MATCHING_CALL_MODE_PER_TRIAL)",
       "    _per_trial_calls = True")],
     lambda m: len(run_node(_SIX, per_trial=False,
                            node=node_of(m))[1].requests),
@@ -3655,11 +3686,16 @@ control(
 control(
     "c13 a worker that renders its own prompt is CAUGHT [3i] -- the shape "
     "that would lose increments from the two decode counters",
-    [('                return ("ok", call_matching_model(\n'
-      '                    system_prompt, prompt_, prompt_cache_key=cache_key_))',
-      '                return ("ok", call_matching_model(\n'
+    # THE ANCHOR MOVED WITH THE SPEND GATE and the plant is re-sited rather
+    # than weakened: `_issue` now brackets its call with the gate and the
+    # ledger charge, so the single `return ("ok", call_matching_model(...))`
+    # this used to key on is two statements. What is planted is unchanged --
+    # the worker renders its own prompt instead of being handed one.
+    [('                _response = call_matching_model(\n'
+      '                    system_prompt, prompt_, prompt_cache_key=cache_key_)',
+      '                _response = call_matching_model(\n'
       '                    system_prompt, _user_prompt_for(chunk_),\n'
-      '                    prompt_cache_key=cache_key_))')],
+      '                    prompt_cache_key=cache_key_)')],
     _worker_names,
     ["_user_prompt_for"],
 )

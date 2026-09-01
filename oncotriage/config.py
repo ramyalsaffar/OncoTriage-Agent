@@ -3561,6 +3561,221 @@ MAX_WORKERS = 12
 
 
 # ===========================================================================
+# THE RUN SPEND GATE  (the spend-gate pass)
+# ===========================================================================
+#
+# WHAT IT IS AND WHAT IT REPLACES. AWS Budgets, and every other provider-side
+# budget alarm, is MONITORING: it observes a bill that has already been
+# incurred and notifies 8 to 24 hours later. Nothing in this pipeline stopped a
+# defect, a mis-set constant or a runaway loop from spending an account's whole
+# balance inside one campaign, and the operator's only brake was the stop
+# sentinel -- which requires a human who already knows something is wrong.
+#
+# THIS IS A PRE-CALL GATE. `oncotriage/spend.py` accumulates the MEASURED cost
+# of every Stage 5 response as it arrives, and every billed call site checks the
+# accumulated total against this cap BEFORE issuing. Crossing it behaves exactly
+# as the operator stop switch behaves -- in-flight work completes and is
+# written, nothing new starts, the checkpoint is current, the run is recorded
+# STOPPED with a machine-readable reason, and a resume continues under the
+# REMAINING budget.
+#
+# THE CAP IS A CAMPAIGN BUDGET AND NOT A PER-INVOCATION ALLOWANCE, which is the
+# whole reason `oncotriage/storage/database_logger.py:campaign_spend_before`
+# exists: a resumed run seeds its ledger with what its predecessors already
+# spent, read out of `inferences.estimated_cost_usd`. Without that, a run that
+# tripped the cap and was restarted by a supervisor would get a fresh $300 every
+# time, which is the failure mode a per-run cap has and a campaign cap does not.
+
+SPEND_CAP_USD = 300.00
+"""The most one campaign may spend on billed Stage 5 calls, in US dollars.
+
+THE VALUE IS AN OPERATOR RULING, RECORDED HERE WITH ITS REASONING. The ruled
+evaluation program is a 300-patient campaign, a 50-patient k=2 stability re-run,
+and a 100-patient judge pass. The cap sits above that program with headroom
+while bounding a runaway well inside the account's credit balance.
+
+THE PROGRAM'S COST, DERIVED RATHER THAN ASSUMED -- and the derivation is here
+rather than in a note somewhere because the cap is only defensible beside it.
+
+    MEASURED INPUTS, all from artifacts in this repository, none invented:
+
+      S  = 8,575  tokens   the shared system prefix, mean over the ELEVEN
+                           characterization fixtures that carry a Stage 5
+                           exchange (prompt_tokens minus the user block at the
+                           4.15 chars/token this corpus actually measures).
+      u  =   372  tokens   the per-trial user block: 1,544 characters mean per
+                           trial across the same eleven, at the same ratio.
+      o  =   696  tokens   output per trial, mean over the same eleven
+                           (completion_tokens / distinct NCT ids in the call).
+      N  =  MAX_TRIALS_FOR_EVALUATION.
+      rates: $2.00 / $12.00 per 1M in/out from PRICING_CONFIG's gpt-5.6-terra
+             row, and $0.20 per 1M for CACHED input, which that row records as
+             published and deliberately NOT modelled by get_model_cost().
+
+    PER PATIENT, PER-TRIAL MODE, CACHE WORKING:
+
+      warmup            S x $2.00/1M                       = $0.017150
+      each trial        S x $0.20/1M                          0.001715
+                      + u x $2.00/1M                          0.000744
+                      + o x $12.00/1M                         0.008352   = $0.010811
+      15 trials                                                          = $0.162240
+      TOTAL                                                              = $0.179390
+
+    PER PATIENT, CACHE **NOT** WORKING -- the failure the three-call probe
+    exists to settle, which raises nothing and is visible only as a zero in
+    `inferences.llm_classifier_call_details`:
+
+      each trial      (S + u) x $2.00/1M + o x $12.00/1M     = $0.026246
+      TOTAL           warmup + 15 trials                     = $0.410840   (2.29x)
+
+    THE RULED PROGRAM, both arms. THE RESAMPLE PASS IS INCLUDED and is easy to
+    forget: `25- Batch Runner.py` re-runs RESAMPLE_COUNT (100) already-completed
+    patients after the main pass, at full price, so a "300-patient campaign" is
+    400 patient-runs.
+
+                                      cache working    cache absent
+      300-patient campaign               $53.79          $123.25
+      + resample pass (100)              $17.93           $41.08
+      50-patient k=2 re-run (100 runs)   $17.93           $41.08
+      100-patient judge pass              $7.50            $7.50
+      ------------------------------------------------------------
+      PROGRAM                            $97.15          $212.91
+
+    So the cap sits at ~3.1x the expected program and ~1.4x the program's own
+    worst case. It is NOT exceeded by the derived estimate in either arm, which
+    is the finding rather than the assumption -- and the second column is why
+    the number is 300 and not 150.
+
+WHAT THE JUDGE PASS ROW IS AND WHY IT IS THE SOFTEST NUMBER HERE. The rater
+(`oncotriage/evaluation/rater.py`) calls a DIFFERENT vendor through the Message
+Batches API, priced from RATER_PRICING rather than PRICING_CONFIG, at
+claude-sonnet-4-6's $3.00/$15.00 with the flat 50% batch discount. The row above
+assumes 25,000 input and 5,000 output tokens per patient; at 40,000/8,000 it is
+$12.00. Either way it is under 10% of the program and it moves no decision here.
+
+**AND THE JUDGE PASS IS NOT COVERED BY THIS GATE.** The gate instruments Stage
+5, which is the batch runner's spend and nothing else. `rater_run.py` and
+`ragas_run.py` bill through their own harnesses, do not write
+`inferences.estimated_cost_usd`, and are not gated. That is stated rather than
+implied: an operator reading "$300 cap" must not believe it bounds the judge.
+
+UNSET SEMANTICS, AND THE CHOICE IS ARGUED RATHER THAN DEFAULTED. `None` here
+means NO CAP. That is the shape a silently-unlimited default would take, and
+this project removes exactly that class of defect -- so the DEFAULT IS A NUMBER,
+not None, and the unlimited state is reachable only by an explicit edit that
+`oncotriage/spend.py:describe_cap()` PRINTS on the run banner of every run that
+takes it. The alternative -- refusing to run without a cap -- was rejected by
+measurement rather than by taste: every offline test harness, every fixture
+replay and every embedder that calls `main()` would then have to set one, and a
+gate that makes the free paths fail is a gate somebody disables.
+
+A CAP OF ZERO IS NOT "UNSET". It is a cap of zero dollars and it stops the run
+before its first billed call, which is a legitimate thing to ask for (a dry
+rehearsal of the whole pipeline's non-billed path). `spend.spend_cap()` refuses
+a negative value at import rather than reading it as unlimited.
+
+THE WORST-CASE OVERSHOOT IS BOUNDED AND IS STATED HERE, because a cap with an
+unstated edge is a promise nobody can rely on.
+
+    Every billed call is bracketed: the gate is checked immediately BEFORE the
+    request and the ledger is charged immediately AFTER the response. So the
+    only spend a trip cannot prevent is what is already past the gate and not
+    yet charged, which is exactly the set of requests in flight:
+
+        overshoot_requests  <=  MAX_WORKERS x per_trial_parallel_bound()
+                            =   12 x 4  =  48                (per-trial mode)
+        overshoot_requests  <=  MAX_WORKERS x 1  =  12       (grouped mode:
+                                the send loop is sequential per patient)
+
+    At the per-request costs derived above:
+
+        per-trial, cache working   48 x $0.010811 = $0.52
+        per-trial, cache absent    48 x $0.026246 = $1.26
+        grouped                    12 x one packed chunk
+
+    So the cap is honoured to within about a dollar and a half, on a $300 cap.
+    THIS IS THE BOUND THE DESIGN BUYS BY CHARGING AT THE RESPONSE RATHER THAN
+    AT THE PATIENT. Charging only where the node folds its accumulators would
+    make the bound MAX_WORKERS whole patients (~$5), because per-trial mode
+    dispatches a patient's entire wave before the node reads any of it.
+"""
+
+SPEND_CAP_ENFORCED = True
+"""Whether the cap above stops a run, or is only measured and reported.
+
+FALSE IS A MEASUREMENT MODE, NOT A DISABLE. The ledger still accumulates, the
+run banner prints the cap and says it is measured only, and the closing spend
+block still reports the campaign total against it -- so an operator can read
+whether the run WOULD have been stopped, and by how much. What changes is that
+no request is declined.
+
+**AND `spend.SPEND_GATE_SKIPS` IS THEREFORE EMPTY IN THIS MODE, WHICH THIS
+PARAGRAPH ONCE CLAIMED THE OPPOSITE OF.** That counter counts requests the gate
+DECLINED; with nothing declined there is nothing to count, and a counter that
+moved here would be counting a decline that did not happen. The closing block is
+the reader for this mode, not the counter. The claim was wrong and is corrected
+rather than deleted, because "the counter still moves" is exactly what somebody
+would rely on when deciding this mode is safe to run a campaign under.
+
+It exists so a first campaign can be run with the gate OBSERVING before it is
+trusted to stop one, which is the only honest way to calibrate a threshold
+nobody has yet seen fire.
+
+IT DEFAULTS TO TRUE because the reverse default is the one that reads as a
+working brake and is not one.
+"""
+
+SPEND_CALL_CEILING_ENFORCED = True
+"""Whether the per-invocation billed-call ceiling stops a run. See
+``spend.stage5_call_ceiling()`` for what the ceiling is and how it is derived,
+and the block below for why this is a call CEILING rather than the
+calls-per-minute detector the brief asked for.
+
+WHY THERE IS NO CALLS-PER-MINUTE BREAKER, WITH THE ARITHMETIC.
+
+  A rate detector needs a threshold in calls per minute. Every candidate
+  derivation of one from this configuration needs a LATENCY term, and this
+  project owns no latency constant -- MATCHING_REQUEST_TIMEOUT_SECONDS is a
+  ceiling, not an expectation, and the only measured figure (78.5s per patient
+  over 205 recorded evaluation runs) is a GROUPED-arm number for a whole
+  patient. A threshold built on an assumed per-request latency is a literal
+  wearing a derivation's clothes, and it fires on a fast provider day.
+
+  AND THE RATE IS ALREADY BOUNDED, STRUCTURALLY. Every billed Stage 5 request
+  goes through one of three call sites, and each runs either on the node's own
+  thread (sequential) or on a wave pool of at most `per_trial_parallel_bound()`
+  workers. With MAX_WORKERS patients in flight the process cannot hold more than
+
+      MAX_WORKERS x per_trial_parallel_bound()  =  12 x 4  =  48
+
+  requests in flight at any instant, whatever a defect does. A retry loop does
+  not raise that number -- it raises the COUNT, which is what the cap governs --
+  and `MAX_LLM_CLASSIFIER_RETRIES` bounds node re-entry at 4 anyway.
+
+  SO A RATE BREAKER COULD NOT SAVE MONEY THE CAP DOES NOT ALREADY SAVE. It
+  would trip at the same three sites with the same 48-request overshoot bound;
+  the only thing it buys is stopping SOONER in wall-clock, and the money spent
+  in the meantime is bounded by the cap the operator has already ruled
+  acceptable.
+
+  WHAT IS *NOT* REDUNDANT, and is what this constant governs instead. The named
+  failure mode is "a defect that re-issues calls" -- a loop that appends to the
+  send queue without popping, a splitter that never converges. Against THAT the
+  cap is a poor instrument, because it lets one patient spend the entire
+  campaign budget. The number of billed calls one Stage 5 invocation can
+  LEGITIMATELY make is exactly derivable from this file -- see
+  `spend.stage5_call_ceiling()` -- so the breaker is a ceiling on that count
+  rather than on a rate, it needs no latency term, and it bounds a runaway at
+  one patient's worth of calls instead of the cap's.
+"""
+
+
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # SQLITE WRITE DURABILITY (the write-durability pass)
 # ===========================================================================
 #

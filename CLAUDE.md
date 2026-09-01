@@ -914,6 +914,25 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # the suite's two writers and are sha256-compared at the end. It DOES exec:
 # twenty-four in-memory copies of agent/evaluation.py, one plant each, argued
 # at _EXEC_ALLOWLIST. Bucket A, ~4 s.
+# The spend-gate pass. Same shape, same directory. No network, no keys, NO
+# SPEND -- every model response is a literal served by a stub installed through
+# oncotriage/agent/deps.py and the graph is never invoked -- no live Qdrant, NO
+# MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports; torch and
+# transformers asserted absent at the end), no corpus, no git history, no live
+# server. It DRIVES THE REAL Stage 5 node AND THE REAL run_batch, with
+# process_patient a stand-in that charges the ledger -- so the submit loop, the
+# sweep, _on_done, _start_patient_unless_stopped and the executor lifecycle are
+# the shipped ones. NOT in the collision matrix: every database is inside a
+# tempfile.mkdtemp it removes and asserts gone, paths._RESOLVED is seeded so
+# nothing can resolve to the production tree, and the four repository files it
+# reads (agent/evaluation.py, spend.py, storage/database_logger.py,
+# batch/runner.py) are written by neither of the suite's two writers and are
+# sha256-compared at the end. It DOES exec: six in-memory copies of
+# agent/evaluation.py, one plant each, argued at _EXEC_ALLOWLIST. Bucket A,
+# ~1.6 s (MEASURED; the first version was 21.6 s because its own harness
+# deadlocked and a timeout hid it -- see the pass's own findings).
+python tests/test_spend_gate.py                                     # 151
+
 python tests/test_agent_stage5_per_trial_calls.py                   # 320 (was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
@@ -12095,6 +12114,303 @@ exactly what it reported before.
    whole -- so the new key flows through untouched; that was established by
    reading, and `tests/test_mcp_server_stdio_contract.py` is bucket C and needs
    a live Qdrant this pass did not use.
+
+
+### No run can outspend its budget (the spend-gate pass)
+
+**AWS BUDGETS IS MONITORING AND NOT ENFORCEMENT.** It fires 8 to 24 hours after
+the money is gone; OpenAI's usage page is a report. Nothing in this pipeline
+could stop a request, and the only brake was the operator stop sentinel -- which
+needs a human who already knows something is wrong. The failure this is built
+for is the one nobody is watching: a mis-set constant, a defect that re-issues
+calls, a corpus ten times the size somebody meant, running overnight.
+
+`oncotriage/spend.py` is the brake: **measured cumulative cost, checked
+immediately before every billed call, hard stop at the cap.** No billed call was
+made building it; the twelve fixtures' replay outcome is **identical to HEAD,
+fixture for fixture and field for field**, and the production `inferences.db`
+and the twelve fixture files are byte-unchanged.
+
+| | |
+|---|---|
+| new module | `oncotriage/spend.py` -- the ledger, the cap, the derived call ceiling, the run-level latch, three counters |
+| new constants | `config.SPEND_CAP_USD` (**300.00**), `SPEND_CAP_ENFORCED`, `SPEND_CALL_CEILING_ENFORCED` |
+| new column | `runs.stop_reason`, additive TEXT, **schema era 7** |
+| new vocabulary | `database_logger.RUN_STOP_REASONS` -- operator / spend_cap / call_ceiling |
+| new counters | `SPEND_GATE_SKIPS`, `SPEND_LEDGER_FAULTS`, `SPEND_CEILING_TRIPS` -- the 37th, 38th and 39th in the degradation registry |
+| new test | `tests/test_spend_gate.py` -- **151 checks, bucket A, ~1.6 s** |
+
+**THE LEDGER IS CHARGED AT THE RESPONSE, NOT AT THE PATIENT, AND THAT PLACEMENT
+IS THE WHOLE OVERSHOOT BOUND.** Every billed call is bracketed -- the gate
+immediately before, the charge immediately after -- so the only spend a trip
+cannot prevent is what is already past the gate and not yet charged, which is
+exactly the requests in flight:
+
+    overshoot <= MAX_WORKERS x per_trial_parallel_bound() = 12 x 4 = 48 requests
+              =  48 x $0.0108 = $0.52   (cache working)
+              =  48 x $0.0262 = $1.26   (cache absent)
+
+Charging where the node folds its accumulators instead would make the bound
+MAX_WORKERS whole PATIENTS, because per-trial mode dispatches a patient's entire
+wave before the node reads any of it. **Measured, both grains**: at the Stage 5
+grain, a barrier of 4 proves the requests are in flight together and exactly
+`1 + parallel` go out past a two-call budget; at the patient grain, a $5 cap at
+$1 a patient with 4 workers starts **8** patients, finishes all 8 and writes all
+8.
+
+**IT IS NOT THE SAME NUMBER THE ROW STORES, AND THE DIFFERENCE IS IN THE GATE'S
+FAVOUR.** `inferences.estimated_cost_usd` carries the token accumulators of ONE
+Stage 5 invocation, and a parse failure routes the graph back in with every
+accumulator reset -- so a patient that spent three attempts stores the last
+one's tokens, which `run_harness.price_result` records as a known under-count
+and surfaces through `cost_complete`. **This ledger has no such gap**: it is
+charged once per RESPONSE, at the three sites where a response is obtained, and
+those sites are INSIDE the retry rather than around it. A gate built on an
+under-counting number under-enforces, which is why it is not a sum over the
+rows. What it still cannot see is stated at the module: SDK transport retries,
+a request that raised before any response, and anything billed outside Stage 5.
+
+**THE CAP IS A CAMPAIGN BUDGET AND A RESUMED RUN INHERITS IT.**
+`database_logger.campaign_spend_before` walks the chain BACKWARDS from the run
+row just opened -- `resumed = 1`, the nearest preceding run with a resumable
+status and an identical fingerprint, transitively -- and sums
+`estimated_cost_usd` over its rows. That is `queries.campaign_summary`'s stitch
+rule, walked forward instead of stitched with a recursive CTE, and the two are
+**pinned against each other** rather than described: a restated rule is a rule
+that can drift. Without it the cap is per INVOCATION, which is not a smaller
+promise but a broken one -- a run that tripped the cap and was restarted by a
+systemd `Restart=` or a cron entry would get a fresh $300 every time, and the
+run lock forbids CONCURRENT runs and says nothing about sequential ones.
+
+**A ROW WITH NO COST MAKES THE BASELINE A FLOOR AND EVERY CONSUMER SAYS SO** --
+`print_cost_by_model`'s "<- A FLOOR, NOT A TOTAL" precedent. The direction
+matters: a floor UNDER-counts, so the gate lets the campaign spend more than it
+should. Refusing to resume instead would let one unpriceable historical row
+block a campaign.
+
+**`CAMPAIGN_RESUMABLE_STATUSES` MOVED TO `database_logger.py` AND IS IMPORTED,
+NOT COPIED.** A second consumer appeared one layer DOWN, in the module that owns
+the `runs` table, and `queries` imports that module so the reverse is a cycle.
+The choice was a third copy of a three-member tuple whose whole value is that
+adding a status is a deliberate edit, or one owner in the module that owns the
+vocabulary it is a subset of. The guard that it is a PROPER subset stays in
+`queries.py`, beside the SQL it protects.
+
+**THE STOP IS THE OPERATOR STOP SWITCH'S SEMANTICS, REUSED RATHER THAN
+REBUILT.** In-flight work completes and is written, nothing new starts, the
+checkpoint is current, the run records STOPPED, and a resume continues under the
+remaining budget. `spend.SpendStop` is `control.StopSwitch`'s SHAPE without its
+sentinel -- a latching `poll(where=)` in the done-callback and in the submit
+loop, a `requested` attribute on the hot path -- so the runner's integration
+reads the same way for both. **It is NOT a subclass**, and the reason is that
+class's own contract: `_resolve_path`, the note reader, the clear vocabulary and
+the stale-sentinel preflight are all about a FILE an operator creates. There is
+no file here and nothing to clear; the state is the ledger. Inheriting would
+give it four methods that answer about a sentinel that does not exist, which is
+the silent-no-op shape `_StopSwitch.arm` had to be re-broken to remove.
+
+**AND `Stage5SpendStopped` SUBCLASSES `Stage5ShutdownRequested`, WHICH IS THE
+WHOLE STAGE 5 INTEGRATION.** Two places single that class out and both are
+exactly right about this one, so neither was edited and neither can drift away
+from covering it: the send loop's `except`, which must NOT isolate it to its
+trial (`_on_done` checkpoints a COMPLETED patient, so a resume would skip it
+forever with most of its trials never judged -- the c33 lesson reached for money
+instead of for a signal), and `_account_unconsumed`'s `abandoned:` skip, because
+a request the gate declined was never issued. The diagnosis is not lost to the
+subclassing: `SPEND_GATE_SKIPS` is a separate counter keyed by phase and by
+limit, so "we stopped for money" and "an orchestrator sent SIGTERM" are never
+one number.
+
+**`runs.stop_reason` IS A COLUMN AND NOT TWO MORE STATUSES, AND THE ALTERNATIVE
+WAS ARGUED BEFORE IT WAS REJECTED.** `runs.status` answers HOW A RUN ENDED, and
+a spend stop's answer is byte-identical to an operator stop's: every patient it
+started completed and was written, patients remain that it never began, the
+checkpoint is intact, a resume continues. That is `RUN_RECORD_STATUS_STOPPED`'s
+definition unamended. A fifth and sixth status would be two more members that
+`TRACKING_STATUS_FOR`, `CAMPAIGN_RESUMABLE_STATUSES`, `campaign_summary`'s
+generated predicate, the Run Health tab's `health_record` CASE and
+`tests/test_storage_run_identity.py`'s composition pin would all have to learn
+-- and every one of them would answer IDENTICALLY for all three. A distinction
+on which no consumer branches differently belongs in a different column;
+`verdict_source`'s argument, one table over, where `canonical` is a value of its
+own column rather than a fourth member of `eligible`. **One correction it
+forced, made in the same commit:** `RUN_RECORD_STATUS_STOPPED`'s docstring said
+"a run AN OPERATOR ASKED TO STOP" and named the sentinel as "THE SWITCH THAT
+PRODUCES IT". True of every STOPPED row ever written, and no longer true.
+
+**AN UNRECOGNISED REASON IS REFUSED AND COUNTED, NEVER STORED.** The column
+exists to be grouped on, and a value outside the closed vocabulary is a bucket
+no `GROUP BY` consumer knows about -- the failure a closed vocabulary with an
+open writer produces. It is refused rather than mapped to a default, because
+every default available is a claim about a mechanism that may not have run.
+
+### THERE IS NO CALLS-PER-MINUTE BREAKER, AND THE ARITHMETIC IS WHY
+
+A rate detector needs a threshold in calls per minute, and **every derivation of
+one from this configuration needs a LATENCY term this project does not own** --
+`MATCHING_REQUEST_TIMEOUT_SECONDS` is a ceiling, not an expectation, and the
+only measured figure (78.5 s per patient over 205 recorded evaluation runs) is a
+GROUPED-arm number for a whole patient. A threshold built on an assumed
+per-request latency is a literal wearing a derivation's clothes, and it fires on
+a fast provider day.
+
+**AND THE RATE IS ALREADY BOUNDED, STRUCTURALLY.** Every billed Stage 5 request
+goes through one of three call sites, and each runs either on the node's own
+thread (sequential) or on a wave pool of at most `per_trial_parallel_bound()`
+workers. With `MAX_WORKERS` patients in flight the process cannot hold more than
+**48** requests in flight at any instant, whatever a defect does. A retry loop
+does not raise that number -- it raises the COUNT, which is what the cap governs
+-- and `MAX_LLM_CLASSIFIER_RETRIES` bounds node re-entry at 4 anyway. So a rate
+breaker would trip at the same three sites with the same 48-request overshoot
+bound: **it could not save money the cap does not already save, only time.**
+
+**WHAT IS NOT REDUNDANT IS A PER-INVOCATION CALL CEILING, AND THAT IS WHAT
+SHIPPED INSTEAD.** The named failure mode is "a defect that re-issues calls" --
+a loop that appends to the send queue without popping, a splitter that never
+converges. Against THAT the cap is a poor instrument, because it lets ONE
+patient spend the entire campaign budget. The number of billed calls one Stage 5
+invocation can LEGITIMATELY make is exactly derivable from `config.py`:
+
+    per-trial:  1 + MAX_TRIALS_FOR_EVALUATION                         = 16
+    grouped:    MATCHING_MAX_INPUT_PACKED_CHUNKS
+                  x (2 ** (MAX_TRUNCATION_SPLITS + 1) - 1)            = 75
+
+-- the same `2**(D+1)-1` expression `HARNESS_POST_READ_TIMEOUT_SECONDS` is
+already written over, for the same reason: raising the split depth must move it.
+So the breaker is a ceiling on that COUNT rather than on a rate, it needs no
+latency term, and **it bounds a runaway at one patient's worth of calls (~$1.7)
+instead of the cap's ($300) -- a 175x difference in blast radius.** It is per
+INVOCATION and not per patient because a retry re-enters the node with fresh
+state and re-entry is already bounded by the router. There is no margin: the
+ceiling is the exact number the configuration permits, and a multiplier would be
+a literal.
+
+**`SPEND_CEILING_TRIPS` COUNTS INVOCATIONS WHILE `SPEND_GATE_SKIPS` COUNTS
+REQUESTS**, and the first draft counted requests in both -- two names for one
+finding, which is what `degradation.register` refuses a duplicate NAME for.
+`Stage5CallCounter.take()` returns `(granted, first_refusal)` with both decided
+inside its own lock, because a caller deriving "first" from a `refusals == 1`
+read after the lock was released would race: with four workers refused at once,
+none of them or several could see the 1. **Measured: exactly 1 of 240 racing
+refusals is told it was the first.**
+
+### WHAT THE PROGRAM COSTS, DERIVED FROM MEASURED INPUTS
+
+Every input is from an artifact in this repository, none invented. `S` = 8,575
+tokens (the shared system prefix, mean over the ELEVEN characterization fixtures
+carrying a Stage 5 exchange), `u` = 372 (per-trial user block, 1,544 chars at
+the 4.15 chars/token this corpus measures), `o` = 696 (output per trial), `N` =
+`MAX_TRIALS_FOR_EVALUATION`, rates $2.00/$12.00 per 1M from `PRICING_CONFIG` and
+$0.20 per 1M for cached input, which that row records as published and
+deliberately unmodelled.
+
+    per patient, cache working   $0.017150 warmup + 15 x $0.010811 = $0.179390
+    per patient, cache ABSENT    $0.017150 warmup + 15 x $0.026246 = $0.410840  (2.29x)
+
+                                      cache working    cache absent
+      300-patient campaign               $53.79          $123.25
+      + resample pass (100)              $17.93           $41.08
+      50-patient k=2 re-run (100 runs)   $17.93           $41.08
+      100-patient judge pass              $7.50            $7.50
+      ------------------------------------------------------------
+      PROGRAM                            $97.15          $212.91
+
+**THE DERIVED ESTIMATE DOES NOT EXCEED THE CAP IN EITHER ARM**, which is the
+finding rather than the assumption -- and the second column is why the number is
+300 and not 150. The cap sits at ~3.1x the expected program and ~1.4x the
+program's own worst case.
+
+**THE RESAMPLE PASS IS IN THE TABLE AND IS EASY TO FORGET**: the batch runner
+re-runs `RESAMPLE_COUNT` (100) already-completed patients at full price, so a
+"300-patient campaign" is 400 patient-runs.
+
+**THE JUDGE PASS IS THE SOFTEST NUMBER AND IS NOT COVERED BY THIS GATE.** The
+rater calls a DIFFERENT vendor through the Message Batches API, priced from
+`RATER_PRICING` at claude-sonnet-4-6's $3.00/$15.00 with the flat 50% batch
+discount, and it does not write `inferences.estimated_cost_usd`. The row assumes
+25,000 in / 5,000 out per patient; at 40,000/8,000 it is $12.00. Either way it
+is under 10% of the program and it moves no decision -- and an operator reading
+"$300 cap" must not believe it bounds the judge.
+
+**NO PER-TRIAL RUN HAS EVER BEEN MEASURED**, which is why the derivation is
+arithmetic over grouped-arm token shapes rather than an average of recorded
+per-trial runs: all 21 evaluation-run manifests on disk (205 patient runs with a
+measured cost) predate the per-trial default, and the three-call probe has still
+not been run. The cache-absent column is what that probe settles.
+
+### WHAT THIS PASS FOUND IN ITS OWN WORK BY RUNNING RATHER THAN READING
+
+* **The harness deadlocked and a 20-second timeout hid it.** Section 8's
+  releaser waited for the spend latch to trip -- but the held workers are the
+  only things that charge the ledger, so nothing could cross the cap while they
+  were held. `gate.wait(timeout=20)` rescued it, so the scenario PASSED, took 20
+  seconds, and was measuring the timeout rather than the gate. It releases on
+  pool saturation now, check **8a-0** asserts the release was not a timeout, and
+  the file went **21.6 s -> 1.6 s**.
+* **A bypass control was masked by the gate one site over.** 9e removed the
+  wave's gate and drove it on a budget already spent -- where the WARMUP gate
+  declines first and clears the queue, so the planted module and the shipped one
+  both reported 0 requests. It is driven on a budget that crosses MID-WAVE now,
+  with its own clean control.
+* **The measurement mode's own docstring claimed the opposite of the truth.**
+  `SPEND_CAP_ENFORCED = False` was documented as still counting into
+  `SPEND_GATE_SKIPS`; that counter counts DECLINED requests, and with nothing
+  declined there is nothing to count. Corrected rather than deleted, because
+  "the counter still moves" is exactly what somebody would rely on when deciding
+  the mode is safe to run a campaign under.
+* **An unreadable cap printed two contradictory lines.** `report_lines()` tested
+  `cap is not None` after the failure branch had already appended its
+  diagnosis, so it printed "UNREADABLE: ..." AND "NONE -- this run was
+  unbounded". Three states now, decided before anything is printed.
+* **Reusing `WARMUP_SOURCE_SHUTDOWN` would have printed "a shutdown was
+  requested" on a row nobody interrupted** -- the exact misdiagnosis that
+  constant's own note gives as the reason IT is not folded into `warmup`.
+  `WARMUP_SOURCE_SPEND_LIMIT` is the fourth member, with its own floor sentence.
+
+### THE EXISTING SUITE CAUGHT FIVE THINGS, AND EVERY ONE WAS THE CHECK WORKING
+
+| check | what it caught | how it was closed |
+|---|---|---|
+| `test_storage_schema_guards` 3b-c/3b-d-i | `RUN_COLUMNS` declared `stop_reason` and `start_run_record` set no value -- a named `RuntimeError` at the INSERT, not a bare `KeyError` | `values["stop_reason"] = None` at open, on `note`'s precedent |
+| `test_storage_run_identity` | a second `run row` console line -- and, once the check was widened to a PROPERTY, that TWO of the four printed a LITERAL `STOPPED` inside a guard that collapses the conditional | both read `_terminal_status` now, printed bytes unchanged; the check is `len(reads) == len(lines)` instead of `== 1` |
+| `test_runner_preflight_and_state_faults` 6f | a fifth `describe_checkpoint_state` call | raised to 5, **and 6f-a added**: EVERY console line in `main()` mentioning the checkpoint must go through the reader, so a sixth verdict added as a literal fails even though the count still reads five |
+| `test_package_invariants` 2i | ten new `@property` definitions | declared, with the argument for why the ledger has ten readers and no setter |
+| `test_agent_stage5_per_trial_calls` 1f, 8a, c9, c12, c13 | three anchors moved by the bracketing, and `matching_call_mode()` called three times in one file | the node binds `_call_mode` ONCE and threads it, which is better code; 8b-q's name set is now DERIVED and its walk SCOPED past the declarations |
+
+### WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED
+
+1. **THE GATE COVERS STAGE 5 AND NOTHING ELSE.** Embeddings at index time
+   (`retrieval/indexer.py`), the independent rater (`evaluation/rater.py`) and
+   the ragas harness are NOT instrumented -- three separate billed paths with
+   two separate price tables. `config.SPEND_CAP_USD` says so; a reader who takes
+   "$300 cap" to mean the whole project would be wrong.
+2. **THE ABLATION STUDY IS NOT GATED.** It drives the same Stage 5 node, so its
+   requests ARE charged to the ledger and the Stage 5 gate DOES decline them --
+   but `oncotriage/ablation/study.py` has no `SPEND_STOP` poll in its pools, no
+   ledger seed, and no `stop_reason` on its own run rows. A capped study would
+   fail every remaining pair rather than stopping cleanly. The runner's
+   integration is ~30 lines and the study already has the stop-switch shape to
+   copy.
+3. **THE API AND THE MCP SERVER ARE NOT GATED.** Both reach
+   `match_patient_to_trials` and therefore charge the ledger, and a long-lived
+   server has no run to reset it -- so the ledger grows for the life of the
+   process and the cap would eventually decline every request. Today the API
+   writes no `runs` row and seeds nothing, so it starts at zero and the cap is
+   reached only after $300 of served requests; that is a real behaviour change
+   to a serving surface and is the reason it is named here rather than shipped.
+4. **`main()`'s TWO NEW CLOSING BLOCKS WERE READ, NOT RUN.** They need a live
+   Qdrant and a compiled graph. What IS driven is the derivation they read
+   (`_stop_reason`, one `Assign`, pinned by AST), the finalize call that carries
+   it, and the two existing structural checks that reach into them -- the
+   checkpoint-reader property and the `run row` line property.
+5. **THE PROBE HAS STILL NOT BEEN RUN**, so the cache-absent column of the cost
+   table is arithmetic rather than a measurement, and it is the column that
+   decides whether $300 is 1.4x or 3.1x the program.
+6. **A CAMPAIGN'S SPEND IS RE-READ FROM THE DATABASE ONCE, AT START.** A second
+   process writing rows for the same campaign while this one runs is not seen --
+   the run lock forbids two batch runners on one checkpoint directory, but the
+   API writes into the same file with a NULL `run_id` and is therefore outside
+   the chain by construction. Stated rather than closed.
 
 
 Data and keys live outside this folder. Never write an

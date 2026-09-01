@@ -1333,8 +1333,17 @@ else:
     _reads_local = [c for c in _row_line
                     if any(isinstance(n, ast.Name)
                            and n.id == "_terminal_status" for n in ast.walk(c))]
-    check("...and one of them reads the SAME local the row does",
-          len(_reads_local), 1)
+    # EVERY SUCH LINE READS IT, NOT "EXACTLY ONE OF THEM DOES". This was
+    # `len(_reads_local) == 1`, which was a count of the `run row` lines that
+    # existed rather than a statement about them -- so the spend-gate pass,
+    # which added a SECOND stop path with its own closing block, made a check
+    # that was satisfied report a failure. The property is that no `run row`
+    # line computes its own status; a count cannot say that and this can, and
+    # it survives the third stop path without another edit.
+    check("...and EVERY `run row` line reads the SAME local the row does, so "
+          "none of them computes its own status",
+          (len(_reads_local), len(_reads_local) == len(_row_line)),
+          (len(_row_line), True))
 
     # NO SECOND DERIVATION ANYWHERE IN main(). This is the check that would have
     # caught the original defect: the console copy was an IfExp over

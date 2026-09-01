@@ -1395,8 +1395,13 @@ control(
     # mode always takes, with `_prefetched` None -- is where the system prompt
     # is handed over. Planting there is the same defect in the same place: the
     # prefix stops being shared across the chunks of one patient.
-    [("        return call_matching_model(system_prompt, _user_prompt_for(chunk))",
-      "        return call_matching_model(\n"
+    # THE ANCHOR MOVED AGAIN WITH THE SPEND GATE, which brackets `_obtain`'s
+    # live call with the gate and the ledger charge -- so the single `return
+    # call_matching_model(...)` this keyed on is now an assignment. The defect
+    # planted is unchanged: the prefix stops being shared across the chunks of
+    # one patient.
+    [("        _live = call_matching_model(system_prompt, _user_prompt_for(chunk))",
+      "        _live = call_matching_model(\n"
       "            system_prompt + chunk[0]['trial']['nct_id'],\n"
       "            _user_prompt_for(chunk))")],
     lambda m: len({r["messages"][0]["content"]

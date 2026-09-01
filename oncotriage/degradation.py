@@ -116,6 +116,7 @@ from oncotriage.registries import cancer_code_registry as _cancer_code_registry
 from oncotriage.registries import mesh as _mesh
 from oncotriage.storage import database_logger as _database_logger
 from oncotriage import run_fingerprint as _run_fingerprint
+from oncotriage import spend as _spend
 from oncotriage import tracking as _tracking
 
 
@@ -373,6 +374,38 @@ _REGISTRY_SPEC = (
      "failed. Every such patient is failed deliberately and is NOT "
      "checkpointed, so a resume re-runs it. The total is a FLOOR -- it is "
      "incremented from worker threads without a lock; see the counter"),
+    # ── THE RUN SPEND GATE (oncotriage/spend.py) ────────────────────────
+    #
+    # THEY SIT DIRECTLY BELOW STAGE5_SHUTDOWN_SKIPS because they are the same
+    # operational event reached for a different reason -- a Stage 5 request
+    # that was not issued -- and an operator reading a stopped run's report
+    # needs the two totals adjacent to tell "an orchestrator stopped this" from
+    # "the budget stopped this".
+    ("SPEND_GATE_SKIPS", _spend.SPEND_GATE_SKIPS,
+     "Stage 5 requests that were NOT issued because a spend limit was reached. "
+     "Keyed {phase}:{limit}, the phases being warmup:/wave:/send: and the "
+     "limits spend_cap / call_ceiling. IT NAMES MONEY NOT SPENT and is in this "
+     "report rather than the census for STAGE5_SHUTDOWN_SKIPS' reason: it is "
+     "the CAUSE of the error rows a gated run leaves behind, and without it "
+     "those patients read as failures. Every such patient is failed "
+     "deliberately and is NOT checkpointed, so a resume runs it. The total is "
+     "a FLOOR -- incremented from worker threads without a lock; the LEDGER, "
+     "which decisions are made on, is locked"),
+    ("SPEND_LEDGER_FAULTS", _spend.SPEND_LEDGER_FAULTS,
+     "a billed response could not be priced, so its cost is MISSING from the "
+     "spend ledger. EVERY KEY HERE IS SPEND THE GATE CANNOT SEE, which means "
+     "the cap is being enforced against a number lower than the truth -- the "
+     "one direction a budget must not fail in silently. An `unpriced_model:` "
+     "key is a model absent from PRICING_CONFIG and is the same configuration "
+     "defect that aborts the row write one layer down; a `bad_usage:` key is a "
+     "response whose usage block could not be read"),
+    ("SPEND_CEILING_TRIPS", _spend.SPEND_CEILING_TRIPS,
+     "a Stage 5 invocation asked for more billed calls than its configuration "
+     "can legitimately produce, and the request was declined. NOT A BUDGET "
+     "EVENT: the campaign may be nowhere near its cap. Keyed "
+     "{call_mode}:{ceiling}, and the ceiling is derived in "
+     "spend.stage5_call_ceiling() rather than chosen -- so a non-zero value "
+     "here is a defect in this pipeline, not a campaign that ran long"),
     ("BEDROCK_ADAPTER_DEGRADATIONS",
      _bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS,
      "Stage 5 ran on Amazon Bedrock and the request or the response was not "

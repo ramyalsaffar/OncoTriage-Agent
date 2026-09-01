@@ -1051,15 +1051,46 @@ _RUNNER_TREE = ast.parse(_RUNNER_SRC)
 _MAIN = next((n for n in ast.walk(_RUNNER_TREE)
               if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
 check("6f  every checkpoint verdict main() prints goes through the reader, so "
-      "none of them can assert a state it did not check. FOUR: the three "
+      "none of them can assert a state it did not check. FIVE: the three "
       "branches of the checkpoint decision -- stopped, cleared, errored -- and "
-      "the `checkpoint` line of the STOPPED closing block, which is the one "
-      "the finding was written about (non-degeneracy: a main() that had "
-      "stopped printing any of them fails on the count)",
+      "the `checkpoint` line of EACH closing block that reports a stop, which "
+      "is the shape the finding was written about (non-degeneracy: a main() "
+      "that had stopped printing any of them fails on the count)",
       0 if _MAIN is None else len(
           [n for n in ast.walk(_MAIN) if isinstance(n, ast.Call)
            and getattr(n.func, "id", None) == "describe_checkpoint_state"]),
-      4)
+      5)
+
+
+def _checkpoint_console_calls():
+    """Every `console.out` in main() whose text mentions the checkpoint."""
+    if _MAIN is None:
+        return []
+    out = []
+    for node in ast.walk(_MAIN):
+        if (isinstance(node, ast.Call)
+                and getattr(node.func, "attr", None) == "out"):
+            text = ast.unparse(node)
+            if "heckpoint" in text:
+                out.append(text)
+    return out
+
+
+# 6f IS A COUNT AND A COUNT CANNOT SAY WHAT THIS SECTION MEANS. It moves
+# deliberately when a verdict is added -- which is its value -- but it is
+# satisfied by five reader calls beside a SIXTH line that asserts a checkpoint
+# state as a literal, and that sixth line is exactly the defect 6f was written
+# about. The spend-gate pass added the fifth verdict and had to raise the
+# literal, which is the moment to notice that the literal was doing the work.
+_CHECKPOINT_LINES = _checkpoint_console_calls()
+check("6f-a ...and it is a PROPERTY rather than a count: EVERY console line in "
+      "main() that mentions the checkpoint goes through the reader, so a sixth "
+      "verdict added as a literal fails here even though 6f's count still "
+      "reads five",
+      (len(_CHECKPOINT_LINES) >= 5,
+       sorted({("reader" if "describe_checkpoint_state" in t else t[:60])
+               for t in _CHECKPOINT_LINES})),
+      (True, ["reader"]))
 check("6f-b ...and both handlers increment their counter rather than only "
       "printing: the two `except OSError` clauses that write state files",
       (_RUNNER_SRC.count('CHECKPOINT_FAULTS[f"write:'),

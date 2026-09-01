@@ -168,6 +168,14 @@ from oncotriage.agent.evaluation import (
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.storage.database_logger import (
     RUN_METRICS_FLUSH_FAILURES,
+    # THE THREE STOP REASONS BY NAME, for RUN_RECORD_STATUS_*'s reason:
+    # `runs.stop_reason` is a CLOSED vocabulary owned by the storage layer,
+    # `finalize_run_record` REFUSES a value outside it, and a typo in a literal
+    # here would leave the column NULL on the one row whose whole purpose is to
+    # say WHICH mechanism stopped the campaign.
+    RUN_STOP_REASON_CALL_CEILING,
+    RUN_STOP_REASON_OPERATOR,
+    RUN_STOP_REASON_SPEND_CAP,
     # THE FOUR TERMINAL STATUSES BY NAME. `runs.status` is a CLOSED vocabulary
     # owned by the storage layer, and this module writes every one of its
     # terminal members. Written out as literals they were eight strings in
@@ -180,6 +188,7 @@ from oncotriage.storage.database_logger import (
     RUN_RECORD_STATUS_STOPPED,
     RUN_RECORD_TERMINAL_STATUSES,
     analyze_database,
+    campaign_spend_before,
     finalize_run_record,
     flush_run_metrics,
     log_inference,
@@ -191,6 +200,7 @@ from oncotriage.utils import CaffeinateSession, preserve_corrupt_file
 from oncotriage import run_fingerprint
 from oncotriage.observability import console, get_logger
 from oncotriage import degradation
+from oncotriage import spend
 from oncotriage import tracking
 
 
@@ -1318,6 +1328,23 @@ def _start_patient_unless_stopped(**kwargs):
     if STOP_SWITCH.requested:
         raise CancelledError(
             "the operator stop switch tripped before this patient started")
+    # THE SPEND GATE'S OUTER LAYER, AND IT IS THE ONE THAT SAVES THE MONEY.
+    # Stage 5's own gate declines requests one at a time and is what bounds a
+    # patient already in flight; this refuses to START a patient at all, which
+    # is what stops the run paying a warmup plus a wave for a budget that is
+    # already spent. Same shape, same argument and the same one-attribute cost
+    # as the line above it: `SPEND_STOP.requested` is a plain read, so this adds
+    # no filesystem call and no lock to the hot path, and it cannot miss a stop
+    # that matters because the value it reads is set by the sweep that is
+    # already cancelling this future's siblings.
+    #
+    # `requested` AND NOT `poll()`, deliberately, and the asymmetry with the
+    # submit loop is the same one the stop switch has: a poll here would read
+    # the ledger from MAX_WORKERS threads at once for an answer the sweep has
+    # already reached and announced.
+    if spend.SPEND_STOP.requested:
+        raise CancelledError(
+            "a spend limit was reached before this patient started")
     return process_patient(**kwargs)
 
 
@@ -2144,7 +2171,28 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         # already current for the patient that just finished before the queue is
         # torn down. The order is what makes "the checkpoint is current" true at
         # the moment the stop is announced rather than one patient later.
-        if STOP_SWITCH.poll(where="main pass"):
+        # ── THE SPEND GATE, AT THE SAME CADENCE AND THROUGH THE SAME SWEEP ─
+        #
+        # ONE SWEEP FOR BOTH, and the `or` is what makes that true rather than
+        # two independent sweeps racing to cancel the same futures and each
+        # reporting the count the other did not cancel. `stop_sweep_done` is
+        # already the flag that makes the stop announcement happen once across
+        # MAX_WORKERS done-callbacks; a second flag beside it would be a second
+        # thing to keep in step for an event that has one consequence.
+        #
+        # THE ORDER OF THE TWO POLLS IS NOT ARBITRARY. `STOP_SWITCH.poll` is a
+        # stat call and `SPEND_STOP.poll` is a float comparison, so the cheap
+        # one would be first on cost -- and the operator's own request is put
+        # first anyway, because when both are true in the same instant the run
+        # should be recorded as having been asked to stop rather than as having
+        # run out of money. `_stop_reason()` in main() reads them in the same
+        # order for the same reason, and that is the ONE derivation both the
+        # column and the console block use.
+        #
+        # `poll()` AND NOT `cap_exceeded()`: the latch is what announces once
+        # and what `_start_patient_unless_stopped` reads on the hot path.
+        if STOP_SWITCH.poll(where="main pass") | spend.SPEND_STOP.poll(
+                where="the main pass"):
             with _stop_sweep_lock:
                 first = not stop_sweep_done
                 stop_sweep_done = True
@@ -2261,7 +2309,20 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
             # `poll()` here is free once tripped and one stat call before that;
             # the alternative, reading `STOP_SWITCH.requested` directly, would
             # not notice a stop asked for BEFORE the first patient completes.
-            if STOP_SWITCH.poll(where="main pass submit"):
+            # THE SPEND GATE IS POLLED HERE TOO, and for the submit loop's own
+            # documented reason rather than by symmetry: submission of a large
+            # corpus takes milliseconds, so in production this branch never
+            # fires -- it fires on a SMALL corpus, a slow filesystem or a machine
+            # under load, exactly the conditions a test runs under, and without
+            # it a patient submitted after the sweep would be neither cancelled
+            # nor accounted for and would run and bill after the stop.
+            #
+            # `|` AND NOT `or`: both polls must RUN. `or` short-circuits, so an
+            # operator stop would leave the spend latch unset -- and
+            # `_stop_reason()` would then report the wrong mechanism on a run
+            # where both were true.
+            if (STOP_SWITCH.poll(where="main pass submit")
+                    | spend.SPEND_STOP.poll(where="the main pass submit loop")):
                 stop_unsubmitted = len(pending_files) - index
                 break
             future = executor.submit(
@@ -2395,7 +2456,8 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
     # THE CANCELLED COUNT IS NAMED ONLY WHEN IT IS NON-ZERO, so a clean run's
     # line is byte-identical to what it has always printed and an interrupted
     # one cannot report work nobody ran as work that failed.
-    console.out(("MAIN BATCH STOPPED: " if STOP_SWITCH.requested
+    console.out(("MAIN BATCH STOPPED: "
+                 if STOP_SWITCH.requested or spend.SPEND_STOP.requested
                  else "MAIN BATCH COMPLETE: ")
                 + f"{batch_success} success, {batch_error} errors"
                 + (f", {batch_cancelled} cancelled (never attempted)"
@@ -2486,9 +2548,13 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     #
     # `poll()` and not `.requested`, so a stop asked for after run_batch
     # finished is seen here rather than being missed for the life of the pass.
-    if STOP_SWITCH.poll(where="resample pass"):
-        console.out("Resample pass SKIPPED: an operator stop is in effect. "
-                    "No resample call was issued.")
+    if (STOP_SWITCH.poll(where="resample pass")
+            | spend.SPEND_STOP.poll(where="the resample pass")):
+        console.out("Resample pass SKIPPED: "
+                    + ("a spend limit is in effect. "
+                       if spend.SPEND_STOP.requested and not STOP_SWITCH.requested
+                       else "an operator stop is in effect. ")
+                    + "No resample call was issued.")
         console.out("=" * 80)
         console.out()
         return
@@ -2586,7 +2652,8 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         # This pass writes no checkpoint (resample entries are supplemental), so
         # "the checkpoint's cadence" here means the health flush's, which is the
         # same per-completed-patient boundary.
-        if STOP_SWITCH.poll(where="resample pass"):
+        if (STOP_SWITCH.poll(where="resample pass")
+                | spend.SPEND_STOP.poll(where="the resample pass")):
             with _stop_sweep_lock:
                 first = not stop_sweep_done
                 stop_sweep_done = True
@@ -2612,7 +2679,9 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     try:
         for index, fhir_path in enumerate(resample_files):
             # run_batch's submit-loop guard, second instance, same argument.
-            if STOP_SWITCH.poll(where="resample pass submit"):
+            if (STOP_SWITCH.poll(where="resample pass submit")
+                    | spend.SPEND_STOP.poll(
+                        where="the resample pass submit loop")):
                 stop_unsubmitted = len(resample_files) - index
                 break
             future = executor.submit(
@@ -2669,7 +2738,8 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
 
     console.out()
     console.out("=" * 80)
-    console.out(("RESAMPLE STOPPED: " if STOP_SWITCH.requested
+    console.out(("RESAMPLE STOPPED: "
+                 if STOP_SWITCH.requested or spend.SPEND_STOP.requested
                  else "RESAMPLE COMPLETE: ")
                 + f"{resample_success} success, {resample_error} errors"
                 + (f", {resample_cancelled} cancelled (never attempted)"
@@ -2753,6 +2823,16 @@ def print_crash_record(where="crash") -> None:
     window is two print calls wide and the original ``raise`` follows
     immediately.
     """
+    # THE SPEND BLOCK IS ON THE CRASH PATH TOO, AND IT IS THE ONE AN OPERATOR
+    # READING A CRASH RECORD WANTS FIRST. A campaign that died halfway still
+    # spent whatever it spent, and until this existed that number left the
+    # process with it -- `print_summary` is not reached on this path. Its own
+    # guard, for the reason the two below have separate ones: a formatting
+    # failure here must not take the census and the degradation block with it.
+    try:
+        spend.print_report()
+    except BaseException as exc:                       # noqa: BLE001 -- noted
+        _crash_record_note("spend", where, exc)
     try:
         degradation.print_census_report(degradation.census_snapshot())
     except BaseException as exc:                       # noqa: BLE001 -- noted
@@ -3255,6 +3335,21 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
     # whole. A reader scanning UP from the bottom -- which is how the tail of a
     # long run is read -- meets the conclusion, then the reasoning, then the
     # background.
+    # ── THE SPEND BLOCK, ABOVE ALL THREE ────────────────────────────────
+    #
+    # FIRST OF THE FOUR AND IT IS NOT A SEVERITY JUDGEMENT. The three below are
+    # ordered severity-ascending with the verdict last, on the argument that a
+    # reader scanning UP from the bottom meets the conclusion first. This is not
+    # on that scale at all: it is what the run COST, which is the question an
+    # operator asks before any of them and which is not evidence for or against
+    # the reconciliation's verdict.
+    #
+    # IT ALWAYS PRINTS, unlike the census and the degradation block, which are
+    # conditional. Silence there means "nothing degraded", which is a statement;
+    # silence here would be indistinguishable from a ledger that was never wired
+    # up -- and this is the number the whole gate exists to make true.
+    spend.print_report()
+
     if census_snapshot is not None:
         degradation.print_census_report(census_snapshot)
 
@@ -3334,6 +3429,15 @@ def main():
     # would make every patient of this one fail with no request sent -- the
     # loudest possible version of "state that describes the wrong run".
     clear_stage5_shutdown()
+    # THE FIFTH AND SIXTH PIECES OF PER-RUN MODULE STATE, cleared for the reason
+    # the four above them are, and with a sharper consequence than any of them:
+    # a ledger that survived into the next run would make that run inherit this
+    # one's spend and refuse to start once the two together crossed the cap --
+    # a campaign stopped by money it did not spend. The latch goes with it,
+    # because a latch that outlived its ledger would cancel the next run's
+    # cohort at its first completed patient.
+    spend.SPEND_LEDGER.reset()
+    spend.SPEND_STOP.reset()
 
     with CaffeinateSession("Batch Runner"):
 
@@ -3367,6 +3471,12 @@ def main():
         # is printed where the run's own log will carry it.
         console.out(f"[Setup] To stop this run cleanly between patients: "
                     f"touch {stop_switch_path()}")
+        # THE CAP IS ANNOUNCED ON EVERY RUN, INCLUDING THE UNCAPPED ONE. See
+        # spend.describe_cap(): an unlimited campaign is reachable by an
+        # explicit edit and must say so, or the dangerous state is the quiet
+        # one. It is here beside the stop sentinel's line because the two are
+        # the same fact for an operator -- what will stop this run, and how.
+        console.out(spend.describe_cap())
         console.out()
 
         # ------------------------------------------------------------------
@@ -3561,6 +3671,34 @@ def main():
         )
 
         # ------------------------------------------------------------------
+        # 3b-ii. Seed the spend ledger from the campaign this run resumes
+        # ------------------------------------------------------------------
+        # AFTER THE RUN ROW AND BEFORE THE FIRST BILLED CALL. The row is what
+        # carries this run's fingerprint and its `resumed` flag, which is what
+        # `campaign_spend_before` walks the chain on -- so it cannot be asked
+        # earlier -- and the answer has to be installed before anything can be
+        # gated against it.
+        #
+        # WITHOUT THIS THE CAP IS PER INVOCATION AND NOT PER CAMPAIGN, which is
+        # not a smaller promise but a broken one: a run that tripped the cap and
+        # was restarted by a supervisor would get a fresh budget every time. The
+        # run lock forbids CONCURRENT runs and says nothing about sequential
+        # ones.
+        #
+        # IT NEVER RAISES and an unreadable answer is an EMPTY seed, which
+        # starts this run's budget at zero. That direction is argued at the
+        # function: a read-only bookkeeping query must not be able to stop a
+        # campaign, and the failure is counted and printed rather than silent.
+        _prior = campaign_spend_before(_run_record_id, db_path=_reconcile_db)
+        spend.SPEND_LEDGER.seed(spend.LedgerSeed(
+            usd=_prior.usd, rows=_prior.rows, unpriced=_prior.unpriced,
+            runs=_prior.runs, source=(spend.SEED_SOURCE_CAMPAIGN
+                                      if _prior.runs
+                                      else spend.SEED_SOURCE_NONE)))
+        console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
+        console.out()
+
+        # ------------------------------------------------------------------
         # 3c. Open the tracking run (the tracking pass)
         # ------------------------------------------------------------------
         # WHY HERE AND NOT HIGHER. It is after every preflight -- the BM25
@@ -3693,9 +3831,11 @@ def main():
             # poll here would additionally trip on a sentinel written in the
             # seconds since -- which run_resample's own entry gate handles,
             # with its own message. One announcement per stop.
-            if STOP_SWITCH.requested:
-                console.out("[Resample] SKIPPED: an operator stop is in "
-                            "effect. Zero resample calls were issued.")
+            if STOP_SWITCH.requested or spend.SPEND_STOP.requested:
+                console.out("[Resample] SKIPPED: "
+                            + ("an operator stop" if STOP_SWITCH.requested
+                               else "a spend limit")
+                            + " is in effect. Zero resample calls were issued.")
             elif completed_ids:
                 run_resample(
                     fhir_files=fhir_files,
@@ -3743,8 +3883,44 @@ def main():
             #
             # A STOP IS STILL ANNOUNCED EITHER WAY. What changes is only which
             # of the two things it is reported as having cut short.
-            _stopped_mid_cohort = (STOP_SWITCH.requested
+            _stopped_mid_cohort = ((STOP_SWITCH.requested
+                                    or spend.SPEND_STOP.requested)
                                    and not _main_pass_complete)
+
+            # WHICH MECHANISM STOPPED THIS CAMPAIGN, DERIVED ONCE.
+            #
+            # None WHEN NOTHING STOPPED IT, which is what `runs.stop_reason`'s
+            # NULL means and what a FINISHED row carries.
+            #
+            # THE OPERATOR OUTRANKS THE GATE, and the precedence is a decision
+            # rather than an accident of ordering. Both can be true in one
+            # instant -- an operator writes the sentinel on a run that is also
+            # out of budget -- and `runs.stop_reason` answers "why did this stop"
+            # for a human who is going to act on it. "I asked for this" is the
+            # answer that needs no investigation; "the budget ran out" sends
+            # somebody to config.SPEND_CAP_USD. Reporting the second when the
+            # first is true sends them to the wrong file.
+            #
+            # ONE DERIVATION, TWO READERS -- the console block below and the
+            # column. `_terminal_status` two blocks down had to be made one
+            # derivation for exactly this reason, and the note there records
+            # what two copies of a three-way conditional cost.
+            #
+            # `spend.SPEND_STOP.limit` IS READ RATHER THAN RE-DERIVED. The latch
+            # recorded which limit fired at the moment it fired; asking
+            # `cap_exceeded()` again here would give the wrong answer for a
+            # call-ceiling stop, whose campaign may be nowhere near its cap.
+            #
+            # ONE `Assign`, NOT AN if/elif CHAIN, and that is the same shape
+            # `_terminal_status` takes for the same reason: a chain is four
+            # assignments to one name, and "derived once" then has to be a
+            # statement about their adjacency rather than about the name.
+            _stop_reason = (
+                RUN_STOP_REASON_OPERATOR if STOP_SWITCH.requested
+                else RUN_STOP_REASON_CALL_CEILING
+                if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_CALL_CEILING
+                else RUN_STOP_REASON_SPEND_CAP if spend.SPEND_STOP.requested
+                else None)
 
             # ------------------------------------------------------------------
             # 6. Reconcile the writes, then the final summary
@@ -4019,6 +4195,62 @@ def main():
             # Printed first, a failure here leaves the row UNFINALIZED and the
             # crash handler finalizes it KILLED -- which is then the truth: the
             # run did die, in the reporting.
+            # ── A SPEND LIMIT THAT LANDED AFTER THE COHORT WAS COVERED ──
+            #
+            # THE STOP-SWITCH BLOCK'S TWIN, and it exists for that block's
+            # reason rather than by symmetry: the gate can fire during the
+            # RESAMPLE pass, after every patient of the cohort has been run, and
+            # the run is then NOT recorded STOPPED -- because STOPPED means the
+            # campaign covers a PREFIX of the cohort and this one does not. An
+            # operator who saw the announcement and then read a FINISHED row is
+            # owed the sentence that reconciles them.
+            if (spend.SPEND_STOP.requested and not STOP_SWITCH.requested
+                    and not _stopped_mid_cohort):
+                console.out()
+                console.out("=" * 80)
+                console.out("A SPEND LIMIT WAS REACHED AFTER THE COHORT WAS "
+                            "COVERED.")
+                console.out(f"  limit          {spend.SPEND_STOP.limit}")
+                console.out(f"  noticed in     {spend.SPEND_STOP.detected_in}")
+                console.out("  main pass      COMPLETE: every patient was "
+                            "attempted, none was cancelled and none was left "
+                            "unsubmitted")
+                console.out("  what it cost   the RESAMPLE pass, and nothing "
+                            "else")
+                console.out("  run row        "
+                            + _terminal_status
+                            + " -- NOT STOPPED, because STOPPED means the "
+                              "campaign covers a PREFIX of the cohort and this "
+                              "one does not")
+                console.out("=" * 80)
+
+            if spend.SPEND_STOP.requested and _stopped_mid_cohort \
+                    and not STOP_SWITCH.requested:
+                console.out()
+                console.out("=" * 80)
+                console.out("RUN STOPPED BY THE SPEND GATE.")
+                console.out(f"  limit          {spend.SPEND_STOP.limit}")
+                console.out(f"  noticed in     {spend.SPEND_STOP.detected_in}")
+                console.out(f"  campaign spend ${spend.SPEND_LEDGER.total:.4f}")
+                if spend.SPEND_STOP.cap is not None:
+                    console.out(f"  cap            "
+                                f"${spend.SPEND_STOP.cap:.2f}")
+                # THE LOCAL, NOT A LITERAL, FOR THE STOP-SWITCH BLOCK'S
+                # REASON -- see the note there.
+                console.out(f"  run row        {_terminal_status}, stop_reason "
+                            f"{_stop_reason!r} (not KILLED, not FINISHED)")
+                # NOT A LITERAL "kept", on the stop-switch block's precedent:
+                # with the checkpoint directory unwritable this line would
+                # otherwise promise a resume that re-bills the whole cohort.
+                console.out("  checkpoint     " + describe_checkpoint_state(
+                    "kept; the next run resumes from it"))
+                console.out("  TO RESUME      raise the cap and run again. The "
+                            "resumed run COUNTS WHAT THIS ONE SPENT, so a "
+                            "restart does not get a fresh budget:")
+                console.out("      # edit config.SPEND_CAP_USD")
+                console.out("      python \"25- Batch Runner.py\"")
+                console.out("=" * 80)
+
             if STOP_SWITCH.requested and not _stopped_mid_cohort:
                 # THE STOP LANDED AFTER THE COHORT WAS COVERED. It is still
                 # announced -- an operator asked for something and got it, and
@@ -4055,8 +4287,17 @@ def main():
                 if STOP_SWITCH.message:
                     console.out(f"  note           {STOP_SWITCH.message}")
                 console.out(f"  noticed in     the {STOP_SWITCH.detected_in}")
-                console.out("  run row        STOPPED (not KILLED, not "
-                            "FINISHED)")
+                # `_terminal_status` AND NOT THE LITERAL "STOPPED" THIS LINE
+                # CARRIED. Under `_stopped_mid_cohort` the derivation yields
+                # exactly that string, so the printed bytes are unchanged -- and
+                # the line stops being correct BY COINCIDENCE OF ITS GUARD,
+                # which is the same defect `_terminal_status`'s own note
+                # describes about the block it replaced. It is what makes
+                # tests/test_storage_run_identity.py's "every `run row` line
+                # reads the same local the row does" a property rather than a
+                # count.
+                console.out(f"  run row        {_terminal_status} (not "
+                            f"KILLED, not FINISHED)")
                 # NOT A LITERAL "kept". See describe_checkpoint_state: with the
                 # checkpoint directory unwritable this line used to promise a
                 # resume that would have re-billed the whole cohort.
@@ -4096,11 +4337,21 @@ def main():
             # (`touch`) and therefore the common case. finalize_run_record
             # leaves the column alone for a None rather than writing NULL over
             # it; see its `note` argument.
+            # ``stop_reason`` IS WRITTEN ON EVERY STOP PATH, INCLUDING THE ONE
+            # WHOSE ROW IS **NOT** STOPPED -- the same rule ``note`` follows one
+            # argument up, and for the same reason. A stop that landed after the
+            # cohort was covered leaves the row FINISHED, and "the spend gate
+            # fired during this campaign" is exactly as worth keeping there: a
+            # reviewer comparing two FINISHED campaigns is entitled to know that
+            # one of them skipped its resample pass because the budget ran out.
+            # A reader asking WHICH of the two happened reads `status`, which is
+            # what says it.
             finalize_run_record(
                 _run_record_id,
                 _terminal_status,
                 db_path=_reconcile_db,
                 note=(STOP_SWITCH.message if STOP_SWITCH.requested else None),
+                stop_reason=_stop_reason,
             )
 
             return results_list

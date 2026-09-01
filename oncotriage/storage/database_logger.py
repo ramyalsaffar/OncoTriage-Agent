@@ -88,7 +88,7 @@ import time
 import urllib.parse
 from collections import Counter
 from datetime import datetime
-from typing import Dict
+from typing import Dict, NamedTuple
 
 from oncotriage import paths
 from oncotriage import settings
@@ -229,6 +229,12 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 7: `runs.stop_reason`, added with RUN_COLUMN_ADDITIONS and its migration
+#        loop. A run stopped by the spend gate and a run stopped by an operator
+#        are both STOPPED -- the campaign covers a prefix of the cohort, the
+#        checkpoint is intact, a resume continues -- and only this column says
+#        which. Additive TEXT, NULL on every existing row and on every run that
+#        was not stopped, never backfilled.
 # ERA 6: `inferences.llm_classifier_input_tokens_estimated` and
 #        `inferences.llm_classifier_input_budget`, added together with
 #        INFERENCE_COLUMN_ADDITIONS -- one era, two columns, on era 5's
@@ -264,7 +270,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 6
+SCHEMA_USER_VERSION = 7
 
 
 #------------------------------------------------------------------------------
@@ -1585,6 +1591,10 @@ RUN_COLUMN_ADDITIONS = {
     # IT IS FREE TEXT AN OPERATOR TYPED, so it is deliberately NOT a loggable
     # field and nothing branches on it. It is stored, and it is read by a human.
     "note": "TEXT",
+    # WHICH STOP THIS WAS, AS A CLOSED MACHINE-READABLE VOCABULARY.
+    # See RUN_STOP_REASONS below for the members and for why this is a column
+    # beside `status` rather than two more members OF `status`.
+    "stop_reason": "TEXT",
 }
 
 
@@ -1966,7 +1976,7 @@ records the START of one as well, so it needs the live value that tuple omits.
 """
 
 RUN_RECORD_STATUS_STOPPED = "STOPPED"
-"""A run an operator asked to stop, which stopped cleanly between patients.
+"""A run that stopped cleanly between patients rather than covering its cohort.
 
 NOT ``KILLED`` AND NOT ``FINISHED``, and it is a third value rather than a flag
 on either because it answers a question neither can. ``KILLED`` means the
@@ -1979,9 +1989,14 @@ from "something went wrong", because only the second is worth investigating, and
 a reviewer needs to tell "this campaign covers the cohort" from "this campaign
 covers a prefix of it", because only the first supports a rate.
 
-THE SWITCH THAT PRODUCES IT is ``oncotriage/batch/runner.py:STOP_SWITCH`` -- a
-sentinel file in the checkpoint directory, polled between patients at the
-checkpoint's own cadence. See ``stop_switch_path()`` there.
+THREE MECHANISMS PRODUCE IT AND ``runs.stop_reason`` IS WHAT SAYS WHICH.
+This paragraph named one -- ``oncotriage/batch/runner.py:STOP_SWITCH``, the
+sentinel file polled between patients at the checkpoint's own cadence -- and it
+was true of every STOPPED row written before era 7. The other two are
+``oncotriage/spend.py``'s cap and its per-invocation billed-call ceiling. All
+three end a run in exactly the shape this status describes, which is why they
+share it; see ``RUN_STOP_REASONS`` for why the distinction is a column rather
+than three statuses.
 
 MLflow HAS NO SUCH STATUS, which is why this tuple stops being value-identical
 to ``tracking.RUN_STATUSES`` -- see ``RUN_RECORD_STATUSES_BEYOND_TRACKING``.
@@ -2076,6 +2091,104 @@ Closed for ``deps.OVERRIDE_KEYS``' reason: a caller may branch on it
 exhaustively, and a status outside it is a run that no ``WHERE status = ...``
 will ever return.
 """
+
+
+CAMPAIGN_RESUMABLE_STATUSES = ("KILLED", "FAILED", "STOPPED")
+"""The statuses a resumed run may attach to.
+
+``RUN_RECORD_TERMINAL_STATUSES`` minus FINISHED, and a strict subset of it --
+``oncotriage/storage/queries.py`` carries the guard that says so, beside the
+SQL it protects.
+
+WRITTEN OUT RATHER THAN DERIVED as ``[s for s in RUN_RECORD_TERMINAL_STATUSES
+if s != "FINISHED"]``, which was the obvious form and is the wrong one: a
+terminal status added tomorrow would silently become resumable without anybody
+deciding that it should. Listing them makes that guard a real check and makes a
+new status a deliberate edit here.
+
+TWO CONSUMERS, ONE OWNER. ``queries.campaign_summary`` stitches every campaign
+in the table with a recursive CTE; ``campaign_spend_before`` below walks ONE
+chain backwards to seed a resumed run's spend gate. They must agree about what
+a campaign IS or a budget would be computed over a different set of runs than
+the report that presents it -- so they read one tuple rather than two.
+
+IT LIVED IN ``queries.py`` UNTIL THE SPEND-GATE PASS and moved here rather than
+being copied, because the second consumer is one layer DOWN: ``queries`` imports
+this module, so this module cannot import it back.
+
+STOPPED IS RESUMABLE FOR THE SAME REASON KILLED IS, and more strongly. A stop is
+an operator -- or, since era 7, the spend gate -- saying "pause this campaign";
+the checkpoint is intact by construction, and the whole point is that the next
+invocation picks up where it left off. A stopped fragment that did NOT stitch
+would report the resumed half as a separate campaign covering a fraction of the
+cohort.
+"""
+
+
+RUN_STOP_REASON_OPERATOR = "operator"
+"""A human wrote the ``STOP`` sentinel. ``oncotriage/control.py``'s switch."""
+
+RUN_STOP_REASON_SPEND_CAP = "spend_cap"
+"""The campaign reached ``config.SPEND_CAP_USD``. See ``oncotriage/spend.py``."""
+
+RUN_STOP_REASON_CALL_CEILING = "call_ceiling"
+"""One Stage 5 invocation hit its derived billed-call ceiling.
+
+NOT a budget event and it must not be read as one: the campaign may be nowhere
+near its cap. It means a single invocation asked for more billed calls than the
+configuration can legitimately produce, which is a defect in this pipeline.
+"""
+
+RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR,
+                    RUN_STOP_REASON_SPEND_CAP,
+                    RUN_STOP_REASON_CALL_CEILING)
+"""Every value ``runs.stop_reason`` may hold. CLOSED.
+
+WHY THIS IS A COLUMN AND NOT THREE MORE MEMBERS OF ``RUN_RECORD_STATUSES``, and
+the alternative was built far enough to be measured before it was rejected.
+
+``runs.status`` answers HOW A RUN ENDED, and its four members partition that
+question. A spend stop's answer to it is BYTE-IDENTICAL to an operator stop's:
+every patient it started completed and was written, patients remain that it
+never began, the checkpoint is intact, and a resume continues. That is
+``RUN_RECORD_STATUS_STOPPED``'s definition, unamended.
+
+So a fifth and sixth status would be two more members that every exhaustive
+consumer -- ``TRACKING_STATUS_FOR``, ``CAMPAIGN_RESUMABLE_STATUSES``,
+``campaign_summary``'s generated predicate, the Run Health tab's
+``health_record`` CASE, ``tests/test_storage_run_identity.py``'s composition pin
+-- would have to learn, and every one of them would answer IDENTICALLY for all
+three. A distinction on which no consumer branches differently is a distinction
+that belongs in a different column; that is ``verdict_source``'s argument one
+table over, where ``canonical`` is a value of its own column rather than a
+fourth member of ``eligible``.
+
+WHAT THE COLUMN BUYS THAT ``note`` CANNOT. ``runs.note`` already carries the
+operator's own words and is deliberately free text -- unbranchable, ungroupable,
+and NULL on every stop where nobody typed anything (``touch`` is the documented
+gesture). "Which mechanism stopped this campaign" is a ``GROUP BY``, and a
+``GROUP BY`` over free text is the query item 38 had to remove from
+``pipeline_consistency``.
+
+NULL MEANS "NOT A STOP, OR A ROW WRITTEN BEFORE ERA 7" and those two are not
+separable in this column alone -- ``status`` separates them, which is why they
+can share a NULL. A FINISHED or KILLED row carries NULL here by construction.
+
+**ONE CORRECTION THIS FORCES, MADE IN THE SAME COMMIT.**
+``RUN_RECORD_STATUS_STOPPED``'s docstring said "a run AN OPERATOR ASKED TO
+STOP" and named the sentinel as "THE SWITCH THAT PRODUCES IT". That was true of
+every STOPPED row ever written and stopped being true here; the docstring now
+names all three producers and points at this tuple.
+"""
+
+if len(set(RUN_STOP_REASONS)) != len(RUN_STOP_REASONS):
+    # A RuntimeError and not an `assert`: `python -O` deletes assert statements,
+    # and a duplicated member would make a GROUP BY over this column report two
+    # mechanisms as one -- which is the whole thing the column exists to
+    # prevent.
+    raise RuntimeError(
+        f"RUN_STOP_REASONS must have no duplicates; it is {RUN_STOP_REASONS!r}")
+
 
 
 RUN_FINGERPRINT_COLUMNS = (
@@ -3621,6 +3734,13 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     # exists at all.
     values["note"] = None
 
+    # NULL AT OPEN FOR ``note``'s REASON, and one more of its own. Which
+    # mechanism stopped a run is a statement about how it ENDED, so only
+    # ``finalize_run_record`` can fill it -- and NULL here is also what makes
+    # ``stop_reason IS NULL`` mean "this run was not stopped" on every row of
+    # every era rather than only on the ones written before era 7.
+    values["stop_reason"] = None
+
     # EVERY DECLARED COLUMN HAS A VALUE, CHECKED BEFORE THE INSERT.
     #
     # `RUN_COLUMNS` is derived from `RUN_COLUMN_ADDITIONS`, so adding an entry
@@ -3717,7 +3837,178 @@ def _coerce_run_note(note, run_id):
     return text
 
 
-def finalize_run_record(run_id, status, db_path=None, note=None):
+class CampaignSpend(NamedTuple):
+    """What the runs this one is RESUMING already spent. See
+    ``campaign_spend_before``."""
+
+    usd: float = 0.0
+    rows: int = 0
+    unpriced: int = 0
+    run_ids: tuple = ()
+
+    @property
+    def runs(self) -> int:
+        return len(self.run_ids)
+
+
+def campaign_spend_before(run_id, db_path=None) -> CampaignSpend:
+    """The billed spend of the runs this run is resuming. NEVER RAISES.
+
+    WHY A RESUME MUST ASK. ``config.SPEND_CAP_USD`` is a CAMPAIGN budget. A cap
+    that reset with each invocation is not a brake at all: a run that tripped
+    the cap and was restarted -- by a systemd ``Restart=``, a cron entry, an
+    operator who thought it had hung -- would get a fresh $300 every time, and
+    the run lock (which forbids CONCURRENT runs) does nothing about SEQUENTIAL
+    ones. This is what closes that.
+
+    THE ROWS ARE THE SOURCE OF TRUTH, and there is no second one. The checkpoint
+    could have carried a running total, and that was rejected: it is a control
+    file an operator may delete (``--fresh`` does), it is written by the very
+    process whose spend it would be claiming, and it would be a SECOND ledger to
+    keep in step with the one the database already holds. ``inferences`` rows are
+    what the money actually bought.
+
+    WHICH RUNS COUNT -- ``campaign_summary``'s STITCH, WALKED FORWARD.
+    A run with ``resumed = 1`` continues the campaign of the nearest PRECEDING
+    run whose status is in ``CAMPAIGN_RESUMABLE_STATUSES`` and whose fingerprint
+    columns are all identical; chains stitch transitively. That rule is
+    ``oncotriage/storage/queries.py``'s and it is not re-decided here -- what is
+    different is only the direction: that query stitches every campaign in the
+    table at once with a recursive CTE, and this walks ONE chain backwards from
+    a known run in a few round trips.
+
+    THE TWO ARE PINNED AGAINST EACH OTHER by ``tests/test_spend_gate.py``, on
+    ``RUN_RECORD_TERMINAL_STATUSES``' precedent: a restated rule is a rule that
+    can drift, so it is checked rather than promised. A test may import both.
+
+    WHY NOT SIMPLY REUSE ``campaign_summary``. It is a REPORTING query over the
+    whole table, keyed on a campaign's FIRST run; this needs the answer for a
+    run that has just been created and has no rows of its own yet, at the top of
+    ``main()``, before the first billed call. Running the whole recursive stitch
+    to read one chain would also make every batch run's startup cost a full-table
+    scan of ``runs`` joined to ``inferences``.
+
+    WHY THE FINGERPRINT MUST MATCH, and it is the same argument
+    ``campaign_summary`` makes: a prompt bump, a renderer edit, a re-index or a
+    model change between the crash and the resume breaks the chain, because
+    "which configuration produced this number" is the question a campaign total
+    is asked. A budget follows the campaign, and a re-configured run is a new
+    campaign.
+
+    NULLS: SQLite's ``IS`` is null-safe equality, so a field that degraded to
+    NULL on both sides compares equal -- correct -- and two runs with NO STAMP
+    AT ALL would also compare equal, which is not. Both sides are therefore
+    additionally required to carry a ``fingerprint_version``, which is
+    ``run_fingerprint``'s own key for "unknown configuration" and is
+    ``campaign_summary``'s guard restated.
+
+    A ROW WITH A NULL COST IS COUNTED IN ``unpriced`` AND CONTRIBUTES NOTHING TO
+    ``usd``, which makes the sum a FLOOR. That is stated by every consumer --
+    ``spend.describe_seed`` prints "<- A FLOOR, NOT A TOTAL" -- rather than
+    hidden, because the direction of the error matters: a floor UNDER-counts,
+    so the gate lets the campaign spend more than it should. The alternative,
+    refusing to resume, would make one unpriceable historical row block a
+    campaign; ``print_cost_by_model`` faced the identical choice and made the
+    identical call.
+
+    Args:
+        run_id: the row this run just opened. ``None`` returns an empty result
+            rather than raising -- a caller with no run row has no campaign.
+        db_path: the database the run row is in.
+
+    Returns:
+        ``CampaignSpend``. Empty on any failure, which is the direction argued
+        below.
+
+    IT NEVER RAISES, AND THE DIRECTION IS THE UNCOMFORTABLE HALF. A failure here
+    returns an EMPTY seed, so a resumed run starts its budget at zero and may
+    spend a second full cap. The alternative -- refusing to run -- turns a
+    read-only bookkeeping query into something that can stop a campaign, and
+    this is called at the top of ``main()`` where the honest failure is "this
+    database could not be read", which every write below would hit anyway. The
+    failure is COUNTED into ``RUN_RECORD_FAILURES`` under ``campaign_spend:``
+    and printed, so it is never silent.
+    """
+    try:
+        if run_id is None:
+            return CampaignSpend()
+
+        db_path = resolve_inference_db_path(db_path)
+        conn = _open_connection(db_path)
+        try:
+            cursor = conn.cursor()
+            _fp = ", ".join(RUN_FINGERPRINT_COLUMNS)
+            cursor.execute(
+                f"SELECT id, resumed, {_fp} FROM runs WHERE id = ?", (run_id,))
+            row = cursor.fetchone()
+            if row is None:
+                RUN_RECORD_FAILURES["campaign_spend:row_not_found"] += 1
+                return CampaignSpend()
+
+            _stamp = list(row[2:])
+            # NO STAMP, NO CHAIN. `fingerprint_version` is RUN_FINGERPRINT_COLUMNS'
+            # first member and is `run_fingerprint`'s own key for "this
+            # configuration was never recorded". Stitching on an all-NULL stamp
+            # would make every unstamped run in the table one campaign.
+            if _stamp[0] is None:
+                return CampaignSpend()
+
+            _match = " AND ".join(f"{c} IS ?" for c in RUN_FINGERPRINT_COLUMNS)
+            _statuses = ", ".join("?" for _ in CAMPAIGN_RESUMABLE_STATUSES)
+
+            chain = []
+            cur_id, cur_resumed = row[0], row[1]
+            # THE WALK IS BOUNDED BY `id <` AND CANNOT LOOP: each step selects a
+            # STRICTLY smaller id, so the sequence is decreasing in a finite set.
+            # A `seen` guard would be defending against a database in which a
+            # row's id is not its own.
+            while cur_resumed == 1:
+                cursor.execute(
+                    f"SELECT id, resumed FROM runs "
+                    f"WHERE id < ? AND status IN ({_statuses}) "
+                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
+                    f"ORDER BY id DESC LIMIT 1",
+                    (cur_id, *CAMPAIGN_RESUMABLE_STATUSES, *_stamp))
+                prev = cursor.fetchone()
+                if prev is None:
+                    break
+                chain.append(prev[0])
+                cur_id, cur_resumed = prev[0], prev[1]
+
+            if not chain:
+                return CampaignSpend()
+
+            _ids = ", ".join("?" for _ in chain)
+            cursor.execute(
+                f"SELECT COALESCE(SUM(estimated_cost_usd), 0.0), "
+                f"       COUNT(*), "
+                f"       SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 "
+                f"                ELSE 0 END) "
+                f"FROM inferences WHERE run_id IN ({_ids})",
+                tuple(chain))
+            total, rows, unpriced = cursor.fetchone()
+        finally:
+            conn.close()
+
+        return CampaignSpend(usd=float(total or 0.0), rows=int(rows or 0),
+                             unpriced=int(unpriced or 0),
+                             run_ids=tuple(reversed(chain)))
+
+    except Exception as exc:                                   # noqa: BLE001
+        RUN_RECORD_FAILURES[f"campaign_spend:{type(exc).__name__}"] += 1
+        console.out(f"⚠ The campaign's prior spend could not be read "
+                    f"(non-critical): {type(exc).__name__}: {exc}")
+        log.error("the resumed campaign's prior spend could not be read, so "
+                  "this run's spend gate starts from zero",
+                  event="campaign_spend_unreadable",
+                  inference_run_id=run_id,
+                  error_type=type(exc).__name__, error_message=str(exc))
+        return CampaignSpend()
+
+
+
+def finalize_run_record(run_id, status, db_path=None, note=None,
+                        stop_reason=None):
     """Stamp ``finished_at`` and ``status`` on a run row. NEVER RAISES.
 
     Args:
@@ -3736,6 +4027,21 @@ def finalize_run_record(run_id, status, db_path=None, note=None):
         db_path: the database the run row is in. Must resolve to the same file
                  ``start_run_record`` wrote to; ``None`` means the configured
                  production database.
+        stop_reason: one of ``RUN_STOP_REASONS``, or ``None``.
+
+                 ``None`` LEAVES THE COLUMN ALONE, exactly as ``note`` does and
+                 for its reason: this function is public, nothing stops a caller
+                 finalizing twice, and an unconditional ``stop_reason = ?``
+                 would let a second call erase the first's.
+
+                 AN UNRECOGNISED VALUE IS REFUSED AND COUNTED, never stored.
+                 The column exists to be grouped on, and a value outside the
+                 closed vocabulary is a bucket no ``GROUP BY`` consumer knows
+                 about -- which is the failure a closed vocabulary with an open
+                 writer produces. It is refused rather than mapped to a default,
+                 because every default available here is a claim about a
+                 mechanism that may not have run.
+
         note:    free text explaining how the run ended, or ``None``.
 
                  ``None`` LEAVES THE COLUMN ALONE rather than writing NULL over
@@ -3830,6 +4136,23 @@ def finalize_run_record(run_id, status, db_path=None, note=None):
         if _stored_note is not None:
             _assignments.append("note = ?")
             _bind.append(_stored_note)
+        # THE REASON IS VALIDATED HERE AND NOT COERCED. See the `stop_reason`
+        # argument: a value outside RUN_STOP_REASONS is refused and counted, so
+        # a typo leaves the column NULL -- which reads as "not a stop" and is
+        # wrong in the honest direction -- rather than creating a bucket that
+        # every GROUP BY over this column silently ignores.
+        if stop_reason is not None:
+            if stop_reason in RUN_STOP_REASONS:
+                _assignments.append("stop_reason = ?")
+                _bind.append(stop_reason)
+            else:
+                RUN_RECORD_FAILURES[
+                    f"finalize:unknown_stop_reason:{stop_reason}"] += 1
+                log.warning("an unrecognised run stop reason was refused "
+                            "rather than stored; runs.stop_reason is left as "
+                            "it was",
+                            event="run_record_stop_reason_refused",
+                            inference_run_id=run_id, reason=str(stop_reason))
         _bind.append(run_id)
 
         with _WRITE_LOCK:

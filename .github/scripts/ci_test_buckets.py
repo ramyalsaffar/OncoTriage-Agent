@@ -1447,6 +1447,27 @@ BUCKETS = {
         "and FHIR file is inside a tempfile.mkdtemp it removes and asserts "
         "gone; the two package files it reads are sha256-compared at the end",
     ),
+    "test_spend_gate.py": (
+        _A, None,
+        "ran green in ~1.6s, 151 checks, against ONLY the directory skeleton: "
+        "the run spend gate and its per-invocation billed-call ceiling. No "
+        "network, no keys, NO SPEND -- every model response is a literal "
+        "served by a stub installed through oncotriage/agent/deps.py and the "
+        "graph is never invoked -- no live Qdrant, NO MODEL LOAD "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports and section "
+        "10 asserts torch and transformers never entered sys.modules), no "
+        "corpus, no git history, no live server. It DRIVES THE REAL Stage 5 "
+        "node and the REAL run_batch (with process_patient a stand-in that "
+        "charges the ledger, so the submit loop, the sweep, _on_done and the "
+        "executor lifecycle are the shipped ones). NOT in the collision "
+        "matrix: every database is inside a tempfile.mkdtemp it removes and "
+        "asserts gone, paths._RESOLVED is seeded so nothing can resolve to the "
+        "production tree, and the four repository files it reads "
+        "(agent/evaluation.py, spend.py, storage/database_logger.py, "
+        "batch/runner.py) are written by neither of the suite's two writers "
+        "and are sha256-compared at the end. It DOES exec: six in-memory "
+        "copies of agent/evaluation.py, one plant each, argued at "
+        "_EXEC_ALLOWLIST."),
     "test_storage_run_identity.py": (
         _A, None,
         # RE-READ OFF A REAL RUN (this pass). The string it replaces was wrong

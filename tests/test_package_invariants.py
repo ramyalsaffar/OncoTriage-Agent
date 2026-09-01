@@ -1183,6 +1183,28 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # sha256'd before the first plant and compared in its
                    # section 10.
                    "tests/test_agent_stage5_per_trial_calls.py",
+                   # SIX execs, each an in-memory copy of
+                   # oncotriage/agent/evaluation.py with ONE part of the RUN
+                   # SPEND GATE broken: the gate removed from each of the three
+                   # billed call sites in turn, the ledger charge removed from
+                   # the wave, and the refusal's inheritance from
+                   # Stage5ShutdownRequested broken so the send loop isolates it
+                   # to its trial instead of failing the patient -- plus one
+                   # no-op that runs the UNPLANTED module through the identical
+                   # probe, which is what makes the other five measurements
+                   # rather than a probe that always answers zero. A `git show`
+                   # control can supply none of them: the gate is new, so no
+                   # blob carries a version with one site ungated -- and the
+                   # inheritance plant is a state no commit has ever had. Nor
+                   # can a real condition: they are one-line deletions inside
+                   # closures over the node's frame, and the file already varies
+                   # every input that CAN be varied (the cap, the seed, the
+                   # parallel bound, the trial list, the call mode) for the
+                   # checks that need no plant. A plant whose needle does not
+                   # appear exactly once is a NAMED failure, and the three
+                   # repository files it reads are sha256'd before the first
+                   # plant and compared in its section 10.
+                   "tests/test_spend_gate.py",
                    # NINE execs, each an in-memory copy of
                    # oncotriage/agent/bedrock_adapter.py with ONE mapping
                    # broken: max_output_tokens deleted, `store` no longer sent,
@@ -4306,6 +4328,28 @@ _DECORATOR_INVENTORY = {
     "oncotriage/retrieval/indexer.py::scroll_criteria_split_distribution._page":
         ["qdrant_retry"],
     "oncotriage/registries/mesh.py::MeSHCancerFilter._stem": ["staticmethod"],
+    # The spend-gate pass. TEN @property READERS AND NOT ONE SETTER, which is
+    # the shape rather than an accident: `SpendLedger` and `Stage5CallCounter`
+    # are both read from the hot path -- `cap_exceeded()` runs before every
+    # billed request and `_start_patient_unless_stopped` reads the latch once
+    # per patient -- and every mutation goes through a METHOD that takes the
+    # lock (`charge`, `seed`, `reset`, `take`). A settable attribute would be
+    # a read-modify-write nothing serialises, which is the defect the ledger's
+    # own lock exists to remove.
+    #
+    # `LedgerSeed.is_floor` and `CampaignSpend.runs` are NamedTuple properties:
+    # derived readings over fields already present, so they cannot disagree with
+    # the tuple the way a second stored field could.
+    "oncotriage/spend.py::LedgerSeed.is_floor": ["property"],
+    "oncotriage/spend.py::SpendLedger.measured": ["property"],
+    "oncotriage/spend.py::SpendLedger.calls": ["property"],
+    "oncotriage/spend.py::SpendLedger.seeded": ["property"],
+    "oncotriage/spend.py::SpendLedger.total": ["property"],
+    "oncotriage/spend.py::Stage5CallCounter.ceiling": ["property"],
+    "oncotriage/spend.py::Stage5CallCounter.call_mode": ["property"],
+    "oncotriage/spend.py::Stage5CallCounter.issued": ["property"],
+    "oncotriage/spend.py::Stage5CallCounter.refusals": ["property"],
+    "oncotriage/storage/database_logger.py::CampaignSpend.runs": ["property"],
     # The structured-logging pass. `_Console` is a namespace of @staticmethods
     # rather than a module of bare functions so that `console.out` reads at
     # 1,100 call sites the way `print` did; `progress` stacks

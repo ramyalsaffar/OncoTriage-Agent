@@ -167,6 +167,7 @@ from oncotriage.storage.database_logger import (
     RUN_METRIC_CATEGORY_META,
     RUN_METRIC_META_COUNTERS_NONZERO,
     RUN_METRIC_META_COUNTERS_REGISTERED,
+    CAMPAIGN_RESUMABLE_STATUSES,
     RUN_FINGERPRINT_COLUMNS,
     RUN_RECORD_STATUS_RUNNING,
     RUN_RECORD_TERMINAL_STATUSES,
@@ -1011,7 +1012,6 @@ database answer the run questions" cannot disagree about the list."""
 #     by `oncotriage/batch/runner.py` and `oncotriage/ablation/study.py`; the API
 #     writes none, on purpose, so nothing it produces appears here at all.
 
-CAMPAIGN_RESUMABLE_STATUSES = ("KILLED", "FAILED", "STOPPED")
 """The statuses a resumed run may attach to. `RUN_RECORD_TERMINAL_STATUSES`
 minus FINISHED, and a strict subset of it by construction -- see the guard
 below. A FINISHED run has nothing left to resume, so gluing a later invocation
@@ -1030,7 +1030,17 @@ construction (the switch is polled at the checkpoint's own cadence, so every
 completed patient is in it), and the whole point of the switch is that the next
 invocation picks up where it left off. A stopped fragment that did NOT stitch
 would report the resumed half as a separate campaign covering a fraction of the
-cohort -- which is exactly the fragmentation this query exists to undo."""
+cohort -- which is exactly the fragmentation this query exists to undo.
+
+IT MOVED TO ``oncotriage/storage/database_logger.py`` (the spend-gate pass) AND
+IS IMPORTED, NOT RESTATED. A second consumer appeared --
+``campaign_spend_before``, which walks the SAME chain backwards to seed a
+resumed run's budget -- and it lives one layer DOWN, in the module that owns the
+`runs` table, so it cannot import this one (this imports it, and the reverse is
+a cycle). The choice was between a third copy of a three-member tuple whose
+whole value is that adding a status is a deliberate edit, or one owner in the
+module that owns the vocabulary it is a subset of. The guard below is unchanged
+and still runs HERE, where the SQL it protects is."""
 
 CALL_MODE_OMISSION_REASON = "omitted_from_model_response"
 """`trial_matches.not_evaluable_reason` for a trial the model was SENT and did
