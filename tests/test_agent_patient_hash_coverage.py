@@ -349,17 +349,67 @@ def moved(base_field, record, **change):
     return guarded(lambda: H(a) != H(b))
 
 
-# --- allergies: display, category, criticality IN; code, onset_date,
+# --- allergies: display, category, criticality, onset_date IN; code,
 #     clinical_status, verification_status OUT ------------------------------
+#
+# ONSET_DATE MOVED FROM THE SECOND LOOP TO THE FIRST, AND THE FLIP IS THE
+# POINT OF THE PAIR RATHER THAN A RELAXATION OF IT. This check read
+# "allergies.onset_date is NOT hashed (nothing downstream reads it)" and was
+# right for as long as its parenthesis was true: the Allergies section of
+# _create_patient_summary printed display, category and criticality and never
+# the date, so hashing it would have moved a hash no prompt could see -- the
+# value_shape mistake this whole section exists to police. The renderer prints
+# the date now, which CREATES the consumer and reverses the reading exactly.
+# Leaving the old pin in place would have pinned the defect: two patients
+# differing only in allergy onset rendering two different prompts under one
+# hash, which is the promise compute_patient_hash's docstring makes.
+#
+# The value is a full ISO stamp with a time and an offset because that is what
+# the corpus carries and what the parser stores. The RENDERER slices it to ten
+# characters; the HASH takes it raw, matching every sibling dated entry
+# (`proc`, `met`, `obs`, the stage observations), so this check is also what
+# pins that choice -- see 3a-ii for its measured consequence.
 for _sub, _val in (("display", "Penicillin G"), ("category", "medication"),
-                   ("criticality", "high")):
+                   ("criticality", "high"),
+                   ("onset_date", "1999-09-09T00:00:00Z")):
     check(f"3a  allergies.{_sub} is hashed",
           moved("allergies", ALLERGY, **{_sub: _val}), True)
-for _sub, _val in (("code", "999999"), ("onset_date", "1999-09-09T00:00:00Z"),
+for _sub, _val in (("code", "999999"),
                    ("clinical_status", "inactive"),
                    ("verification_status", "unconfirmed")):
     check(f"3a  allergies.{_sub} is NOT hashed (nothing downstream reads it)",
           moved("allergies", ALLERGY, **{_sub: _val}), False)
+
+# THE STATED COST OF HASHING THE RAW STAMP, MADE EXECUTABLE RATHER THAN LEFT AS
+# A SENTENCE IN A COMMENT. The renderer prints onset_date[:10], so two records
+# differing only in the time-of-day or the UTC offset of one allergy stamp
+# produce byte-identical prompt text and DIFFERENT hashes. That is the narrow
+# converse of the value_shape rule and it is accepted deliberately, because
+# four sibling entries already accept it for their own dates and one collection
+# hashing dates differently from the rest is a worse thing to have to remember.
+# Pinned here so the trade is a measurement somebody can revisit rather than a
+# claim, and so a future pass that switches to hashing the slice has to come
+# through this check and rewrite the argument.
+#
+# THE PERTURBATION IS DERIVED FROM THE FIXTURE, NOT RETYPED BESIDE IT. It
+# changes ONLY what falls after the tenth character of ALLERGY's own stamp, so
+# `onset_date[:10]` -- the whole of what the renderer prints -- is byte-
+# identical on both sides. A value with a different DAY would have passed this
+# check for the ordinary reason and measured nothing, and a literal typed here
+# would stop being that value the moment somebody edits the fixture. The other
+# half of the claim, that the rendered LINE really is unchanged, is driven in
+# tests/test_agent_summary_allergy_onset.py, which has the renderer.
+_ALLERGY_SAME_DAY = ALLERGY["onset_date"][:10] + "T23:59:59-08:00"
+check("3a-ii  the raw stamp is hashed, not the rendered [:10] slice: a change "
+      "to the time-of-day alone moves the hash while the prompt line does not "
+      "-- the accepted converse of the value_shape rule",
+      moved("allergies", ALLERGY, onset_date=_ALLERGY_SAME_DAY), True)
+check("3a-ii  non-degeneracy: the perturbation really does leave the rendered "
+      "slice alone AND really is a different raw value, so the check above is "
+      "about the raw/sliced distinction and not about a changed day",
+      (_ALLERGY_SAME_DAY[:10] == ALLERGY["onset_date"][:10],
+       _ALLERGY_SAME_DAY != ALLERGY["onset_date"]),
+      (True, True))
 
 # --- variants: seven in; code, genomic_source, value out ------------------
 for _sub, _val in (("display", "BRAF p.Val600Glu: Present"),

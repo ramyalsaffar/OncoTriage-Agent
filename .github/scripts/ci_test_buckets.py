@@ -536,6 +536,16 @@ BUCKETS = {
         "scanned against what the nodes actually return. Static analysis over "
         "the package's own AST -- no network, no keys, no spend, no git "
         "history, no corpus, no database, no subprocess"),
+    "test_agent_summary_allergy_onset.py": (
+        _A, None,
+        "ran green in 1.2s, 36 checks, against ONLY the directory skeleton: "
+        "the allergy onset date the summary renders and the hash covers, and "
+        "the coupling between the two. Every patient is a literal dict; the "
+        "registries _create_patient_summary resolves read no data file for "
+        "these records. Both plants go into an in-memory copy of "
+        "oncotriage/agent/patient.py, which is sha256-compared at the end, so "
+        "nothing is written anywhere. No network, no keys, no spend, no "
+        "corpus, no database, no git history, no model"),
     "test_agent_summary_cancer_stage.py": (
         _A, None,
         "ran green in 2.0s, 53 checks; every patient is a literal dict, the "

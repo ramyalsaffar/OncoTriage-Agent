@@ -1282,6 +1282,19 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # either: the Cancer Stage section is new, so every revision
                    # that HAS it also has it correct.
                    "tests/test_agent_summary_cancer_stage.py",
+                   # Plants into in-memory copies of agent/patient.py.
+                   # Its two controls are one-token edits INSIDE two function
+                   # bodies -- one field dropped from compute_patient_hash's
+                   # allergy f-string, and the onset part dropped from the
+                   # renderer's line -- so there is no attribute to rebind for
+                   # either. `git show` cannot supply the first, which is the
+                   # one that matters: it needs a tree where the RENDERER
+                   # prints the allergy onset and the HASH ignores it, and no
+                   # revision has ever been in that state -- before this pass
+                   # neither did, after it both do, so a blob would produce a
+                   # module that agrees with itself and measure nothing about
+                   # the coupling.
+                   "tests/test_agent_summary_allergy_onset.py",
                    # Plants into in-memory copies of agent/evaluation.py (the
                    # TRIAL_DATA fence render and its marker neutralization) and
                    # agent/prompts.py (the C6 data boundary). `git show` cannot

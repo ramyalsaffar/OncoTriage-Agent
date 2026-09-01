@@ -1,8 +1,8 @@
 # Stage 5 Summary Temporal Tagging Test
 ######################################
 
-"""``_create_patient_summary`` states elapsed time beside EVERY date it renders,
-and every word of it has to be true of the record it came from.
+"""``_create_patient_summary`` states elapsed time beside every date it renders
+except one, and every word of it has to be true of the record it came from.
 
 WHAT THE CHANGE IS (PROMPT_VERSION 1.8.0)
 -----------------------------------------
@@ -22,8 +22,20 @@ not-active condition marker, and a lab reading past ``config.STALE_LAB_AGE_DAYS`
     Metastasis / Biomarkers / mCODE variants
                         each observation's date
 
-    Demographics, Cancer Stage, Allergies and the Tier C / background summary
-    lines render NO date and therefore gain NOTHING.
+    Demographics and the Tier C / background summary lines render NO date and
+    therefore gain NOTHING. Cancer Stage left that group when its two
+    observation-backed tiers gained a staging date and an interval with it.
+
+    ALLERGIES IS THE ONE NAMED EXCEPTION, AND IT IS PARTITIONED OUT RATHER THAN
+    TOLERATED. It renders the parser's onset_date and NO elapsed phrase, on a
+    measured ruling argued at that section: 471 of 471 allergy stamps in this
+    corpus take _parse_allergy's recordedDate arm and run 19 to 99 years old, so
+    an interval there would be a near-constant restated on every allergy of
+    every patient. Section 8's sweep therefore holds BOTH halves -- everything
+    outside Allergies must state an interval, and everything inside it must
+    state none -- so neither the rule nor its exception can quietly grow, and
+    each half carries a non-degeneracy count because an empty partition
+    satisfies either for free.
 
 WHY THE FAILURE MODE IS SILENT IN BOTH DIRECTIONS
 -------------------------------------------------
@@ -835,7 +847,13 @@ for _label, _needle, _expected in (
     check(f"{_label}: the whole line is date + interval",
           line_for(_after7, _needle), _expected)
 
-# --- the dateless sections, byte-identical with every door shut ------------
+# --- the sections that render NO INTERVAL, byte-identical with every door
+#     shut. NOT "the dateless sections", which is what this group was called
+#     and is no longer true of its first member: Allergies renders a date and
+#     no elapsed phrase, on a ruling argued at that section. The property the
+#     group tests was always the interval rather than the date, so the members
+#     did not move -- the heading was simply describing them by an incidental
+#     fact that has since changed under one of them.
 #
 # THREE OF THEM, SLICED APART RATHER THAN LUMPED TOGETHER. The pre-1.8.0 version
 # of this file compared "demographics + performance status + stage" as one
@@ -860,11 +878,30 @@ for _name, _head, _next in (
 check("allergies: byte-identical with every temporal door shut",
       section(_after7, "\nAllergies:\n", "\nProcedures:"),
       section(_bare7, "\nAllergies:\n", "\nProcedures:"))
-check("allergies: and it really does carry an onset_date the renderer never "
-      "prints, so this is a claim about the RENDERER and not about the data",
-      ("onset_date" in _p7["allergies"][0],
-       "2001" in section(_after7, "\nAllergies:\n", "\nProcedures:")),
-      (True, False))
+
+# THIS PIN INVERTED, DELIBERATELY, AND THE CHECK ABOVE IS WHY IT STILL BELONGS
+# IN THIS GROUP. It read "and it really does carry an onset_date the renderer
+# never prints", pinning `"2001" in <the section>` at False. That was true and
+# is not: the Allergies section renders the parser's onset_date now. What did
+# NOT change is the claim this file exists to make -- the section carries a
+# date and NO elapsed interval, so shutting every temporal door leaves it
+# byte-identical, which is exactly what the check above measures. Before the
+# flip that byte-identity was cheap (a section with no date at all cannot
+# differ); after it, it is the whole ruling: a date is printed and no
+# _event_clause is reachable from it.
+#
+# Pinned as the WHOLE LINE rather than as a substring, because a substring test
+# is equally satisfied by a date rendered with an interval glued to it, which is
+# precisely the change this pins against.
+check("allergies: the date IS printed now -- the ruling is 'raw date, no "
+      "interval', not 'no date' (this pin inverted; see the block above)",
+      line_for(_after7, "Penicillin"),
+      "- Penicillin | medication | criticality: high | onset: 2001-06-06")
+check("allergies: and no elapsed phrase anywhere in the section, which is what "
+      "distinguishes this ruling from every other dated section",
+      (BEFORE_REFERENCE_PHRASE
+       in section(_after7, "\nAllergies:\n", "\nProcedures:")),
+      False)
 check("demographics: byte-identical",
       _after7.split("\n\nPerformance Status:")[0],
       _bare7.split("\n\nPerformance Status:")[0])
@@ -903,9 +940,27 @@ check("the mixed patient rendered all four condition shapes",
        conditions_of(_after7).count("| active |"),
        conditions_of(_after7).count("| unconfirmed |")), (2, 1, 1))
 
-# EVERY RENDERED DATE HAS AN INTERVAL BESIDE IT. The structural form of the
-# whole change, checked over one patient carrying every dated section at once:
-# no line may print a resolvable date without also printing an interval.
+# EVERY RENDERED DATE HAS AN INTERVAL BESIDE IT, WITH ONE NAMED EXCEPTION. The
+# structural form of the whole change, checked over one patient carrying every
+# dated section at once.
+#
+# THE EXCEPTION IS THE ALLERGIES SECTION AND IT IS PARTITIONED OUT BY NAME
+# RATHER THAN TOLERATED. Its lines render the parser's onset_date and no
+# elapsed phrase, on a ruling argued at the section: every allergy stamp in
+# this corpus resolves to a recordedDate decades old, so an interval there
+# would be a near-constant restated on every allergy of every patient.
+#
+# BOTH HALVES ARE CHECKED, WHICH IS WHAT KEEPS THE EXCEPTION FROM BEING A HOLE.
+# Everything outside Allergies must state an interval, as before -- so a new
+# section that renders a bare date still fails here. And everything INSIDE
+# Allergies must state NONE, so the exception cannot quietly grow one: a future
+# pass that adds `_dated_suffix` to that line fails the second check rather
+# than passing the first. Each is paired with a non-degeneracy count, because
+# an empty partition satisfies either half for free.
+#
+# The alternative -- deleting the sweep, or widening it to "an interval OR a
+# bare date" -- is what would have made it vacuous: the second form is
+# satisfied by every line it was written to catch.
 #
 # THE FIRST VERSION OF THIS SWEEP LOOKED FOR "20NN-" over a hardcoded year
 # range and found 7 lines where it demanded 8 -- because a CONDITION line
@@ -930,17 +985,41 @@ def date_bearing(text):
     return [ln for ln in text.splitlines() if _ISO_DATE.search(ln)]
 
 
+def allergy_lines(text):
+    """The Allergies section's own rendered lines -- the named exception."""
+    return [ln for ln in
+            section(text, "\nAllergies:\n", "\nProcedures:").splitlines() if ln]
+
+
+def states_no_interval(lines):
+    """Of `lines`, those printing neither an event clause nor a lab age."""
+    return [ln for ln in lines
+            if BEFORE_REFERENCE_PHRASE not in ln and " old)" not in ln]
+
+
 _DATE_BEARING = date_bearing(_after7)
+_ALLERGY_DATED = [ln for ln in _DATE_BEARING if ln in allergy_lines(_after7)]
+_NON_ALLERGY_DATED = [ln for ln in _DATE_BEARING if ln not in _ALLERGY_DATED]
+
 check("the sweep found every dated section's line, so an empty or short result "
       "is not why this passes",
-      len(_DATE_BEARING), 8)
+      len(_DATE_BEARING), 9)
 check("...and the wider filter finds exactly what the `- ` prefix used to, for "
       "this fixture, so the widening changed the corpus and not the count",
       _DATE_BEARING, [ln for ln in _after7.splitlines()
                       if ln.startswith("- ") and _ISO_DATE.search(ln)])
-check("every date-bearing line also states an interval",
-      [ln for ln in _DATE_BEARING
-       if BEFORE_REFERENCE_PHRASE not in ln and " old)" not in ln], [])
+check("the partition is non-degenerate: the Allergies exception really has a "
+      "dated line in it, so the sweep below is not passing over an empty set",
+      len(_ALLERGY_DATED), 1)
+check("...and the rest of the summary still has eight, so partitioning the "
+      "exception out did not quietly empty the sweep it protects",
+      len(_NON_ALLERGY_DATED), 8)
+check("every date-bearing line OUTSIDE the Allergies section states an interval",
+      states_no_interval(_NON_ALLERGY_DATED), [])
+check("...and every line INSIDE it states none, so the named exception cannot "
+      "grow an interval without failing here",
+      [ln for ln in _ALLERGY_DATED if ln not in states_no_interval(_ALLERGY_DATED)],
+      [])
 
 # THE DATED STAGE SECTION, WHICH _p7 CANNOT CARRY. _p7 has no stage at all --
 # deliberately, it is the fixture for the undated branch -- so the staging date
@@ -958,10 +1037,15 @@ check("cancer stage: the staging date and its interval, on one line",
       f"Cancer Stage: Stage III (from a recorded stage group observation; "
       f"staged {_ECOG_DATE}, {event('214 days')})")
 check("...and the sweep sees it, which the `- ` filter could not",
-      len(date_bearing(_after7s)), 9)
-check("every date-bearing line of the STAGED render states an interval too",
-      [ln for ln in date_bearing(_after7s)
-       if BEFORE_REFERENCE_PHRASE not in ln and " old)" not in ln], [])
+      len(date_bearing(_after7s)), 10)
+check("every date-bearing line of the STAGED render states an interval too, "
+      "outside the same named Allergies exception",
+      states_no_interval([ln for ln in date_bearing(_after7s)
+                          if ln not in allergy_lines(_after7s)]), [])
+check("...and the STAGED render's Allergies line is still the exception, so "
+      "the partition above is not silently swallowing the stage line too",
+      [ln for ln in date_bearing(_after7s) if ln in allergy_lines(_after7s)],
+      ["- Penicillin | medication | criticality: high | onset: 2001-06-06"])
 check("cancer stage: NOT byte-identical with the temporal doors shut, which is "
       "what says the interval is this renderer's and not the record's",
       section(_after7s, "\n\nCancer Stage:", "\n\nConditions:")

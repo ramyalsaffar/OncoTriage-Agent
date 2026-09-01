@@ -726,7 +726,7 @@ python tests/test_storage_write_durability.py                       # 111 passed
 # is the natural control for a pure function of its argument. It DOES need the
 # corpus (sections 4 and 7 parse real bundles read-only) and says so as a
 # recorded failure rather than a silent skip. ~2 min, almost all of it parsing.
-python tests/test_agent_patient_hash_coverage.py                    #  71 (was 69; the pre-diagnosis ECOG pass added 3d-i over the new ecog.primary_diagnosis_date sub-field -- NOT hashed, because it explains a refusal whose outcome already rides in `selection`, which is -- and 3d-ii, its non-degeneracy twin)
+python tests/test_agent_patient_hash_coverage.py                    #  73 (was 71; the allergy-onset pass moved allergies.onset_date from the NOT-hashed loop to the hashed one -- the renderer prints it now, which creates the consumer the old exclusion's own argument turned on -- and added 3a-ii, the raw-stamp-versus-rendered-slice pin, with its non-degeneracy twin. Before that 69; the pre-diagnosis ECOG pass added 3d-i over the new ecog.primary_diagnosis_date sub-field -- NOT hashed, because it explains a refusal whose outcome already rides in `selection`, which is -- and 3d-ii, its non-degeneracy twin)
 
 # The tracking pass. Same shape, same directory. No network, no keys, no spend,
 # no live Qdrant, no corpus, no git history required, not in the collision
@@ -11415,6 +11415,202 @@ DIFFER with the temporal doors shut.
    decision about that file's forty checks.
 6. **The M tier's date is the FIRST cM1 in list order**, not the most recent,
    because the tier does not sort. Stated at the function and pinned by a check.
+
+### The allergy line states when the allergy was recorded (the allergy-onset pass)
+
+**ONE MEASURED CHANGE, AND THE HASH IS THE POINT RATHER THAN A SIDE EFFECT.**
+`oncotriage/fhir/parser.py` has carried `allergies[].onset_date` since allergies
+were parsed at all and `_create_patient_summary` never printed it -- so "no
+severe hypersensitivity reaction within the last 12 months", a real oncology
+exclusion criterion, was unanswerable from a field the pipeline had already
+read, and a stamp from 1930 reached the model looking exactly like one from last
+month. **NO BILLED CALL**; the production `inferences.db` was never opened and
+no fixture was re-captured.
+
+**THE RULING, BOTH HALVES.** APPROVED: the raw date on the allergy line.
+REJECTED, BY MEASUREMENT: an elapsed-interval phrase. **Measured over the whole
+1,000-bundle corpus, twice and from both ends: 471 of 471 `AllergyIntolerance`
+resources take the `recordedDate` arm of `_parse_allergy`'s fallback chain --
+not one carries an `onsetDateTime` or an `onsetPeriod` -- and the resulting
+stamps run 19.1 to 99.1 years old, median 73.1, with NONE under five years.**
+So an interval would be a near-constant restated on every allergy of every
+patient. **The rejection is recorded IN THE CODE**, at the render site, because
+an undocumented deliberate absence reads as a section somebody forgot.
+
+    - Penicillin | medication | criticality: high | onset: 1979-06-06
+
+**THE HASH HAD TO MOVE WITH IT, AND THE OLD EXCLUSION'S ARGUMENT IS WHAT SAYS
+SO.** `compute_patient_hash` excluded `onset_date` under a comment reading "no
+consumer reads it, so two allergies identical except for onset produce
+byte-identical prompt text, and hashing it would move the hash without moving
+the prompt -- the value_shape mistake". Correct while it held. Rendering the
+date CREATES the consumer and reverses it exactly: leave it out and two patients
+differing only in allergy onset render two different prompts under ONE hash,
+which is the promise that function's own docstring makes.
+
+**THE RAW FIELD IS HASHED, NOT THE `[:10]` SLICE THE LINE RENDERS**, matching
+every sibling dated entry -- `proc`, `met`, `obs` and the stage observations all
+hash a raw date beside a section that renders `date[:10]`. **THE COST IS STATED
+AND PINNED RATHER THAN GLOSSED**: a re-serialisation that rewrites only a
+stamp's time-of-day or UTC offset moves the hash, and therefore the `Patient:`
+pseudonym, while no clinical line moves. Accepted because four sibling entries
+already accept it and one collection hashing dates differently from the rest is
+worse to have to remember.
+
+**RECONCILED ACROSS ALL 1,000 BUNDLES, BEFORE AND AFTER, THROUGH A `git
+worktree` AT HEAD:**
+
+| | |
+|---|---|
+| summaries changed | **131** |
+| hashes moved | **131** |
+| allergy-bearing patients | **131** |
+| patients with >= 1 DATED allergy | **131** (every allergy in the corpus is dated) |
+| total allergy records | **471** |
+| the other **869** patients | summary AND hash **byte-unchanged** |
+| lines moved in a changed summary | the allergy lines, **and the `Patient:` pseudonym** -- which is DERIVED from the hash and therefore MUST move. Measured: with the allergy section and that one line removed, **0 of 1,000** summaries differ |
+
+**TWO OF THE TWELVE FIXTURES ARE AFFECTED, established from each fixture's OWN
+stored `patient_data` rather than by a corpus proxy**: `truncation_split` (4
+dated allergies) and `unknown_stage` (3). **The other ten carry no allergies at
+all**, so their summaries and their hashes are byte-unchanged and their recorded
+`patient_data_hash` still matches. They were already stale before this pass --
+the de-identification pass took the replay to 1/12 and the pre-diagnosis ECOG
+pass to 0/12 -- so this adds one field family to a recapture already owed.
+
+**`PROMPT_VERSION` IS UNCHANGED AT 1.9.0 AND `FINGERPRINT_VERSION` AT 3.** The
+TEMPLATE did not move, only the record interpolated into it, which is the
+staging-date pass's ruling applied again; the mechanical half is
+`llm_classifier_renderer_digest`, and **exactly one hashed module moved --
+`agent/patient.py`, the one that was edited** (`67e92481a6c0` -> `e2a63f3a057a`,
+the other five byte-identical). A v3-stamped artifact therefore answers
+FP_CHANGED naming that field, which is correct.
+
+**THREE PINS INVERTED, AND THE BRIEF NAMED TWO.**
+
+| pin | was | is |
+|---|---|---|
+| `tests/test_agent_patient_hash_coverage.py` 3a | `allergies.onset_date is NOT hashed (nothing downstream reads it)` | moved into the hashed loop, with the parenthesis's reversal argued in place. **+3a-ii**, which pins the raw/sliced split by perturbing ONLY what falls after the tenth character of the fixture's own stamp -- DERIVED from the fixture, because a literal typed beside it stops being that value the moment somebody edits it. **71 -> 73** |
+| `tests/test_agent_summary_temporal_tagging.py` | `"2001" in <the Allergies section>` pinned at **False** | the WHOLE line pinned, plus "no elapsed phrase anywhere in the section". A substring test would have been satisfied by a date with an interval glued to it, which is the one thing the ruling forbids |
+| **the same file's structural sweep** -- NOT in the brief and the load-bearing one | `every date-bearing line also states an interval`, an absolute invariant over the whole summary | PARTITIONED BY NAME. Everything OUTSIDE Allergies must state an interval (so a new section rendering a bare date still fails); everything INSIDE it must state NONE (so the exception cannot quietly grow one); each half with its own non-degeneracy count, because an empty partition satisfies either for free. Deleting the sweep, or widening it to "an interval OR a bare date", would have made it vacuous -- the second form is satisfied by every line it was written to catch. **224 -> 229** |
+
+**AND TWO PROSE CLAIMS THE CHANGE MADE FALSE WERE CORRECTED RATHER THAN LEFT.**
+The temporal doctrine block at the top of `oncotriage/agent/patient.py` read "the
+rule is now **uniform**: WHEREVER THIS RENDERER PRINTS A DATE, IT PRINTS THE
+ELAPSED TIME BESIDE IT"; the word "uniform" came out and the exception is named
+under it. `tests/test_agent_summary_temporal_tagging.py`'s own docstring listed
+Allergies among the sections that "render NO date and therefore gain NOTHING".
+
+**THE LABEL IS `onset`, AND `recorded` WAS REJECTED FOR THE REASON IT LOOKED
+RIGHT.** The parser collapses `onsetDateTime -> onsetPeriod.start ->
+recordedDate -> "unknown"` into one string, so the renderer cannot tell a true
+onset from a recording stamp. `recorded:` is right ONLY because 471 of 471
+Synthea allergies take the recordedDate arm; a real EHR extract carrying an
+`onsetDateTime` would then be labelled with a word that is false of it. **That
+is writing today's data into the code** -- the argument the scrape-admission
+pass used to DELETE an age filter rather than widen it to the cohort then in
+hand. `ALLERGY_ONSET_LABEL` is a SEPARATE constant from `ONSET_CLAUSE_PREFIX`
+even though the two spell the same word: that one heads a clause naming an
+interval, this one labels a bare pipe-joined field, and sharing it would let a
+change to the condition wording silently move an allergy line.
+
+**ABSENCE FOLLOWS THE LINE'S OWN CONVENTION, NOT THE PARENTHESISED SECTIONS'.**
+A missing value contributes NO part -- never the `date unknown` those sections
+render -- so an allergy without a usable onset renders byte-identically to how
+it rendered before this field was printed at all. The parser's literal
+`"unknown"` is guarded and can never reach the line as text. All four spellings
+(`"unknown"`, `""`, `None`, key absent) are driven.
+
+**ONE ASYMMETRY IS RECORDED AND NOT FIXED, and the first draft of a check
+asserted the opposite and failed on it, correctly.** The hash emits
+`a.get('onset_date') or ''`, so the literal `"unknown"` hashes as `"unknown"`
+while empty / None / absent hash as `""` -- four records that render identically
+do not all hash identically. Not fixed, for three reasons together: it is the
+SAME converse violation section 5 already accepts with a much larger reach;
+every sibling dated entry has it; and **it is unreachable in production** --
+`_parse_allergy` always writes the key as a stamp or as `"unknown"`, and
+measured over the corpus all 471 records are dated and none is `"unknown"`. A
+normalisation would be untested-in-production machinery guarding a state the
+parser cannot produce.
+
+```bash
+# The allergy-onset pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus, no database, no git history,
+# no live server -- every patient is a literal dict and the registries
+# _create_patient_summary resolves read no data file for these records. It
+# writes NOTHING anywhere, not even a temp directory. NOT in the collision
+# matrix: the one repository file it reads, oncotriage/agent/patient.py, is
+# written by neither of the suite's two writers and is sha256-compared at the
+# end. It DOES exec: two in-memory copies of that file, one plant each, argued
+# at _EXEC_ALLOWLIST -- `git show` can supply neither, and cannot supply the
+# first even in principle, because it needs a tree where the RENDERER prints
+# the onset and the HASH ignores it and no revision has ever been in that
+# state. Bucket A, ~1.2 s against ONLY the CI directory skeleton.
+python tests/test_agent_summary_allergy_onset.py                    #  36
+```
+
+**FIVE REVERTS, FIVE CAUGHT**, each into a `copytree`'d copy with `PYTHONPATH`
+pointed at it, a `sitecustomize` that strips the editable install's MetaPathFinder
+(which otherwise beats `PYTHONPATH`), a realpath preflight asserting the COPY is
+what imports, `PYTHONDONTWRITEBYTECODE=1`, and every plant asserting its own
+occurrence count so a plant that matched nothing is a named PLANT-FAILED rather
+than a working check reported as broken.
+
+| revert | caught by |
+|---|---|
+| the hash drops `onset_date` while the renderer still prints it -- **THE COUPLING DEFECT** | allergy-onset (7 failures), hash-coverage (2) |
+| the renderer drops the onset part while the hash keeps it | allergy-onset (8), temporal-tagging (5) |
+| the `"unknown"` guard removed -- the placeholder reaches the line | allergy-onset (6) **only** |
+| the `[:10]` slice dropped -- the raw stamp rendered | allergy-onset (5) **only** |
+| the onset part prepended instead of appended | allergy-onset (6), temporal-tagging (2) |
+
+**THREE DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING.** (i) Three checks compared whole SUMMARIES where they meant clinical
+text, and failed -- correctly -- because the pseudonym moves with the hash; the
+mirror control in particular reported a WORKING plant as broken, because
+"the prompts differ" is trivially true for any hashed field. (ii) A
+non-degeneracy check was written `len(_COUNTS_BEFORE) >= 0`, a tautology, and
+the probe behind it used a well-formed date -- `_resolve_temporal_date` counts
+ONLY on its unreadable and after-reference branches, so over a resolvable date
+the check could not have told a renderer that computes an interval from one that
+does not. It drives an UNPARSEABLE onset now, with an unparseable PROCEDURE date
+as the control that the registry moves at all. (iii) The raw/sliced perturbation
+was a literal beside the fixture rather than derived from it.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **The twelve fixtures are stale and 0/12 replay clean.** Ten were already
+   stale; this pass adds two. The recapture is one paid `python
+   fixture_capture.py` run and remains the standing item.
+2. **An UNPARSEABLE onset renders verbatim** (sliced to ten characters). This
+   section prints the field and derives nothing from it, which is the same
+   treatment `criticality` gets and identical to every other dated section's
+   `date[:10]`. It fires zero times on this corpus and is pinned as a decision.
+3. **The "unknown"/absent hash asymmetry** (above).
+4. **No interval, ever, for this field** -- so a criterion phrased purely as a
+   window ("within the last 12 months") still needs the model to do the
+   arithmetic this renderer does for every other date. That is the ruling, and
+   it is right on THIS corpus; a real EHR extract carrying recent
+   `onsetDateTime` values would make it worth revisiting, and the measurement
+   that would settle it is the one recorded at the section.
+5. **THE PARSER DISCARDS WHICH ARM OF ITS FALLBACK CHAIN ANSWERED, AND THAT IS
+   THE PRINCIPLED FIX THE LABEL ARGUMENT WORKS AROUND.** `_parse_allergy`
+   collapses `onsetDateTime` / `onsetPeriod.start` / `recordedDate` into one
+   string, so neither this renderer nor the model can tell a true onset from a
+   recording stamp -- and the choice between an `onset:` label that is wrong on
+   this corpus and a `recorded:` label that would be wrong on a real extract is
+   forced only by that collapse. An `onset_date_source` field beside it
+   (`"onset" | "recorded" | "unknown"`) is a fact the SOURCE already carries
+   and the parser throws away, and with it the line could say what it means on
+   any corpus. It is out of this pass's scope -- a new parsed field, a decision
+   about whether it is hashed, and a fixture impact of its own -- and it is the
+   right end state.
+6. **The corpus reconciliation is out of band.** The 131 / 131 / 471 numbers
+   above were measured against a `git worktree` at HEAD and are recorded here,
+   not pinned by a test. Pinning them would make the new file corpus-dependent
+   and therefore bucket E, which is a real trade against a ~1.2 s bucket-A
+   file; `tests/test_agent_patient_hash_coverage.py` already carries the
+   corpus sections that would host such a check if it is wanted.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

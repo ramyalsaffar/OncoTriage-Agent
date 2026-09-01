@@ -196,7 +196,7 @@ def compute_patient_hash(patient_data: Dict) -> str:
       - ecog_performance_status: value, date, observations_found, selection
       - cancer_metastasis_observations: display, value, unit, date,
         metastasis_category
-      - allergies: display, category, criticality
+      - allergies: display, category, criticality, onset_date
       - cancer_genomic_variants: display, gene_symbol, hgvs_protein, hgvs_cdna,
         result_value, interpretation, date
       - cancer_stage_observations: stage_display, date, loinc
@@ -368,22 +368,48 @@ def compute_patient_hash(patient_data: Dict) -> str:
     # exclusion criterion in oncology trials ("no known allergy to
     # platinum-based agents").
     #
-    # THE THREE SUB-FIELDS ARE THE THREE THE PROMPT RENDERS: display, category
-    # and criticality. What is left out and why:
+    # THE FOUR SUB-FIELDS ARE THE FOUR THE PROMPT RENDERS: display, category,
+    # criticality and onset_date.
+    #
+    # ONSET_DATE WAS EXCLUDED HERE AND IS NOW INCLUDED, AND THE MOVE IS FORCED
+    # RATHER THAN OPTIONAL. The exclusion's argument was correct while it held:
+    # "no consumer reads it, so two allergies identical except for onset produce
+    # byte-identical prompt text, and hashing it would move the hash without
+    # moving the prompt -- the value_shape mistake." The Allergies section of
+    # _create_patient_summary prints the date now, which CREATES the consumer
+    # and reverses that argument exactly: leaving it out would let two patients
+    # differing only in allergy onset render two different prompts under one
+    # hash, which is the promise this function's own docstring makes.
+    #
+    # THE RAW FIELD IS HASHED, NOT THE [:10] SLICE THE LINE RENDERS, matching
+    # every sibling entry -- `proc`, `met`, `obs` and the stage observations all
+    # hash a raw date beside a section that renders `date[:10]`. Hashing the
+    # source rather than the rendering is `birth_date instead of age`, one field
+    # over: a hash independent of how the derivation is configured. The stated
+    # cost is the narrow converse of the value_shape rule -- a re-serialisation
+    # that changes only a stamp's time-of-day or UTC offset moves the hash while
+    # the rendered line is identical. It is accepted because four sibling
+    # entries already accept it and one collection hashing dates differently
+    # from the rest is a worse thing to have to remember.
+    #
+    # What is still left out and why:
     #   - code: the coding-system identity of the same allergen. Nothing reads
     #     it. Same exclusion the metastasis entry above already makes.
-    #   - onset_date: no consumer reads it. Two allergies identical except for
-    #     onset produce byte-identical prompt text, so hashing it would move the
-    #     hash without moving the prompt -- the value_shape mistake.
     #   - clinical_status / verification_status: read by the PARSER, which
     #     admits only active, non-refuted allergies. Their effect is therefore
     #     already visible here as presence or absence, and an allergy that
     #     becomes inactive leaves the list and changes the hash by disappearing.
+    #
+    # THE SORT KEY CANNOT MOVE UNDER THE ADDITION. _emit sorts the emitted LINE
+    # and onset_date is appended LAST, so two allergies could only reorder by
+    # tying on display, category and criticality -- and File 07 runs
+    # deduplicate_by_display over this list, so display is unique per patient.
     allergies = patient_data.get("allergies") or []
     _emit("allergy", [
         f"{a.get('display') or ''}"
         f"|{a.get('category') or ''}"
         f"|{a.get('criticality') or ''}"
+        f"|{a.get('onset_date') or ''}"
         for a in allergies
     ])
 
@@ -1000,9 +1026,22 @@ PROCEDURE_RENDER_DROPPED = "dropped"
 # a date in that untreated majority -- a 1993 event judged as falling inside a
 # five-year window -- and the temporal-reasoning literature identifies duration
 # arithmetic as a documented weakness of these models rather than an accident of
-# one run. So the rule is now uniform: WHEREVER THIS RENDERER PRINTS A DATE, IT
-# PRINTS THE ELAPSED TIME BESIDE IT. A section that prints no date gains
-# nothing, because there is nothing to anchor to.
+# one run. So the rule is: WHEREVER THIS RENDERER PRINTS A DATE, IT PRINTS THE
+# ELAPSED TIME BESIDE IT. A section that prints no date gains nothing, because
+# there is nothing to anchor to.
+#
+# ONE NAMED EXCEPTION, AND THE WORD "UNIFORM" CAME OUT OF THE SENTENCE ABOVE
+# WHEN IT WAS ADDED. The Allergies section prints the parser's onset_date and
+# NO elapsed phrase. The rule exists because an interval the model would
+# otherwise compute is a documented source of verdict-costing arithmetic
+# errors; it buys nothing where the interval is the same on every line of every
+# patient, which is measured rather than supposed there -- 471 of 471 allergy
+# stamps in this corpus take the recordedDate arm and run 19 to 99 years old.
+# The exception is argued at the section, it is the ONLY one, and
+# tests/test_agent_summary_temporal_tagging.py partitions it out BY NAME rather
+# than tolerating it: everything outside Allergies must state an interval and
+# everything inside it must state none, so neither the rule nor its exception
+# can quietly grow.
 #
 # THE RAW DATE IS NEVER REPLACED. An absolute date and an elapsed interval
 # answer different criteria -- "diagnosed after 2020" is a question about the
@@ -1095,6 +1134,16 @@ STAGE_DATE_CLAUSE_PREFIX = "staged"
 # "date unknown", because it is a clause inside a sentence rather than a field
 # standing where a date would be.
 STAGE_DATE_UNKNOWN_CLAUSE = "staging date not recorded"
+
+# What the Allergies section labels its date with. A SEPARATE CONSTANT FROM
+# ONSET_CLAUSE_PREFIX above even though the two spell the same word today, and
+# the separation is the point: that one is the head of a clause naming an
+# interval ("onset 29 years before reference date") and this one is the label of
+# a bare pipe-joined field ("onset: 2001-06-06"), so the two are free to be
+# reworded independently. Sharing the constant would make a change to the
+# condition wording silently move an allergy line, in a section whose whole
+# ruling is that it renders no interval.
+ALLERGY_ONSET_LABEL = "onset"
 
 # The three sub-unit floors. Each says "shorter than the unit I am allowed to
 # speak in" and none of them is a zero: "0 years" reads as "at the same time",
@@ -1791,7 +1840,11 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
                           Tier B (relevant): full detail with [comorbidity] tag
                           Tier C (background): one summary line with count + preview
       Medications       : all unique active medications
-      Allergies         : active, non-refuted allergies with category and criticality
+      Allergies         : active, non-refuted allergies with category,
+                          criticality and the onset date the parser
+                          carries. The one dated field this record renders
+                          with NO elapsed interval -- see the ruling at the
+                          section itself.
       Procedures        : all unique procedure types, most recent date per type
       Lab Values        : LOINC-filtered oncology-relevant observations,
                           most recent value per lab concept
@@ -1833,10 +1886,19 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
                           staged the patient.
 
     Sections that render NO date gain nothing, because there is nothing to
-    anchor an interval to: Demographics (whose age is already an interval),
-    Allergies (the parser carries onset_date and this renderer has never
-    printed it), and the Tier C condition / background medication summary
-    lines, which are names only.
+    anchor an interval to: Demographics (whose age is already an interval) and
+    the Tier C condition / background medication summary lines, which are names
+    only.
+
+    ALLERGIES IS THE ONE SECTION THAT RENDERS A DATE AND NO INTERVAL, and it is
+    listed here rather than above because the omission is a ruling and not an
+    absence of data. It prints the parser's onset_date and deliberately no
+    elapsed phrase: every one of this corpus's allergy stamps resolves through
+    the parser's fallback chain to a recordedDate decades old, so the interval
+    would be a near-constant restated on every allergy of every patient. The
+    measurement and the consequence -- no TEMPORAL_KEY_*, no _dated_suffix
+    call, and therefore no TEMPORAL_RENDER_COUNTS key -- are argued at the
+    section.
 
     See the block comment at _NOT_ACTIVE_CLINICAL_STATUSES for what is
     deliberately left untouched and why, and _elapsed_phrase for why the
@@ -2234,18 +2296,73 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
     # Only active, non-refuted allergies are included (filtered in parser).
     # Category and criticality are shown when available to help GPT-4o
     # assess severity-gated exclusion criteria.
+    #
+    # THE ONSET DATE IS RENDERED AND ITS ELAPSED INTERVAL IS DELIBERATELY NOT.
+    # Every other dated section of this record states a duration beside its
+    # date, and the absence here is a ruling rather than an oversight -- so it
+    # is written down, because an undocumented deliberate absence is read by
+    # the next pass as a section somebody forgot.
+    #
+    #   APPROVED: the raw date. "No severe hypersensitivity reaction within
+    #   the last 12 months" is a real exclusion criterion and the parser has
+    #   carried the date to answer it since allergies were parsed at all; this
+    #   renderer simply never printed it. A stamp from decades ago is itself
+    #   evidence, and stating it lets the model see that rather than infer a
+    #   recency the record does not support.
+    #
+    #   REJECTED, BY MEASUREMENT: an elapsed-interval phrase. MEASURED over the
+    #   whole 1,000-bundle corpus, twice and from both ends: 471 of 471
+    #   AllergyIntolerance resources take the recordedDate arm of
+    #   _parse_allergy's fallback chain -- not one carries an onsetDateTime or
+    #   an onsetPeriod -- and the resulting stamps run 19.1 to 99.1 years old
+    #   against DATA_SNAPSHOT_DATE, median 73.1, with NONE under five years. So
+    #   an interval would render a near-constant "decades before reference
+    #   date" on every allergy of every patient -- tokens spent restating a
+    #   constant, and a recency the record does not actually support. There is
+    #   therefore no TEMPORAL_KEY_* for this field and no _dated_suffix call:
+    #   the counters under TEMPORAL_RENDER_COUNTS measure dates whose interval
+    #   is rendered, and a key for a field that renders none would report an
+    #   unreadable date nobody was ever going to read.
+    #
+    # WHAT THE LABEL CLAIMS, AND WHAT IT CANNOT. `onset_date` is the parser's
+    # own field name and its fallback chain is onsetDateTime -> onsetPeriod
+    # .start -> recordedDate -> "unknown", collapsed into one string -- so this
+    # renderer cannot tell a true onset from a recording stamp, and neither can
+    # the model. The token matches the field name so a reader of a stored
+    # prompt can trace it to source; the ambiguity is the parser's and is
+    # documented there.
+    #
+    # "recorded:" WOULD BE RIGHT ABOUT THIS CORPUS AND IS REJECTED FOR THAT
+    # REASON. It is right only because 471 of 471 Synthea allergies take the
+    # recordedDate arm; a real EHR extract carrying onsetDateTime would then be
+    # labelled with a word that is false of it. That is writing today's data
+    # into the code -- the same argument the scrape-admission pass used to
+    # DELETE an age filter rather than widen it to the cohort then in hand.
+    #
+    # ABSENCE FOLLOWS THIS LINE'S OWN CONVENTION, not the "date unknown" one
+    # the parenthesised sections use: a missing value contributes NO part, so
+    # an allergy without a usable onset renders byte-identically to how it
+    # rendered before this field was printed at all. "unknown" is the parser's
+    # literal stand-in and must never reach the line as text.
     summary += "\nAllergies:\n"
     if allergies:
         for allergy in allergies:
             display     = allergy.get("display") or "Unknown allergen"
             category    = allergy.get("category") or ""
             criticality = allergy.get("criticality") or ""
+            onset       = allergy.get("onset_date") or ""
 
             parts = [display]
             if category and category != "unknown":
                 parts.append(category)
             if criticality and criticality != "unknown":
                 parts.append(f"criticality: {criticality}")
+            if onset and onset != "unknown":
+                # [:10] is this renderer's standing treatment of a raw date --
+                # the same slice _dated_bracket and every parenthesised section
+                # take. The corpus stamps carry a time and an offset that
+                # answer no criterion.
+                parts.append(f"{ALLERGY_ONSET_LABEL}: {onset[:10]}")
             summary += f"- {' | '.join(parts)}\n"
     else:
         summary += "- No known allergies\n"
