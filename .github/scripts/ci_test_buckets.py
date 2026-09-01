@@ -1821,7 +1821,64 @@ def run_bucket(letter, root=None, workers=None):
         print(f"  {'PASS' if rc == 0 else 'FAIL':<5} exit={rc:<3} {elapsed:6.1f}s  {name}")
     print()
     print(f"  ran {len(results)}, failed {len(failed)}, not run {len(skipped)}")
+
+    _annotate_failures(failed)
     return 1 if failed else 0
+
+
+# ===========================================================================
+# WORKFLOW ANNOTATIONS -- THE ONLY CHANNEL A NON-ADMIN CAN READ
+# ===========================================================================
+# WHY THIS IS NOT DECORATION, and the measurement that produced it. A failing
+# bucket-A step on this repository produced exactly one annotation:
+#
+#     .github  line 97  failure  "Process completed with exit code 1."
+#
+# The per-file PASS/FAIL table and the failure output are in the step LOG, and
+# `GET /actions/jobs/{id}/logs` answers 403 "Must have admin rights to
+# Repository" -- measured, on this public repository, with an unauthenticated
+# client. The check-run `output.summary` and `output.text` come back EMPTY.
+# So for anyone who is not an admin, a red bucket A named no file at all: the
+# information needed to act on it existed and was unreachable.
+#
+# `::error` lines ARE reachable: they become annotations, and the annotations
+# endpoint is public. One per failing file, so the run says WHICH test failed
+# before anybody opens a log they may not be able to open.
+#
+# GUARDED ON GITHUB_ACTIONS so a local run prints nothing new -- a developer
+# already has the output four lines above, and `::error` in a terminal is
+# noise. This changes no exit code and no classification; run_bucket's return
+# is computed above and is untouched.
+_ANNOTATION_BODY_CHARS = 900
+
+
+def _escape_annotation(text):
+    """Escape a message for a `::error::` line.
+
+    Annotations are LINE-based, so a raw newline truncates the message at the
+    first one and leaves the rest as unparsed workflow output. GitHub's own
+    escapes are percent-encodings of exactly three characters, and `%` must go
+    first or it would double-encode the ones added after it.
+    """
+    return (text.replace("%", "%25")
+                .replace("\r", "%0D")
+                .replace("\n", "%0A"))
+
+
+def _annotate_failures(failed):
+    """Emit one `::error` per failing test file, on GitHub Actions only."""
+    if not failed or os.environ.get("GITHUB_ACTIONS") != "true":
+        return
+    for name, rc, elapsed, out, err in sorted(failed):
+        # The TAIL, not the head: these files print a per-check line each and
+        # end with a summary, so the last lines carry the failures and the
+        # counts while the head carries the preamble.
+        body = (out or "") + (("\n--- stderr ---\n" + err) if err else "")
+        tail = body[-_ANNOTATION_BODY_CHARS:]
+        if len(body) > _ANNOTATION_BODY_CHARS:
+            tail = "...(truncated; full output is in the step log)...\n" + tail
+        print(f"::error file=tests/{name},title=Bucket A: {name} failed"
+              f"::exit {rc} after {elapsed:.1f}s%0A{_escape_annotation(tail)}")
 
 
 def _print_table():
