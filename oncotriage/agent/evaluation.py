@@ -1509,7 +1509,7 @@ def _spend_gate(phase, counter, *, where, count=None):
     which is a defect report rather than a budget event, and an operator reading
     it is sent to the traceback rather than to ``config.SPEND_CAP_USD``.
     """
-    if spend.cap_exceeded():
+    if spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5):
         spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_CAP}"] += 1
         # THE LATCH IS ASKED FOR RATHER THAN TAKEN, and that one condition is
         # what makes this node correct inside a SERVER as well as inside a
@@ -1524,17 +1524,24 @@ def _spend_gate(phase, counter, *, where, count=None):
         # issued, under either policy; what the policy decides is whether the
         # NEXT one is refused by a latch or by asking the ledger again.
         if spend.latch_on_limit():
-            spend.SPEND_STOP.poll(where=where)
+            spend.SPEND_STOP.poll(where=where,
+                                  source=spend.SPEND_SOURCE_STAGE5)
         log.warning("a Stage 5 request was not issued because the campaign "
                     "has reached its spend cap", stage=5, status="stopped",
                     event="stage5_spend_cap_declined", phase=phase,
                     reason=spend.SPEND_LIMIT_CAP,
-                    cost_usd=round(spend.SPEND_LEDGER.total, 6),
+                    cost_usd=round(
+                        spend.active_spend(spend.SPEND_SOURCE_STAGE5), 6),
                     count=count, degraded=True)
+        # THE CAMPAIGN BUDGET'S SPEND, NOT THE LEDGER'S TOTAL. Stage 5 is bound
+        # by `spend.SPEND_BUDGET_CAMPAIGN` and the two figures differ the
+        # moment any other budget has been charged in this process -- reporting
+        # the total here would name a number that is not the one this refusal
+        # was decided by.
         return Stage5SpendStopped(
             f"the request was not issued: the campaign has spent "
-            f"${spend.SPEND_LEDGER.total:.2f} and config.SPEND_CAP_USD is the "
-            f"limit")
+            f"${spend.active_spend(spend.SPEND_SOURCE_STAGE5):.2f} and "
+            f"config.SPEND_CAP_USD is the limit")
     _granted, _first = counter.take()
     if not _granted:
         spend.SPEND_GATE_SKIPS[
@@ -1555,7 +1562,8 @@ def _spend_gate(phase, counter, *, where, count=None):
         # its configuration can produce -- and a defect does not heal as a
         # window rolls. A server that hit it will hit it again on the next
         # request, so continuing burns money on a fault that is already known.
-        spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CALL_CEILING, where)
+        spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CALL_CEILING, where,
+                              spend.SPEND_SOURCE_STAGE5)
         log.error("a Stage 5 invocation asked for more billed calls than its "
                   "configuration can produce; the request was not issued",
                   stage=5, status="stopped",

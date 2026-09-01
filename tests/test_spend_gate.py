@@ -108,6 +108,11 @@ _BASELINE_HASHES = {p: hashlib.sha256(open(p, "rb").read()).hexdigest()
 # compares against THESE, so a legitimate change to a shipped default moves
 # check 1a and nothing else -- the lesson
 # tests/test_agent_stage5_per_trial_calls.py records about its own 10e.
+_START_RATER_CAP = config.RATER_SPEND_CAP_USD
+"""The judge's OWN cap, captured at import so the probes below can be shown to
+have put it back. It is a separate constant from the campaign's by operator
+ruling -- see `spend.SPEND_BUDGETS`."""
+
 _START_CONFIG = (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
                  config.SPEND_CALL_CEILING_ENFORCED,
                  config.MATCHING_PER_TRIAL_CALLS_ENABLED,
@@ -405,7 +410,7 @@ _saved_cap = config.SPEND_CAP_USD
 try:
     config.SPEND_CAP_USD = None
     check("1c  None means NO CAP rather than a cap of nothing",
-          (spend.spend_cap(), spend.cap_exceeded(), spend.remaining()),
+          (spend.spend_cap(), spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5), spend.remaining(spend.SPEND_SOURCE_STAGE5)),
           (None, False, None))
     check("1c-i ...and the banner SAYS SO, so the unbounded state is not the "
           "quiet one",
@@ -413,7 +418,7 @@ try:
     config.SPEND_CAP_USD = 0.0
     check("1d  zero IS a cap and is honoured -- a rehearsal of the unbilled "
           "path, not an absence",
-          (spend.spend_cap(), spend.cap_exceeded()), (0.0, True))
+          (spend.spend_cap(), spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)), (0.0, True))
     config.SPEND_CAP_USD = -1.0
     check("1e  a NEGATIVE cap is REFUSED by name, never read as unlimited",
           raised(spend.spend_cap), "SpendCapConfigurationError")
@@ -429,7 +434,7 @@ try:
           "worker: cap_exceeded() swallows it, because a configuration defect "
           "surfacing as a per-request transport failure is a worse diagnosis "
           "of the same fact",
-          spend.cap_exceeded(), False)
+          spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5), False)
     check("1e-iv ...it reaches the operator through the BANNER instead, before "
           "anything is spent",
           "REFUSING TO READ THE CAP" in spend.describe_cap(), True)
@@ -790,7 +795,8 @@ try:
     spend.SPEND_STOP.reset()
     spend.SPEND_LEDGER.seed(spend.LedgerSeed(usd=1000.0, rows=1, runs=1,
                                              source=spend.SEED_SOURCE_CAMPAIGN))
-    spend.SPEND_STOP.poll(where="a probe")
+    spend.SPEND_STOP.poll(where="a probe",
+                      source=spend.SPEND_SOURCE_STAGE5)
 finally:
     spend.console.out = _saved_out
     spend.SPEND_LEDGER.reset()
@@ -1690,10 +1696,26 @@ check("10h the closing spend block ALWAYS prints, even for a run that spent "
       "nothing -- silence there would be indistinguishable from a ledger that "
       "was never wired up",
       (_lines[0] if _lines else _Absent("no lines"),
-       any("campaign total" in ln for ln in _lines)), ("SPEND", True))
+       any("all budgets" in ln for ln in _lines)), ("SPEND", True))
+
+# THE LINE THIS CHECK NAMES USED TO READ "campaign total" AND THE RENAME IS THE
+# FINDING RATHER THAN COSMETIC. That figure is the WHOLE ledger -- every budget
+# -- and once budgets are plural it is a number no cap is compared against, so
+# a label calling it "campaign" put it beside a campaign cap it can exceed
+# without the campaign having spent a cent of it.
+check("10h-0 ...and the whole-ledger figure SAYS no cap is compared against "
+      "it, so it cannot be read as a budget",
+      any("all budgets" in ln and "no cap is compared" in ln
+          for ln in _lines), True)
+check("10h-0-i *** every budget prints its own spent/cap/remaining group on "
+      "every run, INCLUDING one this run never touched -- a budget printed "
+      "only when it spent would make its silence read as coverage ***",
+      sorted(b for b in spend.SPEND_BUDGETS
+             if any(ln.startswith(f"  cap {b} ") for ln in _lines)),
+      sorted(spend.SPEND_BUDGETS))
 
 
-def _cap_lines(cap, enforced=True):
+def _cap_lines(cap, enforced=True, budget=spend.SPEND_BUDGET_CAMPAIGN):
     saved = (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED)
     out = []
     try:
@@ -1701,18 +1723,66 @@ def _cap_lines(cap, enforced=True):
         spend.print_report(out=out.append)
     finally:
         config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED = saved
-    return [ln for ln in out if ln.startswith("  cap")]
+    return [ln for ln in out if ln.startswith(f"  cap {budget} ")]
+
+
+def _rater_cap_lines(cap, enforced=True):
+    saved = (config.RATER_SPEND_CAP_USD, config.SPEND_CAP_ENFORCED)
+    out = []
+    try:
+        config.RATER_SPEND_CAP_USD, config.SPEND_CAP_ENFORCED = cap, enforced
+        spend.print_report(out=out.append)
+    finally:
+        config.RATER_SPEND_CAP_USD, config.SPEND_CAP_ENFORCED = saved
+    return [ln for ln in out if ln.startswith("  cap rater ")]
 
 
 # THREE STATES, NOT TWO. An unreadable cap is not an absent one, and the first
 # version of report_lines() printed BOTH lines for it -- two claims about one
-# value in one block.
+# value in one block. THE BUDGET SPLIT HAD TO KEEP THAT PROPERTY PER BUDGET,
+# which is what the second half of this pair measures: the identical three
+# states of the RATER cap, reached by writing the OTHER constant.
+def _one(lines):
+    """The single line, or a named absence. NEVER raises.
+
+    A bare ``[0]`` raises ``IndexError`` on exactly the defect these checks
+    exist to catch -- a report that stopped printing a budget's cap -- so the
+    run would print one traceback where it owed a summary. MEASURED: the revert
+    that makes `report_lines()` print one budget instead of every one ABORTED
+    this file before this helper existed.
+    """
+    return lines[0] if lines else _Absent("no cap line")
+
+
 check("10h-i a readable cap, an absent cap and an UNREADABLE cap each print "
-      "exactly ONE cap line, and the three lines are different",
+      "exactly ONE campaign cap line, and the three lines are different",
       ([len(_cap_lines(300.0)), len(_cap_lines(None)), len(_cap_lines(-1.0))],
-       len({_cap_lines(300.0)[0], _cap_lines(None)[0],
-            _cap_lines(-1.0)[0]})),
+       # str() BECAUSE `_Absent` DEFINES `__eq__` AND IS THEREFORE
+       # UNHASHABLE. A set of them raises TypeError -- on exactly the defect
+       # `_one` was added to survive, which is the abort shape one level in.
+       # MEASURED: the report-prints-one-budget revert aborted here.
+       len({str(_one(_cap_lines(300.0))), str(_one(_cap_lines(None))),
+            str(_one(_cap_lines(-1.0)))})),
       ([1, 1, 1], 3))
+check("10h-ii ...and the same three states of config.RATER_SPEND_CAP_USD "
+      "print exactly ONE rater cap line each, and differ",
+      ([len(_rater_cap_lines(50.0)), len(_rater_cap_lines(None)),
+        len(_rater_cap_lines(-1.0))],
+       len({str(_one(_rater_cap_lines(50.0))),
+            str(_one(_rater_cap_lines(None))),
+            str(_one(_rater_cap_lines(-1.0)))})),
+      ([1, 1, 1], 3))
+check("10h-iii *** ...and writing ONE constant moves ONE budget's line: an "
+      "unreadable campaign cap leaves the rater line readable, which is the "
+      "whole content of 'per billed program' in the report ***",
+      ("UNREADABLE" in str(_one(_cap_lines(-1.0))),
+       "UNREADABLE" in str(_one(_rater_cap_lines(50.0, True))),
+       "$50.00" in str(_one(_cap_lines(-1.0,
+                                       budget=spend.SPEND_BUDGET_RATER)))),
+      (True, False, True))
+check("10h-iv ...and config.RATER_SPEND_CAP_USD was restored by every probe "
+      "above",
+      config.RATER_SPEND_CAP_USD, _START_RATER_CAP)
 check("10h-ii ...and the measured-only mode says so on the cap line rather "
       "than looking like a working brake",
       ("MEASURED ONLY" in _cap_lines(300.0, enforced=False)[0],

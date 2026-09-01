@@ -1205,6 +1205,25 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # repository files it reads are sha256'd before the first
                    # plant and compared in its section 10.
                    "tests/test_spend_gate.py",
+                   # FOUR execs, each an in-memory copy of oncotriage/spend.py:
+                   # one CLEAN CONTROL that changes nothing, and three plants
+                   # of the cross-wire the budget split exists to prevent --
+                   # rater_batch mapped onto the campaign budget (refused at
+                   # import by the totality guard, which is the check working),
+                   # budget_for() answering "campaign" for every path (past the
+                   # import guard, so only a drive can see it), and
+                   # rater_spend_cap() reading the CAMPAIGN constant. A
+                   # `git show` control can supply none of them: no revision of
+                   # this project has ever had a budget table, so there is no
+                   # blob carrying a version with one wired wrongly. Nor can a
+                   # real condition: each is a one-line edit inside a module's
+                   # own tables, and the file already varies every input that
+                   # CAN be varied (both caps, the seed, the policy, the
+                   # source) for the checks that need no plant. A plant whose
+                   # needle does not appear exactly once is a NAMED failure,
+                   # and the four repository files it reads are sha256'd at
+                   # import and compared in its section 7.
+                   "tests/test_spend_budget_split.py",
                    # NINE execs, each an in-memory copy of
                    # oncotriage/agent/bedrock_adapter.py with ONE mapping
                    # broken: max_output_tokens deleted, `store` no longer sent,

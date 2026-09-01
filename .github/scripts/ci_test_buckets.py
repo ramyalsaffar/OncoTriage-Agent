@@ -1468,6 +1468,22 @@ BUCKETS = {
         "and are sha256-compared at the end. It DOES exec: six in-memory "
         "copies of agent/evaluation.py, one plant each, argued at "
         "_EXEC_ALLOWLIST."),
+    "test_spend_budget_split.py": (
+        _A, None,
+        "ran green in ~2s, 79 checks, against ONLY the directory skeleton: the "
+        "budget split -- the campaign's cap and the rater's are two budgets "
+        "with two measures, and neither reads the other's. No network, no "
+        "keys, NO SPEND -- no provider client is built and no request of any "
+        "kind is issued. NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS is set "
+        "above the imports and section 7 asserts torch and transformers never "
+        "entered sys.modules), no live Qdrant, no corpus, no database, no git "
+        "history, no live server. It writes NOTHING anywhere, not even a temp "
+        "directory. NOT in the collision matrix -- but it DOES read "
+        "oncotriage/config.py, which test_config_snapshot_date_rot.py rewrites "
+        "in place, so all four files it reads are sha256-compared at the end. "
+        "It DOES exec: four in-memory copies of oncotriage/spend.py -- one "
+        "clean control and three cross-wire plants -- argued at "
+        "_EXEC_ALLOWLIST."),
     "test_spend_coverage.py": (
         _A, None,
         "ran green in ~35s, 154 checks: the spend gate's COVERAGE, which is "

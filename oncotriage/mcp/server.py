@@ -327,7 +327,8 @@ def _budget_unavailable_result(tool, exc) -> dict:
         "status": "spend_limit_reached",
         "tool": tool,
         "limit": getattr(exc, "limit", None),
-        "retry_after_seconds": spend.seconds_until_under_cap(),
+        "retry_after_seconds": spend.seconds_until_under_cap(
+            spend.SPEND_SOURCE_STAGE5),
         "message": (
             "This server has reached its spend limit, so this tool cannot "
             "answer. NO RESULT IS BEING REPORTED -- this is not a finding of "

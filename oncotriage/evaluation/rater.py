@@ -1757,10 +1757,15 @@ that did not need covering.
 **WHAT IT DOES NOT DO, STATED PLAINLY: it does not net the judge's spend
 against the batch runner's.** They are separate processes with separate
 ledgers, and no shared store exists that both could read -- the rater writes
-none of the columns ``campaign_spend_before`` sums. So ``config.SPEND_CAP_USD``
-binds WITHIN one rater session (across its resumes) and WITHIN one campaign,
-and not across the two. That is a real gap; it is named here and in
-``spend.SPEND_SOURCES`` rather than left for somebody to discover from a bill.
+none of the columns ``campaign_spend_before`` sums.
+
+**AND THE TWO ARE NOT ONE BUDGET EITHER, WHICH IS NOW THE DESIGN RATHER THAN AN
+ACCIDENT.** ``config.RATER_SPEND_CAP_USD`` binds a judge session across its
+resumes; ``config.SPEND_CAP_USD`` binds a campaign across its own. Neither
+nets against the other, and neither can starve the other. See
+``spend.SPEND_BUDGETS``, where the split is argued, and
+``spend.BUDGET_FOR_SEED_SOURCE``, which is why the seed this key produces is
+added to the rater budget and to no other.
 """
 
 
@@ -3927,8 +3932,14 @@ def main(argv=None):
     # AFTER the state is read and BEFORE anything is submitted. Reading it
     # earlier would seed from a file `require_state_subset` may be about to
     # refuse; reading it later would be after the first batch is created.
+    # `describe_rater_cap()` AND NOT `describe_cap()`. This session is bound by
+    # `config.RATER_SPEND_CAP_USD` -- its OWN budget, per `spend.SPEND_BUDGETS`
+    # -- and the shipped banner printed the CAMPAIGN cap here, so every judge
+    # session announced a bound it does not run under and named a constant that
+    # would not move its own limit. `describe_serving_cap()`'s argument, one
+    # budget over.
     spend.SPEND_LEDGER.seed(rater_spend_before(state))
-    console.out(spend.describe_cap())
+    console.out(spend.describe_rater_cap())
     console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
 
     state.update({"run_dir": run.run_dir, "model": args.model,
@@ -3983,14 +3994,19 @@ def main(argv=None):
             # finish is stopped where the money actually runs out and keeps
             # every batch it did complete. Refusing here on a number nobody
             # measured would be the estimate deciding.
-            _remaining = spend.remaining()
+            # THE RATER BUDGET'S REMAINDER, ASKED FOR BY NAME. A bare
+            # `spend.remaining()` would have to name a budget, and the one it
+            # would have named is the campaign's -- so this preflight would
+            # compare a judge session's estimate against a campaign's balance
+            # and warn, or fail to warn, about the wrong money.
+            _remaining = spend.remaining(spend.SPEND_SOURCE_RATER)
             if _remaining is not None and plan is not None:
                 _upper = plan["no_cache_usd"]
                 console.out("")
                 console.out(f"  budget remaining   ${_remaining:>8.2f}   "
-                            f"(campaign cap ${config.SPEND_CAP_USD}, this "
+                            f"(rater cap ${config.RATER_SPEND_CAP_USD}, this "
                             f"session has spent "
-                            f"${spend.SPEND_LEDGER.total:.2f})")
+                            f"${spend.active_spend(spend.SPEND_SOURCE_RATER):.2f})")
                 if _upper > _remaining:
                     console.out(f"  *** THE UPPER-BOUND ESTIMATE "
                                 f"(${_upper:.2f}) EXCEEDS THE REMAINING "
@@ -3999,8 +4015,8 @@ def main(argv=None):
                                 f"by the spend gate, batch by batch. Every "
                                 f"batch")
                     console.out(f"      it completes is kept and resumable. "
-                                f"Raise config.SPEND_CAP_USD, or narrow the "
-                                f"run with")
+                                f"Raise config.RATER_SPEND_CAP_USD, or narrow "
+                                f"the run with")
                     console.out(f"      --limit / --include-keys, if you want "
                                 f"it to finish in one session.")
             console.out("")

@@ -2192,7 +2192,8 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
         # `poll()` AND NOT `cap_exceeded()`: the latch is what announces once
         # and what `_start_patient_unless_stopped` reads on the hot path.
         if STOP_SWITCH.poll(where="main pass") | spend.SPEND_STOP.poll(
-                where="the main pass"):
+                where="the main pass",
+                source=spend.SPEND_SOURCE_STAGE5):
             with _stop_sweep_lock:
                 first = not stop_sweep_done
                 stop_sweep_done = True
@@ -2322,7 +2323,9 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
             # `_stop_reason()` would then report the wrong mechanism on a run
             # where both were true.
             if (STOP_SWITCH.poll(where="main pass submit")
-                    | spend.SPEND_STOP.poll(where="the main pass submit loop")):
+                    | spend.SPEND_STOP.poll(
+                        where="the main pass submit loop",
+                        source=spend.SPEND_SOURCE_STAGE5)):
                 stop_unsubmitted = len(pending_files) - index
                 break
             future = executor.submit(
@@ -2549,7 +2552,9 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
     # `poll()` and not `.requested`, so a stop asked for after run_batch
     # finished is seen here rather than being missed for the life of the pass.
     if (STOP_SWITCH.poll(where="resample pass")
-            | spend.SPEND_STOP.poll(where="the resample pass")):
+            | spend.SPEND_STOP.poll(
+                where="the resample pass",
+                source=spend.SPEND_SOURCE_STAGE5)):
         console.out("Resample pass SKIPPED: "
                     + ("a spend limit is in effect. "
                        if spend.SPEND_STOP.requested and not STOP_SWITCH.requested
@@ -2653,7 +2658,9 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
         # "the checkpoint's cadence" here means the health flush's, which is the
         # same per-completed-patient boundary.
         if (STOP_SWITCH.poll(where="resample pass")
-                | spend.SPEND_STOP.poll(where="the resample pass")):
+                | spend.SPEND_STOP.poll(
+                where="the resample pass",
+                source=spend.SPEND_SOURCE_STAGE5)):
             with _stop_sweep_lock:
                 first = not stop_sweep_done
                 stop_sweep_done = True
@@ -2681,7 +2688,8 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
             # run_batch's submit-loop guard, second instance, same argument.
             if (STOP_SWITCH.poll(where="resample pass submit")
                     | spend.SPEND_STOP.poll(
-                        where="the resample pass submit loop")):
+                        where="the resample pass submit loop",
+                        source=spend.SPEND_SOURCE_STAGE5)):
                 stop_unsubmitted = len(resample_files) - index
                 break
             future = executor.submit(
@@ -4231,7 +4239,15 @@ def main():
                 console.out("RUN STOPPED BY THE SPEND GATE.")
                 console.out(f"  limit          {spend.SPEND_STOP.limit}")
                 console.out(f"  noticed in     {spend.SPEND_STOP.detected_in}")
-                console.out(f"  campaign spend ${spend.SPEND_LEDGER.total:.4f}")
+                # THE CAMPAIGN BUDGET'S SPEND, NOT THE LEDGER'S TOTAL.
+                # They are equal in a batch run -- it charges no path outside
+                # that budget -- and the label is "campaign spend", so reading
+                # the whole ledger would be a figure that becomes wrong the
+                # first time this process charges another budget while still
+                # calling itself the campaign's.
+                console.out(
+                    f"  campaign spend "
+                    f"${spend.active_spend(spend.SPEND_SOURCE_STAGE5):.4f}")
                 if spend.SPEND_STOP.cap is not None:
                     console.out(f"  cap            "
                                 f"${spend.SPEND_STOP.cap:.2f}")

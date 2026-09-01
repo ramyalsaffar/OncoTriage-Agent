@@ -88,7 +88,8 @@ _BASELINE_HASHES = {p: hashlib.sha256(open(p, "rb").read()).hexdigest()
 
 _START_CONFIG = (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
                  config.SERVING_SPEND_CAP_USD,
-                 config.SERVING_SPEND_WINDOW_SECONDS)
+                 config.SERVING_SPEND_WINDOW_SECONDS,
+                 config.RATER_SPEND_CAP_USD)
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage-spend-coverage-")
 _SAVED_RESOLVED = dict(_paths._RESOLVED)
@@ -172,14 +173,16 @@ def raised(fn, *a, **kw):
 
 @contextlib.contextmanager
 def clean_ledger(*, policy=spend.SPEND_POLICY_CAMPAIGN, cap=None,
-                 serving_cap=None, window=None, enforced=True):
+                 serving_cap=None, window=None, enforced=True,
+                 rater_cap=None):
     """A ledger, a policy and the two caps, restored on the way out.
 
     RESTORED FROM VALUES CAPTURED HERE rather than from literals, so a
     legitimate change to a shipped default costs this file nothing.
     """
     _cfg = (config.SPEND_CAP_USD, config.SERVING_SPEND_CAP_USD,
-            config.SERVING_SPEND_WINDOW_SECONDS, config.SPEND_CAP_ENFORCED)
+            config.SERVING_SPEND_WINDOW_SECONDS, config.SPEND_CAP_ENFORCED,
+            config.RATER_SPEND_CAP_USD)
     _prev = spend.policy()
     spend.SPEND_LEDGER.reset()
     spend.SPEND_STOP.reset()
@@ -189,6 +192,13 @@ def clean_ledger(*, policy=spend.SPEND_POLICY_CAMPAIGN, cap=None,
         config.SPEND_CAP_USD = cap
     if serving_cap is not None:
         config.SERVING_SPEND_CAP_USD = serving_cap
+    # THE RATER'S CAP IS A SEPARATE KNOB HERE BECAUSE IT IS A SEPARATE BUDGET.
+    # Before the split, a rater scenario set `cap=` and was bound by it; now a
+    # rater scenario that set only `cap=` would be bound by the SHIPPED
+    # config.RATER_SPEND_CAP_USD and would pass or fail for a reason it never
+    # stated. Every rater drive below names this one.
+    if rater_cap is not None:
+        config.RATER_SPEND_CAP_USD = rater_cap
     if window is not None:
         config.SERVING_SPEND_WINDOW_SECONDS = window
     config.SPEND_CAP_ENFORCED = enforced
@@ -203,7 +213,7 @@ def clean_ledger(*, policy=spend.SPEND_POLICY_CAMPAIGN, cap=None,
         spend.SPEND_LEDGER_FAULTS.clear()
         (config.SPEND_CAP_USD, config.SERVING_SPEND_CAP_USD,
          config.SERVING_SPEND_WINDOW_SECONDS,
-         config.SPEND_CAP_ENFORCED) = _cfg
+         config.SPEND_CAP_ENFORCED, config.RATER_SPEND_CAP_USD) = _cfg
 
 
 # ===========================================================================
@@ -500,17 +510,17 @@ check("2c  an unrecognised policy RAISES rather than falling back -- the two "
 
 with clean_ledger(policy=spend.SPEND_POLICY_CAMPAIGN, cap=10.0):
     check("2d  under `campaign`, the cap is compared against the MONOTONE "
-          "total", spend.active_cap(), 10.0)
+          "total", spend.active_cap(spend.SPEND_SOURCE_STAGE5), 10.0)
     spend.SPEND_LEDGER.charge_usd(4.0, spend.SPEND_SOURCE_STAGE5)
-    check("2d-i ...which the ledger reports", spend.active_spend(), 4.0)
+    check("2d-i ...which the ledger reports", spend.active_spend(spend.SPEND_SOURCE_STAGE5), 4.0)
 
 with clean_ledger(policy=spend.SPEND_POLICY_WINDOW, serving_cap=5.0,
                   window=3600.0):
     check("2e  under `serving_window`, the cap is the SERVING one",
-          spend.active_cap(), 5.0)
+          spend.active_cap(spend.SPEND_SOURCE_STAGE5), 5.0)
     spend.SPEND_LEDGER.charge_usd(4.0, spend.SPEND_SOURCE_STAGE5)
     check("2e-i ...and the quantity is the window, not the total",
-          (spend.active_spend(), spend.SPEND_LEDGER.total), (4.0, 4.0))
+          (spend.active_spend(spend.SPEND_SOURCE_STAGE5), spend.SPEND_LEDGER.total), (4.0, 4.0))
 
 # *** THE DEFECT, DRIVEN BOTH WAYS ON THE SAME LEDGER. ***
 #
@@ -524,18 +534,18 @@ _HISTORY = []
 with clean_ledger(policy=spend.SPEND_POLICY_CAMPAIGN, cap=3.0, window=0.30):
     for _ in range(4):
         spend.SPEND_LEDGER.charge_usd(1.0, spend.SPEND_SOURCE_STAGE5)
-    _HISTORY.append(("campaign, over", spend.cap_exceeded()))
+    _HISTORY.append(("campaign, over", spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
     time.sleep(0.45)
     _HISTORY.append(("campaign, after the window would have rolled",
-                     spend.cap_exceeded()))
+                     spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
 
 with clean_ledger(policy=spend.SPEND_POLICY_WINDOW, serving_cap=3.0,
                   window=0.30):
     for _ in range(4):
         spend.SPEND_LEDGER.charge_usd(1.0, spend.SPEND_SOURCE_STAGE5)
-    _HISTORY.append(("window, over", spend.cap_exceeded()))
+    _HISTORY.append(("window, over", spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
     time.sleep(0.45)
-    _HISTORY.append(("window, after it rolled", spend.cap_exceeded()))
+    _HISTORY.append(("window, after it rolled", spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
 
 check("2f  *** the long-lived-process defect: under the CAMPAIGN policy a "
       "process past its cap declines for ever, and under the WINDOW policy it "
@@ -644,9 +654,9 @@ with clean_ledger(policy=spend.SPEND_POLICY_WINDOW, serving_cap=100.0,
 with clean_ledger(policy=spend.SPEND_POLICY_WINDOW, serving_cap=2.0,
                   window=600.0) as ledger:
     check("3g  under budget, there is nothing to wait for",
-          spend.seconds_until_under_cap(), None)
+          spend.seconds_until_under_cap(spend.SPEND_SOURCE_STAGE5), None)
     ledger.charge_usd(3.0, spend.SPEND_SOURCE_STAGE5)
-    _wait = spend.seconds_until_under_cap()
+    _wait = spend.seconds_until_under_cap(spend.SPEND_SOURCE_STAGE5)
     check("3h  *** over budget, the wait is derived from when the offending "
           "charge ages out -- not the window width, which would be wrong by "
           "nearly the whole window ***",
@@ -656,7 +666,7 @@ with clean_ledger(policy=spend.SPEND_POLICY_CAMPAIGN, cap=1.0) as ledger:
     ledger.charge_usd(3.0, spend.SPEND_SOURCE_STAGE5)
     check("3i  a campaign total never falls, so there is no wait to report and "
           "None is the honest answer",
-          spend.seconds_until_under_cap(), None)
+          spend.seconds_until_under_cap(spend.SPEND_SOURCE_STAGE5), None)
 
 
 # ===========================================================================
@@ -1031,7 +1041,12 @@ def drive_submit(*, spent, cap, chunks):
     """Drive the REAL submit_batches under a given budget."""
     stub = _BatchStub()
     state, path = {}, os.path.join(_TMP, "rater_state_probe.json")
-    with clean_ledger(cap=cap) as ledger:
+    # `rater_cap=` AND NOT `cap=`: the rater is bound by its OWN budget
+    # (`spend.SPEND_BUDGETS`), and a drive that set the campaign cap would be
+    # measuring the shipped rater cap while claiming to measure the one it
+    # named. Both are set to the same number so the scenario's arithmetic is
+    # unchanged and the BINDING one is stated.
+    with clean_ledger(cap=cap, rater_cap=cap) as ledger:
         if spent:
             ledger.charge_usd(spent, spend.SPEND_SOURCE_RATER)
         outcome = raised(_rater.submit_batches, stub, chunks, state, path,
@@ -1053,7 +1068,7 @@ check("6e  *** with the budget already spent, NOT ONE batch is created ***",
 def drive_submit_crossing():
     stub = _BatchStub()
     state, path = {}, os.path.join(_TMP, "rater_state_probe2.json")
-    with clean_ledger(cap=10.0) as ledger:
+    with clean_ledger(cap=10.0, rater_cap=10.0) as ledger:
         ledger.charge_usd(9.0, spend.SPEND_SOURCE_RATER)
         _orig = stub.create
 
@@ -1087,13 +1102,26 @@ for _bad in ({"spend_usd": "x"}, {"spend_usd": float("nan")},
           f"history is unreadable",
           _rater.rater_spend_before(_bad).usd, 0.0)
 
-with clean_ledger(cap=20.0) as ledger:
+# THE SEED IS ATTRIBUTED TO THE RATER BUDGET AND TO NO OTHER, which is what
+# `spend.BUDGET_FOR_SEED_SOURCE` decides. Asked about the CAMPAIGN the same
+# ledger reports a full budget, and that pairing is the measurement: a seed
+# that leaked across budgets would make both answers the same.
+with clean_ledger(cap=20.0, rater_cap=20.0) as ledger:
     ledger.seed(_rater.rater_spend_before({_rater.STATE_SPEND_KEY: 18.0}))
-    check("6h  *** a RESUMED session runs under the REMAINDER, not a fresh "
-          "cap ***", round(spend.remaining(), 6), 2.0)
+    check("6h  *** a RESUMED session runs under the REMAINDER of its OWN "
+          "budget, not a fresh cap ***",
+          round(spend.remaining(spend.SPEND_SOURCE_RATER), 6), 2.0)
+    check("6h-0 *** ...and the campaign budget is untouched by a judge's "
+          "resumed baseline: the seed lands in ONE budget ***",
+          (round(spend.remaining(spend.SPEND_SOURCE_STAGE5), 6),
+           spend.seed_budget(ledger.seeded)),
+          (20.0, spend.SPEND_BUDGET_RATER))
     ledger.charge_usd(3.0, spend.SPEND_SOURCE_RATER)
     check("6h-i ...so it stops after the batch that crosses",
-          spend.cap_exceeded(), True)
+          spend.cap_exceeded(spend.SPEND_SOURCE_RATER), True)
+    check("6h-ii ...and Stage 5 is STILL admitted, because the judge's spend "
+          "is not the campaign's",
+          spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5), False)
 
 
 # ===========================================================================
@@ -1484,7 +1512,7 @@ check("8g  the operator outranks the budget when both latches are set, so a "
       (_study.STOP_SWITCH.__class__.__name__,), ("_AblationStopSwitch",))
 _saved_req = _study.STOP_SWITCH.requested
 try:
-    spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe")
+    spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe", spend.SPEND_SOURCE_STAGE5)
     _study.STOP_SWITCH.requested = True
     check("8g-i  both set -> operator",
           _study._stop_reason_now(), _study.RUN_STOP_REASON_OPERATOR)
@@ -1492,7 +1520,7 @@ try:
     check("8g-ii only spend -> spend_cap",
           _study._stop_reason_now(), _study.RUN_STOP_REASON_SPEND_CAP)
     spend.SPEND_STOP.reset()
-    spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CALL_CEILING, "probe")
+    spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CALL_CEILING, "probe", spend.SPEND_SOURCE_STAGE5)
     check("8g-iii the ceiling is its own reason -- a DEFECT REPORT, not a "
           "budget event, so an operator is sent to the traceback rather than "
           "to a cap", _study._stop_reason_now(),
@@ -1564,7 +1592,7 @@ check("8j  CLEAN CONTROL: with no limit reached, the pair runs",
       (drive(_study._run_pair_unless_stopped, _pair_body, x=1), len(_ran)),
       ("ok", 1))
 
-spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe")
+spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe", spend.SPEND_SOURCE_STAGE5)
 try:
     check("8k  *** once a spend limit has latched, a pair submitted in the "
           "sweep's edge REFUSES to begin rather than issuing a live billed "
@@ -1589,7 +1617,7 @@ def refusal_message(*, operator, budget):
     try:
         _study.STOP_SWITCH.requested = operator
         if budget:
-            spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe")
+            spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe", spend.SPEND_SOURCE_STAGE5)
         try:
             _study._run_pair_unless_stopped(_pair_body)
             return None
@@ -1624,42 +1652,69 @@ check("8h  the stop-reason vocabulary is closed and NULL is the fourth "
 section("SECTION 9 -- a campaign-plus-judge sequence under one cap")
 
 # *** THE POINT OF THE PASS, IN ONE SEQUENCE. *** Four billed paths, four price
-# tables, one cap. Before this pass the campaign's Stage 5 was the only one the
-# budget could see, so a program that ran a campaign and then a judge could
-# spend the cap twice and nothing would say so.
-with clean_ledger(cap=10.0) as ledger:
+# tables. Before it the campaign's Stage 5 was the only one any budget could
+# see, so a program that ran a campaign and then a judge could spend the cap
+# twice and nothing would say so.
+#
+# *** AND THE RULING THAT CAME AFTER IT SPLIT THE CAP IN TWO, WHICH IS WHY THIS
+# SEQUENCE READS AS IT NOW DOES. *** The CAMPAIGN budget is reached by the sum
+# of the three paths assigned to it; the judge is bound by its own. The
+# sequence below is the same program in the same order, and the second row is
+# where the two designs part: under one cap the judge's $4 pushed the campaign
+# to $8.50, and under the ruling it does not move the campaign at all.
+with clean_ledger(cap=10.0, rater_cap=6.0) as ledger:
     _seq = []
     # 1. The campaign's Stage 5 and its per-patient query embedding.
     ledger.charge_usd(4.0, spend.SPEND_SOURCE_STAGE5)
     ledger.charge_usd(0.5, spend.SPEND_SOURCE_EMBEDDING)
-    _seq.append(("after the campaign", round(spend.remaining(), 4),
-                 spend.cap_exceeded()))
+    _seq.append(("after the campaign", round(spend.remaining(spend.SPEND_SOURCE_STAGE5), 4),
+                 spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
     # 2. The judge, priced from a different table by a different vendor.
     ledger.charge_usd(4.0, spend.SPEND_SOURCE_RATER)
-    _seq.append(("after the judge", round(spend.remaining(), 4),
-                 spend.cap_exceeded()))
+    _seq.append(("after the judge", round(spend.remaining(spend.SPEND_SOURCE_STAGE5), 4),
+                 spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
+    _judge = (round(spend.remaining(spend.SPEND_SOURCE_RATER), 4),
+              spend.cap_exceeded(spend.SPEND_SOURCE_RATER))
     # 3. Ragas, which would have been free of charge to the budget before.
     ledger.charge_usd(2.0, spend.SPEND_SOURCE_RAGAS_JUDGE)
-    _seq.append(("after ragas", round(spend.remaining(), 4),
-                 spend.cap_exceeded()))
-    check("9a  *** the cap is reached by the SUM of four paths priced four "
-          "ways, not by Stage 5 alone ***",
+    _seq.append(("after ragas", round(spend.remaining(spend.SPEND_SOURCE_STAGE5), 4),
+                 spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)))
+    check("9a  *** the CAMPAIGN budget is reached by the SUM of the three "
+          "paths assigned to it, not by Stage 5 alone -- and the judge's $4 "
+          "moves it not at all ***",
           _seq,
           [("after the campaign", 5.5, False),
-           ("after the judge", 1.5, False),
-           ("after ragas", -0.5, True)])
+           ("after the judge", 5.5, False),
+           ("after ragas", 3.5, False)])
+    check("9a-0 *** ...while the JUDGE is bound by its own $6, which its $4 "
+          "left $2 of -- two budgets, two answers, one ledger ***",
+          _judge, (2.0, False))
+    ledger.charge_usd(3.0, spend.SPEND_SOURCE_RATER)
+    check("9a-0-i *** ...and crossing the rater cap declines the RATER and "
+          "admits Stage 5, which is the whole content of the ruling ***",
+          (spend.cap_exceeded(spend.SPEND_SOURCE_RATER),
+           spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5),
+           raised(spend.require_budget, spend.SPEND_SOURCE_RATER, "probe"),
+           raised(spend.require_budget, spend.SPEND_SOURCE_STAGE5, "probe")),
+          (True, False, "SpendLimitReached", None))
     check("9a-i ...and the breakdown says which of them spent what, so an "
           "operator reading a stop knows where to look",
           {k: round(v, 4) for k, v in ledger.by_source().items()},
           {spend.SPEND_SOURCE_STAGE5: 4.0,
            spend.SPEND_SOURCE_EMBEDDING: 0.5,
-           spend.SPEND_SOURCE_RATER: 4.0,
+           spend.SPEND_SOURCE_RATER: 7.0,
            spend.SPEND_SOURCE_RAGAS_JUDGE: 2.0})
-    check("9a-ii ...and every one of the four paths would now be DECLINED",
+    # AND THE ORIGINAL CLAIM, RE-ASKED OF THE BUDGET THAT NOW OWNS IT: with
+    # the campaign budget spent, EVERY path assigned to it is declined --
+    # including the two that reach a different vendor through a different price
+    # table, which is what the coverage pass bought and the split does not
+    # give back.
+    ledger.charge_usd(4.0, spend.SPEND_SOURCE_RAGAS_EMBEDDING)
+    check("9a-ii ...and with the CAMPAIGN budget spent, every one of its "
+          "three paths is DECLINED",
           sorted({raised(spend.require_budget, s, "probe")
                   for s in (spend.SPEND_SOURCE_STAGE5,
                             spend.SPEND_SOURCE_EMBEDDING,
-                            spend.SPEND_SOURCE_RATER,
                             spend.SPEND_SOURCE_RAGAS_JUDGE)}),
           ["SpendLimitReached"])
 
@@ -1670,9 +1725,12 @@ with clean_ledger(cap=10.0) as ledger:
     ledger.charge_usd(4.0, spend.SPEND_SOURCE_STAGE5)
     check("9b  *** BEFORE-STATE: with only Stage 5 charged, the same program "
           "reads as well within budget and the judge is admitted -- which is "
-          "the hole this pass closed ***",
-          (round(spend.remaining(), 4), spend.cap_exceeded(),
-           raised(spend.require_budget, spend.SPEND_SOURCE_RATER, "probe")),
+          "the hole the coverage pass closed for the paths the campaign "
+          "budget owns ***",
+          (round(spend.remaining(spend.SPEND_SOURCE_STAGE5), 4),
+           spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5),
+           raised(spend.require_budget, spend.SPEND_SOURCE_EMBEDDING,
+                  "probe")),
           (6.0, False, None))
 
 # THE REPORT NAMES WHAT THE CAP DOES NOT COVER, on every run.
@@ -1731,7 +1789,7 @@ def study_close(*, spend_stop, operator_stop):
     try:
         _study.STOP_SWITCH.requested = operator_stop
         if spend_stop:
-            spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe")
+            spend.SPEND_STOP.trip(spend.SPEND_LIMIT_CAP, "probe", spend.SPEND_SOURCE_STAGE5)
         _study.print_study_close(_study.STUDY_STATUS_STOPPED, 1.0, 1, 0, 0,
                                  db_path=_STUDY_DB, out=sink)
     finally:
@@ -1772,7 +1830,7 @@ with clean_ledger(cap=1.0) as ledger:
     _any_text = study_close(spend_stop=False, operator_stop=True)
 check("10d the study's closing block carries the SPEND block on every path, "
       "because it is what an operator asks first about a study that stopped",
-      ("SPEND" in _any_text, "campaign total" in _any_text), (True, True))
+      ("SPEND" in _any_text, "all budgets" in _any_text), (True, True))
 
 
 # ===========================================================================
@@ -1796,7 +1854,8 @@ check("11c-i non-degeneracy: the five hashes are five different values, so 11c "
 
 check("11d the shipped configuration is restored",
       (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
-       config.SERVING_SPEND_CAP_USD, config.SERVING_SPEND_WINDOW_SECONDS),
+       config.SERVING_SPEND_CAP_USD, config.SERVING_SPEND_WINDOW_SECONDS,
+       config.RATER_SPEND_CAP_USD),
       _START_CONFIG)
 check("11e ...and the policy is back to the campaign default, so a process "
       "that imports this module is not left under a serving window",

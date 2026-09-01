@@ -297,6 +297,185 @@ to see that rather than infer it.
 
 
 # ===========================================================================
+# WHICH BUDGET GOVERNS WHICH PATH
+# ===========================================================================
+
+SPEND_BUDGET_CAMPAIGN = "campaign"
+SPEND_BUDGET_RATER = "rater"
+
+SPEND_BUDGETS = (SPEND_BUDGET_CAMPAIGN, SPEND_BUDGET_RATER)
+"""The budgets this project's billed paths are bound by. CLOSED.
+
+**BUDGETS ARE PER BILLED PROGRAM, NOT ONE NUMBER FOR ALL, AND THAT IS AN
+OPERATOR RULING.** One cap over every path was the right first move -- it
+closed the hole where a campaign and a judge could each spend the whole budget
+and nothing would say so -- and it conflated two programs an operator runs and
+stops separately. Under one number a campaign that ran long silently leaves the
+judge nothing, and the judge's stop names a ledger belonging to a different
+program: the hardest kind of stop to diagnose, because the cause is not in the
+run that met it.
+
+  ``campaign``  everything the evaluation campaign and the things that run
+                beside it spend -- Stage 5, Stage 2's dense query embedding and
+                both ragas paths. Cap: ``config.SPEND_CAP_USD``, or
+                ``config.SERVING_SPEND_CAP_USD`` under the ``serving_window``
+                policy (see ``SPEND_POLICIES``).
+  ``rater``     the independent judge alone. Cap:
+                ``config.RATER_SPEND_CAP_USD``.
+
+**A BUDGET IS A CAP *AND* A MEASURE, AND SPLITTING ONLY THE CAP WOULD HAVE BEEN
+WORSE THAN NOT SPLITTING.** ``budget_spend`` sums the ledger over THAT budget's
+sources and adds the seed only when the seed belongs to it, so a judge run
+after a campaign is not declined by money the campaign spent, and a campaign is
+not charged for a judge. Giving the rater its own cap while still comparing it
+against the whole ledger's total would have produced the exact defect this
+ruling removes, wearing the costume of a fix.
+
+WHY RAGAS IS UNDER ``campaign`` RATHER THAN BESIDE THE RATER, since both judge
+and both reach Anthropic: the ruling is "every non-rater billed path keeps the
+campaign cap", and the shapes agree with it -- ragas runs inside the evaluation
+campaign's own harness against the campaign's runs, while the rater is a
+separate invocation with a separate resume gesture and a separate state file.
+
+THE TWO ARE STILL NOT NETTED AGAINST EACH OTHER ACROSS PROCESSES, and they
+never were: a campaign seeds from the ``runs`` chain and a rater session from
+``rater_state.json``, and no shared store exists that both write. What the
+split changes is that this is now the DESIGN rather than an accident of which
+process happened to run.
+"""
+
+BUDGET_FOR_SOURCE = {
+    SPEND_SOURCE_STAGE5: SPEND_BUDGET_CAMPAIGN,
+    SPEND_SOURCE_EMBEDDING: SPEND_BUDGET_CAMPAIGN,
+    SPEND_SOURCE_RAGAS_JUDGE: SPEND_BUDGET_CAMPAIGN,
+    SPEND_SOURCE_RAGAS_EMBEDDING: SPEND_BUDGET_CAMPAIGN,
+    SPEND_SOURCE_RATER: SPEND_BUDGET_RATER,
+}
+"""Which budget each billed path is bound by. TOTAL over ``SPEND_SOURCES``.
+
+TOTAL AND NOT DEFAULTED, enforced at import below. A source with no entry would
+have to fall back to SOME budget, and whichever one was chosen would be a
+guess about money made by the dispatch rather than by an operator -- the shape
+``deps.OVERRIDE_KEYS`` refuses for a client and this refuses for a cap.
+"""
+
+BUDGET_SOURCES = {
+    _b: tuple(_s for _s in SPEND_SOURCES if BUDGET_FOR_SOURCE[_s] == _b)
+    for _b in SPEND_BUDGETS
+}
+"""``{budget: (source, ...)}``, DERIVED from the table above rather than typed.
+
+It is the inverse of one mapping and a second hand-written copy is a second
+chance for a path to be bound by one budget and measured against another --
+which is a gate that declines the wrong program and never says so.
+"""
+
+BUDGET_FOR_SEED_SOURCE = {
+    SEED_SOURCE_CAMPAIGN: SPEND_BUDGET_CAMPAIGN,
+    SEED_SOURCE_RATER_STATE: SPEND_BUDGET_RATER,
+}
+"""Which budget a resumed baseline belongs to. TOTAL over ``SEED_SOURCES``
+except ``fresh``, which belongs to none by construction -- it is a zero.
+
+**THE SEED IS WHY A SHARED CAP WITH SPLIT LEDGERS WOULD STILL BE WRONG.** A
+rater session seeded from ``rater_state.json`` carries a number about the
+JUDGE; a campaign seeded from the ``runs`` chain carries one about the
+CAMPAIGN. Adding either into the other budget's measure is the same
+misattribution as charging one program's calls to the other, arriving through
+the resume path instead of through the gate.
+"""
+
+BUDGET_CAP_CONSTANTS = {
+    SPEND_BUDGET_CAMPAIGN: "config.SPEND_CAP_USD",
+    SPEND_BUDGET_RATER: "config.RATER_SPEND_CAP_USD",
+}
+"""The constant an operator edits to move each budget. For MESSAGES only.
+
+It exists because the remedy sentence in a refusal is the one thing an operator
+acts on, and a refusal about the judge that named ``config.SPEND_CAP_USD``
+would send them to raise a cap that had nothing to do with the stop. The
+``serving_window`` policy's own constant is deliberately not in this table --
+that is a POLICY over the campaign budget rather than a third budget, and
+``describe_serving_cap()`` is where it is named.
+"""
+
+
+def _assert_budget_tables_total():
+    """Refuse at import if a source or a seed source has no budget.
+
+    A ``RuntimeError`` and NOT an ``assert``: ``python -O`` deletes assertions,
+    and this is the guard that keeps a billed path from being bound by
+    whichever budget a ``.get`` default happened to name.
+    """
+    missing = sorted(set(SPEND_SOURCES) - set(BUDGET_FOR_SOURCE))
+    extra = sorted(set(BUDGET_FOR_SOURCE) - set(SPEND_SOURCES))
+    if missing or extra:
+        raise RuntimeError(
+            f"spend.BUDGET_FOR_SOURCE must name every SPEND_SOURCES member and "
+            f"nothing else; missing {missing!r}, unknown {extra!r}. A billed "
+            f"path with no declared budget would be bound by a default nobody "
+            f"chose.")
+    unknown = sorted({b for b in BUDGET_FOR_SOURCE.values()
+                      if b not in SPEND_BUDGETS})
+    if unknown:
+        raise RuntimeError(
+            f"spend.BUDGET_FOR_SOURCE names budget(s) {unknown!r} that are not "
+            f"in SPEND_BUDGETS {SPEND_BUDGETS!r}.")
+    empty = sorted(b for b in SPEND_BUDGETS if not BUDGET_SOURCES[b])
+    if empty:
+        raise RuntimeError(
+            f"budget(s) {empty!r} govern no billed path. A budget with no "
+            f"source is a cap that can never be reached and a report line that "
+            f"can never be anything but zero.")
+    seed_expected = set(SEED_SOURCES) - {SEED_SOURCE_NONE}
+    if set(BUDGET_FOR_SEED_SOURCE) != seed_expected:
+        raise RuntimeError(
+            f"spend.BUDGET_FOR_SEED_SOURCE must name every SEED_SOURCES member "
+            f"except {SEED_SOURCE_NONE!r}; it names "
+            f"{sorted(BUDGET_FOR_SEED_SOURCE)!r} against "
+            f"{sorted(seed_expected)!r}. A resumed baseline with no declared "
+            f"budget would be added to the wrong program's spend.")
+    seed_unknown = sorted({b for b in BUDGET_FOR_SEED_SOURCE.values()
+                           if b not in SPEND_BUDGETS})
+    if seed_unknown:
+        raise RuntimeError(
+            f"spend.BUDGET_FOR_SEED_SOURCE names budget(s) {seed_unknown!r} "
+            f"that are not in SPEND_BUDGETS {SPEND_BUDGETS!r}.")
+    if set(BUDGET_CAP_CONSTANTS) != set(SPEND_BUDGETS):
+        raise RuntimeError(
+            f"spend.BUDGET_CAP_CONSTANTS must name every budget; it names "
+            f"{sorted(BUDGET_CAP_CONSTANTS)!r} against "
+            f"{sorted(SPEND_BUDGETS)!r}. A refusal that could not name the "
+            f"constant an operator edits is a refusal with no remedy.")
+
+
+_assert_budget_tables_total()
+
+
+def budget_for(source: str) -> str:
+    """Which budget governs this billed path. ONE OWNER.
+
+    RAISES on an unrecognised source rather than defaulting, on
+    ``set_policy``'s footing: a source read as "the campaign budget" because
+    nobody declared it is a path spending a budget it was never given.
+    """
+    try:
+        return BUDGET_FOR_SOURCE[source]
+    except KeyError:
+        raise SpendCapConfigurationError(
+            f"{source!r} is not a billed path this module knows about. The "
+            f"closed vocabulary is {SPEND_SOURCES!r}, and every member is "
+            f"assigned a budget at spend.BUDGET_FOR_SOURCE. A path with no "
+            f"budget cannot be gated, and reading it as 'the campaign' would "
+            f"charge one program for another's calls.") from None
+
+
+def seed_budget(seed) -> Optional[str]:
+    """Which budget a ``LedgerSeed`` belongs to, or None for a fresh one."""
+    return BUDGET_FOR_SEED_SOURCE.get(getattr(seed, "source", None))
+
+
+# ===========================================================================
 # WHICH LIMIT THIS PROCESS IS UNDER
 # ===========================================================================
 
@@ -512,7 +691,8 @@ class SpendLedger:
         applied to money.
 
         **THE PRICING STAYS WITH THE PATH AND THE LIMIT STAYS HERE.** That
-        split is what lets one cap govern four billed paths priced four ways.
+        split is what lets a budget govern billed paths priced by four
+        different tables. WHICH budget is `BUDGET_FOR_SOURCE`'s answer.
 
         Args:
             usd: a non-negative float. Anything else is a fault, counted and
@@ -565,7 +745,13 @@ class SpendLedger:
             self._calls += 1
             self._by_source[source] += cost
             self._calls_by_source[source] += 1
-            self._events.append((now, cost))
+            # THE SOURCE RIDES WITH THE EVENT, which is what makes the
+            # rolling window answerable PER BUDGET. Without it a serving
+            # process's window would be one number over every path, and the
+            # campaign budget's window would silently include a charge from
+            # another budget -- the same misattribution the per-source
+            # breakdown removes for the total.
+            self._events.append((now, cost, source))
             self._prune(now)
 
     def _prune(self, now: float) -> None:
@@ -592,7 +778,7 @@ class SpendLedger:
         while self._events and self._events[0][0] < cut:
             self._events.popleft()
 
-    def window_spend(self, seconds=None) -> float:
+    def window_spend(self, seconds=None, sources=None) -> float:
         """What this process has been billed within the last ``seconds``.
 
         ``None`` asks ``config.SERVING_SPEND_WINDOW_SECONDS``. Prunes first, so
@@ -600,18 +786,55 @@ class SpendLedger:
         for exactly the case the window exists for: a server that has been idle
         long enough for its window to empty must be able to serve again WITHOUT
         a request having to arrive to trigger the pruning.
+
+        Args:
+            sources: restrict to these ``SPEND_SOURCES`` members. ``None`` --
+                what ``GET /health`` passes -- is every path, which is the
+                honest answer to "what has this process billed lately".
+                ``budget_spend`` passes one budget's sources, because a budget
+                may not be enforced against another budget's money.
+
+        AN UNREADABLE WINDOW FALLS BACK TO THE UNWINDOWED MEASURE, which is the
+        over-reporting and therefore over-enforcing direction -- and it is now
+        restricted to ``sources`` as well, because a fallback that quietly
+        widened to every path would make a typo in one constant charge one
+        budget for another's spend.
         """
         if seconds is None:
             seconds = getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None)
+        keep = None if sources is None else set(sources)
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)):
-            return self._measured
+            if keep is None:
+                return self._measured
+            with self._lock:
+                return sum(v for k, v in self._by_source.items() if k in keep)
         if seconds <= 0:
             return 0.0
         now = time.monotonic()
         cut = now - float(seconds)
         with self._lock:
             self._prune(now)
-            return sum(cost for stamp, cost in self._events if stamp >= cut)
+            return sum(cost for stamp, cost, src in self._events
+                       if stamp >= cut and (keep is None or src in keep))
+
+    def window_events(self, seconds, sources=None) -> list:
+        """``[(monotonic, usd), ...]`` inside the window, OLDEST FIRST. A copy.
+
+        THE ONE QUESTION THE SUMS CANNOT ANSWER, which is why it is a reader of
+        its own rather than ``seconds_until_under_cap`` reaching into the
+        deque: that function needs the events IN ORDER to find which one has to
+        age out, and a caller iterating the live deque while workers append is
+        the ``RuntimeError`` ``by_source()`` takes the lock to avoid. It was a
+        documented private-attribute reach until the budget split needed it
+        filtered as well; a filter written at the reach would have been a
+        second place to forget it.
+        """
+        keep = None if sources is None else set(sources)
+        now = time.monotonic()
+        cut = now - float(seconds)
+        with self._lock:
+            return [(stamp, cost) for stamp, cost, src in self._events
+                    if stamp >= cut and (keep is None or src in keep)]
 
     def by_source(self) -> dict:
         """``{source: usd}``, a copy. The reader for "where did it go".
@@ -769,29 +992,101 @@ def serving_spend_cap() -> Optional[float]:
     return float(cap)
 
 
-def active_cap() -> Optional[float]:
-    """The cap the policy in force is enforced against, or None. May raise."""
+def rater_spend_cap() -> Optional[float]:
+    """The cap ONE JUDGE SESSION runs under, or None. ONE OWNER.
+
+    ``spend_cap()``'s validation applied to ``config.RATER_SPEND_CAP_USD``, and
+    a separate function for ``serving_spend_cap()``'s reason: the two bound
+    different programs on different price tables, and a shared resolver would
+    make a message about one able to name the other's constant -- which is the
+    one sentence in a refusal an operator acts on.
+    """
+    cap = getattr(config, "RATER_SPEND_CAP_USD", None)
+    if cap is None:
+        return None
+    if isinstance(cap, bool) or not isinstance(cap, (int, float)):
+        raise SpendCapConfigurationError(
+            f"config.RATER_SPEND_CAP_USD must be a number of US dollars or "
+            f"None for no cap; it is {cap!r} ({type(cap).__name__}). A value "
+            f"that is not a number cannot be read as 'unlimited' -- that "
+            f"reading is how a typo becomes an unbounded judge session.")
+    if cap < 0:
+        raise SpendCapConfigurationError(
+            f"config.RATER_SPEND_CAP_USD is {cap!r}. A negative cap is not "
+            f"'unlimited'; set it to None if that is what you mean, which "
+            f"prints a line on every judge banner saying so.")
+    return float(cap)
+
+
+def budget_cap(budget: str) -> Optional[float]:
+    """The cap this BUDGET is enforced against, or None. May raise.
+
+    THE POLICY REACHES THE CAMPAIGN BUDGET AND NOT THE RATER'S, and that is a
+    decision rather than an omission. ``serving_window`` exists because a
+    long-lived server's spend is a RATE; a server charges ``stage5`` and
+    nothing else -- ``SPEND_SOURCE_RATER`` is charged at exactly one call site,
+    in ``oncotriage/evaluation/rater.py``, which is not reachable from
+    ``oncotriage/api/server.py`` or ``mcp_server.py``. So a windowed rater cap
+    would be a rate nobody has ruled on, guarding a case that cannot occur; the
+    monotone shape it keeps is the STRICTER of the two if it ever did.
+    """
+    if budget == SPEND_BUDGET_RATER:
+        return rater_spend_cap()
     if policy() == SPEND_POLICY_WINDOW:
         return serving_spend_cap()
     return spend_cap()
 
 
-def active_spend() -> float:
-    """The quantity the policy in force compares against ``active_cap()``.
+def budget_spend(budget: str) -> float:
+    """What this BUDGET has been billed, under the policy in force.
+
+    **THE MEASURE IS SPLIT AS WELL AS THE CAP, AND SPLITTING ONLY THE CAP WOULD
+    HAVE BEEN A DEFECT WEARING A FIX'S COSTUME.** A $50 judge cap compared
+    against a ledger holding $250 of campaign Stage 5 declines the judge's
+    first batch every time -- for money another program spent, which is the
+    conflation the ruling removes.
+
+    THE SEED IS ATTRIBUTED, NOT ADDED. ``LedgerSeed.source`` says which chain a
+    resumed baseline was read from, and ``BUDGET_FOR_SEED_SOURCE`` says which
+    budget that chain belongs to; a seed belonging to another budget
+    contributes ZERO here rather than a number about a different program.
+    """
+    sources = BUDGET_SOURCES[budget]
+    if budget != SPEND_BUDGET_RATER and policy() == SPEND_POLICY_WINDOW:
+        return SPEND_LEDGER.window_spend(sources=sources)
+    seed = SPEND_LEDGER.seeded
+    base = seed.usd if seed_budget(seed) == budget else 0.0
+    by = SPEND_LEDGER.by_source()
+    return base + sum(by.get(src, 0.0) for src in sources)
+
+
+def active_cap(source: str) -> Optional[float]:
+    """The cap this billed path is enforced against, or None. May raise.
+
+    ``source`` IS REQUIRED AND HAS NO DEFAULT, on ``empty_database(db_path,
+    flag)``'s footing. A default would name a budget, and the one thing this
+    split exists to prevent is a path being bound by a budget nobody chose --
+    which is precisely what a caller who forgot the argument would get, and
+    would get silently.
+    """
+    return budget_cap(budget_for(source))
+
+
+def active_spend(source: str) -> float:
+    """The quantity ``active_cap(source)`` is compared against.
 
     THE TWO POLICIES MEASURE DIFFERENT QUANTITIES AND THIS IS WHERE THAT LIVES.
-    Campaign: the seeded baseline plus everything this process has been billed,
-    monotone. Window: only what was billed inside the last
-    ``SERVING_SPEND_WINDOW_SECONDS``, which can go DOWN -- and going down is the
-    whole point, because it is what lets a server recover on its own.
+    Campaign: the seeded baseline plus everything this process has been billed
+    ON THAT BUDGET'S PATHS, monotone. Window: only what those paths were billed
+    inside the last ``SERVING_SPEND_WINDOW_SECONDS``, which can go DOWN -- and
+    going down is the whole point, because it is what lets a server recover on
+    its own.
     """
-    if policy() == SPEND_POLICY_WINDOW:
-        return SPEND_LEDGER.window_spend()
-    return SPEND_LEDGER.total
+    return budget_spend(budget_for(source))
 
 
-def cap_exceeded() -> bool:
-    """Has this process spent its budget under the policy in force?
+def cap_exceeded(source: str) -> bool:
+    """Has this billed path\'s BUDGET been spent, under the policy in force?
 
     A cheap read; never raises. See ``SPEND_POLICIES`` for why "its budget" is
     two different questions and why a server may not be asked the batch
@@ -815,27 +1110,27 @@ def cap_exceeded() -> bool:
     if not config.SPEND_CAP_ENFORCED:
         return False
     try:
-        cap = active_cap()
+        cap = active_cap(source)
     except SpendCapConfigurationError:
         return False
     if cap is None:
         return False
-    return active_spend() >= cap
+    return active_spend(source) >= cap
 
 
-def remaining() -> Optional[float]:
-    """Budget left, in US dollars, or None when there is no cap.
+def remaining(source: str) -> Optional[float]:
+    """This path\'s BUDGET left, in US dollars, or None when there is no cap.
 
     May be negative, and that is not clamped: a reader is entitled to see the
     overshoot rather than a zero that hides it.
     """
     try:
-        cap = active_cap()
+        cap = active_cap(source)
     except SpendCapConfigurationError:
         return None
     if cap is None:
         return None
-    return cap - active_spend()
+    return cap - active_spend(source)
 
 
 class SpendLimitReached(RuntimeError):
@@ -866,7 +1161,7 @@ class SpendLimitReached(RuntimeError):
         self.source = source
 
 
-def seconds_until_under_cap() -> Optional[float]:
+def seconds_until_under_cap(source: str) -> Optional[float]:
     """How long until the rolling window falls back under its cap. Seconds.
 
     ``None`` when the question does not apply -- no cap, enforcement off, the
@@ -896,8 +1191,16 @@ def seconds_until_under_cap() -> Optional[float]:
     """
     if not config.SPEND_CAP_ENFORCED or policy() != SPEND_POLICY_WINDOW:
         return None
+    budget = budget_for(source)
+    if budget == SPEND_BUDGET_RATER:
+        # THE RATER BUDGET DOES NOT HEAL WITH TIME, because `budget_cap` keeps
+        # it monotone under every policy -- see the argument there. Returning a
+        # number here would tell a caller to wait for something that will not
+        # happen, which is what the `None` for the call-ceiling limit already
+        # means one caller up.
+        return None
     try:
-        cap = serving_spend_cap()
+        cap = budget_cap(budget)
     except SpendCapConfigurationError:
         return None
     if cap is None:
@@ -907,15 +1210,11 @@ def seconds_until_under_cap() -> Optional[float]:
             or width <= 0:
         return None
     now = time.monotonic()
-    cut = now - float(width)
-    with SPEND_LEDGER._lock:                        # noqa: SLF001
-        # THE PRIVATE LOCK AND THE PRIVATE DEQUE, deliberately: this is the one
-        # question that cannot be answered from the public readers, because it
-        # needs the events IN ORDER rather than their sum. Adding a public
-        # accessor that hands the deque out would let a caller iterate it while
-        # workers append, which is the `RuntimeError` `by_source()` takes the
-        # lock to avoid. The coupling is inside one module and is stated here.
-        events = [(t, c) for t, c in SPEND_LEDGER._events if t >= cut]
+    # THE EVENTS OF THIS BUDGET ALONE, IN ORDER. `window_events` is the public
+    # reader for the one question the sums cannot answer; it takes the ledger's
+    # lock, so a caller cannot iterate the deque while workers append.
+    events = SPEND_LEDGER.window_events(float(width),
+                                        sources=BUDGET_SOURCES[budget])
     total = sum(c for _t, c in events)
     if total < cap:
         return None
@@ -969,26 +1268,33 @@ def require_budget(source: str, where: str, *, latch=None) -> None:
             forces it, and exists for a test that needs to drive one half
             against the other policy.
     """
-    if not cap_exceeded():
+    budget = budget_for(source)
+    if not cap_exceeded(source):
         return
     SPEND_GATE_SKIPS[f"{source}:{SPEND_LIMIT_CAP}"] += 1
     if latch_on_limit() if latch is None else latch:
-        SPEND_STOP.poll(where=where)
+        SPEND_STOP.poll(where=where, source=source)
     try:
-        cap = active_cap()
+        cap = active_cap(source)
     except SpendCapConfigurationError:
         cap = None
-    spent = active_spend()
+    spent = active_spend(source)
     log.warning("a billed request was not issued because a spend limit was "
                 "reached", status="stopped", event="spend_limit_declined",
                 phase=source, reason=SPEND_LIMIT_CAP, mode=where,
                 cost_usd=round(spent, 6),
                 threshold=(round(cap, 6) if cap is not None else None),
                 degraded=True)
+    # THE MESSAGE NAMES THE BUDGET THAT STOPPED IT AND THE CONSTANT THAT MOVES
+    # THAT BUDGET. A judge session refused with "raise config.SPEND_CAP_USD"
+    # sends an operator to a cap that had nothing to do with the stop -- the
+    # same misdiagnosis `_stop_reason_now()` avoids by putting the operator's
+    # own request first, reached through a budget instead of through a switch.
     raise SpendLimitReached(
-        f"the request was not issued: this process has spent "
+        f"the request was not issued: the {budget} budget has spent "
         f"${spent:.2f} against a {policy()} limit of "
-        f"{'no cap' if cap is None else f'${cap:.2f}'}",
+        f"{'no cap' if cap is None else f'${cap:.2f}'} "
+        f"({BUDGET_CAP_CONSTANTS[budget]})",
         limit=SPEND_LIMIT_CAP, source=source)
 
 
@@ -1331,6 +1637,7 @@ class SpendStop:
         self.detected_in = None
         self.spent = None
         self.cap = None
+        self.budget = None
 
     def reset(self) -> None:
         """Forget a limit reached by an earlier run in this process."""
@@ -1340,42 +1647,69 @@ class SpendStop:
             self.detected_in = None
             self.spent = None
             self.cap = None
+            self.budget = None
 
-    def trip(self, limit: str, where: str) -> bool:
+    def trip(self, limit: str, where: str, source: str) -> bool:
         """Latch on a limit a CALL SITE has already decided. Announces once.
 
         Used by the Stage 5 call-ceiling gate, which reaches its verdict from a
         per-invocation counter this object cannot see.
-        """
-        return self._latch(limit, where)
 
-    def poll(self, where: str = "run") -> bool:
+        ``source`` IS REQUIRED HERE TOO even though the ceiling is not a budget
+        event, because the block this prints reports a spend figure beside it
+        and that figure has to be about ONE budget. A ceiling trip announcing
+        the campaign's total inside a judge session would be a true number
+        about the wrong program.
+        """
+        return self._latch(limit, where, source)
+
+    def poll(self, where: str, source: str) -> bool:
         """Has a spend limit been reached? Reads the ledger.
 
         Args:
             where: which pass noticed. Free text; it never reaches a durable
                 store and every caller passes a literal.
+            source: the billed path being asked about, which selects the
+                BUDGET. Required and with no default, on ``active_cap``'s
+                footing: a default would name a budget, and this latch stops a
+                whole run.
+
+        THE LATCH IS SHARED ACROSS BUDGETS AND THAT IS DELIBERATE. One process
+        runs one program -- a campaign, a study, or a judge -- so at most one
+        budget can be reached in it, and a latch per budget would be state
+        nothing could distinguish while making "has this run stopped" two
+        questions for every caller on the hot path. What the latch RECORDS is
+        per budget: ``budget``, ``spent`` and ``cap`` all describe the one that
+        stopped it.
         """
         with self._lock:
             if self.requested:
                 return True
-        if not cap_exceeded():
+        if not cap_exceeded(source):
             return False
-        return self._latch(SPEND_LIMIT_CAP, where)
+        return self._latch(SPEND_LIMIT_CAP, where, source)
 
-    def _latch(self, limit: str, where: str) -> bool:
+    def _latch(self, limit: str, where: str, source: str) -> bool:
         with self._lock:
             if self.requested:
                 return True
             self.requested = True
             self.limit = limit
             self.detected_in = where
-            self.spent = SPEND_LEDGER.total
             try:
-                self.cap = spend_cap()
+                self.budget = budget_for(source)
             except SpendCapConfigurationError:
-                self.cap = None
+                self.budget = None
+            if self.budget is None:
+                self.spent, self.cap = SPEND_LEDGER.total, None
+            else:
+                self.spent = budget_spend(self.budget)
+                try:
+                    self.cap = budget_cap(self.budget)
+                except SpendCapConfigurationError:
+                    self.cap = None
             _spent, _cap = self.spent, self.cap
+            _budget = self.budget
 
         # OUTSIDE THE LOCK, for control.StopSwitch.poll's reason: the console
         # writer and the logger take locks of their own and this is reached
@@ -1385,12 +1719,18 @@ class SpendStop:
         console.out()
         console.out(rule)
         if limit == SPEND_LIMIT_CAP:
-            console.out(f"[SPEND] THE SPEND CAP HAS BEEN REACHED: "
-                        f"${_spent:.2f} of ${_cap:.2f}")
+            # `_cap` CANNOT BE None ON THIS BRANCH and the formatting relies on
+            # it: `poll()` only reaches here through `cap_exceeded()`, which is
+            # False whenever the cap is absent or unreadable. Stated rather
+            # than guarded, because a guard would suggest the state is
+            # reachable and a reader would go looking for how.
+            console.out(f"[SPEND] THE {_budget.upper()} SPEND CAP HAS BEEN "
+                        f"REACHED: ${_spent:.2f} of ${_cap:.2f}")
         else:
             console.out("[SPEND] A STAGE 5 INVOCATION HIT ITS BILLED-CALL "
                         "CEILING.")
-            console.out(f"[SPEND] Campaign spend so far: ${_spent:.2f}")
+            console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "
+                        f"${_spent:.2f}")
         # WHAT THIS BLOCK MAY SAY IS BOUNDED BY WHAT IT KNOWS, AND THE FIRST
         # DRAFT EXCEEDED IT. It read "No further patient will be STARTED ... the
         # checkpoint is current, and the run will be recorded STOPPED", which is
@@ -1407,12 +1747,14 @@ class SpendStop:
         console.out(f"[SPEND] Noticed during {where}. No further billed request "
                     f"will be ISSUED; work already in flight completes and is "
                     f"written.")
-        console.out(f"[SPEND] To continue, raise config.SPEND_CAP_USD and run "
-                    f"again -- a resumed campaign counts what this one spent.")
+        console.out(f"[SPEND] To continue, raise "
+                    f"{BUDGET_CAP_CONSTANTS.get(_budget, 'config.SPEND_CAP_USD')} "
+                    f"and run again -- a resumed run counts what this one "
+                    f"spent.")
         console.out(rule)
         log.warning("a spend limit stopped the run",
                     event="spend_limit_reached", status="stopped",
-                    mode=where, reason=limit, degraded=True,
+                    mode=where, reason=limit, phase=_budget, degraded=True,
                     cost_usd=round(_spent, 6),
                     threshold=(round(_cap, 6) if _cap is not None else None))
         return True
@@ -1448,6 +1790,33 @@ def describe_cap() -> str:
     return f"[Spend] Cap ${cap:.2f} per campaign."
 
 
+def describe_rater_cap() -> str:
+    """One line for a JUDGE SESSION's banner, printed before the first batch.
+
+    A SEPARATE FUNCTION FROM ``describe_cap()`` FOR ``describe_serving_cap()``'S
+    REASON, AND THE SHIPPED RATER PROVED IT: it printed ``describe_cap()``, so
+    every judge session announced "Cap $300.00 per campaign" -- a bound it does
+    not run under, naming a constant that would not move its own limit. It
+    prints on every session, uncapped included: the dangerous state must not be
+    the quiet one.
+    """
+    try:
+        cap = rater_spend_cap()
+    except SpendCapConfigurationError as exc:
+        return f"[Spend] REFUSING TO READ THE RATER CAP: {exc}"
+    if cap is None:
+        return ("[Spend] NO RATER SPEND CAP IS SET "
+                "(config.RATER_SPEND_CAP_USD is None). This judge session may "
+                "spend without limit.")
+    if not config.SPEND_CAP_ENFORCED:
+        return (f"[Spend] Rater cap ${cap:.2f} -- MEASURED ONLY. "
+                f"config.SPEND_CAP_ENFORCED is False, so nothing will be "
+                f"declined.")
+    return (f"[Spend] Rater cap ${cap:.2f} per judge session -- ITS OWN "
+            f"budget, not the campaign's. The smallest unit it can decline is "
+            f"one batch.")
+
+
 def describe_serving_cap() -> str:
     """One line for a SERVING process's startup banner.
 
@@ -1480,15 +1849,21 @@ def describe_serving_cap() -> str:
 
 
 def describe_seed(seed: LedgerSeed) -> str:
-    """One line for the run banner about what a resume inherited."""
+    """One line for the run banner about what a resume inherited.
+
+    IT NAMES THE BUDGET THE BASELINE LANDS IN, because it does not land in all
+    of them: ``BUDGET_FOR_SEED_SOURCE`` decides, and a judge session resuming
+    $12 must not read as a campaign that has already spent it.
+    """
     if seed.source == SEED_SOURCE_NONE or seed.runs == 0:
-        return ("[Spend] Fresh campaign: no prior run contributes to this "
-                "budget.")
+        return ("[Spend] Fresh run: no prior run contributes to any budget "
+                "here.")
     floor = (f" -- A FLOOR, NOT A TOTAL: {seed.unpriced} of {seed.rows} prior "
              f"rows carry no cost and are counted as $0"
              if seed.is_floor else "")
-    return (f"[Spend] Resumed campaign: ${seed.usd:.2f} already spent across "
-            f"{seed.runs} prior run(s) and {seed.rows} row(s){floor}.")
+    return (f"[Spend] Resumed {seed_budget(seed) or 'unattributed'} budget: "
+            f"${seed.usd:.2f} already spent across {seed.runs} prior run(s) "
+            f"and {seed.rows} row(s){floor}.")
 
 
 def report_lines() -> list:
@@ -1503,27 +1878,25 @@ def report_lines() -> list:
     lines.append(f"  policy              {policy()}  "
                  f"(installed by {policy_source()})")
     seed = SPEND_LEDGER.seeded
-    # THREE STATES, NOT TWO, AND THEY ARE DECIDED BEFORE ANYTHING IS PRINTED.
-    # A cap that could not be READ is not a cap that is ABSENT, and the first
-    # version of this function conflated them by testing `cap is not None`
-    # afterwards -- so an unreadable cap printed its own diagnosis AND then
-    # "NONE -- this run was unbounded" underneath it, two lines making
-    # different claims about the same value.
-    cap, cap_error = None, None
-    try:
-        # active_cap(), NOT spend_cap(): identical under the campaign policy
-        # this block was written for, and correct for a serving process, which
-        # would otherwise print the campaign cap it does not run under.
-        cap = active_cap()
-    except SpendCapConfigurationError as exc:
-        cap_error = exc
     lines.append(f"  this process        ${SPEND_LEDGER.measured:.4f} "
                  f"over {SPEND_LEDGER.calls} billed call(s)")
     if seed.runs:
+        # THE SEED NAMES ITS BUDGET. It is added to ONE budget's measure (see
+        # `BUDGET_FOR_SEED_SOURCE`), so a line reporting it without saying
+        # which would leave a reader to guess which of the figures below it is
+        # inside -- and the guess most readers would make is "all of them".
         lines.append(f"  inherited           ${seed.usd:.4f} "
-                     f"over {seed.rows} row(s) from {seed.runs} prior run(s)"
+                     f"over {seed.rows} row(s) from {seed.runs} prior run(s) "
+                     f"-> {seed_budget(seed) or 'no budget'}"
                      + ("  <- A FLOOR, NOT A TOTAL" if seed.is_floor else ""))
-    lines.append(f"  campaign total      ${SPEND_LEDGER.total:.4f}")
+    # "ALL BUDGETS" AND NOT "CAMPAIGN TOTAL", WHICH IS WHAT THIS LINE SAID AND
+    # WHAT IT STOPPED BEING. It is the whole ledger -- the seeded baseline plus
+    # everything this process billed on every path -- and once budgets are
+    # plural that is a number NO cap is compared against. Leaving the old name
+    # would have put a figure labelled "campaign" beside a campaign cap it can
+    # exceed without the campaign having spent a cent of it.
+    lines.append(f"  all budgets         ${SPEND_LEDGER.total:.4f}"
+                 f"   <- the whole ledger; no cap is compared against it")
     # WHERE IT WENT. Printed only when more than one path spent, because on a
     # batch run every dollar is Stage 5's and a one-row breakdown under a total
     # it equals is noise -- but the moment a second path contributes, a reader
@@ -1535,15 +1908,42 @@ def report_lines() -> list:
         for _src in sorted(_by, key=lambda k: (-_by[k], k)):
             lines.append(f"    {_src:<18}${_by[_src]:.4f}  over "
                          f"{_calls_by.get(_src, 0)} charge(s)")
-    if cap_error is not None:
-        lines.append(f"  cap                 UNREADABLE: {cap_error}")
-    elif cap is None:
-        lines.append("  cap                 NONE -- this run was unbounded")
-    else:
-        lines.append(f"  cap                 ${cap:.2f}"
-                     + ("" if config.SPEND_CAP_ENFORCED
-                        else "   (MEASURED ONLY -- not enforced)"))
-        lines.append(f"  remaining           ${cap - SPEND_LEDGER.total:.4f}")
+    # ONE CAP GROUP PER BUDGET, UNCONDITIONALLY, AND EVERY BUDGET EVERY TIME.
+    # A budget printed only when it spent would make its silence read as
+    # coverage -- the argument the "NOT COVERED BY THE CAP" block below already
+    # makes, applied to a budget instead of to an exemption. A batch run
+    # therefore prints the rater budget at $0.0000, which is the honest
+    # statement that the judge is separately bounded and this run did not touch
+    # it.
+    #
+    # THREE STATES PER BUDGET, NOT TWO, AND THEY ARE DECIDED BEFORE ANYTHING IS
+    # PRINTED. A cap that could not be READ is not a cap that is ABSENT, and
+    # the first version of this function conflated them by testing
+    # `cap is not None` afterwards -- so an unreadable cap printed its own
+    # diagnosis AND then "NONE -- this run was unbounded" underneath it, two
+    # lines making different claims about one value.
+    for _budget in SPEND_BUDGETS:
+        _cap, _cap_error = None, None
+        try:
+            # budget_cap(), NOT spend_cap(): it is the one owner of "which
+            # constant does this budget read", policy included -- so a serving
+            # process prints the window cap it runs under rather than the
+            # campaign cap it does not.
+            _cap = budget_cap(_budget)
+        except SpendCapConfigurationError as exc:
+            _cap_error = exc
+        _spent = budget_spend(_budget)
+        lines.append(f"  spent {_budget:<14}${_spent:.4f}")
+        if _cap_error is not None:
+            lines.append(f"  cap {_budget:<16}UNREADABLE: {_cap_error}")
+        elif _cap is None:
+            lines.append(f"  cap {_budget:<16}NONE -- this budget was "
+                         f"unbounded")
+        else:
+            lines.append(f"  cap {_budget:<16}${_cap:.2f}"
+                         + ("" if config.SPEND_CAP_ENFORCED
+                            else "   (MEASURED ONLY -- not enforced)"))
+            lines.append(f"  remaining {_budget:<10}${_cap - _spent:.4f}")
     if SPEND_LEDGER_FAULTS:
         lines.append(f"  UNPRICED RESPONSES  {sum(SPEND_LEDGER_FAULTS.values())}"
                      f"  <- the total above is LOWER than the truth")

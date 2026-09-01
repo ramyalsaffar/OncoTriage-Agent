@@ -10314,6 +10314,163 @@ spent, no migration was run, no fixture was re-captured and the production
 5. **Two truncated `ecog_selection` spellings survive in test seeds** and are
    provably inert (no registered query names the column). Reported, not swept.
 
+### Budgets are per billed program (the budget-split pass)
+
+**ONE CAP OVER FOUR BILLED PATHS WAS THE RIGHT FIRST MOVE AND IT CONFLATED TWO
+PROGRAMS AN OPERATOR RUNS AND STOPS SEPARATELY.** An operator ruling splits it:
+`config.SPEND_CAP_USD` stays **$300** and bounds the campaign and everything
+that runs beside it; `config.RATER_SPEND_CAP_USD` is **$50** and bounds the
+independent judge alone. **NO BILLED CALL WAS MADE** -- `python
+fixture_replay.py`'s differing-field multiset is **IDENTICAL to HEAD's, 26
+entries, and no content line of the 516-line log differs** (compared against a
+`git worktree`; the 0/12 is the standing recapture item, unchanged by this
+pass), and the production `inferences.db` sha256 is unchanged.
+
+**A BUDGET IS A CAP *AND* A MEASURE, AND SPLITTING ONLY THE CAP WOULD HAVE
+SHIPPED A DEFECT WEARING A FIX'S COSTUME.** A $50 judge cap compared against a
+ledger holding $250 of campaign Stage 5 declines the judge's first batch every
+time, for money another program spent. So `spend.BUDGET_FOR_SOURCE` assigns
+every `SPEND_SOURCES` member to a budget, `BUDGET_SOURCES` is DERIVED from it
+(a second hand-written inverse is a second chance for a path to be bound by one
+budget and measured against another), and `budget_spend` sums only that
+budget's paths.
+
+**THE SEED IS ATTRIBUTED, NOT ADDED**, which is the half a cap-only change
+leaves broken. `BUDGET_FOR_SEED_SOURCE` maps `campaign_rows` -> campaign and
+`rater_state` -> rater, so a resumed judge's $45 does not read as a campaign
+that has already spent it. `fresh` belongs to no budget by construction.
+
+| where | what |
+|---|---|
+| `spend.SPEND_BUDGETS` | the closed two-member vocabulary, argued |
+| `spend.BUDGET_FOR_SOURCE` / `BUDGET_SOURCES` / `BUDGET_FOR_SEED_SOURCE` / `BUDGET_CAP_CONSTANTS` | TOTAL over their vocabularies, enforced by a `RuntimeError` at import -- not an `assert`, which `python -O` deletes |
+| `spend.rater_spend_cap()` | `spend_cap()`'s validation on the other constant: None is no cap, zero IS a cap, a negative or a non-number RAISES, `bool` excluded |
+| `spend.budget_cap` / `budget_spend` / `active_cap(source)` / `active_spend(source)` / `cap_exceeded(source)` / `remaining(source)` / `seconds_until_under_cap(source)` | `source` is REQUIRED with no default, on `empty_database(db_path, flag)`'s footing: a default would name a budget, and a path bound by a budget nobody chose is the one thing the split exists to prevent |
+| `spend.describe_rater_cap()` | the judge's banner. `describe_serving_cap()`'s precedent -- the shipped rater printed `describe_cap()`, so every judge session announced "Cap $300.00 per campaign", a bound it does not run under, naming a constant that would not move its own limit |
+| `SpendStop.poll(where, source)` / `.trip(limit, where, source)` / `.budget` | the latch records WHICH budget stopped the run, with that budget's own spend and cap |
+
+**THE POLICY REACHES THE CAMPAIGN BUDGET AND NOT THE RATER'S, and that is a
+decision.** `serving_window` exists because a server's spend is a RATE; a
+server charges `stage5` only (`SPEND_SOURCE_RATER` has exactly one charge site,
+in the rater, unreachable from either serving surface), so a windowed rater cap
+would be a rate nobody ruled on guarding a case that cannot occur -- and the
+monotone shape it keeps is the STRICTER of the two if it ever did. The ledger's
+events carry their source now, so the window is answerable per budget;
+`SpendLedger.window_events` is the public reader that replaced a documented
+private-deque reach in `seconds_until_under_cap`.
+
+**THE REPORT PRINTS EVERY BUDGET ON EVERY RUN, INCLUDING ONE THE RUN NEVER
+TOUCHED** -- the "NOT COVERED BY THE CAP" block's own argument, applied to a
+budget: printed only when it spent, its silence would read as coverage. The
+line that read `campaign total` is **`all budgets`** now and says *no cap is
+compared against it*: it is the whole ledger, and once budgets are plural that
+is a number labelled "campaign" sitting beside a campaign cap it can exceed
+without the campaign having spent a cent of it.
+
+**WHERE $50 COMES FROM.** The ruled judge pass is 100 patients at under $10 by
+`SPEND_CAP_USD`'s own softest row ($7.50 at 25,000/5,000 per patient, $12.00 at
+40,000/8,000), so $50 is ~5x the estimate and ~4x its own worst case while
+stopping a runaway inside a fifth of the campaign's cap. **AND THE CAMPAIGN'S
+MULTIPLES MOVED WITH IT**: the judge row leaves what `SPEND_CAP_USD` bounds, so
+the program THIS cap governs is $89.65 / $205.41 and the cap sits at ~3.3x
+expected and ~1.5x worst case. The table in that docstring is left whole,
+because it is the PROGRAM's cost; what changed is which rows this number is
+compared against.
+
+**THE OVERSHOOT IS COARSER ON THE JUDGE THAN ON STAGE 5 AND IS STATED AT THE
+CONSTANT.** The Batches API puts the gate and the charge further apart: one
+`batches.create` commits up to `rater.MAX_REQUESTS_PER_BATCH` requests and
+reports no usage until they are collected, so the smallest unit this cap can
+decline is a whole batch. Stage 5's bound is "the requests in flight".
+
+```bash
+# The budget-split pass. Same shape, same directory. No network, no keys, NO
+# SPEND -- no provider client is built and no request of any kind is issued. NO
+# MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports; torch and
+# transformers asserted absent), no live Qdrant, no corpus, no database, no git
+# history, no live server. It writes NOTHING anywhere, not even a temp
+# directory. NOT in the collision matrix -- but it DOES read
+# oncotriage/config.py, which tests/test_config_snapshot_date_rot.py rewrites in
+# place, so all four files it reads are sha256-compared at the end. It DOES
+# exec: four in-memory copies of oncotriage/spend.py -- one CLEAN CONTROL and
+# three cross-wire plants -- argued at _EXEC_ALLOWLIST. Bucket A, ~2 s.
+python tests/test_spend_budget_split.py                             #  79
+```
+
+**TWELVE REVERTS, TWELVE CAUGHT**, each into a `copytree`'d copy with a
+`sitecustomize` that strips the editable install's MetaPathFinder (which
+otherwise beats `PYTHONPATH`), a realpath preflight asserting the COPY is what
+imports, and `PYTHONDONTWRITEBYTECODE=1`. **FOUR WERE MISSED ON THE FIRST RUN
+AND EVERY ONE WAS A REAL GAP IN THE CHECKS**, which is the whole argument for
+running the matrix rather than reasoning about it:
+
+  * **the rater's preflight reading the CAMPAIGN remainder** -- the pin said
+    the module NAMES `SPEND_SOURCE_RATER` somewhere, which stays true because
+    `submit_batches` does. Every budget-selecting call in that module is now
+    required to name it;
+  * **the remedy sentence naming `config.SPEND_CAP_USD`** -- it is an f-string
+    LITERAL, and the pin walked `ast.Attribute` only, so a module telling an
+    operator to raise the wrong constant reported clean. String constants are
+    in the scan now, with **both function and ATTRIBUTE docstrings excluded**
+    (a bare string statement after an assignment, which `STATE_SPEND_KEY`
+    carries) -- the third time this project has met "a file that argues about
+    its own settings cannot be grepped for them";
+  * **the latch recording `SPEND_LEDGER.total`** -- the scenario charged only
+    the rater, so the whole ledger and the rater budget's spend were the SAME
+    number and the wrong reading looked right. It charges both budgets now,
+    with a non-degeneracy check that the two figures differ;
+  * **the totality guard's plant matched the `def` line as well as the call**
+    and reported PLANT-FAILED -- a plant that matches the wrong thing is worse
+    than no plant, because it fails and therefore looks like it is working.
+
+**AND THE ABORT SHAPE TWICE, BOTH FOUND BY RUNNING.** The revert that makes
+`report_lines()` print one budget instead of every one made a bare
+`[...][0]` raise `IndexError` in both spend test files -- the seventeenth time
+this project has shipped that shape -- and the fix's own first version put
+`_Absent` values in a `set`, which is a `TypeError` because a class defining
+`__eq__` is unhashable. Both are closed (`first()` / `_one()` plus `str()`),
+and the same revert now reports 2 and 3 recorded failures with a summary.
+
+**R1 IS THE ONE REVERT THAT ABORTS AND THAT IS THE GUARD WORKING**: mapping
+`rater_batch` onto the campaign budget leaves the rater budget governing no
+path, `_assert_budget_tables_total()` raises at import, and the module is
+unimportable -- so there is no process in which a check could run.
+`TRACKING_STATUS_FOR`'s precedent.
+
+**VERIFIED BY RUNNING.** CI bucket A **90 files, 0 failed, 0 not run**;
+`tests/test_package_invariants.py` **260/0/0**; `tests/run_serial_tests.py`
+**5/5 in 403.9 s** with `oncotriage/config.py` carrying only this pass's own
+edit and `oncotriage/registries/cancer_code_registry.py` byte-unchanged;
+`ci_test_buckets.py --check` consistent at 109 files; `static_checks.py`
+compiles 259; `tests/test_spend_gate.py` **157** (was 151),
+`tests/test_spend_coverage.py` **165** (was 161),
+`tests/test_runner_stop_switch.py` **140**,
+`tests/test_storage_run_identity.py` **159**,
+`tests/test_ablation_stop_and_lock.py` **160** -- none of the last three moved.
+**No money was spent and no migration was run.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE TWO BUDGETS STILL DO NOT NET ACROSS PROCESSES**, and they never did:
+   a campaign seeds from the `runs` chain and a judge from
+   `rater_state.json`, with no shared store either writes. The split makes
+   that the DESIGN rather than an accident of which process happened to run;
+   closing it is a cross-process ledger, which is a persistence design of its
+   own.
+2. **RAGAS IS UNDER THE CAMPAIGN BUDGET**, per the ruling's "every non-rater
+   billed path keeps the campaign cap". It judges and reaches Anthropic like
+   the rater does, and a later ruling could reasonably give it a third budget;
+   the table is where that would be one line.
+3. **THE RATER BUDGET IS MONOTONE UNDER EVERY POLICY** (above). Unreachable
+   today and stricter if it ever is not.
+4. **`ragas_run.py` STILL HAS NO SEED**, so its cap binds within one invocation
+   and not across a resumed pair -- unchanged by this pass and recorded at
+   `SPEND_SOURCES`.
+5. **NEITHER CAP IS GATED BY THE RESUME FINGERPRINT.** Two runs under
+   different caps are indistinguishable to a resume gate. That was true of one
+   cap and is now true of two.
+
+
 ### The identifier exemption is bounded by length (the identifier-cap pass)
 
 **ONE PREDICATE CHANGED. `oncotriage/staging/secrets_scan.py`'s

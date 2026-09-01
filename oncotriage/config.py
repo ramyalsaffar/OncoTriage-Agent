@@ -3646,6 +3646,15 @@ rather than in a note somewhere because the cap is only defensible beside it.
     is the finding rather than the assumption -- and the second column is why
     the number is 300 and not 150.
 
+    **AND THE JUDGE ROW IS NO LONGER INSIDE WHAT *THIS* CONSTANT BOUNDS.** The
+    operator ruling that split the budgets moved it to RATER_SPEND_CAP_USD, so
+    the program THIS cap governs is $89.65 / $205.41 -- the table above less
+    the judge -- and the multiples are ~3.3x expected and ~1.5x worst case. The
+    table is left whole because it is the PROGRAM's cost and a reader deciding
+    what to spend needs all four rows; what changed is which of them this
+    number is compared against. `spend.report_lines()` prints both budgets on
+    every run, so the split cannot be read out of one figure and assumed.
+
 WHAT THE JUDGE PASS ROW IS AND WHY IT IS THE SOFTEST NUMBER HERE. The rater
 (`oncotriage/evaluation/rater.py`) calls a DIFFERENT vendor through the Message
 Batches API, priced from RATER_PRICING rather than PRICING_CONFIG, at
@@ -3660,11 +3669,19 @@ harnesses, do not write `inferences.estimated_cost_usd`, and are not gated."
 Every clause was true when it was written and the LAST one was the hole: a
 budget that covers one door of a building with four is not a budget. The
 spend-coverage pass closed it. Four billed paths now charge one ledger and are
-declined by one cap -- Stage 5, Stage 2's dense query embedding, the
-independent rater and the ragas harness -- each PRICED BY ITS OWN TABLE at its
-own call site and LIMITED here. `spend.SPEND_SOURCES` enumerates them and
+declined by a cap -- Stage 5, Stage 2's dense query embedding, the independent
+rater and the ragas harness -- each PRICED BY ITS OWN TABLE at its own call
+site and LIMITED here. `spend.SPEND_SOURCES` enumerates them and
 `spend.BILLED_SITES` maps every billed call site in the repository to `gated
 here` / `gated upstream` / `exempt, and here is why`.
+
+**"A CAP" AND NOT "ONE CAP", WHICH IS WHAT THIS PARAGRAPH SAID.** The judge is
+bound by `RATER_SPEND_CAP_USD` and everything else by this constant -- an
+operator ruling, argued at `spend.SPEND_BUDGETS`. So THIS number bounds the
+campaign and the things that run beside it (Stage 5, the query embedding, both
+ragas paths) and it does NOT bound the rater. `spend.report_lines()` prints
+every budget, spent and remaining, on every run, so the split cannot be read
+out of one figure and assumed.
 
 WHAT IT STILL DOES NOT BOUND, and it is named rather than implied: an index
 build, the index validator's one diagnostic embedding, `bedrock_probe.py`'s
@@ -3718,6 +3735,56 @@ unstated edge is a promise nobody can rely on.
     AT THE PATIENT. Charging only where the node folds its accumulators would
     make the bound MAX_WORKERS whole patients (~$5), because per-trial mode
     dispatches a patient's entire wave before the node reads any of it.
+"""
+
+RATER_SPEND_CAP_USD = 50.00
+"""The most one JUDGE SESSION may spend, in US dollars. Its OWN budget.
+
+THE VALUE IS AN OPERATOR RULING AND SO IS THE SPLIT ITSELF. Budgets are per
+billed PROGRAM, not one number for all: `SPEND_CAP_USD` bounds the campaign and
+everything that runs beside it, and this bounds the independent rater. The
+ruled judge pass is 100 patients and is estimated at UNDER $10 at
+`SPEND_CAP_USD`'s own softest row -- $7.50 at 25,000 in / 5,000 out per
+patient, $12.00 at 40,000 / 8,000 -- so $50 bounds it with headroom while
+stopping a runaway inside a fifth of the campaign's cap.
+
+WHY THIS IS A SEPARATE NUMBER AND NOT A SHARE OF THE CAMPAIGN'S, and the
+argument is about what the two bound rather than about tidiness:
+
+  * THEY ARE DIFFERENT PROGRAMS AN OPERATOR RUNS AND STOPS SEPARATELY. The
+    judge is a `rater_run.py` invocation against a finished campaign's runs; a
+    campaign is `25- Batch Runner.py`. Neither's budget should be able to
+    starve the other, and under one shared number a campaign that ran long
+    would silently leave the judge nothing -- a stop whose cause is in another
+    program's ledger, which is the hardest kind to diagnose.
+  * THEY ARE DIFFERENT VENDORS ON DIFFERENT PRICE TABLES. Stage 5 is priced
+    from `PRICING_CONFIG`; the rater is priced from `RATER_PRICING` at
+    claude-sonnet-4-6's $3.00/$15.00 with the flat 50% batch discount. One
+    number over two tables is a number whose meaning depends on which of them
+    moved.
+  * THEY ALREADY RESUME FROM DIFFERENT STORES. A campaign seeds its ledger
+    from the `runs` chain (`database_logger.campaign_spend_before`); a rater
+    session seeds from its own `rater_state.json`
+    (`rater.rater_spend_before`). Two chains were already being compared
+    against one cap, which is the conflation `spend.SPEND_BUDGETS` removes.
+
+WHAT THE SPLIT DOES **NOT** BUY, stated so nobody reads more into it than is
+there: it does not net the judge's spend against the campaign's either. It
+never did -- the two are separate processes with no shared store -- and the
+split makes that honest instead of accidental. See `spend.SPEND_BUDGETS`.
+
+WHAT THE OVERSHOOT IS HERE, and it is COARSER than Stage 5's. The Batches API
+puts the gate and the charge further apart: one `batches.create` commits up to
+`rater.MAX_REQUESTS_PER_BATCH` requests and reports no usage until they are
+collected, so the smallest unit this cap can decline is a whole batch. Stage
+5's bound is "the requests in flight"; this one's is "one batch", and it is the
+number an operator needs when choosing this value.
+
+None means NO RATER CAP -- `SPEND_CAP_USD`'s unset semantics, for its reason,
+and `spend.describe_rater_cap()` prints the state it takes on the banner of
+every judge session including the unlimited one. A cap of zero is a cap of zero
+and stops the session before its first batch; a negative value RAISES rather
+than being read as unlimited.
 """
 
 SERVING_SPEND_CAP_USD = 25.00

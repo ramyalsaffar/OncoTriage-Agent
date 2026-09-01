@@ -696,7 +696,7 @@ def _budget_declined(exc):
     the log line `require_budget` already wrote and in `GET /health`.
     """
     headers = {}
-    _wait = spend.seconds_until_under_cap()
+    _wait = spend.seconds_until_under_cap(spend.SPEND_SOURCE_STAGE5)
     if _wait is not None:
         headers["Retry-After"] = str(max(1, int(_wait)))
     return HTTPException(
@@ -1005,7 +1005,7 @@ def create_app():
         # endpoint's job is to let an operator SEE it. The three checks above
         # are the opposite kind of fact -- a missing dependency does not heal
         # and a restart is a reasonable response to it.
-        _spend_over = spend.cap_exceeded()
+        _spend_over = spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5)
         return {
             "status": "healthy" if healthy else "unhealthy",
             "pipeline_ready": graph is not None,
@@ -1023,7 +1023,8 @@ def create_app():
                 "declining": _spend_over,
                 "retry_after_seconds": (
                     None if not _spend_over
-                    else spend.seconds_until_under_cap()),
+                    else spend.seconds_until_under_cap(
+                        spend.SPEND_SOURCE_STAGE5)),
             },
             "timestamp": datetime.now().isoformat()
         }

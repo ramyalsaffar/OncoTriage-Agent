@@ -3546,7 +3546,9 @@ def main():
                     # `_create_run` row with no results is the shape
                     # `_summary_status_warning` then has to explain.
                     if (STOP_SWITCH.poll(where="between configurations")
-                        | spend.SPEND_STOP.poll(where="between configurations")):
+                        | spend.SPEND_STOP.poll(
+                            where="between configurations",
+                            source=spend.SPEND_SOURCE_STAGE5)):
                         _unstarted = total_configs - config_idx + 1
                         study_covered = False
                         console.out(f"[STOP] {_unstarted} "
@@ -3664,7 +3666,9 @@ def main():
                         # which is the contract wanted: pairs in flight are
                         # already paid for and their rows are worth having.
                         if (STOP_SWITCH.poll(where="during a configuration")
-                            | spend.SPEND_STOP.poll(where="during a configuration")):
+                            | spend.SPEND_STOP.poll(
+                                where="during a configuration",
+                                source=spend.SPEND_SOURCE_STAGE5)):
                             _n = control.cancel_queued(_futures)
                             if _n:
                                 console.out(f"[STOP] {_n} queued (config, "
@@ -3717,7 +3721,9 @@ def main():
                             # cancelled nor accounted for, and would run and
                             # bill after the stop was announced.
                             if (STOP_SWITCH.poll(where="while submitting")
-                                | spend.SPEND_STOP.poll(where="the submit loop")):
+                                | spend.SPEND_STOP.poll(
+                                    where="the submit loop",
+                                    source=spend.SPEND_SOURCE_STAGE5)):
                                 pairs_unsubmitted = (len(pending_patients)
                                                      - _index)
                                 break
