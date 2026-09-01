@@ -928,7 +928,14 @@ def drive_mcp(over_budget):
     try:
         _mcp._require_index = lambda tool: None
         _mcp._resolve_bundle_path = lambda p: "/nowhere/bundle.json"
-        _mcp._parse_bundle = lambda p: {"patient_id": "p1"}
+        # `_parse_bundle` RETURNS A PAIR since the MCP de-identification pass:
+        # `(patient_data, source_bundle)`. The decoded bundle is what lets the
+        # response boundary gate scan against the FULL identifier inventory
+        # rather than only `patient_id`. This stub moved with it, and the CLEAN
+        # CONTROL at 5e is what caught the single-value form -- a stub whose
+        # arity is wrong tests the tool's reaction to a broken helper while
+        # claiming to test the happy path.
+        _mcp._parse_bundle = lambda p: ({"patient_id": "p1"}, {"entry": []})
         _mcp.get_graph = lambda: object()
 
         def _stand_in(patient_data, graph):

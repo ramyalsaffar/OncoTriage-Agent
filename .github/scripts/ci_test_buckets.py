@@ -1107,6 +1107,29 @@ BUCKETS = {
     "test_registries_cancer_code_claims_audit_control.py": (
         _B, "UMLS MRCONSO*.RRF (it runs the audit above as its baseline)",
         "'File 42 exited 1 with NO defect planted, so a non-zero exit proves nothing'"),
+    "test_mcp_deidentified_responses.py": (
+        _A, None,
+        "ran green in 1.2s, 96 checks / 0 failed, against ONLY the directory "
+        "skeleton -- MEASURED with ONCOTRIAGE_MAIN_PATH pointed at a freshly "
+        "provisioned one, not inferred from the developer tree. The MCP "
+        "surface's de-identification: the pseudonym, the age cap, the "
+        "RENDERED_FIELDS record, and the response boundary gate with both of "
+        "its exemptions shown to be load-bearing. No network, no keys, NO "
+        "SPEND, no live Qdrant, no corpus (every bundle is fabricated in a "
+        "temp directory), no database, no git history, no live server -- the "
+        "graph is never invoked and every Qdrant-backed call is a stand-in "
+        "installed by rebinding a module attribute inside try/finally with "
+        "the restore asserted BY IDENTITY. It DOES build the ICD-10-CM "
+        "registry, because parse_fhir_bundle resolves the primary cancer "
+        "through registries.primary_cancer; icd10-cm is a declared "
+        "dependency. It EXECS NOTHING and loads no module by location -- the "
+        "bypass plant is an ast walk over an edited STRING, which is the "
+        "right instrument because the check it defeats is itself static. NOT "
+        "in the collision matrix: it writes only inside a tempfile.mkdtemp it "
+        "removes and asserts gone, and the two repository files it reads "
+        "(oncotriage/mcp/server.py, oncotriage/deid.py) are written by "
+        "neither of the suite's two writers and are sha256-compared at the "
+        "end"),
     "test_deid_stage_and_guard.py": (
         _A, None,
         "ran green in 6s, 135 checks / 0 failed / 0 skipped, against the "

@@ -287,10 +287,24 @@ else:
     check("parse status", _parsed.get("status"), "ok")
     check("parse result carries the long framing",
           _parsed.get("not_for_clinical_use"), _LONG)
-    check("parse returned a patient id",
-          bool((_parsed.get("patient_summary") or {}).get("patient_id")), True)
-    check("parse returned the full record",
-          isinstance(_parsed.get("patient_data"), dict), True)
+    # THE DE-IDENTIFICATION PASS MOVED BOTH OF THESE AND IT IS THE CHANGE
+    # WORKING, not a relaxation. `patient_id` -- byte-identical to the bundle's
+    # Medical Record Number on this corpus -- used to be reported here; it is a
+    # stable pseudonym now, and `patient_data` (the raw parsed record, birth
+    # date and all) is `patient_record`, exactly deid.RENDERED_FIELDS. The
+    # ABSENCE of the old keys is asserted rather than only the presence of the
+    # new ones, because a payload carrying both would satisfy a presence-only
+    # check. tests/test_mcp_deidentified_responses.py is the file that proves
+    # the rest of it.
+    check("parse identifies the patient by a pseudonym, not a record number",
+          str((_parsed.get("patient_summary") or {}).get("pseudonym") or "")
+          .startswith("PT-"), True)
+    check("...and no longer reports patient_id",
+          "patient_id" in (_parsed.get("patient_summary") or {}), False)
+    check("parse returned the de-identified record",
+          isinstance(_parsed.get("patient_record"), dict), True)
+    check("...and no longer returns the raw parsed record",
+          "patient_data" in _parsed, False)
     # ECOG is reported as None rather than 0 when absent: 0 is FULLY ACTIVE.
     _ecog = (_parsed.get("patient_summary") or {}).get("ecog_performance_status")
     check("ECOG is an int in 0-4 or None, never a default zero",

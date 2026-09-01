@@ -531,9 +531,78 @@ _MIN_EXACT_MATCH_CHARS = 4
 state and a tumour marker; ``US`` is a country and a word inside ``ultrasound``
 only if boundaries are ignored. Four characters is where a harvested value
 starts being distinctive enough that a hit is worth failing a patient over.
-Values shorter than this are SKIPPED, and ``skipped_short`` on the result says
-how many, so a reader can see the guard's own blind spot rather than infer it.
+Values shorter than this are SKIPPED, and the ``skipped`` count on the result
+says how many, so a reader can see the guard's own blind spot rather than infer
+it.
 """
+
+_MIN_DISTINCT_CHARS = 2
+"""A harvested value made of ONE repeated character carries no identity.
+
+THE LENGTH FLOOR IS A PROXY FOR DISTINCTIVENESS AND THIS IS WHERE THE PROXY WAS
+MEASURED TO FAIL. Synthea writes ``postalCode: "00000"`` for an organisation
+with no address; it is five characters, so it clears ``_MIN_EXACT_MATCH_CHARS``
+-- and ``"00000"`` is a substring of the SNOMED procedure codes ``415300000``
+and ``58000006``, which every oncology record carries. Measured over 120 corpus
+bundles, scanning each patient's SERIALIZED de-identified record against that
+patient's full bundle inventory: **13 bundles hit, and every single hit was
+``"00000"``. No other harvested value collided at all.** Without this rule a
+caller that supplies ``source_bundle`` refuses roughly one patient in nine, for
+a placeholder that identifies nobody.
+
+IT IS DELIBERATELY NARROW: one repeated character, not "all digits". A real ZIP
+code, a real MRN and a real member number are all digit runs and every one of
+them must still be scanned for. ``00000``, ``9999`` and ``----`` are the only
+shape this removes, and a value that cannot distinguish one person from another
+is the same thing the length floor already declines to fail a patient over.
+
+WHY IT IS HERE AND NOT AT THE CALLER THAT FOUND IT. The MCP server is the first
+caller to hand ``scan_for_identifiers`` a full bundle inventory in production,
+so it met this first -- but ``build_patient_record`` has always accepted a
+``source_bundle`` and ``oncotriage/evaluation/run_harness.py`` is one argument
+away from passing one. Fixing it at the caller would leave the identical
+landmine for the next one.
+
+NOTHING ON THE PRODUCTION RENDER PATH MOVES. Stage 5 passes no bundle, so its
+inventory is ``identifiers_from_parsed_record`` -- one UUID ``patient_id``,
+which has 16 distinct characters. Measured both ways over the corpus: zero
+findings before, zero after.
+"""
+
+
+def _is_scannable_value(value: str) -> bool:
+    """Is this harvested value distinctive enough to fail a patient over?
+
+    ONE PREDICATE FOR BOTH REASONS, so a caller cannot apply the length floor
+    and forget the distinctiveness one. Both are the same judgement -- "a hit on
+    this value would be noise rather than evidence" -- and both are counted into
+    the same ``skipped`` total, because what a reader needs is how much of the
+    inventory was not looked for, not which of two rules declined it.
+    """
+    return (len(value) >= _MIN_EXACT_MATCH_CHARS
+            and len(set(value)) >= _MIN_DISTINCT_CHARS)
+
+
+def count_scannable(inventory: Optional[Dict[str, Iterable[str]]]
+                    ) -> Tuple[int, int]:
+    """``(scannable, skipped)`` over an inventory, scanning no text.
+
+    THE SAME PREDICATE ``scan_for_identifiers`` APPLIES, so a caller reporting
+    "this many values were looked for, this many were not" cannot disagree with
+    what the scan actually did. It exists because a caller that wants to REPORT
+    the guard's blind spot before the scan runs -- ``oncotriage/mcp/server.py``
+    builds that report into the payload it is about to scan -- would otherwise
+    have to reimplement the predicate, and two copies of a floor is how a floor
+    drifts.
+    """
+    scannable = skipped = 0
+    for values in (inventory or {}).values():
+        for value in values:
+            if _is_scannable_value(str(value).strip()):
+                scannable += 1
+            else:
+                skipped += 1
+    return scannable, skipped
 
 
 # ===========================================================================
@@ -801,17 +870,18 @@ def scan_for_identifiers(text: str,
 
     Two layers, both always run:
 
-      EXACT      every value in ``inventory``, case-insensitively, at or above
-                 ``_MIN_EXACT_MATCH_CHARS``. Catches a name, an address line or
+      EXACT      every value in ``inventory`` that ``_is_scannable_value``
+                 admits, case-insensitively. Catches a name, an address line or
                  a record number that reached the text however it got there.
       SHAPE      ``_SHAPE_RULES``, provenance-free. Catches an SSN, a phone, an
                  email, a URL or a UUID that no inventory knew about -- which
                  is the case that matters when no bundle was supplied.
 
-    ``skipped`` is how many inventory values were below the length floor and
-    therefore not looked for. It is RETURNED rather than swallowed so a caller
-    can report the guard's own blind spot; a scan that silently declined to
-    look for half its inventory would read exactly like a clean one.
+    ``skipped`` is how many inventory values ``_is_scannable_value`` declined
+    -- too short, or one repeated character -- and therefore not looked for. It
+    is RETURNED rather than swallowed so a caller can report the guard's own
+    blind spot; a scan that silently declined to look for half its inventory
+    would read exactly like a clean one.
 
     FINDINGS CARRY OFFSETS, NOT TEXT. ``start`` and ``length`` locate the hit
     for a human with the record in front of them and carry nothing to a log.
@@ -829,7 +899,7 @@ def scan_for_identifiers(text: str,
     for cls, values in sorted((inventory or {}).items()):
         for value in sorted(values):
             needle = str(value).strip()
-            if len(needle) < _MIN_EXACT_MATCH_CHARS:
+            if not _is_scannable_value(needle):
                 skipped += 1
                 continue
             start = haystack.find(needle.lower())

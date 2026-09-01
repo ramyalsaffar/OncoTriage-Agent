@@ -3411,6 +3411,250 @@ The three defects the plants found — none of them by reading:
   itself cannot satisfy.
 
 
+### No direct identifier leaves the MCP surface (the MCP de-identification pass)
+
+**THE DE-IDENTIFICATION PASS RECORDED THREE LEAKS ON THIS SURFACE AND LEFT
+THEM, DELIBERATELY, BECAUSE CLOSING THEM CHANGES RESPONSE SHAPES AND IT
+REFUSED TO SHIP THAT UNVERIFIED.** That refusal was right and this pass is the
+verification. **NO BILLED CALL, NO RECAPTURE, NO MIGRATION**: the production
+`inferences.db` was never opened, and `python fixture_replay.py`'s output is
+**IDENTICAL to HEAD's -- 145 verdict and differing-field lines, in the same
+sequence** (compared against a `git worktree`; the 0/12 is the standing
+recapture item the de-identification and pre-diagnosis-ECOG passes left, and
+this pass adds nothing to it).
+
+**THE LEAKS, DRIVEN BEFORE AND AFTER RATHER THAN READ.** The pre-change tool
+was run out of a `git worktree` at HEAD with a realpath preflight asserting the
+worktree copy is what imported:
+
+| | BEFORE (driven at HEAD) | AFTER |
+|---|---|---|
+| `patient_summary.patient_id` | `37fdfb01-...` -- byte-identical to the bundle's Medical Record Number | absent; `pseudonym` = `PT-28bbc796fc3f` |
+| `patient_summary.age` for a 97-year-old | **97** | `90 or older` |
+| `parse_fhir_bundle`'s `patient_data` | the whole parsed record, `birth_date` and all | `patient_record`, exactly `deid.RENDERED_FIELDS` |
+| `match_patient`'s `result.patient_id` | present | `patient_pseudonym`, in the same position |
+| **`source_path`** | **the patient's given AND family names, in every successful response** | gone |
+
+**THE FOURTH LEAK WAS NOT IN THE BRIEF AND THE GATE IS WHAT FOUND IT.** This
+corpus's filenames are `Adela471_Virginia437_Verduzco_<uuid>.json`, so echoing
+the caller's `source_path` put a NAME -- the highest identifier class -- into
+every parse and match response. Measured: this pass's gate, applied to the
+PRE-CHANGE payload, reports **6 matches across 4 (class, rule) pairs** --
+`name` exact, `record_number` exact, `record_number` uuid, `other_identifier`
+exact. It is removed rather than exempted; `patient_summary.pseudonym` is the
+correlation key. **RESIDUAL, STATED:** the input-validation `ValueError`s still
+name the path, because a caller who passed one of several has to be told which
+was wrong and no patient has been identified at that point.
+
+**THE FIX IS THE STAGE THAT ALREADY EXISTS.** Every response carrying patient
+material is built from a `deid.DeidentifiedRecord` -- the same object
+`render_patient_record` is handed -- so the pseudonym, the age cap and the key
+set are one implementation with one owner. `_patient_summary` reads
+`record.fields` and no longer `patient_data`, which is the whole of the fix
+rather than a preference: "no identifier is reported" was a property of which
+four keys ten lines happened to read, and they read the wrong ones.
+
+**AND THE PSEUDONYM IS THE PIPELINE'S OWN, CHECKED BY IDENTITY.** It is
+`deid.pseudonym_for_identity(compute_patient_hash(patient_data))`, so it is
+character-identical to the `Patient:` line the Stage 5 prompt prints for the
+same patient AND derivable from `result.patient_data_hash` -- a prompt and an
+MCP response name one patient with one token.
+
+**`patient_data_hash` IS DELIBERATELY RETAINED.** It is not a direct identifier,
+it is never logged, and it is the column `inferences` carries beside
+`patient_id` -- which `oncotriage/deid.py` names as the one permitted crosswalk.
+That is the coordinator's route back to the real patient, THROUGH THE LOCAL
+DATABASE, and it is what "the mapping lives inside the boundary" means here.
+Holding (hash, pseudonym) yields no identity; anyone who can act on it already
+holds the database.
+
+**`parse_fhir_bundle` RETURNS THE DE-IDENTIFIED RECORD RATHER THAN BEING
+REMOVED, and the choice is argued from the tool's own advertised contract.**
+`TOOL_SPECS` describes it as returning "demographics, conditions with coding
+systems, medications with historical status, observations, ECOG performance
+status, procedures, allergies and genomic variants" -- eight names, and
+`RENDERED_FIELDS` is those eight plus the two staging collections. **WHAT A
+CALLER LOSES IS MEASURED**: `deidentify` drops exactly `patient_id` at the top
+level and, inside demographics, `birth_date`, `birth_date_precision`,
+`age_reference_date`, `race_source` and `ethnicity_source`. Two are the leak;
+three are PROVENANCE, and losing them costs a caller the ability to see that an
+age came from a year-only date. Accepted, because the renderer does not read
+them either. **Deleting `patient_id` and `birth_date` in place was rejected**:
+that is a second redaction rule, drifting from `RENDERED_FIELDS` the first time
+the parser carries a new field, and still a promise rather than a guarantee.
+
+**THE GATE: EVERY TOOL RETURN IS `_guard_response`'s RETURN VALUE.** Seven
+return paths, all of them, so there is no response path around it -- a
+structural property `tests/test_mcp_deidentified_responses.py` asserts by AST
+AND behaviourally (a recording stand-in driven through all seven). It calls
+`deid.assert_no_identifiers` rather than reimplementing it, so `DEID_REFUSALS`
+-- registered in the degradation registry -- moves exactly as it does at Stage
+5, and `_counted` tallies `{tool}:IdentifierLeakError` per tool, so **no new
+counter was invented**. **IT IS STRICTLY STRONGER THAN STAGE 5's**: this
+surface has the SOURCE BUNDLE, so it scans against every name, address line,
+telephone number and government identifier the source carried --
+`oncotriage/deid.py`'s documented third layer, finally used.
+
+**IT RAISES RATHER THAN RETURNING A REFUSAL PAYLOAD**, unlike the index and
+spend gates beside it, and the difference is what the conditions ARE: those are
+operational states with an operator remedy and are answered as data; a leak is
+a DEFECT, and the honest answer is no payload at all.
+
+**WHAT IS NOT SCANNED IS MEASURED, NOT ASSUMED, AND BOTH EXEMPTIONS ARE SHOWN
+TO BE LOAD-BEARING.** Scanning the trial subtree was tried first, against the
+live 14,324-trial collection and the real corpus:
+
+* one corpus patient lives in **Ontario**, so their harvested `address.city` is
+  "Ontario" -- which appears in **7 of 200 indexed trials** as a
+  `locations[].city` in Ontario, Canada. 3.5% of `match_patient` calls would
+  refuse a patient over a trial site in another country. It is the exact false
+  positive `deid.py` names in its own cost section, real rather than
+  hypothetical;
+* the same 200 trials carry **2 URLs and 1 email**, which the shape rules fire
+  on -- public ClinicalTrials.gov contact and reference data that the tool
+  exists to return;
+* and `endpoint` in an index refusal is a literal `https://` Qdrant URL, so
+  **without that exemption every single index-unavailable refusal fails**.
+  FOUND BY RUNNING THE GATE, not by reading it.
+
+**THE EXEMPTION IS NOT A HOLE**, and that is the argument rather than a hope:
+the verdict lists are the model's output over the Stage 5 prompt, and
+`result["llm_classifier_prompt"]` -- the prompt itself -- IS scanned here, with
+the FULL bundle inventory. A patient identifier that reached a verdict must have
+passed through the prompt. **THE DEFAULT IS SCANNED**: a key added to a response
+or to `result` is read unless somebody names it with an argument, so a forgotten
+key gets scanned and the symptom of a wrong guess is a refusal an operator fixes
+with one tuple entry.
+
+**ONE CHANGE IN `oncotriage/deid.py`, AND IT IS AT THE ONE OWNER RATHER THAN AT
+THE CALLER THAT FOUND IT.** `_is_scannable_value` adds `_MIN_DISTINCT_CHARS`: a
+harvested value made of ONE repeated character carries no identity. Synthea
+writes `postalCode: "00000"` for an organisation with no address; it is five
+characters, so it clears the length floor -- and `"00000"` is a substring of the
+SNOMED codes `415300000` and `58000006` that every oncology record carries.
+**MEASURED over 120 corpus bundles, scanning each patient's serialized
+de-identified record against that patient's own full inventory: 13 bundles hit,
+and EVERY hit was `"00000"`. No other harvested value collided at all.** After
+the rule: **0**. Narrow by design -- one repeated character, never "all digits",
+because a real ZIP, MRN and member number are all digit runs. **The production
+render path does not move**: Stage 5 passes no bundle, so its inventory is one
+UUID; measured 0 findings before and 0 after, and the RENDERED TEXT is
+**byte-identical across 80 corpus patients, 80 distinct digests**.
+
+**THE RENDERER DIGEST MOVED AND `FINGERPRINT_VERSION` DID NOT.** Measured
+against HEAD: **exactly one hashed module changed -- `deid.py`, `4ecdaafb...` ->
+`779eea53...` -- and the other five are byte-identical.** So a v4-stamped
+artifact answers **FP_CHANGED naming `llm_classifier_renderer_digest`**, which
+is correct: the render path's source genuinely changed even though no rendered
+byte does. The stamp's SHAPE did not move, so nothing refuses for a shape
+reason.
+
+```bash
+# The MCP de-identification pass. Same shape, same directory. No network, no
+# keys, NO SPEND, no live Qdrant, no corpus (every bundle is FABRICATED in a
+# temp directory), no database, no git history, no live server -- the graph is
+# never invoked and every Qdrant-backed call is a stand-in installed by
+# rebinding a module attribute inside try/finally with the restore asserted BY
+# IDENTITY. It DOES build the ICD-10-CM registry, because parse_fhir_bundle
+# resolves the primary cancer through registries.primary_cancer. It EXECS
+# NOTHING and loads no module by location -- the bypass plant is an ast walk
+# over an edited STRING, which is the right instrument because the check it
+# defeats is itself static. NOT in the collision matrix: it writes only inside
+# a tempfile.mkdtemp it removes and asserts gone, and the two repository files
+# it reads are sha256-compared at the end. Every identifier-shaped literal is
+# assembled at run time and section 9g scans this file with the scanner it
+# tests. Bucket A, ~1.2 s against ONLY the CI directory skeleton.
+python tests/test_mcp_deidentified_responses.py                     #  99
+```
+
+**TEN REVERTS, TEN CAUGHT, none of them an abort**, each planted into a
+`copytree`'d copy with `PYTHONPATH` pointed at it and a `sitecustomize` that
+strips the editable install's MetaPathFinder: `_patient_summary` reading
+`patient_data` again (7 recorded failures), the raw record returned (6 here + 2
+in the contract test), `source_path` restored (2), the pseudonym substitution
+removed (7), **the bypass** (9), the `endpoint` exemption removed (1), the trial
+exemption removed (3), the result-level exemption removed (1), the
+distinctiveness rule reverted (2) and the age cap not applied (5 here + 6 in
+`tests/test_deid_stage_and_guard.py`).
+
+**THREE DEFECTS IN THIS PASS'S OWN TEST CODE WERE FOUND BY RUNNING, NOT BY
+READING, AND TWO OF THEM ARE THIS PROJECT'S RECURRING SHAPES.** (i) The bypass
+plant replaced `return _guard_response("...", {` with `return {` and left the
+trailing `}, record)` unmatched, so `ast.parse` raised inside a `check()`
+argument list -- **the eighteenth time this project has shipped that abort
+shape, and the first time in the file written to catch a bypass**; the plant now
+replaces both halves and a plant that does not parse is a RECORDED failure.
+(ii) `list(result)[0]` raised `IndexError` on the empty result a defect
+produces, which the revert matrix caught as an ABORT rather than a failure.
+(iii) A control read `drive(...) is not None`, which a `<RAISED ...>` marker
+also satisfies -- it asserts identity with the payload now. **And two more found
+by the file's own hygiene check**: an email and a URL written as literals, and
+then a `scheme://` quoted IN THE PROSE explaining why they must not be -- the
+fourth time this project has met "a file that argues about its own settings
+cannot be grepped for them".
+
+**ONE EXISTING CHECK CAUGHT A REAL CONTRACT CHANGE AND IT IS THE CHECK
+WORKING.** `_parse_bundle` returns `(patient_data, source_bundle)` now, and
+`tests/test_spend_coverage.py`'s **5e CLEAN CONTROL** failed on a stub that
+still returned one value -- a stub whose arity is wrong tests the tool's
+reaction to a broken helper while claiming to test the happy path. The stub
+moved with the contract.
+
+**VERIFIED BY RUNNING.** `tests/test_mcp_deidentified_responses.py` **99/0**;
+`tests/test_mcp_server_stdio_contract.py` **144** (was 142; live Qdrant
+reachable, so sections 4, 5 and 6 all ran); CI bucket A **92 files, 0 failed, 0
+not run**; `tests/run_serial_tests.py` **5/5 in 435.1 s** with
+`oncotriage/config.py` and `oncotriage/registries/cancer_code_registry.py`
+confirmed byte-unchanged afterwards; `tests/test_package_invariants.py`
+**260/0/0**; `tests/test_deid_stage_and_guard.py` **137**,
+`tests/test_clinical_use_framing.py` **71** (the exact six-payload pin did not
+move -- no payload was added or removed),
+`tests/test_degradation_counter_readers.py` **157**,
+`tests/test_resume_configuration_fingerprint.py` **473**,
+`tests/test_spend_coverage.py` **165**;
+`.github/scripts/ci_test_buckets.py --check` consistent at 111 files;
+`static_checks.py` compiles 262. **No money was spent and no migration was
+run.**
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE GATE COSTS 341 ms ON A REAL BUNDLE, MEASURED**, over an 899 KB
+   serialized payload against 2,625 inventory values -- and the whole
+   `parse_fhir_bundle` call goes from ~250 ms to ~599 ms. The dominant term is
+   the **2,610 intra-bundle `other_identifier` UUIDs** `harvest_identifiers`
+   collects from every resource's `identifier[]`, each costing one `str.find`
+   over the whole payload. They are very nearly redundant -- the provenance-free
+   `uuid` shape rule already catches any canonical UUID whatever carried it --
+   so the cheap fix is in `harvest_identifiers`, not at the gate. Free tool,
+   sub-second, and `match_patient` takes minutes; reported rather than tuned in
+   a pass about the boundary.
+2. **`match_patient` BUILDS THE DE-IDENTIFIED RECORD TWICE** -- once here for
+   the response and once inside Stage 5 for the prompt -- so two
+   `compute_patient_hash` calls (~2 ms each) per patient. Deliberate: handing
+   the graph a pre-stripped record would make this surface's pipeline differ
+   from the batch runner's, and then its numbers would not be comparable.
+3. **`lookup_trial`'s trial payload can carry a real investigator's name and
+   email** -- measured at 1 email per 200 indexed trials, in
+   `full_trial_json.overall_contact`. Public ClinicalTrials.gov data about a
+   professional contact rather than the patient, and returning it is the tool's
+   purpose. Named because a reader of the guarantee is entitled to know the
+   scan does not cover it.
+4. **THE EXACT LAYER DOES NOTHING ON `lookup_trial`**, by construction: there is
+   no patient, so `_no_patient_record()` has an empty inventory and only the
+   shape rules run. Correct by provenance -- trial records come from Qdrant --
+   and stated rather than implied.
+5. **THE LIVE STDIO SESSION WAS NOT RE-DRIVEN AGAINST THE NEW SHAPES.**
+   `tests/test_mcp_server_stdio_contract.py` section 8b spawns a real
+   `mcp_server.py` and calls `lookup_trial` over the pipe; it passes, but no
+   over-the-wire call exercises `parse_fhir_bundle` or `match_patient`, so the
+   new payloads are proven in-process and not through the transport.
+6. **`GET /pipeline/info` AND THE API's `/match` ARE UNCHANGED.**
+   `oncotriage/api/server.py` still returns `result` with `patient_id`, and its
+   consumer is an HTTP client rather than a model -- but "the default assumption
+   is that everything reaching a model is model-facing" applies there too the
+   moment a model is put in front of it. That is a contract change to a
+   different serving surface and belongs to a pass that can measure it.
+
 ### The MCP server (the MCP pass)
 
 A second protocol over the same pipeline, beside `oncotriage/api/server.py`.

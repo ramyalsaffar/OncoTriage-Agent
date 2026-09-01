@@ -3,9 +3,18 @@
 
 """Three tools over the matching pipeline, spoken to an MCP client on stdio.
 
-    parse_fhir_bundle   a path to a FHIR bundle -> the parsed patient record
+    parse_fhir_bundle   a path to a FHIR bundle -> the DE-IDENTIFIED record
     match_patient       a path to a FHIR bundle -> ranked trials with verdicts
     lookup_trial        an NCT ID              -> the indexed trial record
+
+EVERY RESPONSE THAT CARRIES PATIENT MATERIAL IS DE-IDENTIFIED AND THEN SCANNED.
+The consumer of an MCP tool result is a MODEL, so this is a model-facing surface
+in exactly the sense ``oncotriage/deid.py`` is written for. Patient material
+leaves as a ``deid.DeidentifiedRecord`` -- pseudonym in place of ``patient_id``,
+age capped at ``deid.AGE_CAP_YEARS``, no birth date, and exactly
+``deid.RENDERED_FIELDS`` -- and every tool return is the return value of
+``_guard_response``, which refuses rather than sending. See THE
+DE-IDENTIFICATION BOUNDARY and THE RESPONSE BOUNDARY GATE below.
 
 EVERY TOOL IS A WRAPPER AND NOTHING HERE MATCHES, RETRIEVES, RERANKS OR JUDGES.
 The functions actually called, with their import paths:
@@ -150,8 +159,10 @@ from collections import Counter
 from typing import Any
 
 from oncotriage import __version__
+from oncotriage import deid
 from oncotriage import spend
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
+from oncotriage.agent.patient import compute_patient_hash
 from oncotriage.agent.readiness import (
     INDEX_ABSENT,
     INDEX_EMPTY,
@@ -171,6 +182,16 @@ from oncotriage.observability import console
 
 
 SERVER_NAME = "oncotriage"
+
+MAX_AGE_STATED_EXACTLY = deid.AGE_CAP_YEARS
+"""What the tool description tells a caller about the age cap.
+
+READ OFF ``oncotriage/deid.py`` RATHER THAN TYPED. A description that
+said "89" while the stage capped at something else would be a second
+declaration of one number -- the shape this project removed for the
+BM25 model name, the MedCPT checkpoint and the per-model cost
+arithmetic -- and a tool description is spent from a model's context
+window on every listing, so a wrong one is read on every call."""
 
 TOOL_FAILURES = Counter()
 """Every exception that leaves a tool, keyed ``{tool}:{ExceptionType}``.
@@ -442,7 +463,7 @@ def _resolve_bundle_path(bundle_path) -> str:
 
 
 def _parse_bundle(path):
-    """Parse a bundle at ``path``, or raise ``ValueError`` naming the file.
+    """Parse a bundle at ``path``. Returns ``(patient_data, source_bundle)``.
 
     BOTH BUNDLE TOOLS GO THROUGH THIS, so the two cannot disagree about what a
     bad bundle looks like -- and it exists because the first version let the
@@ -458,25 +479,152 @@ def _parse_bundle(path):
     traceback) rather than swallowed, which is the project's rule, and it is
     re-raised as ``ValueError`` so it joins the other input faults instead of
     arriving as a third exception type a caller has to know about.
+
+    THE DECODED BUNDLE IS RETURNED BESIDE THE PARSED RECORD, and that is the
+    de-identification pass's third layer finally being used. ``oncotriage/deid.py``
+    names three inventory layers -- the parsed record's ``patient_id``, the
+    provenance-free shape rules, and ``harvest_identifiers`` "when a caller has
+    the bundle to hand ... the complete answer" -- and says the production graph
+    path holds only ``patient_data`` by the time Stage 5 runs. THIS SURFACE HAS
+    THE FILE. So the guard here scans against every name, address line, telephone
+    number, record number and government identifier the SOURCE carried, which is
+    strictly more than Stage 5 can see.
+
+    The JSON is decoded HERE rather than inside the parser so that the decoded
+    document is available for that harvest. ``parse_fhir_bundle`` takes either a
+    dict or a path (pass 20f-1) and the dict route is "same everything below",
+    so nothing about the parse moves.
     """
     try:
-        with _stdout_to_stderr():
-            patient_data = parse_fhir_bundle(path)
+        with open(path, "r", encoding="utf-8") as handle:
+            source_bundle = json.load(handle)
     except (json.JSONDecodeError, UnicodeDecodeError) as exc:
         raise ValueError(
             f"{path} could not be read as JSON ({type(exc).__name__}: {exc}). "
             f"bundle_path must point at a FHIR bundle JSON file.") from exc
+
+    if not isinstance(source_bundle, dict):
+        # A JSON ARRAY OR SCALAR, which decodes cleanly and is not a Bundle.
+        # Named here rather than left to the parser: handing a list to
+        # `parse_fhir_bundle` takes its PATH branch and dies in `open()` with a
+        # TypeError naming neither the file nor the parameter -- the same defect
+        # this function was written to remove one shape over.
+        raise ValueError(
+            f"{path} decoded as JSON {type(source_bundle).__name__} rather than "
+            f"an object. bundle_path must point at a FHIR Bundle containing a "
+            f"Patient resource.")
+
+    with _stdout_to_stderr():
+        patient_data = parse_fhir_bundle(source_bundle)
 
     if not patient_data or not patient_data.get("patient_id"):
         raise ValueError(
             f"{path} parsed as JSON but yielded no patient record with an id. "
             f"It must be a FHIR Bundle containing a Patient resource.")
 
-    return patient_data
+    return patient_data, source_bundle
 
 
-def _patient_summary(patient_data) -> dict:
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE DE-IDENTIFICATION BOUNDARY
+# ===========================================================================
+#
+# WHAT THIS SURFACE HANDS BACK, AND TO WHOM. The consumer of an MCP tool result
+# is a MODEL: the client puts the payload into a language model's context and
+# the model summarises it. So this file is a model-facing surface in exactly the
+# sense `oncotriage/deid.py` is written for, and until this pass it was the one
+# such surface with no de-identification stage in front of it. Three leaks were
+# recorded by that pass and left, deliberately, because closing them changes
+# response shapes and it refused to ship that unverified:
+#
+#   _patient_summary        returned `patient_id` -- which on this corpus is
+#                           byte-identical to the Medical Record Number in the
+#                           bundle's `identifier[]` -- and the EXACT age, with
+#                           no 90-or-older cap.
+#   parse_fhir_bundle_tool  returned the whole parsed record, `birth_date`
+#                           and all.
+#   match_patient_tool      returned `result`, which carries `patient_id`.
+#
+# A FOURTH WAS FOUND BY BUILDING THE GATE AND NOT BY READING: every successful
+# response carried `source_path`, the caller's bundle path, and this corpus's
+# filenames are `Adela471_Virginia437_Verduzco...json` -- the patient's given
+# and family names, in the response, on every call. It is gone; see
+# `_source_path_note` below for what replaced it and what did not.
+#
+# THE FIX IS THE STAGE THAT ALREADY EXISTS, NOT A SECOND ONE. Every response
+# that carries patient material is built from a `deid.DeidentifiedRecord` --
+# the same object `render_patient_record` is handed and the only thing
+# `deid.deidentify` produces -- so the pseudonym, the age cap and the
+# `RENDERED_FIELDS` key set are one implementation with one owner. A
+# server-local redaction would be a second copy of a rule, which is the drift
+# this project has removed four times (the BM25 model name, the MedCPT
+# checkpoint, the per-model cost arithmetic, the latest-run-per-config SQL).
+#
+# AND THEN IT IS ENFORCED. `_guard_response` scans what is about to leave and
+# raises on a hit, so the guarantee is a gate rather than a promise. It is
+# STRICTLY STRONGER THAN STAGE 5's, because this surface has the source bundle
+# and Stage 5 does not.
+
+
+def _deidentified_record(patient_data, source_bundle):
+    """The de-identification stage, run over one parsed record.
+
+    ``build_patient_record`` in ``oncotriage/agent/patient.py`` is the pairing
+    of these two lines that Stage 5 uses, and it is deliberately NOT called
+    here: it also RENDERS, and rendering increments ``PROCEDURE_RENDER_COUNTS``
+    and ``TEMPORAL_RENDER_COUNTS`` -- census counters an operator reads at the
+    end of a run. `oncotriage/run_fingerprint.py` rejected a probe render for
+    exactly that reason ("pollute ... with a render no patient asked for"), and
+    a parse tool that has no prompt to build must not put a phantom render into
+    a campaign's census. The identity derivation is the same call in both
+    places, which is what keeps the pseudonym here equal to the one in the
+    prompt.
+    """
+    return deid.deidentify(
+        patient_data,
+        identity=compute_patient_hash(patient_data),
+        source_bundle=source_bundle,
+    )
+
+
+def _no_patient_record():
+    """The record used to guard a response that carries no patient at all.
+
+    A REAL ``DeidentifiedRecord`` RATHER THAN ``None``, so `_guard_response`
+    has one signature and every tool return goes through the identical call.
+    Its pseudonym is ``deid.PSEUDONYM_UNKNOWN`` and its inventory is empty,
+    which is the honest statement for a trial lookup or a refusal: there is no
+    patient in this payload, so there is nothing to scan it against. The
+    provenance-free shape rules still run.
+
+    Built per call rather than at module scope: a shared mutable record is one
+    edit away from a caller stashing something on it, and building this costs
+    nothing (`deidentify` opens nothing and renders nothing).
+    """
+    return deid.deidentify({}, identity=None)
+
+
+def _patient_summary(record) -> dict:
     """The small block both bundle tools return, so the two cannot disagree.
+
+    IT IS BUILT FROM THE DE-IDENTIFIED RECORD AND NOT FROM ``patient_data``,
+    and that is the whole of the fix rather than a stylistic preference. The
+    previous version read ``patient_data["patient_id"]`` and
+    ``demographics["age"]`` directly, so "no direct identifier is reported" was
+    a property of which four keys these ten lines happened to read -- and they
+    read the wrong ones. ``record.fields`` carries exactly
+    ``deid.RENDERED_FIELDS`` and its demographics carry exactly
+    ``deid.DEMOGRAPHIC_FIELDS``, so ``patient_id`` and ``birth_date`` are not in
+    scope at the point a line could be written from them, and the age is
+    whatever ``deid._cap_age`` returned.
+
+    ``pseudonym`` REPLACES ``patient_id``. It is stable across runs and across
+    machines, it is the same token the Stage 5 prompt prints for this patient,
+    and it identifies nobody without the local ``inferences`` database -- which
+    is where ``oncotriage/deid.py`` rules the crosswalk must live.
 
     ``deduplicate_by_display`` is the same call ``oncotriage/api/server.py``
     makes for the same counts. ECOG is surfaced because it is the one field the
@@ -484,19 +632,193 @@ def _patient_summary(patient_data) -> dict:
     is meaningful: ECOG 0 is FULLY ACTIVE, the most eligible a patient can be, so
     it is reported as ``None`` and never defaulted to 0.
     """
-    demographics = patient_data.get("demographics", {}) or {}
-    ecog = patient_data.get("ecog_performance_status", {}) or {}
+    fields = record.fields
+    demographics = fields.get("demographics") or {}
+    ecog = fields.get("ecog_performance_status") or {}
     return {
-        "patient_id": patient_data.get("patient_id"),
+        "pseudonym": record.pseudonym,
         "age": demographics.get("age"),
         "sex": demographics.get("sex"),
         "condition_count": len(deduplicate_by_display(
-            patient_data.get("conditions", []))),
+            fields.get("conditions") or [])),
         "medication_count": len(deduplicate_by_display(
-            patient_data.get("medications", []))),
-        "allergy_count": len(patient_data.get("allergies", []) or []),
+            fields.get("medications") or [])),
+        "allergy_count": len(fields.get("allergies") or []),
         "ecog_performance_status": ecog.get("value"),
     }
+
+
+def _deidentification_block(record, scanned, skipped) -> dict:
+    """What the stage DID, reported so a caller need not infer it.
+
+    COUNTS ONLY, NEVER CLASSES AND NEVER VALUES. A refusal names the identifier
+    CLASSES it found, because that reaches an operator who has to act; a routine
+    successful response naming which classes this patient's bundle carried would
+    be telling a model that this record has, say, a government identifier in it.
+    ``oncotriage/deid.py``'s own rule -- minimisation is cheaper than review.
+
+    ``identifier_values_not_scanned`` IS THE GUARD'S OWN BLIND SPOT AND IT IS
+    REPORTED RATHER THAN SWALLOWED, which is `scan_for_identifiers`'s stated
+    reason for returning it at all: a scan that silently declined to look for
+    part of its inventory reads exactly like a clean one.
+    """
+    return {
+        "pseudonym": record.pseudonym,
+        "age_capped": record.age_capped,
+        "age_cap_years": deid.AGE_CAP_YEARS,
+        "identifier_values_scanned": scanned,
+        "identifier_values_not_scanned": skipped,
+    }
+
+
+def _deidentified_result(result, record) -> dict:
+    """``match_patient_to_trials``'s result with the identity replaced.
+
+    ONE FIELD SUBSTITUTION USING THE OWNER'S OWN FUNCTION, not a redaction pass
+    over the result. ``patient_id`` is dropped and ``patient_pseudonym`` takes
+    its POSITION, so a reader of the payload finds the identity where it always
+    was and a client that blindly read ``result["patient_id"]`` gets a KeyError
+    rather than a plausible-looking value that is not an id.
+
+    ``patient_data_hash`` IS DELIBERATELY LEFT IN PLACE. It is not a direct
+    identifier -- it is a hash of the clinical record -- it is never logged, and
+    it is the column ``inferences`` carries beside ``patient_id``, which
+    ``oncotriage/deid.py`` names as the one permitted crosswalk. Removing it
+    would break the coordinator workflow (an authorised operator resolving a
+    match back to a patient THROUGH THE LOCAL DATABASE) and buy nothing: holding
+    the pair (hash, pseudonym) yields no identity, because the pseudonym is
+    derived from the hash by a public function and the hash is derived from the
+    clinical record. Anyone who can act on it already holds the database.
+
+    ``setdefault`` at the end is not decoration: a result shape that stops
+    carrying ``patient_id`` must still carry the pseudonym, or a future
+    consumer would silently lose the only identity the payload has.
+    """
+    out = {}
+    for key, value in result.items():
+        if key == "patient_id":
+            out["patient_pseudonym"] = record.pseudonym
+        else:
+            out[key] = value
+    out.setdefault("patient_pseudonym", record.pseudonym)
+    return out
+
+
+# ===========================================================================
+# THE RESPONSE BOUNDARY GATE
+# ===========================================================================
+#
+# A RESPONSE PATH THAT MERELY DOES NOT PRINT IDENTIFIERS IS A PROMISE. This
+# project ships gates: Stage 5 scans the rendered prompt before any model call
+# and fails the patient rather than sending it, and this is the same enforcement
+# point one surface over. Every tool return in this file is the return value of
+# `_guard_response`, so there is no response path around it -- which is a
+# structural property a test can assert, and does.
+#
+# WHAT IS SCANNED, AND WHY IT IS NOT EVERYTHING. The scan runs over the
+# PATIENT-DERIVED part of the payload. Scanning the trial records too was tried
+# first and MEASURED, against the live 14,324-trial collection and the real
+# corpus:
+#
+#   * EXACT MATCHES ON TRIAL TEXT. One corpus patient lives in Ontario. Their
+#     bundle's `address.city` is therefore the harvested value "Ontario", and
+#     "Ontario" appears in 7 of 200 indexed trials -- Ontario, Canada, in a
+#     `locations[].city`. 3.5% of `match_patient` calls would refuse a patient
+#     over a trial site in another country. It is the exact false positive
+#     `oncotriage/deid.py` names in its own cost section ("a city called
+#     Ontario") and it is real here rather than hypothetical.
+#   * SHAPE RULES ON TRIAL TEXT. 2 URLs and 1 email in the same 200 trials.
+#     ClinicalTrials.gov records carry an `overall_contact` and reference links;
+#     they are public data about a professional contact and they are what the
+#     tool exists to return.
+#
+# So the trial subtree is exempt, and the exemption is NOT a hole:
+# `matches`/`near_misses`/`not_evaluable` are the model's verdicts on trials,
+# derived from the Stage 5 prompt -- and `result["llm_classifier_prompt"]`, the
+# prompt itself, IS scanned here, with the FULL bundle inventory. A patient
+# identifier that reached a verdict must have passed through that prompt, and
+# the prompt is exactly what this gate reads hardest.
+#
+# THE DEFAULT IS SCANNED. A key added to a response, or to `result`, is scanned
+# unless somebody names it below with an argument. That is the fail-safe
+# direction: a forgotten key gets read, and if it turns out to be trial text the
+# symptom is a refusal an operator fixes with one tuple entry -- not a leak
+# nobody sees.
+
+UNSCANNED_RESPONSE_KEYS = ("trial", "endpoint", "probe_error")
+"""Top-level response keys the gate does not read, each argued.
+
+``trial``          the indexed ClinicalTrials.gov record `lookup_trial` exists
+                   to return. Public data, and measured above to carry URLs and
+                   a contact email that the shape rules fire on.
+``endpoint``       the Qdrant URL, reported by an index refusal so an operator
+                   can fix it. It is `config.get_qdrant_url()`'s answer -- server
+                   infrastructure, which no patient material can reach -- and it
+                   is a literal ``https://`` URL, so the URL shape rule fires on
+                   every single index-unavailable refusal if it is scanned.
+                   FOUND BY RUNNING THE GATE, not by reading it.
+``probe_error``    the transport error beside it, same provenance, same reason.
+"""
+
+UNSCANNED_RESULT_KEYS = ("matches", "near_misses", "not_evaluable")
+"""Keys INSIDE ``result`` the gate does not read: the three per-trial verdict
+lists. See the measurement above. Everything else in ``result`` is scanned,
+including ``llm_classifier_prompt``, which is the rendered patient record."""
+
+
+def _scannable_text(payload) -> str:
+    """The patient-derived part of one response, as text to scan.
+
+    ``sort_keys`` so two scans of one payload report identical offsets, which is
+    what makes a refusal comparable across runs -- the same reason
+    `deid.scan_for_identifiers` sorts its findings. ``default=str`` so an object
+    that is not JSON-serialisable is READ rather than raising: a gate that threw
+    on an unexpected type would be a gate that stopped scanning.
+    """
+    scannable = {key: value for key, value in payload.items()
+                 if key not in UNSCANNED_RESPONSE_KEYS}
+    result = scannable.get("result")
+    if isinstance(result, dict):
+        scannable["result"] = {key: value for key, value in result.items()
+                               if key not in UNSCANNED_RESULT_KEYS}
+    return json.dumps(scannable, default=str, sort_keys=True)
+
+
+def _guard_response(tool, payload, record):
+    """Return ``payload``, or raise ``deid.IdentifierLeakError`` if it leaks.
+
+    THE ENFORCEMENT POINT FOR THIS SURFACE. `deid.assert_no_identifiers` is
+    called rather than reimplemented, so the classes, the rules, the length and
+    distinctiveness floors and the ``DEID_REFUSALS`` counter are the same ones
+    Stage 5 uses -- one owner, and a run's degradation block reports an MCP
+    refusal exactly as it reports a Stage 5 one.
+
+    IT RAISES RATHER THAN RETURNING A REFUSAL PAYLOAD, unlike the index and
+    spend gates one section up, and the difference is what the two conditions
+    ARE. An unusable index and a spent budget are expected operational states
+    with an operator remedy, so they are answered as data. A leak is a DEFECT --
+    in the parser, the stage, or the bundle -- and the honest answer to "here is
+    the patient's record" is no payload at all rather than a payload plus a
+    caveat. An exception also cannot leak: `deid.IdentifierLeakError` names the
+    classes and the rules and deliberately quotes no value, and the tool result
+    the client receives is that one sentence.
+
+    `_counted` COUNTS IT AS ``{tool}:IdentifierLeakError``, so the per-tool
+    tally an operator reads through `failure_report()` distinguishes a leak from
+    a bad input without a second counter having to be invented for it.
+    """
+    text = _scannable_text(payload)
+    skipped = deid.assert_no_identifiers(text, record)
+    if skipped:
+        # THE BLIND SPOT, REPORTED. Values below the length floor or made of one
+        # repeated character were not looked for; a scan that declined silently
+        # would read exactly like a clean one. Stage 5 logs the same fact.
+        _log(f"{tool}: the de-identification scan skipped {skipped} "
+             f"identifier value(s) it could not distinguish from noise")
+    return payload
+
+
+#------------------------------------------------------------------------------
 
 
 def _counted(tool):
@@ -562,22 +884,72 @@ def _counted(tool):
 
 @_counted("parse_fhir_bundle")
 def parse_fhir_bundle_tool(bundle_path: str) -> dict[str, Any]:
-    """Parse a FHIR bundle file into the pipeline's patient record."""
-    path = _resolve_bundle_path(bundle_path)
-    patient_data = _parse_bundle(path)
+    """Parse a FHIR bundle file into the pipeline's de-identified record.
 
-    return {
+    IT RETURNS ``patient_record`` AND NOT ``patient_data``, AND THE RENAME IS
+    THE POINT. The previous version returned ``parse_fhir_bundle``'s output
+    whole, under the argument that "trimming it here would be this file deciding
+    what a parse means". That argument was right about a thin wrapper and wrong
+    about the value: it made `birth_date` and `patient_id` reach a model on
+    every call, which is the thing `oncotriage/deid.py` exists to prevent.
+
+    THE TOOL'S PURPOSE SURVIVES INTACT, checked against its own advertised
+    contract rather than against taste. `TOOL_SPECS` describes this tool as
+    returning "demographics, conditions with coding systems, medications with
+    historical status, observations, ECOG performance status, procedures,
+    allergies and genomic variants" -- eight names, and `deid.RENDERED_FIELDS`
+    is those eight plus the two cancer-staging collections. The de-identified
+    record IS the structured patient record this pipeline uses; it is what the
+    renderer is handed and what every prompt is built from.
+
+    WHAT A CALLER LOSES, STATED RATHER THAN DISCOVERED. Measured against a real
+    corpus bundle, ``deid.deidentify`` drops exactly ``patient_id`` at the top
+    level and, inside demographics, ``birth_date``, ``birth_date_precision``,
+    ``age_reference_date``, ``race_source`` and ``ethnicity_source``. The first
+    two are the leak. The other three are PROVENANCE -- which US Core
+    sub-extension answered, and how precise the birth date was -- and losing
+    them costs a caller the ability to see that an age was derived from a
+    year-only date. That is a real loss and it is accepted: the renderer does
+    not read them either, and `deid.DEMOGRAPHIC_FIELDS` argues that a field
+    travelling to a boundary unread is one edit from being printed.
+
+    THE ALTERNATIVE WAS CONSIDERED AND REJECTED. Returning the raw record with
+    `patient_id` and `birth_date` deleted in place is a SECOND redaction rule,
+    living here, drifting from `RENDERED_FIELDS` the first time the parser
+    carries a new field -- the drift this project has removed four times. And it
+    would still be a promise rather than a guarantee: nothing would stop the
+    next field.
+
+    REMOVING THE TOOL WAS ALSO CONSIDERED. It was rejected because the tool's
+    purpose is NOT defeated by de-identification -- an eligibility question is
+    answered by stage, histology, ECOG, labs and medications, none of which is
+    an identifier -- so what it returns after this pass is still the whole of
+    what it was for.
+    """
+    path = _resolve_bundle_path(bundle_path)
+    patient_data, source_bundle = _parse_bundle(path)
+    record = _deidentified_record(patient_data, source_bundle)
+    scanned, skipped = deid.count_scannable(record.inventory)
+
+    return _guard_response("parse_fhir_bundle", {
         "not_for_clinical_use": NOT_FOR_CLINICAL_USE,
         "status": "ok",
-        "source_path": path,
-        "patient_summary": _patient_summary(patient_data),
-        # The whole parsed record, because that is what this tool IS. It is
-        # large -- conditions, medications with historical status labels,
-        # observations, procedures, allergies, genomic variants. Trimming it
-        # here would be this file deciding what a parse means, which is the one
-        # thing a thin wrapper must not do.
-        "patient_data": patient_data,
-    }
+        # `source_path` USED TO BE HERE AND IS GONE. On this corpus a bundle
+        # filename is `Adela471_Virginia437_Verduzco_<uuid>.json` -- the
+        # patient's given and family names -- so echoing the caller's path put a
+        # name into every successful response. The gate is what found it: with
+        # the path still in the payload, the exact-match layer fires on the
+        # harvested `name` values and every call refuses. The caller supplied
+        # the path and does not need it back; `patient_summary.pseudonym` is the
+        # correlation key, and it is stable across calls and across runs.
+        # RESIDUAL, STATED: the input-validation ValueErrors above still name
+        # the path, because a caller that passed one of several paths has to be
+        # told which one was wrong and no patient has been identified at that
+        # point.
+        "patient_summary": _patient_summary(record),
+        "patient_record": record.fields,
+        "deidentification": _deidentification_block(record, scanned, skipped),
+    }, record)
 
 
 @_counted("match_patient")
@@ -590,7 +962,8 @@ def match_patient_tool(bundle_path: str) -> dict[str, Any]:
     # answer, and everything below this line is on the way to that call.
     unavailable = _require_index("match_patient")
     if unavailable is not None:
-        return unavailable
+        return _guard_response("match_patient", unavailable,
+                               _no_patient_record())
 
     # THE BUDGET GATE IS BELOW THE INDEX GATE AND ABOVE THE PARSE. Below,
     # because an unusable index is a fault an operator must fix while a spent
@@ -605,22 +978,31 @@ def match_patient_tool(bundle_path: str) -> dict[str, Any]:
     # `spend.BILLED_SITE_EXEMPTIONS` states for the index validator, met here.
     over_budget = _require_budget("match_patient")
     if over_budget is not None:
-        return over_budget
+        return _guard_response("match_patient", over_budget,
+                               _no_patient_record())
 
-    patient_data = _parse_bundle(path)
+    patient_data, source_bundle = _parse_bundle(path)
+    record = _deidentified_record(patient_data, source_bundle)
+    scanned, skipped = deid.count_scannable(record.inventory)
 
     graph = get_graph()
 
     with _stdout_to_stderr():
         result = match_patient_to_trials(patient_data=patient_data, graph=graph)
 
-    return {
+    # THE PIPELINE IS GIVEN THE RAW PARSED RECORD, NOT THE DE-IDENTIFIED ONE,
+    # and that is deliberate. Stage 5 runs `build_patient_record` itself and
+    # runs its own guard on the rendered prompt; handing it a pre-stripped
+    # record would change what the graph evaluates on this surface only, and a
+    # serving surface whose pipeline differs from the batch runner's is a
+    # surface whose numbers are not comparable. What changes is what LEAVES.
+    return _guard_response("match_patient", {
         "not_for_clinical_use": NOT_FOR_CLINICAL_USE,
         "status": "ok",
-        "source_path": path,
-        "patient_summary": _patient_summary(patient_data),
-        "result": result,
-    }
+        "patient_summary": _patient_summary(record),
+        "result": _deidentified_result(result, record),
+        "deidentification": _deidentification_block(record, scanned, skipped),
+    }, record)
 
 
 @_counted("lookup_trial")
@@ -628,7 +1010,8 @@ def lookup_trial_tool(nct_id: str) -> dict[str, Any]:
     """Fetch one indexed clinical trial by its NCT ID."""
     unavailable = _require_index("lookup_trial")
     if unavailable is not None:
-        return unavailable
+        return _guard_response("lookup_trial", unavailable,
+                               _no_patient_record())
 
     with _stdout_to_stderr():
         found = lookup_trial(nct_id)
@@ -639,7 +1022,7 @@ def lookup_trial_tool(nct_id: str) -> dict[str, Any]:
         # `found: False` when it could not ask, so this branch means the server
         # said there is no such trial HERE -- which is a fact about this index,
         # not about ClinicalTrials.gov, and the message says so.
-        return {
+        return _guard_response("lookup_trial", {
             "not_for_clinical_use": NOT_FOR_CLINICAL_USE,
             "status": "not_found",
             "nct_id": found["nct_id"],
@@ -649,15 +1032,15 @@ def lookup_trial_tool(nct_id: str) -> dict[str, Any]:
                 f"{found['collection']!r}. The index holds recruiting oncology "
                 f"trials as of the last index build, so this means the trial "
                 f"was not scraped into it -- not that the trial does not exist."),
-        }
+        }, _no_patient_record())
 
-    return {
+    return _guard_response("lookup_trial", {
         "not_for_clinical_use": NOT_FOR_CLINICAL_USE,
         "status": "ok",
         "nct_id": found["nct_id"],
         "collection": found["collection"],
         "trial": found["trial"],
-    }
+    }, _no_patient_record())
 
 
 #------------------------------------------------------------------------------
@@ -681,8 +1064,12 @@ TOOL_SPECS = (
         "Parse a FHIR bundle JSON file into the structured patient record this "
         "pipeline uses: demographics, conditions with coding systems, "
         "medications with historical status, observations, ECOG performance "
-        "status, procedures, allergies and genomic variants. Takes a PATH to a "
-        "file on the machine running this server, not the bundle's contents. "
+        "status, procedures, allergies, genomic variants and cancer staging. "
+        "Takes a PATH to a file on the machine running this server, not the "
+        "bundle's contents. THE RECORD IS DE-IDENTIFIED: the patient is "
+        "identified by a stable pseudonym rather than a record number, there "
+        "is no name, address, telephone number or birth date, and an age over "
+        f"{MAX_AGE_STATED_EXACTLY} is reported as a category. "
         "Reads only; nothing is written and no model is called. "
         + NOT_FOR_CLINICAL_USE_SHORT,
     ),
@@ -697,7 +1084,9 @@ TOOL_SPECS = (
         f"billed language-model call and evaluates up to "
         f"{MAX_TRIALS_FOR_EVALUATION} trials, taking minutes. Refuses with an "
         "explanation, rather than reporting zero matches, when the trial index "
-        "is empty, absent or unverifiable. " + NOT_FOR_CLINICAL_USE_SHORT,
+        "is empty, absent or unverifiable. The patient is identified in the "
+        "result by a stable pseudonym rather than a record number. "
+        + NOT_FOR_CLINICAL_USE_SHORT,
     ),
     (
         "lookup_trial",
