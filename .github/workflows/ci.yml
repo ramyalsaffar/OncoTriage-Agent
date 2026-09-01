@@ -54,8 +54,20 @@
 # three gates fails on what is ACTIONABLE HERE and prints everything else:
 #
 #   pip-audit  fails on a fixable finding that is not in the per-id accepted
-#              table in .github/scripts/audit_gate.py. 26 accepted, 4 unfixable,
-#              all printed on every run. It was 32 until the Airflow upgrade
+#              table in .github/scripts/audit_gate.py. 28 accepted, 3 unfixable,
+#              all printed on every run (MEASURED 2026-09-01 against the
+#              resolved linux/py3.11 dependency set, pip-audit 2.10.1). It was
+#              26/4 and it moved for TWO reasons, one red and one silent:
+#              transformers CVE-2026-9856 was reviewed into GitHub's advisory
+#              database at 18:58Z that day and turned this gate red on a commit
+#              that touches no dependency; and PYSEC-2026-2290 had been sitting
+#              in the UNFIXABLE column, which was false of it -- one finding
+#              arrives from pip-audit twice with two different answers about its
+#              own fixability, and the gate's de-duplication kept whichever came
+#              first. It unions the fix versions now, so a finding any record
+#              calls fixable is GATED rather than filed as unfixable by output
+#              order. Both entries argue themselves at the table.
+#              It was 32 until the Airflow upgrade
 #              released fastapi from `starlette<0.49.0`; those six starlette
 #              entries are deleted because they are FIXED, and the gate's own
 #              staleness check would have failed on them otherwise.

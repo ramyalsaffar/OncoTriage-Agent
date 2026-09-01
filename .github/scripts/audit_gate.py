@@ -133,6 +133,93 @@ _ACCEPTED = {
     "PYSEC-2026-2286": ("torch", "2.10.0", "MODEL cross-encoder numerics"),
     "PYSEC-2026-2288": ("transformers", "5.0.0", "MODEL MedCPT cross-encoder major"),
     "PYSEC-2026-2289": ("transformers", "5.3.0", "MODEL MedCPT cross-encoder major"),
+    #
+    # CVE-2026-9856 (GHSA-xrqw-3rrv-vx5w) IS THE ENTRY THAT TURNED THIS GATE RED
+    # WITH NO COMMIT, and the timing is the record: GitHub reviewed the advisory
+    # at 2026-09-01T18:58:08Z, OSV modified it at 19:02:53Z, run 20 was green at
+    # 16:45Z and run 21 red at 19:35Z. Nothing in run 21's commit touches a
+    # dependency. That is this gate's advertised property working -- a NEW
+    # advisory against an ALREADY-ACCEPTED package still fails -- and the cost of
+    # that property is that it gates commits that did not cause it.
+    #
+    # IT IS THE SAME BLOCKER AS THE TWO ABOVE, ONE MAJOR FURTHER OUT: the fix
+    # landed in 5.10.0 and this project pins transformers==4.57.1 as the MedCPT
+    # cross-encoder's loader. Taking it is a 4.x -> 5.x bump of the library that
+    # instantiates the Stage 3 tokenizer and weights, which is exactly what the
+    # twelve characterization fixtures exist to pin and exactly what cannot be
+    # replayed to prove today (they are stale: the de-identification and
+    # pre-diagnosis-ECOG passes invalidated them and the recapture is the
+    # standing item). Bumping it to clear a gate would be changing ranking
+    # behaviour to make a check pass, unverified by the one mechanism built to
+    # verify it.
+    #
+    # AND THE SINK IS NOT REACHABLE FROM THIS PROJECT -- MEASURED ON BOTH
+    # PRECONDITIONS, rather than argued from the advisory summary. The advisory
+    # is a path traversal in `save_pretrained()` on `PreTrainedTokenizerBase`
+    # and `ProcessorMixin`: attacker-controlled keys of a `chat_template` dict,
+    # arriving in a crafted `tokenizer_config.json` from a Hub repository, are
+    # used as filenames when the victim SAVES the tokenizer or processor. Both
+    # preconditions fail here, independently:
+    #
+    #   1. THE SINK IS NEVER CALLED. `git grep` for that method name over every
+    #      tracked file in this repository returns hits in THIS COMMENT AND
+    #      NOWHERE ELSE -- no code, no test, no entry point. Stated that way on
+    #      purpose: before this note existed the count was zero, and a claim
+    #      phrased as "appears nowhere" would have been falsified by the
+    #      sentence making it. That is the trap this project has now met five
+    #      times: a file that argues about a string cannot be grepped for it.
+    #   2. The load is not attacker-directed. The only two `from_pretrained`
+    #      calls in the package are AutoTokenizer and
+    #      AutoModelForSequenceClassification in oncotriage/agent/deps.py, both
+    #      handed `config.CROSS_ENCODER_MODEL` == "ncbi/MedCPT-Cross-Encoder" --
+    #      and tests/test_package_invariants.py section 2f(ii) asserts BY AST
+    #      that the checkpoint literal appears exactly once in the package, that
+    #      both calls are handed that constant, that there are exactly two of
+    #      them, and that no other package module calls `from_pretrained` at
+    #      all. So pointing this project at an arbitrary Hub repository is not a
+    #      configuration change; it is a source edit that fails a standing check.
+    #      AutoModelForSequenceClassification is also not a ProcessorMixin, and
+    #      none of the processors the advisory names (Idefics, Florence, Gemma,
+    #      Phi, Qwen-VL) is loaded anywhere here.
+    #
+    # THAT IS AN ARGUMENT FOR WHY ACCEPTING IS SAFE, NOT A FOURTH BLOCKING
+    # CLASS. The class field answers "what stops the fix being taken", and what
+    # stops it is MODEL, the same as its two siblings. Unreachability is why
+    # leaving it unpatched is defensible; it does not make the bump takeable.
+    "CVE-2026-9856":   ("transformers", "5.10.0", "MODEL MedCPT cross-encoder major"),
+    #
+    # PYSEC-2026-2290 (CVE-2026-5241, GHSA-fgcw-684q-jj6r) WAS NOT RED. IT WAS
+    # INVISIBLE, and it is here because the de-duplication fix in main() made it
+    # visible. Before that fix it was filed UNFIXABLE -- printed on every green
+    # run under a heading reading "no released fix", which is false of it: the
+    # fix is transformers 5.5.0. See the merge comment in main() for how one
+    # finding arrived twice with two different answers about its own fixability
+    # and why first-wins was the wrong tie-break.
+    #
+    # THE BLOCKER IS THE SAME MODEL CONSTRAINT AS THE FOUR ENTRIES ABOVE, and
+    # 5.5.0 is still a 4.x -> 5.x major on the MedCPT cross-encoder's loader.
+    #
+    # THE SINK IS NOT REACHABLE FROM THIS PROJECT, and this one is narrower than
+    # CVE-2026-9856's. The advisory is arbitrary code execution in the LIGHTGLUE
+    # model loading path: `LightGlueConfig` reads `trust_remote_code` out of an
+    # untrusted `config.json` and propagates it into nested
+    # `AutoConfig.from_pretrained()` calls, so an attacker-controlled repository
+    # executes its own Python during `AutoModel.from_pretrained()` even when the
+    # caller passed `trust_remote_code=False`. Three independent measurements,
+    # not three readings of the summary:
+    #
+    #   1. `git grep trust_remote_code` over every tracked file returns ZERO
+    #      hits. This project never passes the parameter in either direction.
+    #   2. No LightGlue model is loaded, and none can be reached by
+    #      configuration: the only two loads in the package are AutoTokenizer
+    #      and AutoModelForSequenceClassification, both handed
+    #      `config.CROSS_ENCODER_MODEL` == "ncbi/MedCPT-Cross-Encoder", and
+    #      tests/test_package_invariants.py section 2f(ii) pins that by AST.
+    #   3. The repository is not attacker-controlled. It is a first-party NCBI
+    #      checkpoint named by a module constant, which is the same premise
+    #      pass 20f-2 already made load-bearing when it gave that checkpoint one
+    #      owner and one construction site.
+    "PYSEC-2026-2290": ("transformers", "5.5.0", "MODEL MedCPT cross-encoder major"),
 }
 
 # Packages whose findings are about the BUILD TOOLING rather than this project's
@@ -181,12 +268,45 @@ def main():
                 "fix": tuple(vuln.get("fix_versions") or ()),
             })
 
-    # De-duplicate: pip-audit emits the same (package, id) more than once when a
-    # package is reachable by several paths. Counting those twice would make the
-    # printed totals disagree with the number of distinct problems.
+    # De-duplicate, AND UNION THE FIX VERSIONS RATHER THAN KEEPING THE FIRST.
+    # Counting one problem twice would make the printed totals disagree with the
+    # number of distinct problems, which is what the de-duplication is for.
+    #
+    # THE UNION IS A CORRECTNESS FIX AND NOT TIDINESS -- MEASURED 2026-09-01,
+    # against the resolved linux/py3.11 set. `setdefault` alone kept whichever
+    # record came FIRST, and pip-audit emits ONE (package, id) here with two
+    # records that DISAGREE about fixability:
+    #
+    #     transformers PYSEC-2026-2290   fix_versions []        <- kept
+    #     transformers PYSEC-2026-2290   fix_versions ['5.5.0']  <- discarded
+    #
+    # Both describe CVE-2026-5241. The cause is upstream and is not a pip-audit
+    # bug: OSV carries two records for that CVE and they model the range
+    # differently -- GHSA-fgcw-684q-jj6r has `{"fixed": "5.5.0"}` while
+    # PYSEC-2026-2290 has `{"last_affected": "5.2.0"}` and no `fixed` event at
+    # all, so one yields a fix version and the other yields none. pip-audit
+    # reports both under the PYSEC id, because that is the alias it prefers.
+    #
+    # WHAT FIRST-WINS COST: the finding was filed UNFIXABLE and therefore never
+    # gated, while a fix exists and is not accepted anywhere. It was reported on
+    # every green run, in the section headed "no released fix", which is false
+    # of it. And which way it fell was decided by pip-audit's output ORDER,
+    # which is not a contract -- so the gate would have turned red on a day when
+    # nothing about this project or the advisory had changed. This project does
+    # not leave a classification resting on an ordering nobody guarantees.
+    #
+    # THE UNION IS THE CONSERVATIVE DIRECTION, which is why it is the right
+    # merge rather than a coin toss between two records: a finding that ANY
+    # record says is fixable must be GATED, not silently filed as unfixable.
+    # The reverse (intersection, or first-wins) can only ever hide work.
     unique = {}
     for f in findings:
-        unique.setdefault((f["package"], f["id"]), f)
+        key = (f["package"], f["id"])
+        if key in unique:
+            merged = set(unique[key]["fix"]) | set(f["fix"])
+            unique[key]["fix"] = tuple(sorted(merged))
+        else:
+            unique[key] = dict(f)
     findings = sorted(unique.values(), key=lambda f: (f["package"], f["id"]))
 
     fixable    = [f for f in findings if f["fix"]]
@@ -225,6 +345,42 @@ def main():
     # justification is now describing nothing. Left alone it becomes a
     # permanent, unexamined exemption -- the shape this project removes
     # elsewhere by failing on stale exemption tables.
+    # AND AN ACCEPTED ID THAT IS PRESENT BUT NOT FIXABLE IS THE SAME DEFECT ONE
+    # STEP IN. "Accepted" means, in this table's own words, that a fix exists
+    # and something specific blocks taking it -- every entry carries the version
+    # the fix landed in. An entry whose finding reports NO fix version is
+    # therefore describing something other than what it claims, and it is INERT:
+    # `accepted` is computed from `fixable`, so such an id falls into UNFIXABLE
+    # instead, is never gated, and the table goes on naming a blocked fix that
+    # the data says does not exist.
+    #
+    # THIS CHECK IS HERE BECAUSE ITS ABSENCE IS WHY PYSEC-2026-2290 SURVIVED.
+    # That finding was fixable (5.5.0), was filed unfixable by the first-wins
+    # de-duplication above, and produced no complaint from anything -- the
+    # staleness check below could not see it, because the id was still PRESENT.
+    # The union fixes the classification; this fixes the blind spot that let a
+    # wrong classification pass silently, which is the more durable half.
+    #
+    # It is exit 2 rather than exit 1 for the reason stale entries are: nothing
+    # a commit can do turns it green, and the fix is a human reading the table.
+    fix_by_id = {f["id"]: f["fix"] for f in findings}
+    inert = sorted(vid for vid in _ACCEPTED
+                   if vid in fix_by_id and not fix_by_id[vid])
+    if inert:
+        print("-" * 78)
+        print(f"ACCEPTED ENTRIES THAT ARE NOT FIXABLE: {len(inert)}")
+        print("-" * 78)
+        for vid in inert:
+            pkg, fixed, why = _ACCEPTED[vid]
+            print(f"  {vid} ({pkg}) — this table says the fix is {fixed} and is")
+            print(f"      blocked by: {why}. The audit reports NO fix version for")
+            print("      it, so the entry gates nothing and one of the two is wrong.")
+        print("\n  Either the advisory data lost its fix version, in which case")
+        print("  the entry belongs in the unfixable column and should go, or the")
+        print("  de-duplication above is discarding the record that carries it.")
+        print()
+        return 2
+
     seen_ids = {f["id"] for f in findings}
     stale = sorted(set(_ACCEPTED) - seen_ids)
     if stale:
