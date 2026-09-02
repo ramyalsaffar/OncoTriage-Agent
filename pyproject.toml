@@ -202,8 +202,105 @@ dependencies = [
     # image this project has twice had to shrink, and a declared dependency
     # nothing imports is the packaging form of the dead declaration check 2h
     # exists to report.
-    "transformers==4.57.1",
-    "torch==2.9.0",
+    # --- transformers 5.10.4, NOT 4.57.1, AND THE RANKING WAS MEASURED -------
+    # This is the loader for the Stage 3 cross-encoder, so it is the one pin in
+    # this file that can change what the pipeline RANKS without changing what it
+    # does. It was held at 4.57.1 through five accepted advisories under a MODEL
+    # argument reading "the fixtures cannot prove a bump safe"; that argument was
+    # about a MISSING MEASUREMENT rather than about a constraint, and this pass
+    # took the measurement instead. See the MODEL block in
+    # .github/scripts/audit_gate.py for what replaced it.
+    #
+    # WHAT THE MEASUREMENT WAS, 2026-09-02, on macOS/arm64, free:
+    #   * every fixture's REAL recorded (query, trial_texts) pair re-scored
+    #     through oncotriage.agent.models.score_pairs -- the shipped seam --
+    #     11 patients, 43 rerank passes, 4,300 pairs, with Stage 3's own RRF
+    #     fusion reproduced from node_cross_encoder_rerank;
+    #   * a REPRODUCIBILITY CONTROL first: two baseline runs at 4.57.1 are
+    #     bit-identical, 43/43 vectors, so a delta is attributable;
+    #   * a POSITIVE CONTROL: the same probe with CROSS_ENCODER_MAX_LENGTH
+    #     forced to 256 moves 3,038/4,300 pairs, 43/43 orders and 11/11 patients'
+    #     top-15, largest movement 67 places -- so the harness discriminates and
+    #     the zero below is a measured zero rather than a comparison of nothing;
+    #   * RESULT: 4.57.1 -> 5.10.4 is BIT-IDENTICAL. 43/43 score vectors, 0 of
+    #     4,300 pairs moved, 0 rank changes, 0 top-15 changes.
+    #
+    # WHY IT IS BIT-IDENTICAL RATHER THAN MERELY CLOSE, and this is the fact
+    # that decided CROSS_ENCODER_DTYPE. 5.0.0 changed from_pretrained's default
+    # dtype from a forced float32 to "auto" -- the checkpoint's own declaration
+    # -- and ncbi/MedCPT-Cross-Encoder's config.json declares
+    # `"torch_dtype": "float32"`, so "auto" resolves to exactly what 4.x forced.
+    # That is a property of a third-party JSON file and not of this project, so
+    # oncotriage/agent/deps.py now PASSES the dtype and verifies what came back.
+    # The tokenizer rewrite (5.x drops the slow/fast split and always uses the
+    # Rust backend) is a no-op here: this checkpoint ships tokenizer.json, so
+    # 4.57.1 was already using that backend.
+    #
+    # 5.10.4 IS THE LAST PATCH OF THE LOWEST MINOR THAT CLEARS EVERY ACCEPTED
+    # ADVISORY. The three accepted ids need 5.3.0, 5.5.0 and 5.10.0, so 5.10 is
+    # the floor; OSV reports ZERO advisories against 5.10.4 (and against 5.16.1),
+    # so nothing is bought by going further. What going further COSTS is
+    # measured: 5.16.1 declares `tokenizers>=0.23.1` and `safetensors>=0.8.0`,
+    # which would move the Rust tokenizer -- the one component under this ranker
+    # that 5.10.4 leaves exactly where it is -- to clear nothing. 5.10.0 and
+    # 5.10.4 declare byte-identical core dependencies (checked against PyPI
+    # metadata), so the patch is free.
+    #
+    # IT MOVES huggingface-hub 0.36.0 -> 1.x, WHICH IS A MAJOR, and that is the
+    # one transitive consequence worth naming. Every 5.x declares
+    # `huggingface-hub<2.0,>=1.5.0`. fastembed 0.7.4 declares
+    # `huggingface-hub<2.0,>=0.20` and tokenizers `<2.0,>=0.16.4`, so both admit
+    # it by metadata -- and metadata is a claim, so it was run: fastembed and
+    # qdrant-client import and the BM25 path is exercised by the suite.
+    "transformers==5.10.4",
+
+    # --- torch 2.10.0, NOT 2.9.0 AND NOT 2.13.0, AND THE STOP IS MEASURED ----
+    # transformers 5.10.4 declares `torch>=2.4`, so 2.9.0 already satisfied it
+    # and this move is NOT forced. It is taken under the same ruling that took
+    # the transformers move -- the four accepted torch advisories were accepted
+    # under the same MODEL argument, and the measurement above covers the whole
+    # numerical stack rather than one library of it.
+    #
+    # 2.10.0 CLEARS THREE OF THE FOUR: CVE-2025-2999 (fix 2.9.1),
+    # CVE-2025-3001 (fix 2.10.0) and CVE-2026-24747 / PYSEC-2026-2286 (fix
+    # 2.10.0). The fourth, CVE-2025-3000 / PYSEC-2025-194, needs 2.13.0 and is
+    # NOT taken; the accepted table carries it with a measured blocker and an
+    # unreachability argument.
+    #
+    # WHY THE STOP IS AT 2.10.0 AND NOT AT 2.13.0 -- MEASURED, by resolving each
+    # release inside `python:3.11-slim` on BOTH architectures rather than read
+    # off the metadata. torch's Linux CUDA dependency markers LOST their
+    # `platform_machine == "x86_64"` guard at 2.11.0, so from that release on an
+    # aarch64 install pulls fifteen nvidia wheels:
+    #
+    #     linux/arm64   2.9.0  109 MB / 0 nvidia     <- what ships today
+    #                   2.10.0 149 MB / 0 nvidia     <- what ships now
+    #                   2.11.0 2.7 GB / 15 nvidia
+    #                   2.12.1 2.7 GB / 15 nvidia
+    #                   2.13.0 2.7 GB / 15 nvidia
+    #     linux/amd64   2.9.0  3.8 GB               2.13.0 2.6 GB
+    #
+    # `make up` builds linux/arm64 on the development machine, so 2.13.0 would
+    # add ~2.6 GB of CUDA to an image with no GPU to clear one local-only
+    # `torch.jit.script` advisory. On amd64 the same move would SHRINK the image
+    # by 1.2 GB, which is why the number below is a property of the build
+    # architecture and not of the release.
+    #
+    # THE PROPER FIX IS THE CPU WHEEL INDEX AND IT IS NOT DONE HERE.
+    # `--index-url https://download.pytorch.org/whl/cpu` gives torch 2.13.0+cpu
+    # at 158 MB on arm64 -- measured -- and would make the fourth advisory free.
+    # It cannot be expressed in this file: a PEP 508 requirement carries no
+    # index, so the Dockerfile would have to install torch OUTSIDE the tomllib
+    # extraction that makes this the ONE dependency list, and `+cpu` is a local
+    # version that a bare `pip install .` cannot resolve. That is a build-system
+    # decision with its own verification, and it is the recorded follow-up.
+    #
+    # WHAT 2.10.0 DOES TO THE RANKING, measured on the same 4,300 pairs: at
+    # 2.13.0 the scores move by at most 1.1e-04 (mean 3.5e-06) -- float32
+    # kernel-order noise -- and ZERO ranks, ZERO top-15 memberships and ZERO
+    # top-40 memberships change. 2.10.0's own figures are in the pass record.
+    # transformers alone is bit-identical; torch is what moves the last bits.
+    "torch==2.10.0",
     # The Qdrant/bm25 sparse encoder. See the note above; it is a hard
     # requirement that no module imports at the top.
     "fastembed==0.7.4",

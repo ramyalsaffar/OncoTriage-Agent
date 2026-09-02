@@ -530,6 +530,16 @@ LOGGABLE_FIELDS = frozenset({
     # data into a message, and because "unverified" is only actionable when the
     # record says which half was unverified and against what number.
     "max_length_configured", "max_length_declared", "max_length_source",
+    # The cross-encoder's numeric precision, both sides of the same comparison
+    # one field over. `dtype_configured` is a project constant ("float32") and
+    # `dtype_reported` is a torch dtype NAME, so the argument above carries
+    # verbatim: model geometry, no patient, no trial, no diagnosis. They are
+    # fields for that section's reason too -- "unverified" is only actionable
+    # when the record says what was asked for and what came back. Added with
+    # the transformers 5.x upgrade, which is what made the precision a decision
+    # this project makes rather than one the library forced; see
+    # config.CROSS_ENCODER_DTYPE.
+    "dtype_configured", "dtype_reported",
     # How many of the trials a render pass covered were changed by it, beside
     # `total` (how many it covered) and `count` (how many sequences it
     # rewrote). Three numbers rather than one because they answer three

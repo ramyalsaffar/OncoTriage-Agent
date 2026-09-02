@@ -94,7 +94,7 @@ except ImportError:
         raise
     del _candidate, _how
 
-from oncotriage import config, degradation
+from oncotriage import config, degradation, observability
 from oncotriage.agent import deps
 
 
@@ -463,6 +463,241 @@ _text = "\n".join(degradation.report_lines(_snap))
 check_true("6d  ...and the printed report names it and says what a non-zero "
            "means", "CROSS_ENCODER_LIMIT_DEGRADATIONS" in _text
            and "UNVERIFIED" in _text)
+
+
+# ===========================================================================
+# SECTION 7 -- the cross-encoder's PRECISION, the second property of the same
+#              checkpoint, and the one transformers 5.x stopped deciding
+# ===========================================================================
+
+section("SECTION 7 -- config.CROSS_ENCODER_DTYPE and its verifier")
+
+# WHY THIS SECTION EXISTS AND WHY IT DID NOT BEFORE. transformers 4.x FORCED
+# float32 on every from_pretrained that did not ask for something else, so the
+# precision of Stage 3 was a property of the LIBRARY and there was nothing here
+# to own or to check. 5.0.0 changed the default to "auto" -- the checkpoint's
+# own config.json -- so it became a property of a JSON FILE ON A THIRD-PARTY
+# HUB. The failure that creates is verbatim the one sections 1-6 are about, one
+# field over: a checkpoint republished at bfloat16 loads without a word, scores
+# every pair, and only the ranking moves.
+#
+# MEASURED 2026-09-02, which is why the upgrade moved not one score of 4,300:
+# ncbi/MedCPT-Cross-Encoder's config.json declares "torch_dtype": "float32", so
+# 5.x's "auto" resolves to exactly what 4.x forced. 7c pins the constant to
+# that value for the same reason 1c pins 512 -- the number is a FACT ABOUT THE
+# CHECKPOINT, and a constant that drifted off it is the whole subject here.
+
+_DTYPE = config.CROSS_ENCODER_DTYPE
+
+# Sentinel for "the model has no `dtype` attribute at all", which is a
+# different input from "it has one and it is None". Bound ABOVE verify_dtype
+# because that function's default-argument-free body reads it at call time and
+# 7g/7i drive both spellings.
+_ABSENT = object()
+
+check_true("7a  config.CROSS_ENCODER_DTYPE exists and is a plain str",
+           isinstance(_DTYPE, str))
+check_true("7b  ...and it is NOT a torch.dtype and NOT the 'torch.' spelling "
+           "(non-degeneracy: deps.py must not import torch, so the constant "
+           "has to be the string form transformers accepts)",
+           bool(_DTYPE) and not _DTYPE.startswith("torch."))
+check("7c  it is float32 today, which is what MedCPT's config.json declares "
+      "and what transformers 4.x forced", _DTYPE, "float32")
+
+
+def verify_dtype(reported, checkpoint="probe/checkpoint"):
+    """Drive the dtype verifier; convert a RAISE into a comparable value.
+
+    Same argument as verify() above: the mismatch arm raises BY DESIGN, and a
+    bare call lets it escape through check()'s argument list and abort the run.
+    """
+    class _Model:
+        pass
+    m = _Model()
+    if reported is not _ABSENT:
+        m.dtype = reported
+    try:
+        return deps._verify_cross_encoder_dtype(m, checkpoint)
+    except deps.CrossEncoderDtypeMismatchError as exc:
+        return ("RAISED", str(exc))
+    except Exception as exc:                        # noqa: BLE001
+        return ("RAISED-WRONG-TYPE", type(exc).__name__, str(exc))
+
+# --- the three non-raising arms -------------------------------------------
+_before = dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+
+check("7d  a bare 'float32' matching the constant VERIFIES",
+      verify_dtype("float32"), deps.DTYPE_VERIFIED)
+check("7e  ...and so does the torch spelling of the same fact, because "
+      "str(torch.float32) is 'torch.float32' and comparing them as written "
+      "would report a mismatch that is not one",
+      verify_dtype("torch.float32"), deps.DTYPE_VERIFIED)
+check("7f  ...and neither of those moved the counter, because a verified "
+      "precision is not a degradation",
+      counter_delta(_before, dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)), {})
+
+_before = dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+check("7g  a model that reports NO dtype is UNREPORTED, not a mismatch -- "
+      "nobody can make a third-party object declare one, so it is counted "
+      "(item 11a's line) rather than raised on",
+      verify_dtype(_ABSENT), deps.DTYPE_UNREPORTED)
+check("7h  ...counted under its own key",
+      counter_delta(_before, dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)),
+      {"unreported": 1})
+
+_before = dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+check("7i  an explicit None is the same fact as an absent attribute and must "
+      "not be a mismatch against 'float32'",
+      verify_dtype(None), deps.DTYPE_UNREPORTED)
+check("7j  ...under the same key",
+      counter_delta(_before, dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)),
+      {"unreported": 1})
+
+# --- the raising arm, in BOTH directions ----------------------------------
+#
+# A LOWER precision is the silent one (the ranking degrades and nothing says
+# so) and a HIGHER one means the request was ignored; both are the same defect
+# -- transformers returned something other than what it was asked for -- so
+# both raise. Driving only one would leave a one-sided `<` or `>` passing.
+_before = dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+check("7k  a LOWER precision RAISES rather than degrading the ranking silently",
+      marker(verify_dtype("bfloat16")), "RAISED")
+check("7l  a HIGHER precision RAISES too -- the defect is 'not what was asked "
+      "for', not 'smaller than what was asked for'",
+      marker(verify_dtype("float64")), "RAISED")
+check("7m  ...and a MISMATCH moves no counter, because it raised "
+      "(non-degeneracy for 7h/7j: if a mismatch also counted, those two "
+      "checks would pass against a verifier that never raises)",
+      counter_delta(_before, dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)), {})
+
+_raise = verify_dtype("bfloat16")
+check_true("7n  the raise NAMES both sides, so the message says what was asked "
+           "for and what came back",
+           isinstance(_raise, tuple) and _DTYPE in at(_raise, 1, "")
+           and "bfloat16" in at(_raise, 1, ""))
+check_true("7o  ...and it is a RuntimeError subclass, deliberately not a "
+           "ValueError, so a stray `except ValueError` around a model load "
+           "cannot eat it (the UnknownModelPricingError precedent)",
+           issubclass(deps.CrossEncoderDtypeMismatchError, RuntimeError)
+           and not issubclass(deps.CrossEncoderDtypeMismatchError, ValueError))
+
+# --- the UNREADABLE arm, DRIVEN rather than declared -----------------------
+#
+# THE FIRST VERSION OF 7p UNIONED `DTYPE_UNREADABLE` INTO ITS EXPECTED SET BY
+# HAND, because no input above produces it -- which is the vacuous shape this
+# project forbids: a member of a closed vocabulary that nothing ever reaches is
+# a member nobody has checked, and unioning it in makes the closure check agree
+# with itself. It IS reachable, by an object whose str() is empty and by one
+# whose __str__ raises, so it is driven.
+class _EmptyDtype:
+    def __str__(self):
+        return ""
+
+
+class _RaisingDtype:
+    def __str__(self):
+        raise RuntimeError("this object refuses to describe itself")
+
+
+_before = dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+check("7p  a dtype whose str() is EMPTY is UNREADABLE, not a mismatch against "
+      "'float32' -- an unreadable answer and a wrong answer have different "
+      "remedies", verify_dtype(_EmptyDtype()), deps.DTYPE_UNREADABLE)
+check("7q  ...counted under a key that NAMES THE TYPE, so the record says what "
+      "could not be read rather than only that something could not",
+      counter_delta(_before, dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)),
+      {"unreadable:_EmptyDtype": 1})
+
+_before = dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+check("7r  an object whose __str__ RAISES is also UNREADABLE and does not "
+      "escape the verifier -- a model load must not die because an attribute "
+      "declined to render", verify_dtype(_RaisingDtype()),
+      deps.DTYPE_UNREADABLE)
+check("7s  ...under its own type-named key",
+      counter_delta(_before, dict(deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)),
+      {"unreadable:_RaisingDtype": 1})
+
+check("7t  DTYPE_VERIFICATION_STATES is CLOSED and is exactly the set of "
+      "values the verifier can return, EVERY ONE OF THEM DRIVEN above, so a "
+      "caller may branch on it exhaustively",
+      sorted(set(deps.DTYPE_VERIFICATION_STATES)),
+      sorted({marker(verify_dtype(x))
+              for x in ("float32", "torch.float32", None, _ABSENT,
+                        _EmptyDtype(), _RaisingDtype())}))
+
+# --- the STRUCTURAL half: the constant is PASSED, not merely declared ------
+#
+# Everything above drives a pure function with a fabricated model. None of it
+# can see a factory that stopped handing the constant to from_pretrained, which
+# is the edit that would make all of it decorative -- the verifier would go on
+# comparing "float32" against whatever "auto" happened to resolve to, and would
+# agree with it on this checkpoint forever. So the call site is pinned by AST.
+_DEPS_SRC = os.path.abspath(deps.__file__)
+_deps_tree = ast.parse(open(_DEPS_SRC, encoding="utf-8").read(), _DEPS_SRC)
+_dtype_kwargs = []
+for _node in ast.walk(_deps_tree):
+    if (isinstance(_node, ast.Call) and isinstance(_node.func, ast.Attribute)
+            and _node.func.attr == "from_pretrained"):
+        for _kw in _node.keywords:
+            if _kw.arg == "dtype":
+                _v = _kw.value
+                _dtype_kwargs.append(
+                    _v.attr if isinstance(_v, ast.Attribute)
+                    else _v.id if isinstance(_v, ast.Name)
+                    else f"<{type(_v).__name__}>")
+
+check("7u  the weights load is handed CROSS_ENCODER_DTYPE by name, so the "
+      "precision is a decision this project makes rather than one it inherits "
+      "from the checkpoint's config.json",
+      _dtype_kwargs, ["CROSS_ENCODER_DTYPE"])
+check_true("7v  ...exactly ONE from_pretrained call passes it -- the tokenizer "
+           "has no dtype and a `dtype=` there would be a request nothing reads "
+           "(non-degeneracy for 7q: an empty list also 'contains no wrong "
+           "name')", len(_dtype_kwargs) == 1)
+
+_verify_calls = sorted(
+    _n.func.id for _n in ast.walk(_deps_tree)
+    if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
+    and _n.func.id.startswith("_verify_cross_encoder"))
+check("7w  ...and BOTH verifiers are actually called from the factories -- the "
+      "sequence limit twice (tokenizer and weights) and the dtype once",
+      _verify_calls,
+      ["_verify_cross_encoder_dtype",
+       "_verify_cross_encoder_sequence_limit",
+       "_verify_cross_encoder_sequence_limit"])
+
+# --- the counter has a reader, same as section 6 ---------------------------
+check("7x  CROSS_ENCODER_DTYPE_DEGRADATIONS is in the run-end registry",
+      "CROSS_ENCODER_DTYPE_DEGRADATIONS" in degradation.registered_names(),
+      True)
+check_true("7y  ...and the registry holds the SAME Counter OBJECT, not a "
+           "snapshot",
+           degradation._REGISTRY.get("CROSS_ENCODER_DTYPE_DEGRADATIONS")
+           is deps.CROSS_ENCODER_DTYPE_DEGRADATIONS)
+
+_snap7 = degradation.snapshot()
+check_true("7z  the counter this section moved appears in the run-end snapshot "
+           "(non-degeneracy for 7t/7u)",
+           sum(_snap7.get("CROSS_ENCODER_DTYPE_DEGRADATIONS", {}).values()) > 0)
+
+_text7 = "\n".join(degradation.report_lines(_snap7))
+check_true("7z-b ...and the printed report names it and says what a non-zero "
+           "means", "CROSS_ENCODER_DTYPE_DEGRADATIONS" in _text7
+           and "UNVERIFIED" in _text7)
+
+# --- the two log fields are allowlisted, or the record says nothing --------
+#
+# MEASURED RATHER THAN ASSUMED, and it is why this check is here: the first
+# version of the verifier emitted these two fields and observability's
+# formatter DROPPED both, reporting `dropped_fields` on the record. That is the
+# allowlist working, and it means a verifier whose fields are not allowlisted
+# logs "verified" with nothing saying what was verified against what.
+check("7z-c dtype_configured and dtype_reported are on LOGGABLE_FIELDS, so the "
+      "record carries both sides of the comparison rather than being filtered "
+      "down to a bare status",
+      sorted(f for f in ("dtype_configured", "dtype_reported")
+             if f in observability.LOGGABLE_FIELDS),
+      ["dtype_configured", "dtype_reported"])
 
 
 # ===========================================================================

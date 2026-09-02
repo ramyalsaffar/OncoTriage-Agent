@@ -265,6 +265,13 @@ _REGISTRY_SPEC = (
      "against that half; a genuine mismatch raises rather than counting, and "
      "the shipped MedCPT tokenizer reports undeclared_placeholder on every "
      "load"),
+    ("CROSS_ENCODER_DTYPE_DEGRADATIONS",
+     _agent_deps.CROSS_ENCODER_DTYPE_DEGRADATIONS,
+     "the loaded cross-encoder did not report a precision this code could "
+     "compare, so config.CROSS_ENCODER_DTYPE went UNVERIFIED against the "
+     "weights that were actually loaded and every Stage 3 score of this run "
+     "was produced at a precision nothing confirmed; a genuine mismatch "
+     "raises rather than counting"),
     ("DEID_REFUSALS", _deid.DEID_REFUSALS,
      "a rendered patient record carried a direct identifier and the prompt "
      "was NOT sent; keyed by deid.IDENTIFIER_CLASSES and never by the matched "

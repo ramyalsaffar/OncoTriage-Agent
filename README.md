@@ -63,7 +63,7 @@ in this project.
 | Orchestration | LangGraph 1.0.10 — `StateGraph`, conditional edges, cyclic retry, error handler |
 | Eligibility model | `config.MATCHING_MODEL` (`gpt-5.6-terra`), via the OpenAI SDK |
 | Embeddings | OpenAI `text-embedding-3-small` |
-| Reranker | `ncbi/MedCPT-Cross-Encoder` via Transformers 4.57.1 / Torch 2.9.0 |
+| Reranker | `ncbi/MedCPT-Cross-Encoder` via Transformers 5.10.4 / Torch 2.10.0, loaded at `config.CROSS_ENCODER_DTYPE` (float32) |
 | Sparse retrieval | `Qdrant/bm25` via FastEmbed 0.7.4 |
 | Vector database | Qdrant 1.18.0, zero-downtime aliased collections |
 | API | FastAPI 0.136.3 + Uvicorn, SlowAPI rate limiting |

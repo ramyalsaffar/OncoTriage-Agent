@@ -113,11 +113,22 @@
 # CRITICAL:
 #   pillow 11.3.0          13 HIGHs. Fixes are all 12.x; streamlit 1.46.0 and
 #                          fastembed 0.7.4 both cap `pillow<12`.
-#   transformers 4.57.1    two HIGHs, fixed in 5.x. It loads the MedCPT
-#                          cross-encoder that Stage 3's ranking depends on.
 #   setuptools / msgpack   two HIGHs, in copies VENDORED INSIDE pip. Neither is
 #                          separately installable and neither is what this
 #                          project imports; argued in `.trivyignore`.
+#
+# transformers IS NO LONGER ON THAT LIST EITHER, and it was not dropped — it was
+# fixed. Its two ids (CVE-2026-4372, CVE-2026-5241) were accepted on the
+# argument that a bump would change Stage 3's ranking and that the twelve
+# characterization fixtures could not be replayed to prove otherwise. That was a
+# statement about a missing measurement, so the measurement was taken: every
+# fixture's real recorded (query, trial_texts) pair re-scored through the
+# shipped seam — 4,300 pairs — behind a reproducibility control and a positive
+# control, and 4.57.1 -> 5.10.4 came back BIT-IDENTICAL. torch moved 2.9.0 ->
+# 2.10.0 in the same commit, clearing three of its four accepted ids and
+# changing no rank. The fourth is reclassified ARCH-COST in
+# .github/scripts/audit_gate.py, with the per-architecture measurement that
+# stops it here.
 #
 # starlette IS NO LONGER ON THAT LIST, and it was not dropped — it was fixed.
 # Its three ids were accepted because `fastapi==0.117.1` declared
@@ -216,11 +227,19 @@ jobs:
           python-version: '3.11'
 
       - name: Reclaim runner disk before install
-        # MEASURED, NOT PRECAUTIONARY. `torch==2.9.0`'s x86_64 wheel is 900 MB
-        # and pulls 15 `nvidia-*` CUDA packages totalling 2,988 MB — ~3.9 GB of
-        # downloads, against 104 MB for the same pin on arm64. Installed, the
+        # MEASURED, NOT PRECAUTIONARY. `torch==2.10.0`'s x86_64 wheel pulls the
+        # same 15 `nvidia-*` CUDA packages `torch==2.9.0` did; re-measured on
+        # 2026-09-02 by resolving each release inside `python:3.11-slim`, the
+        # x86_64 download total is ~3.8 GB at 2.9.0 and unchanged in kind at
+        # 2.10.0, against 149 MB for the same pin on arm64. Installed, the
         # dependency set is ~2 GB on arm64 (measured in the built image) and
-        # several times that on x86_64. A hosted runner starts with roughly
+        # several times that on x86_64.
+        #
+        # THE arm64 FIGURE IS WHY THE torch PIN STOPS AT 2.10.0 rather than at
+        # the 2.13.0 one accepted advisory wants: torch's Linux CUDA markers
+        # lost their `platform_machine == "x86_64"` guard at 2.11.0, so from
+        # there on the aarch64 total is 2.7 GB too. See pyproject.toml's torch
+        # pin and audit_gate.py's ARCH-COST entry. A hosted runner starts with roughly
         # 14 GB free, and pip failing on ENOSPC surfaces as a wheel error that
         # reads like a dependency problem.
         #

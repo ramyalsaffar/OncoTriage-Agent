@@ -260,6 +260,52 @@ CROSS_ENCODER_MODEL = "ncbi/MedCPT-Cross-Encoder"
 # recordings.cross_encoder and would have to be recaptured, which costs money.
 CROSS_ENCODER_MAX_LENGTH = 512
 
+# CROSS_ENCODER_DTYPE is the numeric precision the Stage 3 weights are loaded
+# in, and it is a constant HERE for the same reason the two above it are: it is
+# a property OF the checkpoint named above, it decides every score the ranker
+# produces, and until the transformers 5.x upgrade this project did not own it.
+#
+# WHAT CHANGED AND WHY THIS EXISTS NOW. transformers 4.x FORCED float32 on every
+# `from_pretrained` that did not ask for something else -- `dtype` stayed None
+# and `_get_dtype` fell through to `torch.get_default_dtype()`. transformers
+# 5.0.0 changed the default to `"auto"`; its release notes say so in as many
+# words ("model instantiations respecting the dtype in which the model was
+# saved, rather than forcing it to load in float 32",
+# https://github.com/huggingface/transformers/releases/tag/v5.0.0, published
+# 2026-01-26), and the docs give the resolution order: the `dtype` or legacy
+# `torch_dtype` value out of config.json, else the dtype of the first
+# floating-point weight in the checkpoint.
+#
+# SO UNDER 5.x THE PRECISION OF THIS PIPELINE'S RANKER IS DECIDED BY A JSON FILE
+# ON A THIRD-PARTY HUB, and that is the whole argument for this line.
+# ncbi/MedCPT-Cross-Encoder's config.json declares `"torch_dtype": "float32"`
+# today -- MEASURED 2026-09-02 by reading the cached snapshot, which is why the
+# upgrade moved not one score of 4,300 -- and nothing in this repository makes
+# that stay true. A re-publish of that checkpoint carrying `"dtype":
+# "bfloat16"`, which is an ordinary thing to do to halve a download, would
+# change every Stage 3 score on the next cold load. Nothing raises: the model
+# loads, the tokenizer is unaffected, the ranker keeps ranking, and the only
+# symptom is that the ordering moved. That is the SAME silent-ranking-drift
+# shape as a mismatched tokenizer/weights pair above and as a
+# CROSS_ENCODER_MAX_LENGTH that stopped matching its checkpoint, and this
+# project's answer to that shape is an owner and a check rather than a default.
+#
+# IT IS A STRING AND NOT A `torch.dtype`. oncotriage/agent/deps.py must not
+# import torch -- the deferral of that import is what keeps `import
+# oncotriage.agent.deps` from pulling in hundreds of megabytes, and
+# tests/test_package_invariants.py section 2 forbids it at module scope -- and
+# transformers accepts the string form ("A string that is a valid torch.dtype").
+# So the constant is the one thing both sides can name without either of them
+# importing torch.
+#
+# CHANGING IT CHANGES EVERY RANKING, exactly as the two constants above do, so
+# the twelve characterization fixtures would replay as misses on
+# recordings.cross_encoder and would have to be recaptured, which costs money.
+# float32 is not a performance choice here: it is the precision every score
+# this project has ever recorded was computed in, and lowering it is a
+# measurement, not an edit.
+CROSS_ENCODER_DTYPE = "float32"
+
 # Matching parameters
 TOP_K_CANDIDATES = 40  # Top N of trials to evaluate initially with cross encoder
 BM25_RETRIEVAL_SIZE = 75  # Trials from BM25 search

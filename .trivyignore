@@ -40,12 +40,31 @@
 #            starlette resolves to 1.6.0, and all three ids that were listed
 #            here now report clean against the built image.
 #
-#   MODEL    transformers is the MedCPT cross-encoder's loader and Stage 3's
-#            ranking is what the twelve characterization fixtures pin. Those
-#            fixtures cannot currently be replayed to prove a bump safe — the
-#            Qdrant alias moved to trial_criteria_20260807_111807 while they
-#            are pinned to ...20260803_104642 — so the one mechanism built to
-#            verify this change is unavailable.
+#   (THE `MODEL` CLASS IS GONE, AND SO ARE ITS TWO ENTRIES.) It held
+#            transformers 4.57.1 -- CVE-2026-4372 and CVE-2026-5241 -- on the
+#            argument that "those fixtures cannot currently be replayed to prove
+#            a bump safe ... so the one mechanism built to verify this change is
+#            unavailable". That was a statement about a MISSING MEASUREMENT
+#            rather than about a constraint. The transformers-5.x pass built the
+#            measurement instead of waiting for the fixtures: every fixture's
+#            real recorded (query, trial_texts) pair re-scored through the
+#            shipped seam, 4,300 pairs, behind a reproducibility control and a
+#            positive control. 4.57.1 -> 5.10.4 is BIT-IDENTICAL. The pin moved
+#            and both ids report clean against the built image.
+#
+#   ARCH-COST the fix is takeable and changes no behaviour, and taking it as
+#            published would multiply the image on the architecture this project
+#            builds. Mirrors the class of the same name in
+#            .github/scripts/audit_gate.py, which carries the per-release
+#            measurement. NOTHING IS LISTED UNDER IT HERE TODAY: torch's one
+#            remaining accepted advisory, PYSEC-2025-194 / CVE-2025-3000, is
+#            rated MEDIUM by Trivy 0.73.0, so the gate's
+#            `--severity HIGH,CRITICAL` never sees it and an entry would
+#            suppress nothing while silently swallowing a future re-rating to
+#            HIGH -- the same reasoning that keeps CVE-2026-13595 and
+#            CVE-2026-27456 out of the util-linux block below. If it is ever
+#            re-rated, its argument is in audit_gate.py's accepted table,
+#            including the removal condition.
 
 # --- PIN-CAP: pillow 11.3.0, capped below 12 by streamlit and fastembed ------
 CVE-2026-25990   # HIGH   fixed 12.1.1
@@ -61,10 +80,6 @@ CVE-2026-59199   # HIGH   fixed 12.3.0
 CVE-2026-59200   # HIGH   fixed 12.3.0
 CVE-2026-59204   # HIGH   fixed 12.3.0
 CVE-2026-59205   # HIGH   fixed 12.3.0
-
-# --- MODEL: transformers 4.57.1, the MedCPT cross-encoder loader -------------
-CVE-2026-4372    # HIGH   fixed 5.3.0
-CVE-2026-5241    # HIGH   fixed 5.5.0
 
 # --- VENDORED: bundled inside pip itself, not separately installable ---------
 #

@@ -769,6 +769,133 @@ def _verify_cross_encoder_sequence_limit(declared, source, checkpoint):
 
 
 # ---------------------------------------------------------------------------
+# The cross-encoder's numeric precision, verified against the loaded weights
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS, AND WHY IT DID NOT BEFORE THE transformers 5.x UPGRADE.
+# 4.x forced float32 on every load that did not ask for something else, so the
+# precision of Stage 3 was a property of the LIBRARY and there was nothing here
+# to own. 5.0.0 changed the default to `"auto"` -- resolved from the
+# checkpoint's own config.json, else from the first floating-point weight -- so
+# it became a property of a JSON FILE ON A THIRD-PARTY HUB. The full argument,
+# with the release note it comes from and the date, is at
+# config.CROSS_ENCODER_DTYPE.
+#
+# THE FAILURE IS THE ONE THIS MODULE IS ALREADY FULL OF: silent. A checkpoint
+# republished at bfloat16 loads without a word, scores every pair, and ranks --
+# only worse. So the dtype is DECLARED and PASSED rather than inherited, and
+# what came back is checked against what was asked for.
+#
+# MISMATCH RAISES; UNREADABLE COUNTS. That is item 11a's line applied here
+# exactly as the sequence-limit verifier above applies it. A mismatch means
+# transformers accepted `dtype=` and did something else, which is a library
+# contract break that would put every stored score at a precision the record
+# does not name -- loud, at first load, before Stage 5 spends a cent. An
+# ABSENT `model.dtype` is a third-party object declining to say, which no edit
+# here can fix, so it is counted and named.
+
+
+class CrossEncoderDtypeMismatchError(RuntimeError):
+    """The loaded cross-encoder is not in config.CROSS_ENCODER_DTYPE."""
+
+
+CROSS_ENCODER_DTYPE_DEGRADATIONS = Counter()
+"""Times the cross-encoder's loaded precision could not be VERIFIED, by cause.
+
+A non-zero count is not a mismatch -- a mismatch raises. It means the loaded
+object declined to report a dtype (`unreported`) or reported one this code
+could not read (`unreadable:<type>`), so config.CROSS_ENCODER_DTYPE went
+unchecked against the weights that were actually loaded and every Stage 3
+score of that run was produced at a precision nothing confirmed.
+"""
+
+DTYPE_VERIFIED = "verified"
+DTYPE_UNREPORTED = "unreported"
+DTYPE_UNREADABLE = "unreadable"
+
+DTYPE_VERIFICATION_STATES = (DTYPE_VERIFIED, DTYPE_UNREPORTED, DTYPE_UNREADABLE)
+"""Every value _verify_cross_encoder_dtype can RETURN.
+
+Closed, so a caller may branch on it exhaustively, and declared for the same
+reason LIMIT_VERIFICATION_STATES is. A fourth outcome is not in it: a mismatch
+RAISES.
+"""
+
+
+def _normalise_dtype_name(value):
+    """``torch.float32`` / ``"torch.float32"`` / ``"float32"`` -> ``"float32"``.
+
+    A str() of a torch.dtype is ``"torch.float32"``; config names the bare
+    ``"float32"`` because that is the spelling transformers accepts as a string
+    argument. Both are the same fact, and comparing them as written would
+    report a mismatch that is not one.
+    """
+    text = value if isinstance(value, str) else str(value)
+    prefix = "torch."
+    return text[len(prefix):] if text.startswith(prefix) else text
+
+
+def _verify_cross_encoder_dtype(model, checkpoint):
+    """Check the loaded model's precision against config.CROSS_ENCODER_DTYPE.
+
+    Returns one of DTYPE_VERIFICATION_STATES. Raises
+    CrossEncoderDtypeMismatchError when the model reports a precision that is
+    not the configured one; the full argument is in the block above.
+    """
+    configured = config.CROSS_ENCODER_DTYPE
+    reported = getattr(model, "dtype", None)
+
+    if reported is None:
+        CROSS_ENCODER_DTYPE_DEGRADATIONS["unreported"] += 1
+        log.warning("the loaded cross-encoder reports no dtype, so the "
+                    "configured precision went unverified against it",
+                    event="cross_encoder_dtype_unverified",
+                    status=DTYPE_UNREPORTED, model=checkpoint,
+                    dtype_configured=configured, reason="attribute absent")
+        return DTYPE_UNREPORTED
+
+    try:
+        actual = _normalise_dtype_name(reported)
+    except Exception:                                    # pragma: no cover
+        actual = None
+    if not actual:
+        CROSS_ENCODER_DTYPE_DEGRADATIONS[
+            f"unreadable:{type(reported).__name__}"] += 1
+        log.warning("the loaded cross-encoder reported a dtype this code could "
+                    "not read, so the configured precision went unverified "
+                    "against it", event="cross_encoder_dtype_unverified",
+                    status=DTYPE_UNREADABLE, model=checkpoint,
+                    dtype_configured=configured,
+                    reason=type(reported).__name__)
+        return DTYPE_UNREADABLE
+
+    if actual != configured:
+        raise CrossEncoderDtypeMismatchError(
+            f"config.CROSS_ENCODER_DTYPE is {configured!r} and was passed to "
+            f"from_pretrained, but the loaded checkpoint {checkpoint!r} came "
+            f"back as {actual!r}. Every Stage 3 score this process would "
+            f"produce is at a precision the record does not name, and nothing "
+            f"downstream would report it -- the model loads, the ranker ranks, "
+            f"and only the ordering moves. Either the installed transformers "
+            f"stopped honouring `dtype=` on this path, or the checkpoint "
+            f"cannot be materialised at the configured precision. Do not "
+            f"widen this check to accept what came back: the constant is the "
+            f"precision every score this project has recorded was computed "
+            f"in, and changing it is a measurement (see "
+            f"oncotriage/config.py:CROSS_ENCODER_DTYPE)."
+        )
+
+    log.info("the cross-encoder precision matches the configured one",
+             event="cross_encoder_dtype_verified", status=DTYPE_VERIFIED,
+             model=checkpoint, dtype_configured=configured,
+             dtype_reported=actual)
+    return DTYPE_VERIFIED
+
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
 # Factories
 # ---------------------------------------------------------------------------
 #
@@ -877,8 +1004,16 @@ def _build_medcpt_model():
     # what a divergent pair costs and why nothing would raise.
     log.info("loading the MedCPT cross-encoder weights",
              event="local_model_load_started", model=config.CROSS_ENCODER_MODEL)
+    # `dtype=` IS PASSED RATHER THAN LEFT TO THE LIBRARY, and it is the one
+    # from_pretrained argument here that is about numerics rather than about
+    # where the files live. transformers 5.x defaults it to "auto", which means
+    # "whatever the checkpoint's own config.json says", so omitting it hands a
+    # third-party file the decision that sets every Stage 3 score's precision.
+    # The string form is used because this module must not import torch; see
+    # config.CROSS_ENCODER_DTYPE for the whole argument and the release note.
     model = AutoModelForSequenceClassification.from_pretrained(
-        config.CROSS_ENCODER_MODEL, **_cache_kwargs)
+        config.CROSS_ENCODER_MODEL, dtype=config.CROSS_ENCODER_DTYPE,
+        **_cache_kwargs)
     model.eval()
     log.info("MedCPT cross-encoder weights loaded",
              event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
@@ -892,6 +1027,13 @@ def _build_medcpt_model():
         getattr(getattr(model, "config", None), "max_position_embeddings", None),
         "weights.config.max_position_embeddings",
         config.CROSS_ENCODER_MODEL)
+
+    # AND THE PRECISION, against what actually came back rather than against
+    # what was asked for. Passing `dtype=` above is a request; this is the
+    # answer. Same placement argument as the line above it -- below the
+    # deferral return, unreachable behind an override, and reading an attribute
+    # off an object the caller already built.
+    _verify_cross_encoder_dtype(model, config.CROSS_ENCODER_MODEL)
     return model
 
 

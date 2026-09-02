@@ -65,12 +65,32 @@ import sys
 #             changes 96 snapshot values including 43 True->False and four figure
 #             heights collapsing to 0. Regenerating a golden file to accommodate
 #             that makes whatever the code does correct by definition.
-#   MODEL     the fix changes a model or numerical stack that this project's
-#             twelve characterization fixtures exist to pin. They cannot
-#             currently be replayed to prove otherwise -- the Qdrant alias moved
-#             to trial_criteria_20260807_111807 while the fixtures are pinned to
-#             ...20260803_104642 -- so a bump here would be unverifiable by the
-#             one mechanism built to verify it.
+#   (THE `MODEL` CLASS IS GONE, AND ITS SIX ENTRIES WITH IT.) It read: "the fix
+#             changes a model or numerical stack that this project's twelve
+#             characterization fixtures exist to pin. They cannot currently be
+#             replayed to prove otherwise ... so a bump here would be
+#             unverifiable by the one mechanism built to verify it." That was a
+#             statement about a MISSING MEASUREMENT, not about a constraint --
+#             and the transformers-5.x pass took the measurement rather than
+#             waiting for the fixtures. It re-scored every fixture's real
+#             recorded (query, trial_texts) pair through the shipped
+#             `models.score_pairs` seam -- 4,300 pairs, 43 rerank passes, 11
+#             patients, with Stage 3's own RRF fusion -- behind a
+#             reproducibility control (two baseline runs bit-identical) and a
+#             positive control (max_length forced to 256 moves 11/11 patients'
+#             top-15). transformers 4.57.1 -> 5.10.4 came back BIT-IDENTICAL,
+#             torch 2.9.0 -> 2.10.0 moves no rank at all, and both pins moved.
+#             See pyproject.toml for the full record.
+#
+#             THE LESSON IS WORTH KEEPING WHERE THE CLASS WAS: a blocking class
+#             whose reason is "we cannot check this" expires the moment somebody
+#             builds a check, and it will not expire on its own -- nothing in
+#             this file goes stale when a measurement becomes possible. Anything
+#             filed here for that reason is a task, not a constraint.
+#
+#   ARCH-COST the fix is takeable, changes no behaviour, and would multiply the
+#             shipped image on the architecture this project builds. One entry,
+#             measured per release on both arches inside python:3.11-slim.
 #   (THE `SCOPE` CLASS IS GONE.) It described apache-airflow, moved to the
 #             `orchestration` extra and therefore invisible to this audit, with
 #             two CRITICALs left unfixed. The upgrade to 3.3.0 is done, so there
@@ -124,102 +144,69 @@ _ACCEPTED = {
     "PYSEC-2026-212":  ("streamlit", "1.53.1", "RENDER dashboard snapshot"),
     "PYSEC-2026-2285": ("streamlit", "1.54.0", "RENDER dashboard snapshot"),
 
-    # ---- torch / transformers: MODEL -------------------------------------
-    # transformers is the MedCPT cross-encoder's loader and torch is what runs
-    # it. Stage 3's ranking is the thing the fixtures pin.
-    "CVE-2025-2999":   ("torch", "2.9.1",  "MODEL cross-encoder numerics"),
-    "CVE-2025-3001":   ("torch", "2.10.0", "MODEL cross-encoder numerics"),
-    "PYSEC-2025-194":  ("torch", "2.13.0", "MODEL cross-encoder numerics"),
-    "PYSEC-2026-2286": ("torch", "2.10.0", "MODEL cross-encoder numerics"),
-    "PYSEC-2026-2288": ("transformers", "5.0.0", "MODEL MedCPT cross-encoder major"),
-    "PYSEC-2026-2289": ("transformers", "5.3.0", "MODEL MedCPT cross-encoder major"),
+    # ---- transformers: FIVE ENTRIES DELETED, AND THEY ARE FIXED, NOT DROPPED
+    # PYSEC-2026-2288 (CVE-2026-1839), PYSEC-2026-2289 (CVE-2026-4372),
+    # PYSEC-2026-2290 (CVE-2026-5241) and CVE-2026-9856 (GHSA-xrqw-3rrv-vx5w)
+    # were accepted here under the MODEL class -- and the fifth id in that
+    # family, the duplicate GHSA record of CVE-2026-4372, with them. The pin is
+    # transformers==5.10.4 now, past every one of 5.0.0 / 5.3.0 / 5.5.0 /
+    # 5.10.0, and OSV reports ZERO advisories against 5.10.4. Two further
+    # advisories that affected 4.57.1 (PYSEC-2025-217, PYSEC-2025-218) were
+    # never in this table because they carry no fix version; they were printed
+    # in the UNFIXABLE column on every run and they clear with the same move.
     #
-    # CVE-2026-9856 (GHSA-xrqw-3rrv-vx5w) IS THE ENTRY THAT TURNED THIS GATE RED
-    # WITH NO COMMIT, and the timing is the record: GitHub reviewed the advisory
-    # at 2026-09-01T18:58:08Z, OSV modified it at 19:02:53Z, run 20 was green at
-    # 16:45Z and run 21 red at 19:35Z. Nothing in run 21's commit touches a
-    # dependency. That is this gate's advertised property working -- a NEW
-    # advisory against an ALREADY-ACCEPTED package still fails -- and the cost of
-    # that property is that it gates commits that did not cause it.
+    # THE STALENESS CHECK BELOW IS WHAT MAKES THIS SAFE IN ONE COMMIT: an
+    # accepted id that no longer appears exits 2. Leaving these behind after
+    # the pin moved would have turned the gate red rather than letting a dead
+    # exemption sit here being re-read as a live constraint. Same mechanism the
+    # six starlette entries above went out through.
     #
-    # IT IS THE SAME BLOCKER AS THE TWO ABOVE, ONE MAJOR FURTHER OUT: the fix
-    # landed in 5.10.0 and this project pins transformers==4.57.1 as the MedCPT
-    # cross-encoder's loader. Taking it is a 4.x -> 5.x bump of the library that
-    # instantiates the Stage 3 tokenizer and weights, which is exactly what the
-    # twelve characterization fixtures exist to pin and exactly what cannot be
-    # replayed to prove today (they are stale: the de-identification and
-    # pre-diagnosis-ECOG passes invalidated them and the recapture is the
-    # standing item). Bumping it to clear a gate would be changing ranking
-    # behaviour to make a check pass, unverified by the one mechanism built to
-    # verify it.
+    # WHAT THE BUMP WAS MEASURED TO DO: nothing. See the class note above and
+    # pyproject.toml's transformers pin for the harness, both controls and the
+    # numbers.
+
+    # ---- torch: THREE OF FOUR DELETED; ONE REMAINS, RECLASSIFIED -----------
+    # CVE-2025-2999 (fix 2.9.1), CVE-2025-3001 (fix 2.10.0) and PYSEC-2026-2286
+    # / CVE-2026-24747 (fix 2.10.0) are cleared by the move to torch==2.10.0.
     #
-    # AND THE SINK IS NOT REACHABLE FROM THIS PROJECT -- MEASURED ON BOTH
-    # PRECONDITIONS, rather than argued from the advisory summary. The advisory
-    # is a path traversal in `save_pretrained()` on `PreTrainedTokenizerBase`
-    # and `ProcessorMixin`: attacker-controlled keys of a `chat_template` dict,
-    # arriving in a crafted `tokenizer_config.json` from a Hub repository, are
-    # used as filenames when the victim SAVES the tokenizer or processor. Both
-    # preconditions fail here, independently:
+    # PYSEC-2025-194 IS NOT CLEARED, AND ITS BLOCKER IS NOW A MEASUREMENT
+    # RATHER THAN AN ABSENCE OF ONE. The fix is torch 2.13.0. Between 2.10.0
+    # and 2.11.0 torch's Linux CUDA dependency markers lost their
+    # `platform_machine == "x86_64"` guard, so from 2.11.0 on an aarch64 install
+    # pulls fifteen nvidia wheels. Resolved inside python:3.11-slim on both
+    # arches rather than read off the metadata:
     #
-    #   1. THE SINK IS NEVER CALLED. `git grep` for that method name over every
-    #      tracked file in this repository returns hits in THIS COMMENT AND
-    #      NOWHERE ELSE -- no code, no test, no entry point. Stated that way on
-    #      purpose: before this note existed the count was zero, and a claim
-    #      phrased as "appears nowhere" would have been falsified by the
-    #      sentence making it. That is the trap this project has now met five
-    #      times: a file that argues about a string cannot be grepped for it.
-    #   2. The load is not attacker-directed. The only two `from_pretrained`
-    #      calls in the package are AutoTokenizer and
-    #      AutoModelForSequenceClassification in oncotriage/agent/deps.py, both
-    #      handed `config.CROSS_ENCODER_MODEL` == "ncbi/MedCPT-Cross-Encoder" --
-    #      and tests/test_package_invariants.py section 2f(ii) asserts BY AST
-    #      that the checkpoint literal appears exactly once in the package, that
-    #      both calls are handed that constant, that there are exactly two of
-    #      them, and that no other package module calls `from_pretrained` at
-    #      all. So pointing this project at an arbitrary Hub repository is not a
-    #      configuration change; it is a source edit that fails a standing check.
-    #      AutoModelForSequenceClassification is also not a ProcessorMixin, and
-    #      none of the processors the advisory names (Idefics, Florence, Gemma,
-    #      Phi, Qwen-VL) is loaded anywhere here.
+    #     linux/arm64   2.10.0  149 MB / 0 nvidia      <- the pin
+    #                   2.11.0  2.7 GB / 15 nvidia
+    #                   2.13.0  2.7 GB / 15 nvidia     <- the fix
+    #     linux/amd64   2.9.0   3.8 GB   2.13.0  2.6 GB
     #
-    # THAT IS AN ARGUMENT FOR WHY ACCEPTING IS SAFE, NOT A FOURTH BLOCKING
-    # CLASS. The class field answers "what stops the fix being taken", and what
-    # stops it is MODEL, the same as its two siblings. Unreachability is why
-    # leaving it unpatched is defensible; it does not make the bump takeable.
-    "CVE-2026-9856":   ("transformers", "5.10.0", "MODEL MedCPT cross-encoder major"),
+    # `make up` builds linux/arm64, so taking the fix as published adds ~2.6 GB
+    # of CUDA to an image with no GPU. That is a cost, not an impossibility, and
+    # it is filed as ARCH-COST rather than as a model risk: the ranking
+    # measurement covers torch 2.13.0 too and reports zero rank changes.
     #
-    # PYSEC-2026-2290 (CVE-2026-5241, GHSA-fgcw-684q-jj6r) WAS NOT RED. IT WAS
-    # INVISIBLE, and it is here because the de-duplication fix in main() made it
-    # visible. Before that fix it was filed UNFIXABLE -- printed on every green
-    # run under a heading reading "no released fix", which is false of it: the
-    # fix is transformers 5.5.0. See the merge comment in main() for how one
-    # finding arrived twice with two different answers about its own fixability
-    # and why first-wins was the wrong tie-break.
+    # AND THE SINK IS NOT REACHABLE FROM THIS PROJECT -- MEASURED, not argued
+    # from the summary. The advisory is memory corruption in
+    # `torch.jit.script` (CVSS:3.1/AV:L/AC:L/PR:L/UI:N, local, low across
+    # C/I/A). `git grep` over every tracked file for `torch.jit`, `jit.script`,
+    # `torch.compile` and `TorchScript` returns hits in THIS COMMENT AND NOWHERE
+    # ELSE -- phrased that way deliberately, because before this note the count
+    # was zero and a claim reading "appears nowhere" would be falsified by the
+    # sentence making it. The only torch API this project calls is
+    # `torch.no_grad()` and a forward pass, in
+    # oncotriage/agent/models.py:medcpt_score_pairs.
     #
-    # THE BLOCKER IS THE SAME MODEL CONSTRAINT AS THE FOUR ENTRIES ABOVE, and
-    # 5.5.0 is still a 4.x -> 5.x major on the MedCPT cross-encoder's loader.
-    #
-    # THE SINK IS NOT REACHABLE FROM THIS PROJECT, and this one is narrower than
-    # CVE-2026-9856's. The advisory is arbitrary code execution in the LIGHTGLUE
-    # model loading path: `LightGlueConfig` reads `trust_remote_code` out of an
-    # untrusted `config.json` and propagates it into nested
-    # `AutoConfig.from_pretrained()` calls, so an attacker-controlled repository
-    # executes its own Python during `AutoModel.from_pretrained()` even when the
-    # caller passed `trust_remote_code=False`. Three independent measurements,
-    # not three readings of the summary:
-    #
-    #   1. `git grep trust_remote_code` over every tracked file returns ZERO
-    #      hits. This project never passes the parameter in either direction.
-    #   2. No LightGlue model is loaded, and none can be reached by
-    #      configuration: the only two loads in the package are AutoTokenizer
-    #      and AutoModelForSequenceClassification, both handed
-    #      `config.CROSS_ENCODER_MODEL` == "ncbi/MedCPT-Cross-Encoder", and
-    #      tests/test_package_invariants.py section 2f(ii) pins that by AST.
-    #   3. The repository is not attacker-controlled. It is a first-party NCBI
-    #      checkpoint named by a module constant, which is the same premise
-    #      pass 20f-2 already made load-bearing when it gave that checkpoint one
-    #      owner and one construction site.
-    "PYSEC-2026-2290": ("transformers", "5.5.0", "MODEL MedCPT cross-encoder major"),
+    # REMOVAL CONDITION, mechanical rather than a judgement call. Delete this
+    # entry when EITHER (a) a torch release >= 2.13.0 restores the
+    # `platform_machine == "x86_64"` guard on its Linux CUDA markers -- check by
+    # resolving it in python:3.11-slim on linux/arm64 and counting nvidia wheels
+    # -- OR (b) the Dockerfile gains the CPU wheel index, which was measured at
+    # 158 MB for 2.13.0+cpu on arm64 and is the recorded follow-up at
+    # pyproject.toml's torch pin.
+    "PYSEC-2025-194":  ("torch", "2.13.0",
+                        "ARCH-COST +2.6 GB of CUDA on linux/arm64; "
+                        "torch.jit sink unreachable"),
 }
 
 # Packages whose findings are about the BUILD TOOLING rather than this project's
