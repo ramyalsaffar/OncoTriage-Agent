@@ -129,6 +129,40 @@ dynamic = ["version"]
 # true at pass 20c-1 and describes about a tenth of what is in the package now.
 description = "OncoTriage Agent — oncology patient / clinical-trial matching over a LangGraph pipeline and hybrid BM25 + vector RAG."
 requires-python = ">=3.10"
+authors = [{ name = "Ramy Alsaffar", email = "ramyalsaffar@gmail.com" }]
+# THE LICENCE KEY IS THE PEP 621 TABLE FORM, NOT PEP 639's STRING, AND THAT WAS
+# MEASURED RATHER THAN CHOSEN. PEP 639 (`license = "PolyForm-Noncommercial-1.0.0"`
+# plus `license-files`) needs setuptools >= 77; the development interpreter here
+# carries setuptools 72.1.0 (measured 2026-09-02), where that form does not warn
+# — it RAISES `ValueError: project.license must be valid exactly by one
+# definition`, so a `--no-build-isolation` install fails outright. The image is
+# on the other side of that line (the builder pins `setuptools>=78.1.1` and
+# installs with --no-build-isolation), so both forms build THERE; only the table
+# form builds in BOTH places, which is why it is the one written down.
+#
+# `{ text = ... }` AND NOT `{ file = "LICENSE" }`: the file form inlines the
+# whole licence into the `License:` core-metadata field — measured, METADATA
+# goes 181 -> 5436 bytes and `pip show oncotriage` prints the entire PolyForm
+# text — while the text form gives the one-line SPDX identifier a reader wants.
+# Nothing is lost by not naming the file: `License-File: LICENSE` is emitted in
+# EVERY form, from [tool.setuptools]'s default LICEN[CS]E* glob, so the licence
+# ships in the sdist and the wheel either way. There is no `license-files` key
+# here for the same reason the string form is absent — it is PEP 639 and fails
+# identically on 72.1.0.
+#
+# THE COST, STATED: setuptools >= 77 emits `SetuptoolsDeprecationWarning:
+# project.license as a TOML table is deprecated` (measured against 84.0.0). The
+# migration is two lines — this key becomes the bare string plus
+# `license-files = ["LICENSE"]`, and [build-system] requires becomes
+# "setuptools>=77" — and it is correct the day this machine's setuptools clears
+# 77. Deliberately NOT done today, because raising that floor breaks the
+# --no-build-isolation path on the interpreter this project is developed on.
+#
+# NO License CLASSIFIER: PEP 639 deprecates them, there is no
+# `License :: OSI Approved ::` entry for PolyForm (it is not an OSI-approved
+# licence), and a `License :: Other/Proprietary License` classifier would say
+# strictly less than the identifier already on the line above.
+license = { text = "PolyForm-Noncommercial-1.0.0" }
 dependencies = [
     # --- Core scientific computing ------------------------------------------
     "numpy==2.1.3",

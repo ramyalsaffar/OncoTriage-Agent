@@ -251,10 +251,16 @@ repository's history and treated as compromised. Read the file.
 
 ## Licence
 
-See [`LICENSE`](LICENSE). **This is not an open source licence.** It grants
-permission to read this repository and reserves everything else; any use beyond
-reading needs prior written permission. [`CITATION.cff`](CITATION.cff) carries
-the citation metadata.
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0)
+— the full text is in [`LICENSE`](LICENSE), verbatim, with the required notice
+appended. **Noncommercial use is permitted** — research, teaching, personal
+study, and use by a charitable, educational, public-research, public-safety,
+public-health, environmental or government organisation — including copying,
+modifying, and distributing under the licence's own terms. **Commercial use is
+not**, and needs a separate licence from the copyright holder. Read the licence
+rather than this paragraph; it defines "noncommercial" and "your company"
+precisely, and this summary is not a term of it. [`CITATION.cff`](CITATION.cff)
+carries the citation metadata.
 
 ## Contact
 

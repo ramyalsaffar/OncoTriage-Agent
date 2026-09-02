@@ -39,7 +39,7 @@ UMLS Metathesaurus, which is distributed under a licence agreement that
 restricts redistribution of its content — and the other three files are
 derived from it, row by row, including source vocabularies (SNOMED CT) with
 their own affiliate licensing. `Dockerfile` STAGE 2 carries
-`org.opencontainers.image.source="https://github.com/ramyalsaffar/trialbridge-ai"`,
+`org.opencontainers.image.source="https://github.com/ramyalsaffar/OncoTriage-Agent"`,
 so anything committed here is a candidate for public distribution.
 
 Vendoring 105 KB of public-domain NLM lookup is a judgement call about repository

@@ -5,27 +5,33 @@
 #
 #     pip install cffconvert && cffconvert --validate -i CITATION.cff
 #
-# WHY THERE IS NO `license:` KEY. That key takes an SPDX identifier and only an
-# SPDX identifier -- the CFF 1.2.0 schema enumerates 459 of them and admits no
-# `LicenseRef-` form and no all-rights-reserved entry, so this project's terms
-# cannot be named there. `license-url` is the field the schema provides for
-# exactly that case ("only for non-standard licenses not included in the SPDX
-# License List") and it points at LICENSE, which is the authority.
+# THE LICENCE IS NAMED HERE, AND IT USED TO BE UNNAMEABLE. `license:` takes an
+# SPDX identifier and only an SPDX identifier, and this project's former terms
+# were a bespoke all-rights-reserved text with no identifier on the SPDX License
+# List -- so the key was omitted and `license-url` carried a link instead, which
+# is the field the schema provides for exactly that case ("only for non-standard
+# licenses not included in the SPDX License List"). The project is now under
+# PolyForm Noncommercial 1.0.0, whose identifier IS on the SPDX License List and
+# IS in the CFF 1.2.0 enum, so `license:` carries it and `license-url` is gone:
+# keeping a non-standard-licence field beside a standard identifier would assert
+# the opposite of what is true. LICENSE remains the authority; this is a label.
 #
 # WHAT IS DELIBERATELY ABSENT, so nobody adds it back by guessing: there is no
 # `doi:` and no `preferred-citation:` because no DOI has been minted and no
 # paper exists; no `date-released:` because this version carries no release tag
 # to date; and no author `orcid:` because no tracked file in this repository
 # records one, and a citation file is not the place to invent one. The author
-# `email:` IS recorded, deliberately: LICENSE clause 2 requires prior written
-# permission for every use beyond reading, and a permission request needs an
-# address to go to.
+# `email:` IS recorded, deliberately: PolyForm Noncommercial permits
+# noncommercial use without asking, and permits commercial use not at all, so a
+# commercial licence has to be negotiated and that request needs an address to
+# go to.
 
 cff-version: 1.2.0
 title: OncoTriage Agent
 message: >-
-  If you reference this software, please cite it as below. Reuse requires the
-  prior written permission of the copyright holder; see LICENSE.
+  If you reference this software, please cite it as below. Reuse is permitted
+  for noncommercial purposes under the terms in LICENSE (PolyForm Noncommercial
+  1.0.0); commercial use requires a separate licence from the copyright holder.
 type: software
 authors:
   - family-names: Alsaffar
@@ -47,4 +53,4 @@ keywords:
   - retrieval-augmented generation
   - LangGraph
   - FHIR
-license-url: "https://github.com/ramyalsaffar/OncoTriage-Agent/blob/main/LICENSE"
+license: PolyForm-Noncommercial-1.0.0

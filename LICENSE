@@ -1,104 +1,133 @@
-OncoTriage Agent — Terms of Use
+# PolyForm Noncommercial License 1.0.0
 
-Copyright (c) 2026 Ramy Alsaffar. All rights reserved.
+<https://polyformproject.org/licenses/noncommercial/1.0.0>
 
-THIS IS NOT AN OPEN SOURCE LICENCE, and it is not an open source licence
-wearing another name. It confers none of the freedoms of the Open Source
-Definition, it is not approved by the Open Source Initiative, and it does not
-correspond to any identifier on the SPDX License List. It is a grant of
-permission to READ this repository, and a reservation of everything else.
+## Acceptance
 
+In order to get any license under these terms, you must agree
+to them as both strict obligations and conditions to all
+your licenses.
 
-1. WHAT YOU MAY DO WITHOUT ASKING
+## Copyright License
 
-   1.1  You may view and read this repository and its contents — the source
-        code, the documentation, the configuration, and the data files.
+The licensor grants you a copyright license for the
+software to do everything you might do with the software
+that would otherwise infringe the licensor's copyright
+in it for any permitted purpose.  However, you may
+only distribute the software according to [Distribution
+License](#distribution-license) and make changes or new works
+based on the software according to [Changes and New Works
+License](#changes-and-new-works-license).
 
-   1.2  You may clone or download the repository and keep a local copy for the
-        sole purpose of reading, studying, evaluating, or reviewing it. This
-        permission covers the copying that reading a git repository requires
-        and nothing beyond it.
+## Distribution License
 
-   1.3  You may quote short excerpts in commentary, review, teaching, or
-        academic discussion, and you may cite the work, provided the excerpt
-        or citation attributes the work to this repository and to the
-        copyright holder named above. CITATION.cff in this repository gives
-        the citation.
+The licensor grants you an additional copyright license
+to distribute copies of the software.  Your license
+to distribute covers distributing the software with
+changes and new works permitted by [Changes and New Works
+License](#changes-and-new-works-license).
 
+## Notices
 
-2. WHAT REQUIRES PRIOR WRITTEN PERMISSION
+You must ensure that anyone who gets a copy of any part of
+the software from you also gets a copy of these terms or the
+URL for them above, as well as copies of any plain-text lines
+beginning with `Required Notice:` that the licensor provided
+with the software.  For example:
 
-   Everything else. Without limiting the generality of that sentence, you may
-   not do any of the following without the prior written permission of the
-   copyright holder:
+> Required Notice: Copyright Yoyodyne, Inc. (http://example.com)
 
-   2.1  reproduce, publish, or distribute this work or any part of it, beyond
-        the local copy permitted by clause 1.2;
+## Changes and New Works License
 
-   2.2  modify, adapt, port, translate, or create derivative works from it;
+The licensor grants you an additional copyright license to
+make changes and new works based on the software for any
+permitted purpose.
 
-   2.3  sublicense, sell, rent, lease, or otherwise transfer it, or offer it
-        as or within a hosted or managed service;
+## Patent License
 
-   2.4  use it, or any part of it, in any product, service, dataset, model, or
-        research output, whether commercial or non-commercial, and whether or
-        not the result is distributed;
+The licensor grants you a patent license for the software that
+covers patent claims the licensor can license, or becomes able
+to license, that you would infringe by using the software.
 
-   2.5  use it, or any part of it, to train, fine-tune, distil, evaluate, or
-        ground any machine learning model.
+## Noncommercial Purposes
 
-   Prior written permission means an explicit written grant from the copyright
-   holder that names what is permitted. Silence is not permission. Nothing is
-   implied by this repository being publicly readable, and nothing is implied
-   by the absence of a technical measure preventing any of the above.
+Any noncommercial purpose is a permitted purpose.
 
-   To request permission, open an issue on the repository named in
-   CITATION.cff, or contact the copyright holder through that repository.
+## Personal Uses
 
+Personal use for research, experiment, and testing for
+the benefit of public knowledge, personal study, private
+entertainment, hobby projects, amateur pursuits, or religious
+observance, without any anticipated commercial application,
+is use for a permitted purpose.
 
-3. NO WARRANTY, AND NO CLINICAL USE
+## Noncommercial Organizations
 
-   THIS WORK IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-   FITNESS FOR A PARTICULAR PURPOSE, ACCURACY, AND NONINFRINGEMENT. IN NO
-   EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY CLAIM, DAMAGES, OR
-   OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE,
-   ARISING FROM, OUT OF, OR IN CONNECTION WITH THIS WORK OR ANY USE OR OTHER
-   DEALING IN IT.
+Use by any charitable organization, educational institution,
+public research organization, public safety or health
+organization, environmental protection organization,
+or government institution is use for a permitted purpose
+regardless of the source of funding or obligations resulting
+from the funding.
 
-   In the words this project already uses for its own output:
+## Fair Use
 
-        NOT FOR CLINICAL USE — research demonstration on synthetic data;
-        unvalidated automated output, not medical advice.
+You may have "fair use" rights for the software under the
+law. These terms do not limit them.
 
+## No Other Rights
 
-4. THIRD-PARTY COMPONENTS
+These terms do not allow you to sublicense or transfer any of
+your licenses to anyone else, or prevent the licensor from
+granting licenses to anyone else.  These terms do not imply
+any other licenses.
 
-   4.1  This repository declares, but does not distribute, third-party
-        dependencies. Each is governed by its own licence, granted by its own
-        author, and nothing in this file grants or restricts any right in
-        them. The dependency list is in pyproject.toml.
+## Patent Defense
 
-   4.2  The files under docker/mesh-core/ are derived from the National
-        Library of Medicine's MeSH descriptor data, which the NLM places in
-        the public domain. They are not covered by this file. Their provenance
-        is recorded in docker/mesh-core/PROVENANCE.md.
+If you make any written claim that the software infringes or
+contributes to infringement of any patent, your patent license
+for the software granted under these terms ends immediately. If
+your company makes such a claim, your patent license ends
+immediately for work on behalf of your company.
 
-   4.3  Where any third-party term conflicts with this file, the third-party
-        term governs that third-party component.
+## Violations
 
+The first time you are notified in writing that you have
+violated any of these terms, or done anything with the software
+not covered by your licenses, your licenses can nonetheless
+continue if you come into full compliance with these terms,
+and take practical steps to correct past violations, within
+32 days of receiving notice.  Otherwise, all your licenses
+end immediately.
 
-5. TERM
+## No Liability
 
-   Permission under clause 1 continues until the copyright holder withdraws
-   it, and ends automatically on any breach of clause 2. A grant made under
-   clause 2 is governed by its own terms and is not affected by this clause.
+***As far as the law allows, the software comes as is, without
+any warranty or condition, and the licensor will not be liable
+to you for any damages arising out of these terms or the use
+or nature of the software, under any kind of legal claim.***
 
+## Definitions
 
-6. RESERVATION
+The **licensor** is the individual or entity offering these
+terms, and the **software** is the software the licensor makes
+available under these terms.
 
-   No right is granted by implication, estoppel, or otherwise. Any right not
-   expressly granted in clause 1 is reserved to the copyright holder.
+**You** refers to the individual or entity agreeing to these
+terms.
 
+**Your company** is any legal entity, sole proprietorship,
+or other kind of organization that you work for, plus all
+organizations that have control over, are under the control of,
+or are under common control with that organization.  **Control**
+means ownership of substantially all the assets of an entity,
+or the power to direct its management and policies by vote,
+contract, or otherwise.  Control can be direct or indirect.
 
-#------------------------------------------------------------------------------
+**Your licenses** are all the licenses granted to you for the
+software under these terms.
+
+**Use** means anything you do with the software requiring one
+of your licenses.
+
+Required Notice: Copyright Ramy Alsaffar (https://github.com/ramyalsaffar/OncoTriage-Agent)
