@@ -168,6 +168,245 @@ def primary_cancer_onset_date(conditions: List[Dict]) -> Optional[str]:
     return onset
 
 
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
+# THE ONE CANCER GROUPING VOCABULARY
+# ===========================================================================
+#
+# WHAT WAS HERE BEFORE: TWO VOCABULARIES FOR ONE CONCEPT, AND THE OLDER ONE HAD
+# GONE STALE WITHOUT ANYTHING FAILING.
+#
+#   * `oncotriage/ablation/study.py:_cancer_group_key` -- fifteen anatomical
+#     groups plus "other", used to stratify the ablation draw.
+#   * `oncotriage/evaluation/sampling.py:classify_cancer` -- THREE groups
+#     (breast, colon, lung) plus "other", used to build the evaluation extract
+#     and, through `evaluation/medcpt_calibration.py`, the pool
+#     `config.MEDCPT_SCORE_FLOOR` was calibrated over.
+#
+# The three-group vocabulary was fitted to a retired corpus in which "other"
+# was one patient. On the corpus this project runs today "other" is 289 of
+# 1,000 -- every prostate, myeloma and leukaemia patient -- so the evaluation
+# sampler was drawing from 71% of the corpus and calling the rest ungrouped,
+# and at a cohort of a few hundred its fixed ten-per-group draw RAISED on the
+# lung stratum. Nothing detected either: a classifier that answers "other" is
+# not a classifier that errors, and the raise arrived as a ValueError about
+# patient counts rather than about a vocabulary.
+#
+# TWO GROUPERS FOR ONE CONCEPT IS THE DRIFT DEFECT THIS PROJECT KEEPS FINDING
+# -- `CROSS_ENCODER_MODEL`, `"Qdrant/bm25"`, `_LATEST_RUN_PER_CONFIG_SQL`,
+# `_RUN_HEALTH_CASE_SQL` -- and the answer here is the same one: one owner, and
+# an AST pin that no second vocabulary survives.
+#
+# WHY THIS MODULE OWNS IT. The question "which broad group is this cancer in"
+# is a projection of "which condition is THE cancer", which is what this module
+# already answers, and the two consumers may not import each other:
+# `oncotriage/ablation/study.py` imports the agent, the graph and the storage
+# layer, and `oncotriage/evaluation/sampling.py` opens a SQLite database -- an
+# import edge either way would put one of those in the other's graph for a
+# keyword table. `oncotriage.registries` is the layer both already sit above,
+# it imports nothing from either, and `cancer_group_key` needs no registry at
+# all. It is NOT in `cancer_code_registry.py` for the reason this module's own
+# header gives: that file's SOURCE TEXT is the corpus two tests read, and this
+# is not a code table.
+#
+# THE VOCABULARY IS `oncotriage/ablation/study.py`'s, MOVED AND NOT REWRITTEN.
+# The ordered keyword list below is that function's, byte-for-byte, including
+# its ordering -- which is load-bearing, because the lists overlap ("small cell
+# lung carcinoma" matches `lung` before it could match anything else) and a
+# reordering would silently regroup patients. It was chosen over the
+# three-group list because it is the one that is not stale, and widening the
+# narrow one to five groups would have been inventing a third vocabulary.
+
+CANCER_GROUP_KEYWORDS = (
+    ("lung",        ("lung", "pulmonary", "bronch", "nsclc", "sclc")),
+    ("breast",      ("breast",)),
+    ("colorectal",  ("colon", "rectal", "rectum", "colorectal")),
+    ("prostate",    ("prostate",)),
+    ("pancreatic",  ("pancrea",)),
+    ("ovarian",     ("ovary", "ovarian")),
+    ("uterine",     ("uterus", "uterine", "cervix", "cervical")),
+    ("hematologic", ("leukemia", "leukaemia", "lymphoma", "myeloma")),
+    ("melanoma",    ("melanoma",)),
+    ("liver",       ("liver", "hepato", "hepatic")),
+    ("kidney",      ("kidney", "renal")),
+    ("bladder",     ("bladder",)),
+    ("thyroid",     ("thyroid",)),
+    ("brain",       ("brain", "glioma", "glioblastoma")),
+    ("head_neck",   ("oropharyn", "oral cavity", "head and neck")),
+)
+"""The ordered (group, keywords) table. FIRST MATCH WINS and the order matters.
+
+A TUPLE OF TUPLES RATHER THAN A DICT OF LISTS, which is what
+``oncotriage/ablation/study.py`` built per call. Ordering is the semantics here,
+and a mutable module-level table is the hazard
+``tests/test_package_invariants.py`` section 6a exists for one package over --
+``MATCH_TIERS`` and ``MATCH_TIER_COLORS`` are checked for mutation because a
+module-level list mutated once leaks into every later caller in the process.
+"""
+
+CANCER_GROUP_OTHER = "other"
+"""A resolved cancer display that matches no keyword set.
+
+DISTINCT FROM ``CANCER_GROUP_UNRESOLVED`` and the distinction is the whole
+reason both names exist: "we found this patient's cancer and it is not one of
+the fifteen" and "we could not find this patient's cancer at all" send a reader
+to two different places, and collapsing them is how the old three-group
+vocabulary hid 289 prostate, myeloma and leukaemia patients inside one bucket.
+"""
+
+CANCER_GROUP_UNRESOLVED = "unknown"
+"""No primary cancer condition could be resolved for this patient at all."""
+
+CANCER_GROUPS = tuple(name for name, _ in CANCER_GROUP_KEYWORDS) + (
+    CANCER_GROUP_OTHER, CANCER_GROUP_UNRESOLVED)
+"""Every value ``cancer_group_key`` or ``patient_cancer_group`` can return.
+
+DERIVED FROM THE TABLE rather than written out, so a group added above joins
+this tuple in the same edit. A consumer that branches exhaustively -- a
+stratified draw reporting per-group counts, a test pinning the vocabulary --
+reads this and cannot be one member behind.
+"""
+
+# A group name repeated in the table would make the second entry unreachable
+# and its patients silently join the first. RuntimeError rather than assert:
+# `python -O` deletes asserts, and this is a correctness guard. Same shape as
+# `RUN_STOP_REASONS`' duplicate check in
+# oncotriage/storage/database_logger.py and the seed guard in
+# oncotriage/evaluation/cohort.py.
+if len(set(CANCER_GROUPS)) != len(CANCER_GROUPS):
+    raise RuntimeError(
+        "CANCER_GROUP_KEYWORDS carries a duplicate group name, or a group is "
+        "named identically to CANCER_GROUP_OTHER / CANCER_GROUP_UNRESOLVED. "
+        "The second entry would be unreachable and its patients would be "
+        "counted under the first.")
+
+
+def cancer_group_key(display: Optional[str]) -> str:
+    """Map a cancer DISPLAY NAME onto one broad anatomical group.
+
+    A pure function of a string. It builds no registry, opens nothing and is
+    the one place in this project that answers this question -- see the block
+    above for what it replaced and why it is here.
+
+    Args:
+        display: the resolved primary cancer's display text. ``None`` and the
+            empty string answer ``CANCER_GROUP_OTHER``, because a missing
+            display is a cancer that matched no keyword rather than a patient
+            with no cancer; the second state is
+            ``patient_cancer_group``'s ``CANCER_GROUP_UNRESOLVED``.
+
+    Returns:
+        A member of ``CANCER_GROUPS``. Never ``None``.
+    """
+    if not display:
+        return CANCER_GROUP_OTHER
+    display_lower = str(display).lower()
+    for group_name, keywords in CANCER_GROUP_KEYWORDS:
+        if any(kw in display_lower for kw in keywords):
+            return group_name
+    return CANCER_GROUP_OTHER
+
+
+def patient_cancer_group(patient: Dict, registry=None) -> str:
+    """The cancer group of a PARSED PATIENT dict. ONE definition of "primary".
+
+    IT DERIVES FROM ``_resolve_primary_cancer_condition`` AND THAT IS THE
+    POINT. It was moved here byte-for-byte from
+    ``oncotriage/ablation/study.py:_get_patient_group``, and the byte-for-byte
+    move preserved a SECOND, DISAGREEING definition of which condition is the
+    primary cancer:
+
+        the resolver (used by the pipeline)     this function (used to sample)
+        ------------------------------------   -------------------------------
+        drops refuted / entered-in-error        did not -- a REFUTED cancer
+        conditions before looking               could decide a patient's group
+        falls back to the first VALID           answered "unknown"
+        condition when no cancer is found
+
+    So a patient could be STAGED, QUERY-EXPANDED and RECORDED in
+    ``inferences.primary_condition`` by one condition and SAMPLED by another.
+    That is this project's recurring drift defect in its most damaging form:
+    the two answers agree on almost every patient, nothing fails when they
+    disagree, and the disagreement lands in which patients a study measures.
+
+    WHAT IT IS NOT. This does not simply return the resolver's answer, because
+    the resolver's FALLBACK arm is not a cancer: when no condition passes
+    ``is_primary_cancer`` it returns the first valid condition so that
+    ``inferences.primary_condition`` records SOMETHING for a non-cancer patient
+    that reached the pipeline. Grouping on that display would put a patient
+    with no cancer into ``other`` -- "we found their cancer and it is not one
+    of the fifteen" -- which is exactly the conflation
+    ``CANCER_GROUP_UNRESOLVED`` exists to prevent. So the fallback arm is
+    detected with the registry predicate the resolver itself used, and answers
+    ``CANCER_GROUP_UNRESOLVED``.
+
+        THE PREDICATE IS ASKED OF THE RESOLVER'S ANSWER, not re-derived over
+        the condition list. There is one selection and one test of it; a second
+        walk of the conditions would be a second definition again.
+
+    MEASURED OVER THE WHOLE CORPUS, ONE PARSE: **0 of 1,000 patients change
+    group**, and the drawn 500-patient cohort's membership digest is
+    byte-identical before and after (``7ac166944199ea64``). THAT NUMBER IS NOT
+    EVIDENCE THAT THE FIX DOES NOTHING, and the census that says why was run
+    rather than assumed:
+
+        53,040 conditions across the 1,000 bundles, every one of them
+        `confirmed` (52,698) or `unconfirmed` (342). ZERO `refuted`, ZERO
+        `entered-in-error`, and ZERO patients carrying conditions but no
+        primary cancer.
+
+    So NEITHER of the two inputs that separate the derivations occurs in this
+    corpus at all -- Synthea does not generate a refuted diagnosis, and
+    ``oncotriage/fhir/clean.py`` has already deleted every non-cancer patient.
+    The disagreement was latent, not absent: it is one refuted diagnosis away
+    on any real EHR extract, and on that day it would have staged a patient by
+    one condition and sampled them by another with nothing failing. The
+    constructed patients in
+    ``tests/test_cancer_grouping_single_owner.py`` section 8 are the only
+    thing that can exercise it, which is stated there.
+
+    ONE ARM IS INHERITED RATHER THAN RE-DECIDED, and it surfaced when a check
+    written to assert the opposite failed: when EVERY condition is refuted the
+    resolver's step 1 falls back to the unfiltered list ("use all if filter
+    empties list") and a refuted cancer decides the group after all. That is
+    the resolver's own documented behaviour, and following it is what one
+    definition MEANS -- second-guessing it here would recreate the divergence
+    this function was changed to remove.
+
+    Args:
+        patient:  a parsed FHIR patient dict.
+        registry: a ``CancerCodeRegistry``. ``None`` -- what every caller
+            outside the ablation study passes -- resolves ``load_registry()``,
+            the module's own thread-safe cached accessor. It is an ARGUMENT
+            because the ablation study already holds one and resolving it per
+            patient inside a 1,000-patient loop would take the construction
+            lock a thousand times.
+
+            It is deliberately NOT ``oncotriage.agent.deps.get_cancer_registry``
+            when unsupplied: a stub installed for an agent test must not change
+            which patients a draw selects. Same argument
+            ``oncotriage/fhir/clean.py`` makes about the deletion path -- and
+            the same one ``_resolve_primary_cancer_condition`` makes one
+            function up, which is why the two now agree about that too.
+
+    Returns:
+        A member of ``CANCER_GROUPS``. Never ``None``.
+    """
+    primary = _resolve_primary_cancer_condition(patient.get("conditions", []))
+    if primary is None:
+        # No conditions at all. The resolver returns None only here.
+        return CANCER_GROUP_UNRESOLVED
+    if registry is None:
+        registry = load_registry()
+    if not registry.is_primary_cancer(primary):
+        # The resolver's non-cancer fallback arm. See above.
+        return CANCER_GROUP_UNRESOLVED
+    return cancer_group_key(primary.get("display"))
+
+
 #------------------------------------------------------------------------------
 
 

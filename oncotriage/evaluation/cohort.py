@@ -56,49 +56,59 @@ states it in one line that every artefact records.
     reproduces an earlier draw, because there was no earlier draw.
 
 
-WHY THE DRAW IS SIMPLE RANDOM AND **NOT** STRATIFIED BY CANCER GROUP
----------------------------------------------------------------------
-The two existing samplers in this project both stratify -- the ablation study
-proportionally by primary cancer group, the 30-patient extract by three
-hand-named groups -- so the default expectation is that this one would too. It
-does not, for four reasons in the order that decided it:
+WHY THE DRAW IS STRATIFIED BY CANCER GROUP, AND WHAT THAT COSTS
+----------------------------------------------------------------
+IT WAS SIMPLE RANDOM AND THE OPERATOR OVERRULED THAT, FOR COVERAGE. The whole
+of the previous argument is kept below, because three of its four reasons are
+still TRUE and are now COSTS this module pays rather than reasons it declines:
 
-1.  **STRATIFICATION DESTROYS THE RECOMPUTABILITY THIS MODULE EXISTS FOR.** A
+1.  **A STRATIFIED MEMBERSHIP IS NOT RECOMPUTABLE FROM THE SEED ALONE.** A
     group key needs ``CancerCodeRegistry``: SNOMED exact, then ICD-10-CM 2024
     exact through the ``icd10-cm`` package, then a display-term morphology
     fallback. ``oncotriage/run_fingerprint.py:RENDERER_COVERAGE`` states that
     the registry's DATA "is outside the repository entirely and could not be
-    hashed from source at any granularity". So a stratified membership is a
-    function of an artefact this project cannot pin, and a reader on another
-    machine with a different ``icd10-cm`` release would compute DIFFERENT
-    STRATA from the same seed and therefore a different cohort. Hash-ranking
-    would buy nothing: the ranking would be reproducible and the buckets it
-    ranked within would not.
+    hashed from source at any granularity" -- so a reader on another machine
+    with a different ``icd10-cm`` release computes different STRATA from the
+    same seed and therefore a different cohort.
 
-2.  **THE POPULATION IS ALREADY A SIMPLE RANDOM DRAW.**
+        THE RESIDUAL, STATED HONESTLY RATHER THAN ENGINEERED AROUND. A reader
+        recomputing a membership needs the file list, the seed, the size, the
+        algorithm below AND THE SAME REGISTRY DATA. What proves that a GIVEN
+        RUN used a GIVEN MEMBERSHIP is not the recomputation -- it is
+        ``cohort_digest``, which the run row and the checkpoint already carry
+        and which the batch runner's resume gate already compares. That column
+        is what turns "you can probably rebuild this" into "this run
+        demonstrably ran that set", and it does not depend on the registry.
+
+        WITHIN A STRATUM THE DRAW IS STILL sha256 RANK, not
+        ``random.Random``. The registry decides the BUCKETS; nothing about the
+        interpreter decides the ORDER inside one. So the part that can be made
+        machine-independent is, and the part that cannot is named.
+
+2.  **THE POPULATION IS ITSELF A SIMPLE RANDOM DRAW.**
     ``oncotriage/fhir/clean.py`` step 3 caps the corpus with
-    ``rng.sample(remaining_files, COHORT_CAP)`` -- unstratified. So the 1,000
-    on disk are a simple random sample of the alive cancer patients Synthea
-    produced, and a simple random sample of THAT is a simple random sample of
-    the same population at the same proportions in expectation. Stratifying the
-    second stage while the first is unstratified fixes the cohort's marginals
-    to the CORPUS's marginals, which are themselves one random realisation --
-    it makes the 300 match the 1,000 exactly rather than matching the
-    population, which is not the quantity anyone wants fixed.
+    ``rng.sample(remaining_files, COHORT_CAP)`` -- unstratified. So stratifying
+    here fixes the cohort's marginals to the CORPUS's marginals, which are one
+    random realisation, rather than to the population's. The cohort's group
+    shares are therefore a statement about the corpus and not about Synthea's
+    generator, and the pass record reports both side by side.
 
-3.  **IT WOULD COST A FULL PARSE BEFORE THE FIRST PATIENT.** A group key needs
-    the parsed bundle, so stratifying means parsing every file on disk and
-    building the ICD-10-CM registry at cohort-selection time -- which this
-    runner otherwise does lazily, one patient at a time, inside the pool.
+3.  **IT COSTS A FULL PARSE BEFORE THE FIRST PATIENT.** A group key needs the
+    parsed bundle. ``oncotriage/evaluation/cohort_groups.py`` is that parse,
+    measured at roughly three minutes for 1,000 bundles plus the ICD-10-CM
+    build, and it is work the runner otherwise did lazily inside the pool.
 
-4.  **WHAT THE PAPER CLAIMS.** "A seeded simple random sample of size N from
-    the corpus, drawn by sha256 rank over the filename stem" is a claim a
-    reader verifies with the file list and ten lines of code. "Proportionally
-    stratified by primary cancer group" is a claim a reader can only verify by
-    reproducing the registry, and (1) says they cannot.
+4.  What the paper claims is now "a seeded sample of size N, stratified
+    proportionally by primary cancer group and hash-ranked within each
+    stratum", with the group key named and the digest published.
 
-The group composition the cohort inherits is a MEASUREMENT rather than a
-guarantee, and it is reported in the pass record beside the corpus's own.
+    THIS MODULE STAYS PURE AND THE GROUPING ARRIVES AS AN ARGUMENT.
+    ``select(..., group_of=callable)``. With ``group_of=None`` the draw is
+    simple random and the selection RECORDS that it was -- so nothing here
+    imports the parser or the registry, every function is still drivable
+    offline with a fabricated population, and a caller that cannot resolve
+    groups gets a working cohort and a record saying it is unstratified rather
+    than a crash or a silent stratification over one bucket.
 
 
 WHY THE STEM IS THE IDENTITY
@@ -186,7 +196,8 @@ print time, because the checkpoint's guard compares what it stored.
 # SAME ranking -- and the smaller of the two is then a strict PREFIX of the
 # larger. With all three seeds equal the 50-patient stability sample would be a
 # SUBSET of the 100-patient judge sample, every time, with 100% overlap where an
-# independent pair expects 50 * 100 / 300 = 16.7. Every judged patient would
+# independent pair expects 50 * 100 / 500 = 10 (the shipped seeds realise 16 on
+# the current corpus -- MEASURED, and chance). Every judged patient would
 # also be a re-run patient, and the judge's agreement rate would be measured
 # entirely on the sub-population selected for stability.
 #
@@ -315,6 +326,169 @@ def digest(stems) -> str:
     return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:DIGEST_CHARS]
 
 
+STRATIFIED_DRAW_ALGORITHM = (
+    "proportional largest-remainder allocation by cancer group "
+    "(minimum 1 per non-empty group), then "
+    "sha256(seed|stem) ascending rank within each group")
+"""The one-line statement of ``stratified_draw()``, recorded in every artefact.
+
+``DRAW_ALGORITHM``'s argument, for the stratified arm: a value a consumer
+writes into its own artefact cannot go stale silently, whereas a sentence in a
+docstring can. ``CohortSelection.record()`` writes whichever of the two
+actually ran, so an artefact never claims an algorithm the draw did not use.
+"""
+
+MINIMUM_PER_GROUP = 1
+"""How many members a non-empty stratum is guaranteed, budget permitting.
+
+THIS IS THE COVERAGE THE STRATIFICATION WAS RULED FOR. Pure proportional
+allocation drops a group whose share rounds below 0.5 -- on this corpus that is
+lung at 1.6%, which would vanish from a cohort of 30 and be represented by
+noise at 500. A floor of 1 is also what
+``oncotriage/ablation/study.py:stratified_sample`` has always applied, so the
+two draws in this project now agree on the rule rather than on nothing.
+
+IT IS NOT ALWAYS AFFORDABLE and the allocator says so rather than raising: when
+the requested size is smaller than the number of non-empty groups, the floor is
+granted to the LARGEST groups first (population descending, name ascending) and
+the smallest groups get nothing. That is a real state for a smoke corpus and it
+is reported in ``CohortSelection.describe()``, never silent.
+"""
+
+
+def allocate_proportional(counts, size, minimum=MINIMUM_PER_GROUP) -> dict:
+    """How many members each stratum contributes. A pure function of its inputs.
+
+    Args:
+        counts:  ``{group: population size}``. Empty groups may be present and
+                 are allocated 0; they cost nothing and letting a caller pass
+                 the whole vocabulary keeps its own code branch-free.
+        size:    the total to allocate. ``None`` or a value at or above the
+                 population means "everyone", returned as ``counts`` itself.
+        minimum: the per-group floor. See ``MINIMUM_PER_GROUP``.
+
+    Returns:
+        ``{group: allocation}`` for every key of ``counts``, summing to
+        ``min(size, sum(counts.values()))``.
+
+    LARGEST REMAINDER, NOT A ROUNDED SHARE, AND NOT AN RNG. Rounding each
+    group's share independently -- which is what
+    ``oncotriage/ablation/study.py:stratified_sample`` does -- can overshoot or
+    undershoot the target by several patients, and that study then TRIMS the
+    overshoot with a shuffle. A trim is a second random draw layered on a
+    stratified one: it can empty a stratum the stratification just guaranteed,
+    and it makes the realised allocation depend on the seed as well as on the
+    populations. Largest remainder hits the target exactly, by construction,
+    with no rng at all -- so the allocation is a function of ``(counts, size)``
+    and the seed decides only WHICH members of each group are taken.
+
+    EVERY TIE IS BROKEN ON THE GROUP NAME, ASCENDING. Two groups with an equal
+    fractional remainder is the ordinary case at round numbers, and a tie
+    resolved by dict order is a tie resolved by how the caller happened to build
+    its input. The lesson ``oncotriage/extraction/stage.py``'s observation sort
+    had to learn, one module over.
+    """
+    counts = {g: int(n) for g, n in counts.items()}
+    if any(n < 0 for n in counts.values()):
+        raise ValueError(f"group populations must not be negative; got {counts!r}")
+    total = sum(counts.values())
+    if size is None or size >= total:
+        return dict(counts)
+    if size < 0:
+        raise ValueError(f"draw size must not be negative; got {size!r}")
+
+    non_empty = [g for g in sorted(counts) if counts[g] > 0]
+    alloc = {g: 0 for g in counts}
+    if not non_empty or size == 0:
+        return alloc
+
+    # 1. The floor, largest population first so that a size smaller than the
+    #    number of groups represents the biggest ones rather than whichever
+    #    sorted first.
+    remaining = size
+    for g in sorted(non_empty, key=lambda k: (-counts[k], k)):
+        if remaining <= 0:
+            break
+        take = min(minimum, counts[g], remaining)
+        alloc[g] = take
+        remaining -= take
+
+    # 2. The proportional body, floored, capped by capacity.
+    ideal = {g: size * counts[g] / total for g in non_empty}
+    for g in sorted(non_empty):
+        if remaining <= 0:
+            break
+        want = int(ideal[g]) - alloc[g]
+        if want <= 0:
+            continue
+        take = min(want, counts[g] - alloc[g], remaining)
+        alloc[g] += take
+        remaining -= take
+
+    # 3. The remainder, one at a time, by largest fractional part then name.
+    #    Repeated rounds because a group at capacity is skipped and its slot
+    #    must go somewhere; the loop terminates because every round either
+    #    spends a slot or finds no capacity anywhere.
+    while remaining > 0:
+        order = sorted(
+            (g for g in non_empty if alloc[g] < counts[g]),
+            key=lambda k: (-(ideal[k] - int(ideal[k])), k))
+        if not order:
+            break
+        for g in order:
+            if remaining <= 0:
+                break
+            alloc[g] += 1
+            remaining -= 1
+    return alloc
+
+
+def stratified_draw(stems, size, seed, group_of, minimum=MINIMUM_PER_GROUP):
+    """``size`` stems, proportional by group, hash-ranked inside each group.
+
+    Args:
+        stems:    the population. Duplicates raise, through ``draw``.
+        size:     how many to take. ``None`` or >= the population takes all.
+        seed:     recorded verbatim and stringified into the rank key.
+        group_of: ``stem -> group name``. Called once per stem. It MUST be
+                  total: a grouper that raises takes the cohort selection with
+                  it, above the first billed call, which is where that failure
+                  is cheapest.
+        minimum:  the per-group floor. See ``MINIMUM_PER_GROUP``.
+
+    Returns:
+        ``(stems, group_counts)`` -- the drawn stems SORTED BY STEM for
+        ``draw``'s reason (processing order must not be an artefact of the
+        seed), and ``{group: how many were drawn}`` for every group the
+        POPULATION had, including the ones that got zero. A group present in
+        the population and absent from the draw is a fact a reader needs and an
+        omitted key is not one.
+
+    THE DUPLICATE CHECK IS ``draw``'s AND IS REACHED THROUGH IT, once per
+    stratum, so the two arms cannot come to disagree about what a duplicate
+    stem means. A duplicate WITHIN one group raises there; a stem cannot be in
+    two groups, because ``group_of`` is a function.
+    """
+    stems = list(stems)
+    # The whole-population duplicate check first: two identical stems landing in
+    # ONE group would be caught by draw() below, but the message would name a
+    # stratum rather than the corpus, and a caller whose grouper is not a
+    # function would be told nothing at all.
+    draw(stems, 0, seed)
+
+    buckets = {}
+    for s in stems:
+        buckets.setdefault(group_of(s), []).append(s)
+
+    counts = {g: len(v) for g, v in buckets.items()}
+    alloc = allocate_proportional(counts, size, minimum=minimum)
+
+    selected = []
+    for g in sorted(buckets):
+        selected.extend(draw(buckets[g], alloc[g], seed))
+    return sorted(selected), {g: alloc[g] for g in sorted(counts)}
+
+
 #------------------------------------------------------------------------------
 
 
@@ -332,12 +506,16 @@ class CohortSelection(object):
 
     __slots__ = ("files", "stems", "corpus_size",
                  "seed", "requested_size", "size", "digest",
+                 "stratified", "group_counts", "corpus_group_counts",
+                 "_group_of",
                  "stability_stems", "stability_seed", "stability_size",
                  "judge_stems", "judge_seed", "judge_size")
 
     def __init__(self, files, stems, corpus_size, seed, requested_size, digest_,
                  stability_stems, stability_seed,
-                 judge_stems, judge_seed):
+                 judge_stems, judge_seed,
+                 stratified=False, group_counts=None,
+                 corpus_group_counts=None, group_of=None):
         self.files = files
         self.stems = stems
         self.corpus_size = corpus_size
@@ -345,6 +523,19 @@ class CohortSelection(object):
         self.requested_size = requested_size
         self.size = len(stems)
         self.digest = digest_
+        # WHETHER THE DRAW WAS STRATIFIED IS A RECORDED FACT AND NOT AN
+        # INFERENCE FROM `group_counts` BEING NON-EMPTY. A caller can supply a
+        # grouper that answers one bucket for everybody, and that is a
+        # stratified draw over a degenerate partition rather than a simple
+        # random one; the two are different provenance and the record says
+        # which happened.
+        self.stratified = bool(stratified)
+        self.group_counts = dict(group_counts or {})
+        self.corpus_group_counts = dict(corpus_group_counts or {})
+        # KEPT SO A SUBSAMPLE OF THIS COHORT USES THIS COHORT'S GROUPING. It is
+        # the only mutable-ish thing on the object and it is a callable the
+        # caller already owns; `subsample` is the one reader.
+        self._group_of = group_of
         self.stability_stems = stability_stems
         self.stability_seed = stability_seed
         self.stability_size = len(stability_stems)
@@ -371,7 +562,11 @@ class CohortSelection(object):
         silently reporting 240 as though that had been the plan.
         """
         return {
-            "algorithm":           DRAW_ALGORITHM,
+            "algorithm":           (STRATIFIED_DRAW_ALGORITHM if self.stratified
+                                    else DRAW_ALGORITHM),
+            "stratified":          self.stratified,
+            "group_counts":        dict(self.group_counts),
+            "corpus_group_counts": dict(self.corpus_group_counts),
             "digest_algorithm":    DIGEST_ALGORITHM,
             "corpus_size":         self.corpus_size,
             "cohort_seed":         self.seed,
@@ -400,7 +595,8 @@ class CohortSelection(object):
             f"[Cohort] {self.size} of {self.corpus_size} patients "
             f"(requested {self.requested_size}, seed {self.seed!r}, "
             f"digest {self.digest})",
-            f"[Cohort] draw: {DRAW_ALGORITHM}",
+            f"[Cohort] draw: "
+            f"{STRATIFIED_DRAW_ALGORITHM if self.stratified else DRAW_ALGORITHM}",
             f"[Cohort] stability sample (k=2 re-run): {self.stability_size} "
             f"patients, seed {self.stability_seed!r}, "
             f"digest {digest(self.stability_stems)}",
@@ -410,6 +606,31 @@ class CohortSelection(object):
             f"they overlap in {overlap} patient(s), which is chance and is "
             f"neither forced nor prevented",
         ]
+        if self.stratified:
+            # THE SHARES ARE THE POINT OF STRATIFYING, so they are printed
+            # rather than only recorded: the cohort's share beside the
+            # corpus's is what says the draw did what it claims.
+            for g in sorted(self.corpus_group_counts):
+                pop = self.corpus_group_counts[g]
+                got = self.group_counts.get(g, 0)
+                corpus_share = (pop / self.corpus_size) if self.corpus_size else 0.0
+                cohort_share = (got / self.size) if self.size else 0.0
+                lines.append(
+                    f"[Cohort]   {g:<13s} {got:>4d} of {pop:>4d}  "
+                    f"cohort {cohort_share:6.2%} vs corpus {corpus_share:6.2%}")
+            # A GROUP THE FLOOR COULD NOT AFFORD IS NAMED. See
+            # MINIMUM_PER_GROUP: at a size below the number of non-empty
+            # groups the floor is granted largest-first and the rest get zero,
+            # which is a real state for a smoke corpus and must not be silent.
+            _dropped = sorted(g for g, pop in self.corpus_group_counts.items()
+                              if pop > 0 and not self.group_counts.get(g, 0))
+            if _dropped:
+                lines.append(
+                    f"[Cohort] NOTE: {len(_dropped)} non-empty group(s) "
+                    f"contributed no patient -- {', '.join(_dropped)}. The "
+                    f"cohort is smaller than the number of groups the corpus "
+                    f"holds, so the per-group floor could not be granted to "
+                    f"all of them.")
         if self.size < self.requested_size:
             lines.append(
                 f"[Cohort] SHORT: the corpus offers {self.corpus_size} "
@@ -430,10 +651,47 @@ class CohortSelection(object):
         return lines
 
 
+    def subsample(self, size, seed, group_of=None, minimum=None):
+        """A further draw FROM THIS COHORT, stratified by this cohort's grouper.
+
+        THE ABLATION STUDY'S SAMPLE IS THIS. The ruling is that the study's
+        patients come out of the campaign cohort rather than out of the corpus,
+        so a configuration's mean is measured over patients the campaign
+        actually ran; drawing from the corpus would let a study report on
+        patients no campaign has a verdict for.
+
+        Args:
+            size:     how many. ``None`` or >= the cohort takes all of it.
+            seed:     recorded verbatim. It MUST differ from the two programme
+                      sample seeds for the reason argued at the import guard
+                      above -- one seed over one population makes the smaller
+                      draw a prefix of the larger -- and this method does not
+                      enforce that, because it does not know what else the
+                      caller has drawn. The constant that names it does.
+            group_of: ``stem -> group``. ``None`` reuses the grouper this
+                      cohort was drawn with, which is what makes "the same
+                      grouper" true by construction rather than by a caller
+                      remembering to pass the same callable twice.
+            minimum:  the per-group floor; ``None`` is ``MINIMUM_PER_GROUP``.
+
+        Returns:
+            ``(stems, group_counts)``, exactly ``stratified_draw``'s shape --
+            or ``(stems, {})`` when there is no grouper at all, in which case
+            the draw is simple random and the EMPTY DICT is what says so.
+        """
+        grouper = self._group_of if group_of is None else group_of
+        if grouper is None:
+            return draw(self.stems, size, seed), {}
+        return stratified_draw(
+            self.stems, size, seed, grouper,
+            minimum=MINIMUM_PER_GROUP if minimum is None else minimum)
+
+
 def select(fhir_files,
            size=None, seed=None,
            stability_size=None, stability_seed=None,
-           judge_size=None, judge_seed=None) -> CohortSelection:
+           judge_size=None, judge_seed=None,
+           group_of=None) -> CohortSelection:
     """Draw the campaign cohort and both programme samples from a file list.
 
     Args:
@@ -483,9 +741,31 @@ def select(fhir_files,
     # population handed to `draw` is built from the ORIGINAL list.
     population = [stem_of(p) for p in fhir_files]
 
-    stems = draw(population, size, seed)
+    # THE STRATIFIED ARM IS TAKEN ONLY WHEN A GROUPER IS SUPPLIED, and the
+    # unstratified arm is not a fallback that hides a failure: a caller that
+    # cannot resolve groups -- a test, an embedder, a smoke run with no
+    # registry -- gets a working cohort whose RECORD says it was simple random.
+    # See the module header for why the grouping arrives as an argument rather
+    # than being resolved here.
+    if group_of is None:
+        stems = draw(population, size, seed)
+        group_counts = {}
+        corpus_group_counts = {}
+    else:
+        stems, group_counts = stratified_draw(population, size, seed, group_of)
+        corpus_group_counts = {}
+        for s in population:
+            g = group_of(s)
+            corpus_group_counts[g] = corpus_group_counts.get(g, 0) + 1
     files = sorted(by_stem[s][0] for s in stems)
 
+    # THE TWO PROGRAMME SAMPLES ARE UNCHANGED AND ARE SIMPLE RANDOM DRAWS FROM
+    # THE COHORT. That is the ruling and it is also the reading that costs
+    # least: the cohort's own marginals are already fixed to the corpus's by
+    # the stratification above, so a sample of it inherits those proportions in
+    # expectation, and stratifying twice would fix the SAMPLE's marginals to
+    # the COHORT's realisation -- the objection reason (2) in the module header
+    # makes about stratifying a population that is itself a draw, one level in.
     return CohortSelection(
         files=files,
         stems=stems,
@@ -497,6 +777,10 @@ def select(fhir_files,
         stability_seed=stability_seed,
         judge_stems=draw(stems, judge_size, judge_seed),
         judge_seed=judge_seed,
+        stratified=group_of is not None,
+        group_counts=group_counts,
+        corpus_group_counts=corpus_group_counts,
+        group_of=group_of,
     )
 
 

@@ -63,7 +63,9 @@ import sqlite3
 import threading
 
 from oncotriage import paths
+from oncotriage.evaluation.cohort import allocate_proportional
 from oncotriage.observability import console
+from oncotriage.registries.primary_cancer import cancer_group_key
 
 
 #------------------------------------------------------------------------------
@@ -74,20 +76,41 @@ from oncotriage.observability import console
 # ===========================================================================
 
 SEED = 42
-PATIENTS_PER_CANCER = 10
 
-CANCER_TYPES = {
-    "breast": ["breast"],
-    "colon":  ["colon", "colorectal", "rectal"],
-    "lung":   ["lung", "small cell", "non-small cell", "nsclc", "sclc"],
-}
+# THE THREE-GROUP VOCABULARY IS DELETED AND THE DRAW IS NO LONGER N-PER-GROUP.
+#
+# `CANCER_TYPES` used to live here -- breast, colon, lung -- and everything else
+# was "other" and was NOT SAMPLED. It was fitted to a retired corpus in which
+# "other" was one patient. On the corpus this project runs today it is 289 of
+# 1,000, all of them prostate, myeloma and leukaemia, so this sampler drew from
+# 71% of the corpus and said nothing about the rest; and `PATIENTS_PER_CANCER`,
+# a fixed ten from each group, RAISED on the lung stratum at any cohort small
+# enough that lung's 1.6% did not reach ten. Both are properties of the
+# vocabulary rather than of the sample size, which is why widening the number
+# would not have fixed either.
+#
+# ONE GROUPER, OWNED BY oncotriage/registries/primary_cancer.py. See
+# CANCER_GROUP_KEYWORDS there for the argument and the measurement.
+#
+# ONE ALLOCATOR TOO. `cohort.allocate_proportional` decides how many each group
+# contributes here and in the campaign cohort draw, so the two samplers in this
+# package cannot come to disagree about what "proportional, minimum one" means.
+# `oncotriage/ablation/study.py:stratified_sample` is the third and is
+# deliberately NOT converted in this pass -- it rounds each share independently
+# and then TRIMS the overshoot with a seeded shuffle, and replacing that changes
+# which patients every historical ablation study would have drawn. Named as a
+# follow-up.
 
-# THE SAMPLE TOTAL IS DERIVED FROM THE TWO CONSTANTS THAT PRODUCE IT: one group
-# per CANCER_TYPES key, PATIENTS_PER_CANCER drawn from each. select_samples()
-# computes the same product independently as `expected_total` and asserts the
-# output database matches it, so this is the number the draw actually produces
-# rather than a second declaration of it.
-SAMPLE_TOTAL = PATIENTS_PER_CANCER * len(CANCER_TYPES)
+# How many patients the extract holds. A RULING AND NO LONGER A PRODUCT: with a
+# proportional draw over however many groups the source database happens to
+# carry, there is no "per cancer" number to multiply. 30 is what this extract
+# has always held, so the derived subdirectory and filename below are
+# byte-identical to the historical ones -- which is the acceptance criterion
+# tests/test_evaluation_sample_naming.py holds.
+#
+# UNCALIBRATED, on ABLATION_SAMPLE_SIZE_DEFAULT's footing: 30 was not solved
+# for the precision of anything. It is an inspection extract.
+SAMPLE_TOTAL = 30
 
 # The historical output location, relative to results_path. File 28 spelled the
 # whole thing out from main_path; results_path is the glob-resolved parent, so a
@@ -245,12 +268,12 @@ def default_output_db(total=None) -> str:
     the count.
 
     THE COUNT IS A PARAMETER BECAUSE THE DRAW SIZE IS ONE.
-    ``select_samples(..., patients_per_cancer=N)`` beside a bare
-    ``default_output_db()`` writes 3N patients into a file whose name says
-    SAMPLE_TOTAL, and nothing raises: the assertions at the end of ``select_samples`` check
-    the CONTENTS against ``patients_per_cancer``, never the name. A caller
-    drawing a different size passes that size here and gets a destination that
-    says what is in it.
+    ``select_samples(..., sample_total=N)`` beside a bare
+    ``default_output_db()`` writes N patients into a file whose name says
+    SAMPLE_TOTAL, and nothing raises: the assertions at the end of
+    ``select_samples`` check the CONTENTS against the ALLOCATION, never the
+    name. A caller drawing a different size passes that size here and gets a
+    destination that says what is in it.
 
     THE CACHE IS KEYED ON THE COUNT, NOT ON A FIXED STRING. It used to key on
     the literal ``"output_db"``, which is correct for a function taking no
@@ -278,27 +301,43 @@ def default_output_db(total=None) -> str:
 #------------------------------------------------------------------------------
 
 
-def classify_cancer(primary_condition):
-    """Map a primary_condition string onto one of the three sampled groups.
-
-    Byte-for-byte File 28's function. Anything that matches none of the three
-    keyword sets is "other" and is not sampled.
-    """
-    if not primary_condition:
-        return "other"
-    lower = primary_condition.lower()
-    for cancer_type, keywords in CANCER_TYPES.items():
-        if any(kw in lower for kw in keywords):
-            return cancer_type
-    return "other"
+# THE NAME SURVIVES AS AN ALIAS OF THE ONE GROUPER, not as a wrapper.
+#
+# `oncotriage/evaluation/medcpt_calibration.py` and
+# "28- Select Evaluation Sample.py" both import this name, and
+# `config.MEDCPT_SCORE_FLOOR`'s derivation names it as the classifier its
+# calibration pool was drawn through. An alias is the same function object, so
+# those consumers reach the shipped implementation rather than a local
+# forwarder that could drift from it -- the same reasoning
+# `oncotriage/ablation/study.py` applies to `_cancer_group_key`.
+#
+# WHAT CHANGED FOR A CALLER: it answers a member of `CANCER_GROUPS` (fifteen
+# anatomical groups plus "other") where it used to answer one of four. Every
+# caller that BRANCHED on the old three names now sees the same patients
+# arriving under `prostate`, `hematologic` and the rest instead of under
+# `other`. `MEDCPT_SCORE_FLOOR`'s fourth staleness condition records the one
+# consequence that is a measurement rather than a bug fix.
+classify_cancer = cancer_group_key
 
 
 #------------------------------------------------------------------------------
 
 
 def select_samples(source_db, output_db, seed=SEED,
-                   patients_per_cancer=PATIENTS_PER_CANCER):
-    """Extract 10 breast + 10 colon + 10 lung patients into a new database.
+                   sample_total=SAMPLE_TOTAL):
+    """Extract a seeded, proportionally stratified patient sample.
+
+    THE DRAW CHANGED AT THE COHORT-STRATIFICATION PASS and this docstring used
+    to read "10 breast + 10 colon + 10 lung". It is now ``sample_total``
+    patients allocated across every cancer group the source database holds --
+    proportionally, minimum one per non-empty group, by
+    ``cohort.allocate_proportional`` -- with the group of each patient decided
+    by the one grouper in ``oncotriage/registries/primary_cancer.py``.
+
+    TWO DEFECTS THAT REMOVES, both of which were properties of the vocabulary
+    rather than of the size: the extract described 71% of the corpus and called
+    the rest "other", and the fixed ten-per-group draw RAISED a ValueError about
+    patient counts whenever a group held fewer than ten.
 
     Both paths are REQUIRED -- see the module docstring. ``output_db`` is
     DELETED if it exists and then rebuilt.
@@ -316,8 +355,14 @@ def select_samples(source_db, output_db, seed=SEED,
         source_db:           production inferences.db, opened read-only in effect
                              (this function issues no write against it).
         output_db:           destination; removed first if present.
-        seed:                sampling seed. 42 reproduces the shipped sample.
-        patients_per_cancer: how many of each of the three groups to draw.
+        seed:                sampling seed. Note that 42 no longer reproduces
+                             the pre-stratification 30-patient extract: the
+                             population it draws from is now every grouped
+                             patient rather than three groups' worth, so the
+                             same seed over a different population is a
+                             different sample. Nothing reproduces the old
+                             extract, and nothing consumes it by identity.
+        sample_total:        how many patients the extract holds, in total.
 
     Returns:
         dict: the verification counts, so a caller can assert on them rather
@@ -343,36 +388,54 @@ def select_samples(source_db, output_db, seed=SEED,
 
         console.out(f"Total unique patients in DB: {len(patients)}")
 
-        # Classify by cancer type
-        by_type = {"breast": [], "colon": [], "lung": []}
-
+        # Classify by cancer group. EVERY PATIENT LANDS IN A BUCKET -- there
+        # is no `if cancer in by_type` filter any more, because there is no
+        # short list to be outside of. That filter is what silently discarded
+        # 289 of this corpus's 1,000 patients.
+        by_group = {}
         for p in patients:
-            cancer = classify_cancer(p["primary_condition"])
-            if cancer in by_type:
-                by_type[cancer].append(p["patient_id"])
+            by_group.setdefault(
+                classify_cancer(p["primary_condition"]), []).append(
+                    p["patient_id"])
 
-        console.out(f"  Breast: {len(by_type['breast'])}")
-        console.out(f"  Colon:  {len(by_type['colon'])}")
-        console.out(f"  Lung:   {len(by_type['lung'])}")
+        # SORTED WITHIN EACH GROUP BEFORE THE DRAW. `GROUP BY patient_id ORDER
+        # BY MIN(id)` is insertion order, so without this the sample would
+        # depend on the order rows happened to be written -- and two databases
+        # holding the same patients would give two different samples from one
+        # seed. `random.Random.sample` reads its population positionally.
+        for pids in by_group.values():
+            pids.sort()
+
+        for group in sorted(by_group):
+            console.out(f"  {group:<13s}: {len(by_group[group])}")
         console.out()
 
-        # Validate
-        for cancer_type, pids in by_type.items():
-            if len(pids) < patients_per_cancer:
-                raise ValueError(f"Not enough {cancer_type} patients: need {patients_per_cancer}, found {len(pids)}")
+        # ONE ALLOCATOR, SHARED WITH THE CAMPAIGN COHORT DRAW. It is a pure
+        # function of (populations, total), so the allocation is not a function
+        # of the seed and a group cannot be emptied by a later trim.
+        allocation = allocate_proportional(
+            {g: len(v) for g, v in by_group.items()}, sample_total)
 
-        # Sample with seed 42. Local Random instance rather than random.seed():
-        # seeding the process-wide state would shift the draw of every other consumer
-        # of `random` in the same session. One rng shared across all three draws --
-        # the loop below consumes a single continuing stream, as it did when the
-        # global state was seeded once above it.
+        # NO VALIDATION LOOP AND NO RAISE. `allocate_proportional` never asks a
+        # group for more than it holds, so "not enough patients" is not a state
+        # this function can reach; a source database too small to fill
+        # `sample_total` yields every patient it has, and the assertion below
+        # compares against what was ALLOCATED rather than against the request.
+        #
+        # Local Random instance rather than random.seed(): seeding the
+        # process-wide state would shift the draw of every other consumer of
+        # `random` in the same session. One rng shared across every group, in
+        # sorted group order, so the stream is consumed deterministically.
         rng = random.Random(seed)
 
         sampled_pids = []
-        for cancer_type in ["breast", "colon", "lung"]:
-            selected = rng.sample(by_type[cancer_type], patients_per_cancer)
+        for group in sorted(by_group):
+            share = allocation[group]
+            if not share:
+                continue
+            selected = rng.sample(by_group[group], share)
             sampled_pids.extend(selected)
-            console.out(f"  Sampled {cancer_type}: {len(selected)} patients")
+            console.out(f"  Sampled {group}: {len(selected)} patients")
 
         console.out(f"\nTotal sampled patients: {len(sampled_pids)}")
 
@@ -471,11 +534,17 @@ def select_samples(source_db, output_db, seed=SEED,
         verify_inferences = out_conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0]
         verify_matches = out_conn.execute("SELECT COUNT(*) FROM trial_matches").fetchone()[0]
 
-        verify_types = {"breast": 0, "colon": 0, "lung": 0}
-        for row in out_conn.execute("SELECT DISTINCT patient_id, primary_condition FROM inferences"):
+        # VERIFIED OVER EVERY GROUP, not over a fixed three. The old dict was
+        # seeded with the three sampled names and `if cancer in verify_types`
+        # dropped the rest -- so a patient wrongly admitted from any other
+        # group was counted by nothing and the assertions below could not see
+        # it. Every group the extract holds is counted now, and the total is
+        # what the allocation asked for.
+        verify_types = {}
+        for row in out_conn.execute(
+                "SELECT DISTINCT patient_id, primary_condition FROM inferences"):
             cancer = classify_cancer(row[1])
-            if cancer in verify_types:
-                verify_types[cancer] += 1
+            verify_types[cancer] = verify_types.get(cancer, 0) + 1
     finally:
         # File 28 closed both only on the success path, so a ValueError from the
         # count validation above left a handle open on the production database.
@@ -489,15 +558,30 @@ def select_samples(source_db, output_db, seed=SEED,
     console.out(f"  Unique patients:  {verify_patients}")
     console.out(f"  Total inferences: {verify_inferences}")
     console.out(f"  Trial matches:    {verify_matches}")
-    console.out(f"  Breast: {verify_types['breast']}  Colon: {verify_types['colon']}  Lung: {verify_types['lung']}")
+    for _g in sorted(verify_types):
+        console.out(f"  {_g:<13s}: {verify_types[_g]}")
     console.out(f"  Seed: {seed}")
     console.out(f"{'='*60}")
 
-    expected_total = patients_per_cancer * len(verify_types)
-    assert verify_patients == expected_total, f"Expected {expected_total} patients, got {verify_patients}"
-    assert verify_types["breast"] == patients_per_cancer, f"Expected {patients_per_cancer} breast, got {verify_types['breast']}"
-    assert verify_types["colon"] == patients_per_cancer, f"Expected {patients_per_cancer} colon, got {verify_types['colon']}"
-    assert verify_types["lung"] == patients_per_cancer, f"Expected {patients_per_cancer} lung, got {verify_types['lung']}"
+    # THE EXPECTATION IS THE ALLOCATION, NOT THE REQUEST. A source database
+    # holding fewer patients than `sample_total` yields all of them, and
+    # asserting against the request would fail a run that did exactly the right
+    # thing. The allocation is a pure function of the populations and the
+    # request, computed above, so this compares the extract against the plan
+    # that produced it rather than against a second derivation.
+    expected_total = sum(allocation.values())
+    assert verify_patients == expected_total, \
+        f"Expected {expected_total} patients, got {verify_patients}"
+    for _g, _want in sorted(allocation.items()):
+        assert verify_types.get(_g, 0) == _want, \
+            f"Expected {_want} {_g}, got {verify_types.get(_g, 0)}"
+    # AND NOTHING FROM A GROUP THE ALLOCATION DID NOT ASK FOR. Without this the
+    # per-group loop above is satisfied by an extract carrying extra patients
+    # from an unallocated group, which the old three-name dict could not have
+    # seen at all.
+    _unexpected = sorted(g for g in verify_types if not allocation.get(g, 0))
+    assert not _unexpected, \
+        f"Extract carries patient(s) from unallocated group(s): {_unexpected}"
 
     console.out("\nAll validations passed.")
 

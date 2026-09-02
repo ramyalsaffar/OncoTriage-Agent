@@ -1281,8 +1281,21 @@ section("SECTION 8 -- the study stops cleanly, records why, and resumes")
 #   CaffeinateSession              a macOS subprocess
 #
 # THE GRAPH IS NEVER INVOKED, so no billed call is reachable.
+#   restrict_to_campaign_cohort    A FULL CORPUS PARSE. The cohort-stratification
+#                                  pass made the ablation study draw from the
+#                                  campaign cohort, which means parsing every
+#                                  bundle under paths.data_fhir_path and
+#                                  building the ICD-10-CM registry -- ~3 minutes
+#                                  against the development machine's corpus,
+#                                  inside a file whose whole design is that it
+#                                  touches no corpus at all. `data_fhir_path` is
+#                                  NOT one of the two keys this file seeds into
+#                                  paths._RESOLVED, so without this stub the
+#                                  real corpus is what it reached. MEASURED: the
+#                                  file went from ~6 s to a five-minute timeout.
 _STUDY_ATTRS = ("build_bm25_index_from_qdrant", "build_matching_graph",
-                "load_all_patients", "stratified_sample",
+                "load_all_patients", "restrict_to_campaign_cohort",
+                "stratified_sample",
                 "match_patient_ablation", "log_ablation_result",
                 "run_fingerprint", "tracking", "CaffeinateSession",
                 "generate_summary")
@@ -1312,6 +1325,11 @@ def drive_study(db_path, *, cap, per_pair_usd, sample_size, configs,
         _study.load_all_patients = lambda _p: [
             {"patient_id": f"p{i}", "conditions": [], "age": 60}
             for i in range(sample_size)]
+        # THE COHORT RESTRICTION IS THE IDENTITY HERE, and the `None` second
+        # member is the shape `main()` treats as "no cohort was drawn" -- so
+        # this drives the degraded arm deliberately rather than fabricating a
+        # CohortSelection whose provenance would then be a fiction.
+        _study.restrict_to_campaign_cohort = lambda pats, _dir: (list(pats), None)
         _study.stratified_sample = lambda pats, n, seed: pats[:n]
         _study.CaffeinateSession = lambda *a, **kw: contextlib.nullcontext()
         _study.generate_summary = lambda **kw: None

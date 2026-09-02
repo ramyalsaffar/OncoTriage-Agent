@@ -766,6 +766,47 @@ BUCKETS = {
         "naturally and through a planted lookup, so the outcome does not "
         "depend on what the runner happens to have. Section 7 spawns one "
         "subprocess that imports the harness and takes a stamp"),
+    "test_cohort_group_cache.py": (
+        _A, None,
+        "ran green in 0.6s, 71 checks, against ONLY the directory skeleton "
+        "this script provisions -- and in fact against no data tree at all: "
+        "paths._RESOLVED is seeded with a scratch checkpoint root BEFORE the "
+        "module under test is imported, so cache_path() can never resolve to "
+        "the real 08- Checkpoint/, and the corpus is six fabricated files in a "
+        "tempfile.mkdtemp. NO CORPUS AND NO PARSER: parse_fhir_bundle, "
+        "patient_cancer_group and load_registry are counting stand-ins "
+        "installed by rebinding module attributes inside try/finally with the "
+        "restores asserted BY IDENTITY, so no FHIR bundle is fabricated, none "
+        "is read and the ICD-10-CM release is never built. No network, no "
+        "keys, no spend, no live Qdrant, NO MODEL LOAD, no database, no git "
+        "history, no live server and no subprocess. It EXECS NOTHING and loads "
+        "no module by location. NOT in the collision matrix: every file it "
+        "writes is inside that mkdtemp, which it removes and asserts gone, and "
+        "the one repository file it reads "
+        "(oncotriage/evaluation/cohort_groups.py) is sha256-compared at the "
+        "end and is written by neither of the matrix's two writers"),
+    "test_cancer_grouping_single_owner.py": (
+        _A, None,
+        "ran green in 1.4s, 92 checks, against ONLY the directory skeleton "
+        "this script provisions. No network, no keys, no spend, no live "
+        "Qdrant, NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the "
+        "imports), no corpus, no database and no live server. It writes "
+        "NOTHING anywhere, not even a temp directory. "
+        "IT DOES SPAWN ONE SUBPROCESS AND IT DOES PREFER GIT HISTORY, and "
+        "neither is a dependency: section 7c runs `git show HEAD:` to verify "
+        "that its retyped control reproduces the retired allocator, and a tree "
+        "where that fails RECORDS the fact as a passing check naming the "
+        "reason rather than failing or aborting -- MEASURED at 92 checks with "
+        "git and 90 without, both green. The DRIVE the control feeds does not "
+        "touch git at all. "
+        "It EXECS NOTHING and loads no module by location -- every control is "
+        "a different INPUT to an ast walk over a STRING, which is the right "
+        "instrument because the check it controls is itself static. NOT in the "
+        "collision matrix: the package files it walks are written by neither "
+        "of the matrix's two writers, and it walks them read-only. It DOES "
+        "import oncotriage.ablation.study, which pulls in the agent and the "
+        "graph -- that import is the point of section 2, which asserts the "
+        "study's grouper IS the registry's function by IDENTITY"),
     "test_evaluation_sample_naming.py": (
         _A, None,
         "ran green in 1.0s, 72 checks, against ONLY the directory skeleton "

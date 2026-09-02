@@ -592,10 +592,37 @@ check("4a the two cohort facts are GATED FIELDS of the shared stamp",
        "campaign_cohort_seed" in _fp.FINGERPRINT_FIELDS),
       (True, True))
 
-check("4b ...and the stamp's version was bumped with them, so a v3 artifact "
-      "answers FP_VERSION once rather than having a missing field compared "
-      "against a live value",
-      _fp.FINGERPRINT_VERSION, 4)
+# 4b PINS THE LIVE VERSION AND IT HAS MOVED SINCE THIS CHECK WAS WRITTEN.
+# The cohort-selection pass bumped it 3 -> 4 to add `campaign_cohort_size` and
+# `campaign_cohort_seed`, and this check recorded that. The reranker-pinning
+# pass (commit 1f657ca, "record per-run environment and model identities and
+# pin the reranker revision") then bumped it 4 -> 5 to add
+# `cross_encoder_revision` -- so the literal 4 stopped being the live value and
+# started being a record of when this check was last read. It sat FAILING on a
+# developer tree, in a bucket-A file, for the whole of the intervening period.
+#
+# WHY THE PIN IS KEPT RATHER THAN DERIVED. `_fp.FINGERPRINT_VERSION` compared
+# against itself is a tautology; the point of a literal here is that a bump
+# forces somebody to come to this line and state which pass moved it and what
+# it added, because a bump makes EVERY EXISTING ARTIFACT answer FP_VERSION once
+# and that cost belongs in a changelog a reader can find. The cost of the
+# literal is exactly what happened above: it goes stale silently unless the
+# bumping pass runs this file. That is the trade, and it is the same one
+# `RUN_FINGERPRINT_COLUMNS`' round trip in
+# tests/test_storage_run_identity.py makes in the other direction.
+check("4b ...and the stamp's version was bumped with them. LIVE VALUE IS 5: "
+      "3 -> 4 added the two cohort fields (the cohort-selection pass), "
+      "4 -> 5 added cross_encoder_revision (the reranker-pinning pass, "
+      "1f657ca). A v4 artifact answers FP_VERSION once rather than having a "
+      "missing field compared against a live value",
+      _fp.FINGERPRINT_VERSION, 5)
+# THE TWO COHORT FIELDS ARE STILL GATED, which is what 4b was really about --
+# without this, a later bump that DROPPED them would keep 4b green by moving
+# the version alone.
+check("4b-i ...and both cohort fields are still gated at that version",
+      [f for f in ("campaign_cohort_size", "campaign_cohort_seed")
+       if f in _fp.FINGERPRINT_FIELDS],
+      ["campaign_cohort_size", "campaign_cohort_seed"])
 
 check("4c ...and `summary()` names them, so the banner an operator reads is "
       "not one field short of what the gate compares",
@@ -1183,7 +1210,7 @@ check("10d the ruled programme's constants are what config declares",
       (_config.CAMPAIGN_COHORT_SIZE, _config.CAMPAIGN_COHORT_SEED,
        _config.CAMPAIGN_STABILITY_SAMPLE_SIZE, _config.CAMPAIGN_STABILITY_SEED,
        _config.CAMPAIGN_JUDGE_SAMPLE_SIZE, _config.CAMPAIGN_JUDGE_SEED),
-      (300, 42, 50, 43, 100, 44))
+      (500, 42, 50, 43, 100, 44))
 check("10e ...and the cohort module's own bindings agree with them, so nothing "
       "this file rebound is still installed",
       (_cohort.CAMPAIGN_COHORT_SIZE, _cohort.CAMPAIGN_COHORT_SEED,

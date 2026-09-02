@@ -597,9 +597,32 @@ QUALITY_THRESHOLD_PERCENTILE = 25
 # honest size of this knob's effect on this sample, and it is recorded whether
 # or not it flatters the change.
 #
-# STALE AS SOON AS ANY OF THREE THINGS MOVES: the indexed corpus, the rerank
-# queries, or the cross-encoder checkpoint. Re-measure with
-# `python measure_medcpt_scores.py`.
+# STALE AS SOON AS ANY OF FOUR THINGS MOVES: the indexed corpus, the rerank
+# queries, the cross-encoder checkpoint, or THE GROUPING THE CALIBRATION POOL IS
+# DRAWN THROUGH. Re-measure with `python measure_medcpt_scores.py`.
+#
+# THE FOURTH CONDITION IS NEW AND IT HAS ALREADY FIRED. The pool above was
+# "10 breast + 10 colon + 10 lung, classified by
+# oncotriage/evaluation/sampling.py:classify_cancer" -- a THREE-GROUP
+# vocabulary fitted to a retired corpus, in which everything else was "other"
+# and unsampled. On the corpus this project runs today that "other" is 289 of
+# 1,000 patients, all of them prostate, myeloma or leukaemia, and the
+# cohort-stratification pass replaced that vocabulary with the fifteen-group
+# one now owned by oncotriage/registries/primary_cancer.py. So the pool
+# `python measure_medcpt_scores.py` draws today is NOT the pool this number was
+# measured over: it is proportional across every group the corpus holds rather
+# than ten each from three of them.
+#
+# THE NUMBER WAS DELIBERATELY NOT RE-MEASURED IN THAT PASS, which spent nothing
+# and made no billed call -- a recalibration is a real measurement against a
+# live index and belongs to a pass that can run one. WHAT THAT COSTS, STATED:
+# the floor in force is a 5th percentile of a distribution over breast, colon
+# and lung pools, applied to a pipeline that now also evaluates prostate,
+# hematologic and every other group. It is a FLOOR, so the direction of the
+# error is that it drops too little rather than too much -- the state it
+# replaced -- and `quality_dropped_floor_only` is the counter that would show
+# it doing nothing. It is recorded here so the recalibration item knows there
+# are four conditions and that one of them is already true.
 MEDCPT_SCORE_FLOOR = -8.4173
 
 
@@ -3733,7 +3756,7 @@ SPEND_CAP_USD = 300.00
 """The most one campaign may spend on billed Stage 5 calls, in US dollars.
 
 THE VALUE IS AN OPERATOR RULING, RECORDED HERE WITH ITS REASONING. The ruled
-evaluation program is a 300-patient campaign, a 50-patient k=2 stability re-run,
+evaluation program is a 500-patient campaign, a 50-patient k=2 stability re-run,
 and a 100-patient judge pass. The cap sits above that program with headroom
 while bounding a runaway well inside the account's credit balance.
 
@@ -3771,28 +3794,39 @@ rather than in a note somewhere because the cap is only defensible beside it.
       each trial      (S + u) x $2.00/1M + o x $12.00/1M     = $0.026246
       TOTAL           warmup + 15 trials                     = $0.410840   (2.29x)
 
-    THE RULED PROGRAM, both arms. THE RESAMPLE PASS IS INCLUDED and is easy to
-    forget: `25- Batch Runner.py` re-runs RESAMPLE_COUNT (100) already-completed
-    patients after the main pass, at full price, so a "300-patient campaign" is
-    400 patient-runs.
+    THE RULED PROGRAM, both arms, RE-DERIVED AT THE 500-PATIENT COHORT. The
+    cohort-stratification pass moved CAMPAIGN_COHORT_SIZE 300 -> 500 on an
+    operator ruling, so every row below is that ruling's cost rather than the
+    previous one's.
+
+    THE RESAMPLE ROW IS GONE AND ITS ABSENCE IS THE CORRECTION. This table used
+    to carry BOTH "+ resample pass (100)" and "50-patient k=2 re-run", which is
+    the same mechanism counted twice: the batch runner's resample pass is now
+    DRIVEN BY the stability sample (see CAMPAIGN_STABILITY_SAMPLE_SIZE and the
+    reconciliation at RESAMPLE_COUNT), so a campaign re-runs 50 patients and
+    not 150. The old table therefore over-stated the program by one 100-patient
+    re-run, in the safe direction, and this is the first derivation since that
+    reconciliation landed.
 
                                       cache working    cache absent
-      300-patient campaign               $53.79          $123.25
-      + resample pass (100)              $17.93           $41.08
-      50-patient k=2 re-run (100 runs)   $17.93           $41.08
+      500-patient campaign               $89.69          $205.42
+      50-patient k=2 re-run               $8.97           $20.54
       100-patient judge pass              $7.50            $7.50
       ------------------------------------------------------------
-      PROGRAM                            $97.15          $212.91
+      PROGRAM                           $106.16          $233.46
 
-    So the cap sits at ~3.1x the expected program and ~1.4x the program's own
-    worst case. It is NOT exceeded by the derived estimate in either arm, which
-    is the finding rather than the assumption -- and the second column is why
-    the number is 300 and not 150.
+    THE DERIVED ESTIMATE DOES NOT EXCEED THE CAP IN EITHER ARM, which is the
+    finding rather than the assumption, and THE CAP VALUE IS UNCHANGED AT 300
+    -- it was not adjusted to accommodate a larger cohort. It sits at ~2.8x the
+    expected program and ~1.3x the program's own worst case, down from ~3.1x
+    and ~1.4x at the 300-patient cohort. The second column is why it is 300 and
+    not 150; the margin at the worst case is now thin enough that the next
+    cohort widening is a decision about this number as well.
 
     **AND THE JUDGE ROW IS NO LONGER INSIDE WHAT *THIS* CONSTANT BOUNDS.** The
     operator ruling that split the budgets moved it to RATER_SPEND_CAP_USD, so
-    the program THIS cap governs is $89.65 / $205.41 -- the table above less
-    the judge -- and the multiples are ~3.3x expected and ~1.5x worst case. The
+    the program THIS cap governs is $98.66 / $225.96 -- the table above less
+    the judge -- and the multiples are ~3.0x expected and ~1.3x worst case. The
     table is left whole because it is the PROGRAM's cost and a reader deciding
     what to spend needs all four rows; what changed is which of them this
     number is compared against. `spend.report_lines()` prints both budgets on
@@ -4231,7 +4265,7 @@ COHORT_SELECTION_SEED = 42
 # ===========================================================================
 #
 # THE OPERATOR'S RULING, AS THREE SIZES AND THREE SEEDS. The programme is a
-# 300-patient campaign drawn from the corpus on disk, a 50-patient stability
+# 500-patient campaign drawn from the corpus on disk, a 50-patient stability
 # sample re-run once so each member has two observations, and a 100-patient
 # sample rated by the independent judge. Every draw is seeded, and the seed and
 # the size of each are recorded in the run row, in the checkpoint and in the
@@ -4268,7 +4302,7 @@ COHORT_SELECTION_SEED = 42
 # PROVENANCE: AN OPERATOR RULING, like COHORT_CAP above and for the same reason
 # -- it is a decision about how much money one campaign spends, not a number
 # derived from a power calculation. At the derivation in SPEND_CAP_USD's
-# docstring this is $53.79 of Stage 5 with the prompt cache working and $123.25
+# docstring this is $89.69 of Stage 5 with the prompt cache working and $205.42
 # without it.
 #
 # IT IS NOT REQUIRED TO BE <= THE CORPUS SIZE. A configured cohort larger than
@@ -4277,7 +4311,19 @@ COHORT_SELECTION_SEED = 42
 # `cohort_requested` (what was asked for). Refusing instead would make a
 # 40-patient smoke corpus unrunnable for a reason that has nothing to do with
 # the smoke test.
-CAMPAIGN_COHORT_SIZE = 300
+# STRATIFIED BY PRIMARY CANCER GROUP AS OF THE COHORT-STRATIFICATION PASS, and
+# 300 -> 500 in the same operator ruling. The previous pass drew SIMPLE RANDOM
+# and argued for it at length in oncotriage/evaluation/cohort.py; the deciding
+# objection was that a group key needs the ICD-10-CM registry, whose DATA is
+# outside this repository, so a stratified membership is not recomputable from
+# the seed alone. THE OPERATOR OVERRULED THAT FOR COVERAGE, and the residual is
+# recorded rather than argued away: a reader recomputing a membership needs the
+# same registry data as well as the seed, the size and the algorithm, and what
+# proves a GIVEN RUN used a GIVEN MEMBERSHIP is `runs.cohort_digest` -- already
+# on the row, already compared by the resume gate, and independent of the
+# registry. Within a stratum the draw is still sha256 rank, so the part that
+# can be machine-independent is.
+CAMPAIGN_COHORT_SIZE = 500
 
 # The seed the campaign cohort is drawn with.
 #
@@ -4300,11 +4346,13 @@ CAMPAIGN_COHORT_SEED = 42
 # runner's pass is now driven by this selection and RESAMPLE_COUNT no longer
 # governs a campaign. See the reconciliation at RESAMPLE_COUNT itself.
 #
-# 50 IS THE RULING AND IT IS ALSO A COST DECISION: at 300 patients this is a
-# further 16.7% of the campaign's Stage 5 spend, where RESAMPLE_COUNT's 100
-# against a 300-patient cohort would have been 33% -- a third of the campaign
-# again, for a constant last ruled when the cohort was 1,000 and 100 was 10%.
-# That is the re-ruling this constant records.
+# 50 IS THE RULING AND IT IS ALSO A COST DECISION. At the 500-patient cohort
+# this is a further 10% of the campaign's Stage 5 spend; at the 300 it was
+# ruled against it was 16.7%, and RESAMPLE_COUNT's 100 against that 300 would
+# have been 33% -- a third of the campaign again, for a constant last ruled
+# when the cohort was 1,000 and 100 was 10%. That is the re-ruling this
+# constant records. THE SIZE DID NOT MOVE WITH THE COHORT: 50 was ruled as a
+# sample size rather than as a share, and it is still uncalibrated as one.
 #
 # UNCALIBRATED AS A SAMPLE SIZE, and stated so on ABLATION_SAMPLE_SIZE_DEFAULT's
 # footing: 50 was not solved for the precision of any stability statistic. A
@@ -4317,8 +4365,8 @@ CAMPAIGN_STABILITY_SAMPLE_SIZE = 50
 # CAMPAIGN_JUDGE_SEED and oncotriage/evaluation/cohort.py RAISES AT IMPORT if it
 # does not: both samples are drawn from ONE population by one rank function, so
 # a shared seed makes the smaller a strict subset of the larger -- 100% overlap
-# where independence expects 50 * 100 / 300 = 16.7, and every judged patient
-# also a re-run patient.
+# where independence expects 50 * 100 / 500 = 10 and the shipped seeds realise
+# 16 (MEASURED on the current corpus), and every judged patient a re-run one.
 CAMPAIGN_STABILITY_SEED = 43
 
 # How many cohort patients the independent judge rates.
@@ -4372,7 +4420,20 @@ CAMPAIGN_JUDGE_SEED = 44
 # indistinguishable from effects that are genuinely absent. The MDE block is
 # what separates those two, and reading it AFTER the money is spent is reading
 # it too late to change n.
-ABLATION_SAMPLE_SIZE_DEFAULT = 75
+# 75 -> 100 AND THE POPULATION MOVED, IN THE SAME OPERATOR RULING. The study
+# used to draw from the WHOLE CORPUS; it now draws from the CAMPAIGN COHORT, so
+# every configuration's mean is measured over patients a campaign has verdicts
+# for. Both draws are stratified by the one grouper in
+# oncotriage/registries/primary_cancer.py -- the same partition the cohort was
+# drawn with, reused through `CohortSelection.subsample` rather than rebuilt, so
+# "the same grouper" is true by construction rather than by a caller
+# remembering to pass the same callable twice.
+#
+# THE RE-DERIVATION INSTRUCTION BELOW STILL STANDS AND IS NOT SETTLED BY THIS
+# RULING. 100 is a larger holding value than 75 and it is still a holding
+# value: it was not solved for a target effect size, and the MDE block is still
+# the instrument that would solve for one.
+ABLATION_SAMPLE_SIZE_DEFAULT = 100
 
 # Seed for the ablation study's stratified draw.
 #

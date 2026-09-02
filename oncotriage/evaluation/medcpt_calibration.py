@@ -70,7 +70,8 @@ from oncotriage.agent.retrieval import (
     node_hybrid_retrieval,
     node_query_expansion,
 )
-from oncotriage.evaluation.sampling import CANCER_TYPES, SEED, classify_cancer
+from oncotriage.evaluation.cohort import allocate_proportional
+from oncotriage.evaluation.sampling import SEED, classify_cancer
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage.observability import console, correlation_scope
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
@@ -107,16 +108,19 @@ FLOOR_PERCENTILE = 5
 # above from the same numbers.
 REPORTED_PERCENTILES = (0, 1, 5, 10, 25, 50, 75, 90, 95, 99, 100)
 
-PATIENTS_PER_CANCER = 10
-
-# The total this measurement draws, derived from the two constants that produce
-# it -- select_patients() takes one group per CANCER_TYPES key. It is here for
-# the same reason sampling.SAMPLE_TOTAL is there: --help used to render
-# "(default 10, so 30 total)" with the 30 retyped, so raising the per-group
-# count would have left the flag's own help stating a total the run does not
-# draw. CANCER_TYPES is the sampler's, imported above, so a fourth group moves
-# this number too.
-SAMPLE_TOTAL = PATIENTS_PER_CANCER * len(CANCER_TYPES)
+# THE DRAW IS A TOTAL, NOT A PER-GROUP COUNT, AS OF THE COHORT-STRATIFICATION
+# PASS. `PATIENTS_PER_CANCER = 10` and `CANCER_TYPES` used to live here and in
+# oncotriage/evaluation/sampling.py; that three-group vocabulary was fitted to a
+# retired corpus and on the current one it excluded 289 of 1,000 patients -- so
+# the pool this floor is calibrated over covered 71% of the corpus and RAISED
+# whenever a group held fewer than ten. Both are properties of the vocabulary,
+# which now has one owner in oncotriage/registries/primary_cancer.py.
+#
+# `config.MEDCPT_SCORE_FLOOR`'s FOURTH STALENESS CONDITION IS THIS CHANGE, and
+# it is recorded there. The shipped floor was measured over the OLD pool; this
+# pass deliberately did not re-measure it, because a recalibration is a real
+# run against a live index.
+SAMPLE_TOTAL = 30
 
 
 #------------------------------------------------------------------------------
@@ -138,19 +142,34 @@ def _primary_condition(patient_data) -> str:
     return _resolve_primary_cancer(patient_data.get("conditions", [])) or ""
 
 
-def select_patients(patients_per_cancer: int = PATIENTS_PER_CANCER,
+def select_patients(sample_total: int = SAMPLE_TOTAL,
                     seed: int = SEED) -> list:
-    """Draw ``patients_per_cancer`` of each cancer type from the FHIR corpus.
+    """Draw ``sample_total`` patients from the FHIR corpus, stratified by group.
 
-    Returns a list of ``(cancer_type, bundle_path, patient_data)``, ordered by
-    cancer type and then by the draw. Raises when a group is smaller than the
-    requested size: a silently short group would put a floor measured on
-    twenty-two patients into a config comment claiming thirty.
+    Returns a list of ``(cancer_group, bundle_path, patient_data)``, ordered by
+    group and then by the draw.
+
+    PROPORTIONAL, MINIMUM ONE PER NON-EMPTY GROUP, through
+    ``cohort.allocate_proportional`` -- the same allocator the campaign cohort
+    and the evaluation extract use, so the three samplers in this package
+    cannot come to disagree about what "proportional" means.
+
+    THE RAISE IS GONE AND ITS ARGUMENT IS ANSWERED RATHER THAN DROPPED. It read
+    "a silently short group would put a floor measured on twenty-two patients
+    into a config comment claiming thirty" -- which is right, and the allocator
+    makes it unreachable rather than merely tolerated: it never asks a group for
+    more than it holds, so the total is ``min(sample_total, corpus)`` by
+    construction. ``measure()`` records the realised total and the per-group
+    breakdown, so the comment states what was drawn.
     """
     bundles = sorted(glob.glob(os.path.join(paths.data_fhir_path, "*.json")))
     console.out(f"Corpus: {len(bundles)} bundles at {paths.data_fhir_path}")
 
-    groups = {name: [] for name in CANCER_TYPES}
+    # EVERY PATIENT LANDS IN A GROUP. The dict is built from what the corpus
+    # HOLDS rather than seeded with a short list of names, and the
+    # `if kind in groups` filter that used to discard everything else is gone
+    # -- that filter is what excluded 289 of this corpus's 1,000 patients.
+    groups = {}
     parsed = {}
     for path in bundles:
         try:
@@ -162,25 +181,29 @@ def select_patients(patients_per_cancer: int = PATIENTS_PER_CANCER,
             parsed.setdefault("_errors", []).append((os.path.basename(path), repr(exc)))
             continue
         kind = classify_cancer(_primary_condition(patient_data))
-        if kind in groups:
-            groups[kind].append(path)
-            parsed[path] = patient_data
+        groups.setdefault(kind, []).append(path)
+        parsed[path] = patient_data
 
     errors = parsed.pop("_errors", [])
     if errors:
         console.out(f"WARNING: {len(errors)} bundle(s) failed to parse and are "
                     f"excluded from the pool. First: {errors[0]}")
 
+    allocation = allocate_proportional(
+        {k: len(v) for k, v in groups.items()}, sample_total)
+
     selected = []
     for kind in sorted(groups):
+        share = allocation[kind]
+        if not share:
+            continue
         pool = sorted(groups[kind])          # filename order: draw-independent
-        if len(pool) < patients_per_cancer:
-            raise RuntimeError(
-                f"only {len(pool)} '{kind}' patients in the corpus, "
-                f"{patients_per_cancer} requested -- the sample this floor "
-                f"would be measured on is smaller than the one it claims"
-            )
-        for path in random.Random(seed).sample(pool, patients_per_cancer):
+        # A FRESH Random(seed) PER GROUP, which is what this function has always
+        # done. It is not the shared-stream convention the other samplers use,
+        # and it is kept rather than "corrected" because changing it changes
+        # which patients this floor would be re-measured over -- a change to a
+        # calibration input, disguised as a tidy-up.
+        for path in random.Random(seed).sample(pool, share):
             selected.append((kind, path, parsed[path]))
 
     console.out(f"Pool sizes: "
@@ -249,7 +272,7 @@ def pool_digest(reranked: list) -> str:
     return hashlib.sha256(payload.encode()).hexdigest()[:16]
 
 
-def rerank_sample(patients_per_cancer: int = PATIENTS_PER_CANCER,
+def rerank_sample(sample_total: int = SAMPLE_TOTAL,
                   seed: int = SEED) -> list:
     """Run Stages 1-3 ONCE for the whole sample.
 
@@ -259,7 +282,7 @@ def rerank_sample(patients_per_cancer: int = PATIENTS_PER_CANCER,
     earlier draft of this file did by calling select_patients() again inside
     floor_impact().
     """
-    selected = select_patients(patients_per_cancer, seed)
+    selected = select_patients(sample_total, seed)
     pools = []
     for idx, (kind, path, patient_data) in enumerate(selected, 1):
         name = os.path.basename(path)
@@ -283,7 +306,7 @@ def distinct_pools(pools: list) -> list:
     return out
 
 
-def measure(pools: list, seed: int, patients_per_cancer: int) -> dict:
+def measure(pools: list, seed: int, sample_total: int) -> dict:
     """The distribution report, over pools produced by ``rerank_sample``."""
     scores = []                # every medcpt_score_max, across every patient
     per_patient = []
@@ -317,7 +340,7 @@ def measure(pools: list, seed: int, patients_per_cancer: int) -> dict:
         "patients_requested": len(selected),
         "patients_measured": sum(1 for p in per_patient if p["scored"] > 0),
         "seed": seed,
-        "patients_per_cancer": patients_per_cancer,
+        "sample_total_requested": sample_total,
         "trials_scored": len(scores),
         "trials_unscored": unscored,
         "queries_scored_histogram": {str(k): v for k, v in sorted(
@@ -462,7 +485,8 @@ def print_report(report: dict) -> None:
     console.out("medcpt_score_max DISTRIBUTION")
     console.out("=" * 70)
     console.out(f"patients drawn      : {report['patients_requested']} "
-                f"({report['patients_per_cancer']} per cancer type, "
+                f"(of {report['sample_total_requested']} requested, "
+                f"proportional across cancer groups, "
                 f"seed {report['seed']})")
     console.out(f"patients measured   : {report['patients_measured']}")
     console.out(f"trials scored       : {report['trials_scored']}")
@@ -555,11 +579,12 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Measure the medcpt_score_max distribution and propose "
                     "MEDCPT_SCORE_FLOOR.")
-    parser.add_argument("--patients-per-cancer", type=int,
-                        default=PATIENTS_PER_CANCER,
-                        help="how many of each of breast/colon/lung "
-                             f"(default {PATIENTS_PER_CANCER}, so "
-                             f"{SAMPLE_TOTAL} total)")
+    parser.add_argument("--sample-total", type=int,
+                        default=SAMPLE_TOTAL,
+                        help="how many patients in total, allocated "
+                             "proportionally across every cancer group the "
+                             "corpus holds, minimum one per non-empty group "
+                             f"(default {SAMPLE_TOTAL})")
     parser.add_argument("--seed", type=int, default=SEED,
                         help=f"sampling seed (default {SEED})")
     parser.add_argument("--floor", type=float, default=None,
@@ -573,9 +598,9 @@ def main(argv=None) -> int:
     # around the measurement, which is the part that takes ~20 minutes and is
     # the reason a laptop must not sleep mid-run.
     with CaffeinateSession("medcpt-calibration"):
-        pools = rerank_sample(args.patients_per_cancer, args.seed)
+        pools = rerank_sample(args.sample_total, args.seed)
 
-    report = measure(pools, args.seed, args.patients_per_cancer)
+    report = measure(pools, args.seed, args.sample_total)
     print_report(report)
 
     if "recommended_floor" not in report:

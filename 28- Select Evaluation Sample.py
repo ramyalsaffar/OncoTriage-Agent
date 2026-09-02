@@ -115,8 +115,8 @@ def _parse_args(argv=None):
     results_path, so the help cannot disagree with the default.
 
     IMPORTING THEM RESOLVES NOTHING. All three are computed from
-    PATIENTS_PER_CANCER and CANCER_TYPES at the sampler's import -- one int and
-    two strings, no filesystem -- and the lazy glob is in default_output_db(),
+    SAMPLE_TOTAL at the sampler's import -- one int and two strings, no
+    filesystem -- and the lazy glob is in default_output_db(),
     which is still called only inside the guard. The {results_path}
     placeholder is kept verbatim for that reason -- rendering the real
     directory here would fire the glob while the parser is built.

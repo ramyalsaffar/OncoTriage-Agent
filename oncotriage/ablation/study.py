@@ -119,6 +119,7 @@ accessors that build on first call.
 
 import argparse
 import contextlib
+import glob
 import json
 import os
 import random
@@ -184,6 +185,13 @@ from oncotriage.agent.state import CHANNEL_ABLATED, CHANNEL_OK
 from oncotriage.config import (ABLATION_SAMPLE_SIZE_DEFAULT, ABLATION_SEED,
                               MATCHING_MODEL, MAX_WORKERS, Project_Name)
 from oncotriage.fhir.parser import load_all_patients
+from oncotriage.evaluation import cohort as campaign_cohort
+from oncotriage.evaluation.cohort import allocate_proportional
+from oncotriage.evaluation import cohort_groups as campaign_cohort_groups
+from oncotriage.registries.primary_cancer import (
+    cancer_group_key,
+    patient_cancer_group,
+)
 from oncotriage.utils import (
     CaffeinateSession,
     get_model_cost,
@@ -1406,43 +1414,94 @@ _VALID_CONFIG_NAMES = {c["name"] for c in ABLATION_CONFIGS}
 # STRATIFIED SAMPLING
 # ===========================================================================
 
-def _cancer_group_key(display: str) -> str:
-    """Map a cancer display name to a broad anatomical group for sampling."""
-    display_lower = display.lower()
-
-    groups = [
-        ("lung",        ["lung", "pulmonary", "bronch", "nsclc", "sclc"]),
-        ("breast",      ["breast"]),
-        ("colorectal",  ["colon", "rectal", "rectum", "colorectal"]),
-        ("prostate",    ["prostate"]),
-        ("pancreatic",  ["pancrea"]),
-        ("ovarian",     ["ovary", "ovarian"]),
-        ("uterine",     ["uterus", "uterine", "cervix", "cervical"]),
-        ("hematologic", ["leukemia", "leukaemia", "lymphoma", "myeloma"]),
-        ("melanoma",    ["melanoma"]),
-        ("liver",       ["liver", "hepato", "hepatic"]),
-        ("kidney",      ["kidney", "renal"]),
-        ("bladder",     ["bladder"]),
-        ("thyroid",     ["thyroid"]),
-        ("brain",       ["brain", "glioma", "glioblastoma"]),
-        ("head_neck",   ["oropharyn", "oral cavity", "head and neck"]),
-    ]
-
-    for group_name, keywords in groups:
-        if any(kw in display_lower for kw in keywords):
-            return group_name
-
-    return "other"
+# THE GROUPING VOCABULARY MOVED TO oncotriage/registries/primary_cancer.py.
+#
+# `_cancer_group_key` and `_get_patient_group` were defined here and a SECOND,
+# three-group vocabulary lived in oncotriage/evaluation/sampling.py. Two
+# groupers for one concept is this project's recurring drift defect, and the
+# narrow one had gone stale against the current corpus without anything
+# failing; the argument and the measurement are at CANCER_GROUP_KEYWORDS in the
+# owning module.
+#
+# BOTH NAMES SURVIVE AS ALIASES rather than as wrappers, and the difference is
+# not cosmetic: `tests/test_ablation_db_isolation.py` reaches
+# `_get_patient_group` by name and asserts which registry methods it calls, and
+# `tests/test_spend_coverage.py` and `tests/test_ablation_stop_and_lock.py`
+# rebind `stratified_sample` around it. An alias is the same function object,
+# so those checks measure the shipped implementation rather than a local
+# forwarder that could drift from it.
+#
+# THE REGISTRY ARGUMENT IS STILL PASSED EXPLICITLY at both call sites below.
+# `patient_cancer_group(patient)` would resolve `load_registry()` per patient
+# and take its construction lock once per element of a 1,000-patient loop.
+_cancer_group_key = cancer_group_key
+_get_patient_group = patient_cancer_group
 
 
-def _get_patient_group(patient, registry):
-    """Get the cancer group key for a single patient."""
-    conditions = patient.get("conditions", [])
-    cancer_conditions = [c for c in conditions if registry.is_primary_cancer(c)]
-    if cancer_conditions:
-        primary = sorted(cancer_conditions, key=registry.sort_key)[0]
-        return _cancer_group_key(primary.get("display", "Unknown"))
-    return "unknown"
+def restrict_to_campaign_cohort(patients, fhir_dir):
+    """The subset of ``patients`` that the campaign cohort actually runs.
+
+    THE RULING THIS IMPLEMENTS. An ablation study used to draw from the WHOLE
+    CORPUS; it draws from the CAMPAIGN COHORT now, so every configuration's
+    mean is measured over patients a campaign has verdicts for. A study patient
+    the campaign never ran has no verdict for any configuration to be a delta
+    against.
+
+    THE COHORT IS DRAWN BY THE SAME MODULE, THE SAME CONSTANTS AND THE SAME
+    GROUPER the batch runner uses -- `oncotriage/evaluation/cohort.py` reads
+    the three sizes and the three seeds, so no programme number appears in this
+    file. The draw is over STEMS, because that is the identity the runner's
+    checkpoint and the cohort digest are keyed on; the join back to a parsed
+    patient is by PATIENT ID, read off the same scan that produced the groups.
+
+    A SEPARATE FUNCTION AND NOT INLINE IN main(), for two reasons. It costs a
+    full corpus parse (~3 minutes for 1,000 bundles, argued at
+    oncotriage/evaluation/cohort_groups.py), and a step that expensive inside a
+    250-line `main()` is a step no test can drive around --
+    `tests/test_spend_coverage.py` stubs `load_all_patients` and
+    `stratified_sample` precisely so it never touches the corpus, and an inline
+    scan would have reached past both of them to the real one. It is also the
+    ONE place the cohort restriction happens, so `stratified_sample` below is
+    unchanged and is still the seam every existing harness rebinds.
+
+    A CORPUS THAT YIELDS NO BUNDLES DEGRADES TO THE WHOLE POPULATION AND SAYS
+    SO. `main()` has already refused an empty `all_patients` by this point, so
+    an empty glob here means the patients came from somewhere the glob cannot
+    see -- a stand-in, an embedder, a redirected path -- and refusing would
+    break a caller whose population is perfectly good. It is printed, never
+    silent.
+
+    Returns:
+        ``(patients, cohort)`` -- the restricted list sorted by patient_id, and
+        the ``CohortSelection`` (or ``None`` when the glob found nothing) so a
+        caller can print its provenance.
+    """
+    bundles = sorted(glob.glob(os.path.join(fhir_dir, "*.json")))
+    if not bundles:
+        console.out(f"  [Ablation] no bundles under {fhir_dir}; the study runs "
+                    f"over the whole population it was handed rather than over "
+                    f"a campaign cohort. NO NUMBER FROM THIS RUN IS ABOUT THE "
+                    f"RULED COHORT.")
+        return sorted(patients, key=lambda p: p["patient_id"]), None
+
+    console.out("  Grouping the corpus for the stratified cohort draw...")
+    # ONE SCAN, TWO ANSWERS. `scan()` carries the patient id alongside the
+    # group precisely so the stem -> patient join below costs no second parse.
+    records = campaign_cohort_groups.scan(bundles)
+    cohort = campaign_cohort.select(
+        bundles,
+        group_of=campaign_cohort_groups.grouper(
+            {stem: rec["group"] for stem, rec in records.items()}))
+
+    ids_by_stem = campaign_cohort_groups.patient_ids(records)
+    wanted = {ids_by_stem[s] for s in cohort.stems if s in ids_by_stem}
+    # A COHORT STEM WITH NO ID IS A BUNDLE THAT FAILED TO PARSE and is already
+    # counted in CORPUS_GROUPING_FAULTS by the scan; naming it again here would
+    # double-count. The shortfall is visible as the difference between the
+    # cohort size and what this returns, which main() prints.
+    return (sorted((p for p in patients if p.get("patient_id") in wanted),
+                   key=lambda p: p["patient_id"]),
+            cohort)
 
 
 def stratified_sample(patients, sample_size, seed):
@@ -1450,8 +1509,54 @@ def stratified_sample(patients, sample_size, seed):
     Select a stratified sample covering diverse cancer types.
 
     Groups patients by primary cancer (via CancerCodeRegistry 3-layer
-    detection + tiebreaker sort), then samples proportionally. At least
-    1 patient per group. Sorted by patient_id for deterministic ordering.
+    detection + tiebreaker sort), then allocates the sample across those groups
+    with ``oncotriage/evaluation/cohort.py:allocate_proportional`` -- the same
+    allocator the campaign cohort, the evaluation extract and the MedCPT
+    calibration pool use. Sorted by patient_id for deterministic ordering.
+
+    THE ROUND-AND-TRIM THIS REPLACED COULD EMPTY A STRATUM THE STRATIFICATION
+    HAD JUST GUARANTEED, and that is the defect rather than an inefficiency.
+    The old body did three things in sequence:
+
+        share = max(1, round(len(group) / total * sample_size))
+        ...
+        if len(sampled) > sample_size:
+            trim_rng.shuffle(sampled); sampled = sampled[:sample_size]
+
+    Rounding each group's share INDEPENDENTLY overshoots whenever the fractions
+    sum above the target -- and the ``max(1, ...)`` floor makes that the normal
+    case, not a corner: every group whose proportional share rounds to 0 is
+    lifted to 1, so a population with many small groups overshoots by roughly
+    the number of them. The trim then shuffles the WHOLE sampled list and
+    truncates, which is a second, unstratified random draw layered on top of a
+    stratified one. It cannot see strata at all, so the single patient the
+    floor granted to a 1.6%-of-corpus group is exactly as likely to be
+    truncated as any of the 200 from the largest -- and MORE likely to
+    disappear entirely, because it is the group's only member.
+
+        MEASURED ON THE REAL CORPUS PROPORTIONS (405 colorectal / 290 breast /
+        237 prostate / 52 hematologic / 16 lung), and it is not a corner case:
+
+            size  6   8  10  12  15  20  30
+            over  7   9  11  13  16  21  31      <- pre-trim total
+
+        THE OLD BODY OVERSHOOTS AT EVERY SIZE TESTED, so the trim ALWAYS ran.
+        At ``sample_size = 6`` with the shipped ``ABLATION_SEED = 42`` it
+        empties LUNG outright -- a group the floor had just guaranteed, gone,
+        with the study reporting a stratified sample of six. At
+        ``sample_size = 10``, 43 of the first 200 seeds (21.5%) empty at least
+        one stratum; seed 17 empties lung and seed 9 empties hematologic. The
+        regression test drives seed 42 at size 6 both ways.
+
+    ``allocate_proportional`` removes the whole class by construction: largest
+    remainder hits the target EXACTLY, so there is nothing to trim, and the
+    allocation is a pure function of ``(populations, size)`` with the seed
+    deciding only WHICH members of each group are taken.
+
+    THIS CHANGES WHICH PATIENTS A STUDY DRAWS, and that is acceptable because
+    no ablation number has been measured on the current corpus -- the whole
+    grouping vocabulary moved underneath this function in the same pass
+    sequence. It is a behaviour change, stated as one.
 
     Args:
         patients:    Parsed FHIR patient dicts from load_all_patients()
@@ -1467,7 +1572,9 @@ def stratified_sample(patients, sample_size, seed):
 
     # Local Random instance rather than random.seed(): seeding the
     # process-wide state would shift the draw of every other consumer of
-    # `random` in the same session.
+    # `random` in the same session. ONE rng consumed across the groups in
+    # sorted order, so the stream is deterministic without depending on dict
+    # iteration order.
     rng = random.Random(seed)
     registry = deps.get_cancer_registry()
 
@@ -1476,23 +1583,28 @@ def stratified_sample(patients, sample_size, seed):
     for patient in patients:
         cancer_groups[_get_patient_group(patient, registry)].append(patient)
 
-    # Proportional sampling, minimum 1 per group
-    total = len(patients)
+    # SORTED WITHIN EACH GROUP BEFORE THE DRAW. `random.Random.sample` reads
+    # its population POSITIONALLY, and `patients` arrives in whatever order
+    # `load_all_patients` globbed -- so without this the sample is a function
+    # of the filesystem's directory order as well as of the seed, and two
+    # machines holding the same corpus draw two different studies. The old
+    # body did not do this; it is a defect fixed alongside the allocator
+    # rather than introduced by it.
+    for group in cancer_groups.values():
+        group.sort(key=lambda p: p["patient_id"])
+
+    # ONE ALLOCATOR, SHARED WITH EVERY OTHER DRAW IN THIS PROJECT. No trim
+    # follows it, because it cannot overshoot: see the docstring.
+    allocation = allocate_proportional(
+        {name: len(group) for name, group in cancer_groups.items()},
+        sample_size)
+
     sampled = []
-
     for group_name in sorted(cancer_groups):
-        group = cancer_groups[group_name]
-        share = max(1, round(len(group) / total * sample_size))
-        share = min(share, len(group))
-        sampled.extend(rng.sample(group, share))
-
-    # Trim if rounding + min-1 caused oversampling. Fresh Random(seed) here,
-    # not the rng above: the original code re-seeded at this point, so the
-    # shuffle must start from the seed state to reproduce the same trim.
-    if len(sampled) > sample_size:
-        trim_rng = random.Random(seed)
-        trim_rng.shuffle(sampled)
-        sampled = sampled[:sample_size]
+        share = allocation[group_name]
+        if not share:
+            continue
+        sampled.extend(rng.sample(cancer_groups[group_name], share))
 
     # Deterministic processing order
     sampled.sort(key=lambda p: p["patient_id"])
@@ -3266,7 +3378,16 @@ def main():
         console.out("[Step 1] Compiling LangGraph pipeline...")
         graph = build_matching_graph()
 
-        # --- Step 2: Load and sample patients ---
+        # --- Step 2: Load, restrict to the campaign cohort, and sample ---
+        #
+        # THE STUDY DRAWS FROM THE CAMPAIGN COHORT AND NOT FROM THE CORPUS.
+        # That is the operator's ruling and it is also the only reading that
+        # makes a configuration's mean comparable to a campaign's: a study
+        # patient the campaign never ran has no verdict for any configuration
+        # to be a delta against. The cohort is drawn with the SAME module, the
+        # SAME constants and the SAME grouper the batch runner uses -- the
+        # three sizes and seeds are read only by
+        # oncotriage/evaluation/cohort.py, so no programme number appears here.
         console.out(f"\n[Step 2] Loading patients from {paths.data_fhir_path}...")
         all_patients = load_all_patients(paths.data_fhir_path)
         console.out(f"  {len(all_patients)} patients loaded")
@@ -3275,7 +3396,25 @@ def main():
             console.out("ERROR: No patients found. Run Files 04-07 first.")
             sys.exit(1)
 
-        sample = stratified_sample(all_patients, args.sample_size, ABLATION_SEED)
+        _cohort_patients, _cohort = restrict_to_campaign_cohort(
+            all_patients, paths.data_fhir_path)
+        if _cohort is not None:
+            for _line in _cohort.describe():
+                console.out(_line)
+            console.out(f"  {len(_cohort_patients)} of {_cohort.size} cohort "
+                        f"patients resolved to a parsed record.")
+
+        # THE DRAW IS `stratified_sample`, over a SMALLER POPULATION. It
+        # stratifies by `_get_patient_group`, which is the one grouper the
+        # cohort was drawn with, so "stratified by the same grouper" holds at
+        # both stages -- and since the allocator convergence it also allocates
+        # by the same RULE at both stages, so a stratum guaranteed by the
+        # cohort draw cannot be emptied by the study draw's rounding.
+        sample = stratified_sample(_cohort_patients, args.sample_size,
+                                   ABLATION_SEED)
+        if not sample:
+            console.out("ERROR: the ablation sample resolved to no patients.")
+            sys.exit(1)
 
         # --- Step 3: Resume support ---
         #

@@ -166,6 +166,7 @@ from oncotriage.agent.evaluation import (
     request_stage5_shutdown,
 )
 from oncotriage.evaluation import cohort as campaign_cohort
+from oncotriage.evaluation import cohort_groups as campaign_cohort_groups
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage import environment as _environment
 from oncotriage.storage.database_logger import (
@@ -3679,7 +3680,23 @@ def main():
         # than to the corpus. A corpus smaller than the configured cohort
         # selects all of it, which is what keeps a 40-patient smoke corpus
         # runnable, and `describe()` says so on its own line.
-        _cohort = campaign_cohort.select(fhir_files)
+        # THE STRATIFICATION MAP IS BUILT HERE AND COSTS A FULL CORPUS PARSE.
+        # That is the operator's coverage ruling and its price is stated at
+        # oncotriage/evaluation/cohort_groups.py: roughly three minutes for
+        # 1,000 bundles plus the ICD-10-CM build. It is paid ONCE, above the
+        # first billed call and above the checkpoint, so a corpus that cannot
+        # be grouped costs nothing -- and a bundle that will not parse is
+        # COUNTED rather than fatal, entering the population under the
+        # `unknown` group.
+        #
+        # THIS RUNNER STAYS COHORT-BLIND. It supplies a grouper and a file
+        # list; the three sizes, the three seeds and the allocation rule live
+        # in `oncotriage/config.py` and `oncotriage/evaluation/cohort.py`. No
+        # number of the programme appears in this file.
+        console.out("[Setup] Grouping the corpus for the stratified cohort draw...")
+        _group_map = campaign_cohort_groups.group_map(fhir_files)
+        _cohort = campaign_cohort.select(
+            fhir_files, group_of=campaign_cohort_groups.grouper(_group_map))
         for _line in _cohort.describe():
             console.out(_line)
         console.out()

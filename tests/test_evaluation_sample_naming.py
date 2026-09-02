@@ -17,13 +17,21 @@ file most likely to change" -- and the two constants and the two rendered
 strings went on carrying it. Widening the draw to 20 per group would have
 written 60 patients into ``inferences_sample_30.db``, under a ``--help`` still
 advertising the 30 path, with nothing raising: ``select_samples`` asserts its
-output's CONTENTS against ``patients_per_cancer`` and never its name.
+output's CONTENTS against the ALLOCATION and never its name.
 
 WHAT THIS FILE HOLDS
 
-  1  The derivation itself -- ``SAMPLE_TOTAL == PATIENTS_PER_CANCER *
-     len(CANCER_TYPES)`` -- with a non-degeneracy pin, because 1 x 30 and
-     30 x 1 also multiply to 30 and neither describes this draw.
+  1  SAMPLE_TOTAL IS A RULING AND NO LONGER A PRODUCT, as of the
+     cohort-stratification pass. It was ``PATIENTS_PER_CANCER *
+     len(CANCER_TYPES)`` -- ten each of breast, colon and lung -- and that
+     THREE-GROUP VOCABULARY WAS THE DEFECT: fitted to a retired corpus in
+     which everything else was one patient, it excluded 289 of the current
+     1,000 and RAISED whenever a group held fewer than ten. The draw is now
+     proportional across every group the source database carries, so there is
+     no "per cancer" number to multiply and the derivation this section pinned
+     has no subject. What it pins instead is that the two NAMES are still
+     rendered from the total rather than retyped, which is the property this
+     whole file exists for and which the change did not touch.
 
   2  VALUE PRESERVATION, which is the acceptance criterion the change was made
      under: at today's constants both derived strings are BYTE-IDENTICAL to
@@ -128,6 +136,7 @@ except ImportError:
     del _candidate, _how
 
 from oncotriage import paths
+from oncotriage.registries import primary_cancer as _pc
 from oncotriage.evaluation import sampling
 
 
@@ -226,20 +235,21 @@ _reset_caches()
 # ===========================================================================
 section("SECTION 1 -- SAMPLE_TOTAL is the product of the two constants")
 
-check("SAMPLE_TOTAL == PATIENTS_PER_CANCER * len(CANCER_TYPES)",
-      sampling.SAMPLE_TOTAL,
-      sampling.PATIENTS_PER_CANCER * len(sampling.CANCER_TYPES))
-check("...and that product is today's 30", sampling.SAMPLE_TOTAL,
-      _HISTORICAL_TOTAL)
+check("SAMPLE_TOTAL is today's 30 -- the value both names render",
+      sampling.SAMPLE_TOTAL, _HISTORICAL_TOTAL)
 
-# NON-DEGENERACY. 1 x 30 and 30 x 1 also make 30; neither is this draw, and a
-# check that only asserted the product would pass against both.
-check_true("NON-DEGENERATE: more than one patient per group",
-           sampling.PATIENTS_PER_CANCER > 1)
-check_true("NON-DEGENERATE: more than one cancer group",
-           len(sampling.CANCER_TYPES) > 1)
-check("the three groups are the ones select_samples draws",
-      sorted(sampling.CANCER_TYPES), ["breast", "colon", "lung"])
+# THE TWO RETIRED CONSTANTS ARE GONE, NOT MERELY UNUSED. `CANCER_TYPES` was the
+# second cancer grouping vocabulary in this package and
+# tests/test_cancer_grouping_single_owner.py is the standing pin that no second
+# one comes back; this is the half of that pin that belongs here, because a
+# reintroduced `PATIENTS_PER_CANCER` would also reintroduce the per-group draw
+# whose raise this pass removed.
+check_true("PATIENTS_PER_CANCER is gone",
+           not hasattr(sampling, "PATIENTS_PER_CANCER"))
+check_true("CANCER_TYPES is gone -- one grouping owner",
+           not hasattr(sampling, "CANCER_TYPES"))
+check("classify_cancer IS the one owner's function, by identity",
+      sampling.classify_cancer is _pc.cancer_group_key, True)
 
 # _resolve_total is the one place `None` becomes the module derivation.
 check("_resolve_total(None) is the module derivation",
@@ -333,9 +343,15 @@ check("SAMPLE_DB_FILENAME is assigned from sample_db_filename() with no "
       "argument",
       _call_of(_module_assign(_SAMPLING_TREE, "SAMPLE_DB_FILENAME")),
       ("sample_db_filename", 0))
-check("SAMPLE_TOTAL is assigned from a product, not a literal",
-      isinstance(_module_assign(_SAMPLING_TREE, "SAMPLE_TOTAL"), ast.BinOp),
-      True)
+# SAMPLE_TOTAL IS NOW A LITERAL AND THAT IS THE CHANGE RATHER THAN A
+# REGRESSION -- see section 1. It used to be pinned as an ast.BinOp, on the
+# argument that a product cannot go stale against the constants that produce
+# it; with a proportional draw there are no such constants. What must still
+# hold, and is what this file is actually about, is that the two NAMES are
+# rendered from it rather than retyped, which the checks above and below pin.
+check("SAMPLE_TOTAL is a plain integer ruling",
+      isinstance(_module_assign(_SAMPLING_TREE, "SAMPLE_TOTAL"), ast.Constant)
+      and isinstance(sampling.SAMPLE_TOTAL, int), True)
 
 # ...and the builders' only string source is the two format constants.
 _FUNC_BY_NAME = {n.name: n for n in _SAMPLING_TREE.body
@@ -653,14 +669,16 @@ check("the unplanted entry point is clean under the plant collector",
 # ===========================================================================
 section("SECTION 7 -- medcpt_calibration renders its total, it does not retype it")
 
-# oncotriage/evaluation/medcpt_calibration.py draws the SAME 10/10/10 stratum
-# (it imports CANCER_TYPES and SEED from the sampler and keeps its own
-# PATIENTS_PER_CANCER) and its --patients-per-cancer help said
-# "(default 10, so 30 total)" with the 30 retyped. Raising the per-group count
-# there would have left the flag's own help stating a total the run does not
-# draw. It is checked HERE rather than in a file of its own because the fact is
-# the same fact and this is the file that owns it; medcpt_calibration itself is
-# bucket C (a live Qdrant index), so nothing else can reach it for free.
+# oncotriage/evaluation/medcpt_calibration.py draws the SAME stratum as the
+# sampler -- it imports SEED and classify_cancer from it -- and its
+# --sample-total help renders the total rather than retyping it. It used to say
+# "(default 10, so 30 total)" with the 30 written out, so raising the count
+# would have left the flag's own help stating a total the run does not draw.
+# The per-group draw both files shared is gone (see section 1), so its
+# SAMPLE_TOTAL is a ruling here too. It is checked HERE rather than in a file
+# of its own because the fact is the same fact and this is the file that owns
+# it; medcpt_calibration itself is bucket C (a live Qdrant index), so nothing
+# else can reach it for free.
 
 from oncotriage.evaluation import medcpt_calibration as _mc      # noqa: E402
 
@@ -668,12 +686,14 @@ _MC_PATH = os.path.abspath(_mc.__file__)
 _MC_SRC = io.open(_MC_PATH, encoding="utf-8").read()
 _MC_TREE = ast.parse(_MC_SRC)
 
-check("7a. its SAMPLE_TOTAL is the product of its own two constants",
-      _mc.SAMPLE_TOTAL, _mc.PATIENTS_PER_CANCER * len(_mc.CANCER_TYPES))
-check("7a. ...and equals the sampler's, because both draw the same stratum",
+check("7a. its SAMPLE_TOTAL equals the sampler's -- both draw one stratum",
       _mc.SAMPLE_TOTAL, sampling.SAMPLE_TOTAL)
-check("7a. SAMPLE_TOTAL is assigned from a product, not a literal",
-      isinstance(_module_assign(_MC_TREE, "SAMPLE_TOTAL"), ast.BinOp), True)
+check("7a. ...and is a plain integer ruling, like the sampler's",
+      isinstance(_module_assign(_MC_TREE, "SAMPLE_TOTAL"), ast.Constant), True)
+check("7a. it reads the ONE grouper rather than a vocabulary of its own",
+      _mc.classify_cancer is _pc.cancer_group_key, True)
+check("7a. and its retired per-group constant is gone",
+      hasattr(_mc, "PATIENTS_PER_CANCER"), False)
 
 
 def _main_strings(tree):
@@ -690,7 +710,7 @@ check("7b. no string in main() spells the total",
 check_true("NON-DEGENERATE: main() does contain strings",
            len(_mc_main_strings or []) > 3)
 
-_mc_needle = 'f"{SAMPLE_TOTAL} total)")'
+_mc_needle = 'f"(default {SAMPLE_TOTAL})")'
 if _MC_SRC.count(_mc_needle) == 1:
     _mc_planted = ast.parse(_MC_SRC.replace(_mc_needle, '"30 total)")'))
     check_true("CONTROL: 7c. a restored total literal in the help is caught",
