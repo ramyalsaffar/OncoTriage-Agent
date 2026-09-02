@@ -203,6 +203,45 @@ x-app-environment: &app-environment
   # swap is for a live index that must not blink, and this one is empty.)
   ONCOTRIAGE_QDRANT_URL: http://qdrant:6333
 
+  # WHICH BUILD PRODUCED THESE ROWS. Without it a containerised run records
+  # `image_identity_source = 'containerised_unrecorded'`, which
+  # oncotriage/environment.py counts as a DEGRADATION and states in as many
+  # words: a containerised run whose image cannot be named is a run whose code
+  # cannot be reproduced from the record. It sits at the shared anchor because
+  # every one of these services can reach `start_run_record` and open a `runs`
+  # row.
+  #
+  # THE VALUE IS THE VERSION, NOT THE IMAGE REFERENCE, and that is a choice
+  # against the obvious one. `clinical-trial-patient-match:latest` is a CONSTANT
+  # of this file -- the same string on every build ever made here -- so
+  # recording it would replace an honest degradation with a value that looks
+  # like an identity and distinguishes nothing. ONCOTRIAGE_APP_VERSION is the
+  # one build-varying fact reachable from inside the container:
+  # docker/app_version.py derives it from oncotriage/__init__.py, and it is the
+  # SAME value the APP_VERSION build arg carries, which STAGE 2's
+  # `RUN --check` compares against the source that was copied in -- so an image
+  # whose label disagrees with its own code cannot ship, and this variable
+  # inherits that guard rather than needing one of its own.
+  #
+  # AND IT IS THE ONLY ONE. `.dockerignore` excludes `.git/`, so
+  # environment.git_commit() resolves UNKNOWN in every one of these containers.
+  #
+  # IT IS THE TAG CHANNEL AND NOT THE DIGEST, which is correct and is LABELLED.
+  # A digest names bytes; this names a build, and a version can be moved onto
+  # different bytes by rebuilding without bumping it. environment.py reports
+  # `build_tag` as the channel and IMAGE_IDENTITY_SOURCES already states that
+  # the two are not interchangeable. For the stronger answer set
+  # ONCOTRIAGE_IMAGE_DIGEST at run time from `docker image inspect --format
+  # '{{index .RepoDigests 0}}'`; it OUTRANKS this one and needs no edit here.
+  #
+  # `:-` AND NOT `:-unset`. Unset renders EMPTY, settings._resolve_image_field
+  # reads a blank value as "nobody told this process", and the run records
+  # containerised_unrecorded and counts it -- unchanged from today. The
+  # Dockerfile's `unset` sentinel works only because a guard REJECTS it; there
+  # is no guard on this path, so a literal here would be a fake identity that is
+  # never counted, which is worse than the degradation it replaced.
+  ONCOTRIAGE_IMAGE_TAG: ${ONCOTRIAGE_APP_VERSION:-}
+
 x-app-volumes: &app-volumes
   # THERE IS NO `.:/app` HERE ANY MORE, and removing it was forced by a
   # measurement rather than chosen for tidiness.

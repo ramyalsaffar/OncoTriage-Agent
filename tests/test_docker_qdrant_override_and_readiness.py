@@ -88,6 +88,7 @@ import copy
 import hashlib
 import importlib
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -796,6 +797,58 @@ check("5e  ...and names no api key for it (the .env's cloud key must not be "
       "ONCOTRIAGE_QDRANT_API_KEY" in _settings_in_compose, False)
 check("5e  ...and the comment-stripper is not vacuous: it still sees settings",
       _settings_in_compose.get("DOCKER_CONTAINER"), ['"true"'])
+
+# --- 5f. a containerised run can name the build that produced it ------------
+# WITHOUT THIS THE RECORD DEGRADES SILENTLY-ish: every containerised run wrote
+# `image_identity_source = 'containerised_unrecorded'`, which
+# oncotriage/environment.py counts and warns about but which no configuration
+# could clear -- so the degradation was permanent rather than actionable.
+#
+# WHAT IS CHECKED IS THE WIRING, NOT THE VALUE. `image_identity()`'s own three
+# states are driven in tests/test_run_environment_record.py (1k/1l/1m); what
+# only this file can see is that docker-compose.yml actually supplies the
+# channel, at the SHARED anchor so all five app services get it, from the SAME
+# variable the APP_VERSION build arg reads.
+_image_tag_in_compose = _settings_in_compose.get("ONCOTRIAGE_IMAGE_TAG")
+_app_version_arg = _settings_in_compose.get("APP_VERSION")
+
+
+def _interpolated_variable(values):
+    """The `${NAME` a compose setting interpolates, or None.
+
+    Returns the NAME rather than the whole expression so the two settings can
+    be compared on their SOURCE while differing, correctly, in their defaults:
+    the build arg defaults to a sentinel a guard rejects and the environment
+    variable defaults to empty. Comparing the raw strings would fail on that
+    difference, which is the one thing about them that must differ.
+    """
+    if not values or len(values) != 1:
+        return None
+    match = re.match(r"^\$\{([A-Za-z_][A-Za-z0-9_]*)", values[0].strip())
+    return match.group(1) if match else None
+
+
+check("5f  the compose file supplies the image-identity channel at the shared "
+      "app environment, so every app service can name its build",
+      _image_tag_in_compose is not None, True)
+check("5f  ...and it is INTERPOLATED, not a literal (a hardcoded tag would be "
+      "the same string on every build ever made here)",
+      _interpolated_variable(_image_tag_in_compose) is not None, True)
+check("5f  ...from the SAME variable the APP_VERSION build arg reads, so the "
+      "recorded identity cannot disagree with the label STAGE 2 guards",
+      _interpolated_variable(_image_tag_in_compose),
+      _interpolated_variable(_app_version_arg))
+check("5f  ...and NON-DEGENERACY: that variable was really found",
+      _interpolated_variable(_app_version_arg), "ONCOTRIAGE_APP_VERSION")
+# THE DEFAULT IS EMPTY AND MUST STAY EMPTY. `:-unset` -- which is right for the
+# build arg, where STAGE 2's `RUN --check` REJECTS the sentinel -- would here be
+# a fake identity that is never counted, because nothing on this path rejects
+# anything: settings._resolve_image_field would return the literal "unset" and
+# environment.image_identity() would report it as a build_tag, replacing an
+# honest degradation with a value that looks like an answer.
+check("5f  ...and it defaults to EMPTY, so an unsupplied version still "
+      "degrades and counts rather than recording a sentinel as an identity",
+      _image_tag_in_compose, ["${ONCOTRIAGE_APP_VERSION:-}"])
 
 
 #------------------------------------------------------------------------------

@@ -653,7 +653,7 @@ python tests/test_degradation_counter_readers.py                    # 157 (was 1
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
 # subprocesses import oncotriage.config only. Not in the collision matrix.
-python tests/test_docker_qdrant_override_and_readiness.py           # 122
+python tests/test_docker_qdrant_override_and_readiness.py           # 127 (was 122; the image-identity pass added section 5f over docker-compose.yml supplying ONCOTRIAGE_IMAGE_TAG at the shared anchor from the same variable the APP_VERSION build arg reads)
 
 # The resume pass. Same shape, same directory. No network, no keys, no spend,
 # no live judge, no live Qdrant, no corpus, no git history, and NOT in the
