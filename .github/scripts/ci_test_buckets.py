@@ -986,6 +986,38 @@ BUCKETS = {
         "then asserts gone, and .dockerignore -- the only repository file it "
         "reads -- is written by neither of the suite's two writers and is "
         "sha256-compared in its section 6"),
+    "test_license_metadata_drift.py": (
+        _A, None,
+        "ran green in 0.13s, 72 checks, against ONLY the directory skeleton "
+        "-- and identically with ONCOTRIAGE_MAIN_PATH pointed at a directory "
+        "that does not exist, because it imports nothing from the package: "
+        "its subjects are six repository files that each declare the same two "
+        "facts (WHICH LICENCE and WHICH REPOSITORY) in six different "
+        "notations, and nothing fails when they disagree -- CITATION.cff, "
+        "LICENSE, pyproject.toml, the Dockerfile's OCI labels, "
+        "docker/mesh-core/PROVENANCE.md and README.md. Every identifier "
+        "comparison is against a value READ OUT OF CITATION.cff rather than "
+        "retyped, so a check cannot agree with a stale literal; the ONE "
+        "pinned literal is the sha256 of the published PolyForm text, which "
+        "has no other declaration in the tree to be compared against, and "
+        "what a pinned digest cannot catch is stated at it. The repository "
+        "sweep forbids a reservation notice as a raw substring (measured "
+        "zero) and the retired non-standard-licence key as a DECLARATION "
+        "rather than as a substring, because CITATION.cff's own header "
+        "explains why that key is gone and a substring form would report the "
+        "documentation of the fix as the defect -- the prose count is printed "
+        "beside it and not gated. Both needles are assembled at run time, so "
+        "the file does not report itself. No network, no keys, no spend, no "
+        "Docker daemon, no live Qdrant, no model, no corpus, no database, no "
+        "git history, no subprocess, and it execs nothing and loads no module "
+        "by location: every control is a different ARGUMENT to a pure "
+        "function over a string mutated in memory. IT WRITES NOTHING "
+        "ANYWHERE, not even a temp directory. NOT in the collision matrix, "
+        "derived: it writes no repository file, and the six it reads are "
+        "written by neither of the suite's two writers -- the audit control "
+        "writes oncotriage/registries/cancer_code_registry.py and the "
+        "snapshot-date test writes oncotriage/config.py -- and all six are "
+        "sha256-compared in its section 9 anyway"),
     "test_harness_endpoint_budget.py": (
         _A, None,
         "ran green in 0.9s, 38 checks, against ONLY the directory skeleton: "

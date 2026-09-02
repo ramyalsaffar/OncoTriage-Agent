@@ -276,14 +276,14 @@ ARG APP_VERSION=unset
 
 # Set metadata for security scanning and compliance
 LABEL maintainer="Ramy Alsaffar" \
-      description="Clinical-Trial-Patient-Match - Clinical Trial Matching System" \
+      description="Oncology patient / clinical-trial matching over a LangGraph pipeline and hybrid BM25 + vector RAG" \
       version="${APP_VERSION}" \
       org.opencontainers.image.version="${APP_VERSION}" \
       org.opencontainers.image.source="https://github.com/ramyalsaffar/OncoTriage-Agent" \
       org.opencontainers.image.licenses="PolyForm-Noncommercial-1.0.0" \
       org.opencontainers.image.vendor="Ramy Alsaffar" \
-      org.opencontainers.image.title="Clinical-Trial-Patient-Match" \
-      org.opencontainers.image.description="AI-powered clinical trial patient matching" \
+      org.opencontainers.image.title="OncoTriage Agent" \
+      org.opencontainers.image.description="Oncology patient / clinical-trial matching over a LangGraph pipeline and hybrid BM25 + vector RAG" \
       security.scan="docker scout cves" \
       security.sbom="true"
 

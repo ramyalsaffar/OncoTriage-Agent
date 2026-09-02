@@ -1,6 +1,7 @@
 # OncoTriage Agent
 
 [![CI](https://github.com/ramyalsaffar/OncoTriage-Agent/actions/workflows/ci.yml/badge.svg)](https://github.com/ramyalsaffar/OncoTriage-Agent/actions/workflows/ci.yml)
+[![License: PolyForm-Noncommercial-1.0.0](https://img.shields.io/badge/license-PolyForm%20Noncommercial%201.0.0-blue.svg)](LICENSE)
 
 OncoTriage Agent reads a cancer patient's medical record — in the FHIR format
 electronic health records already speak — and finds the clinical trials that
