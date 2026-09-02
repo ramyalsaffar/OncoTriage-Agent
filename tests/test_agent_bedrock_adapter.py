@@ -1236,9 +1236,17 @@ check("matching_provider is TEXT in the real schema",
 # table for this column than `runs` is: it holds one row per degradation counter
 # per campaign, keyed by `run_id`, and `matching_provider` remains a plain
 # string on `inferences`.
+# `run_environment` JOINED AT THE ENVIRONMENT-RECORD PASS and is no more a
+# lookup table for this column than the two above: it holds one row per
+# DISTINCT RESOLVED PACKAGE LIST, keyed by that list's own digest, and
+# `matching_provider` remains a plain string on `inferences`. It is the first
+# content-keyed table in this schema, which is exactly why the pin is kept
+# EXACT -- a table keyed by content is what a lookup table for this column
+# would look like, and only naming the members separates the two.
 check("...and no lookup table was introduced for it",
       sorted(_tables),
-      ["drift_metrics", "inferences", "run_metrics", "runs", "trial_matches"])
+      ["drift_metrics", "inferences", "run_environment", "run_metrics", "runs",
+       "trial_matches"])
 check("...beside matching_model, which is TEXT for the same reason",
       at(_decl, "matching_model"), "TEXT")
 

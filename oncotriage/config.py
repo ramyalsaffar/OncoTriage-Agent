@@ -209,6 +209,56 @@ MATCHING_MODEL = "gpt-5.6-terra"  # For criterion-level evaluation
 # recordings.cross_encoder and would have to be recaptured -- which costs money.
 CROSS_ENCODER_MODEL = "ncbi/MedCPT-Cross-Encoder"
 
+# CROSS_ENCODER_REVISION IS THE EXACT HUB COMMIT THE NAME ABOVE RESOLVES TO, AND
+# WITHOUT IT THE NAME IS A MOVING TARGET. `from_pretrained("ncbi/MedCPT-Cross-
+# Encoder")` with no `revision=` resolves the repository's `main` branch --
+# whatever `main` points at ON THE DAY THE CACHE WAS FILLED. A third party can
+# push to `main`; a machine with a cold cache downloads whatever is there now; a
+# machine with a warm cache keeps whatever it got. So two runs a month apart can
+# be ranked by two different sets of weights while every artifact either one
+# writes names the identical checkpoint string, and NOTHING RAISES -- the model
+# loads, Stage 3 scores, and only the ordering moves. That is the same silent
+# failure the tokenizer/weights pairing above and CROSS_ENCODER_MAX_LENGTH below
+# are each written against, arrived at from the VERSION axis rather than the
+# identity or the geometry one.
+#
+# IT IS PASSED, NOT JUST RECORDED. Both from_pretrained calls in
+# oncotriage/agent/deps.py are handed `revision=` this constant, so the pin is
+# what DECIDES which bytes load rather than a label describing what happened to
+# load. Recording without pinning would produce an accurate record of a
+# checkpoint nobody chose.
+#
+# AND WHAT CAME BACK IS CHECKED AGAINST WHAT WAS ASKED FOR.
+# _verify_cross_encoder_revision() in that module reads the loaded object's own
+# `config._commit_hash` -- which transformers fills from the CACHE, with no
+# network call -- and a value that differs raises
+# CrossEncoderRevisionMismatchError at first load, before Stage 3 scores
+# anything and before Stage 5 spends a cent. An object that declines to report
+# one is COUNTED rather than raised on, which is item 11a's line and exactly the
+# treatment the sequence-limit and dtype verifiers beside it already give.
+#
+# HOW THIS VALUE WAS READ, on 2026-09-02, from the cache on this machine and not
+# from the network:
+#
+#   $ cat "02- Data/07- Model Cache/huggingface/hub/
+#          models--ncbi--MedCPT-Cross-Encoder/refs/main"
+#   71caf65d4927987813984f54c284405a13fcca49
+#
+# and confirmed to be what an offline load actually reports, by loading the
+# weights with HF_HUB_OFFLINE=1 and reading `model.config._commit_hash` back:
+# the same forty hex characters. THE CACHE ALSO HOLDS A SECOND SNAPSHOT --
+# `refs/pr/3` -> 75e855e5aaeda1e16da04a894207072d4b0db66a -- which is precisely
+# why an unpinned name is not an identity: two sets of bytes for one string sit
+# on this disk right now.
+#
+# CHANGING IT CHANGES EVERY RANKING, exactly as CROSS_ENCODER_MODEL does, so the
+# twelve characterization fixtures would have to be recaptured, which costs
+# money. It is a GATED FINGERPRINT FIELD for that reason -- see
+# oncotriage/run_fingerprint.py:FINGERPRINT_FIELDS -- so a checkpoint that moved
+# under a resumed campaign refuses rather than putting two rankers' output into
+# one artifact.
+CROSS_ENCODER_REVISION = "71caf65d4927987813984f54c284405a13fcca49"
+
 # CROSS_ENCODER_MAX_LENGTH is the sequence limit every tokenizer call in this
 # project passes as `max_length`, and it belongs TO THE CHECKPOINT NAMED
 # DIRECTLY ABOVE. MedCPT is BERT-shaped: its weights carry 512 learned position

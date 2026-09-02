@@ -895,6 +895,143 @@ def _verify_cross_encoder_dtype(model, checkpoint):
 #------------------------------------------------------------------------------
 
 
+# WHICH BYTES ANSWERED TO THE NAME.
+#
+# config.CROSS_ENCODER_MODEL is a REPOSITORY, not a revision. Unpinned, both
+# from_pretrained calls resolve `main`, and `main` is a third party's branch
+# pointer: it can be moved onto different weights at any time, and a machine
+# with a cold cache then downloads a different cross-encoder under the same
+# string. The failure is the one this module is already full of -- silent. The
+# model loads, Stage 3 scores every pair, the ranker ranks, and the only symptom
+# is that two campaigns a month apart were ranked by two different models while
+# every artifact either wrote names the identical checkpoint.
+#
+# SO THE REVISION IS PASSED AND THEN VERIFIED, in that order and for the reason
+# the dtype block above gives: passing is a REQUEST and reading back is the
+# ANSWER. transformers records the resolved commit on the loaded config as
+# `_commit_hash`, filled from the CACHE it resolved out of -- so reading it
+# costs no network call, which is what makes this verification available on a
+# machine with HF_HUB_OFFLINE set.
+#
+# MISMATCH RAISES; UNREPORTED COUNTS. Item 11a's line, applied exactly as the
+# two verifiers above apply it. A mismatch means transformers accepted
+# `revision=` and loaded something else, which puts every stored score under a
+# checkpoint the record does not name; an object that carries no `_commit_hash`
+# is a third-party attribute this code cannot conjure, so it is counted and
+# named. MEASURED, and it decides which half is load-bearing: on the shipped
+# checkpoint the WEIGHTS report a commit hash and the slow BertTokenizer does
+# not (`init_kwargs["_commit_hash"]` is None), which is the same asymmetry the
+# sequence-limit verifier records one block up, with the halves the same way
+# round.
+
+
+class CrossEncoderRevisionMismatchError(RuntimeError):
+    """The loaded cross-encoder is not config.CROSS_ENCODER_REVISION."""
+
+
+CROSS_ENCODER_REVISION_DEGRADATIONS = Counter()
+"""Times the cross-encoder's loaded REVISION could not be verified, by cause.
+
+A non-zero count is not a mismatch -- a mismatch raises. It means the loaded
+object declined to report a commit hash (`unreported:<source>`) or reported one
+this code could not read (`unreadable:<type>`), so config.CROSS_ENCODER_REVISION
+went unchecked against the bytes that were actually loaded and every Stage 3
+score of that run came from a checkpoint version nothing confirmed.
+
+THE SHIPPED TOKENIZER IS EXPECTED TO CONTRIBUTE ONE `unreported:` PER PROCESS,
+measured: transformers 5.10.4 leaves `_commit_hash` None on this checkpoint's
+slow tokenizer. That is the tokenizer half of this check being informational and
+the weights half being load-bearing, exactly as
+CROSS_ENCODER_LIMIT_DEGRADATIONS records for the sequence limit.
+"""
+
+REVISION_VERIFIED = "verified"
+REVISION_UNREPORTED = "unreported"
+REVISION_UNREADABLE = "unreadable"
+
+REVISION_VERIFICATION_STATES = (REVISION_VERIFIED, REVISION_UNREPORTED,
+                                REVISION_UNREADABLE)
+"""Every value _verify_cross_encoder_revision can RETURN.
+
+Closed, so a caller may branch on it exhaustively, and declared for the reason
+LIMIT_VERIFICATION_STATES and DTYPE_VERIFICATION_STATES are. A fourth outcome is
+not in it: a mismatch RAISES.
+"""
+
+
+def _verify_cross_encoder_revision(reported, source, checkpoint):
+    """Check one reported commit hash against config.CROSS_ENCODER_REVISION.
+
+    Args:
+        reported: what the loaded object says it came from, or ``None``.
+        source: where that reading came from, named in the log and in the
+            counter key so `unreported:tokenizer.init_kwargs` and
+            `unreported:weights.config._commit_hash` are distinguishable --
+            the first is expected on this checkpoint and the second is not.
+        checkpoint: the repository name, for the messages.
+
+    Returns one of REVISION_VERIFICATION_STATES. Raises
+    CrossEncoderRevisionMismatchError on a genuine disagreement; the whole
+    argument is in the block above.
+
+    THE COMPARISON IS CASE-FOLDED AND STRIPPED AND IS OTHERWISE EXACT. A git
+    object id is hex, so case is not information; a prefix is NOT accepted,
+    because "the loaded revision starts with the configured one" is satisfied by
+    a configured value of the empty string and by any short prefix an operator
+    typed instead of the full id.
+    """
+    configured = config.CROSS_ENCODER_REVISION
+
+    if reported is None:
+        CROSS_ENCODER_REVISION_DEGRADATIONS[f"unreported:{source}"] += 1
+        log.warning("the loaded cross-encoder reports no commit hash, so the "
+                    "pinned revision went unverified against it",
+                    event="cross_encoder_revision_unverified",
+                    status=REVISION_UNREPORTED, model=checkpoint,
+                    revision_configured=configured, revision_source=source,
+                    reason="attribute absent")
+        return REVISION_UNREPORTED
+
+    if not isinstance(reported, str) or not reported.strip():
+        CROSS_ENCODER_REVISION_DEGRADATIONS[
+            f"unreadable:{type(reported).__name__}"] += 1
+        log.warning("the loaded cross-encoder reported a commit hash this code "
+                    "could not read, so the pinned revision went unverified "
+                    "against it", event="cross_encoder_revision_unverified",
+                    status=REVISION_UNREADABLE, model=checkpoint,
+                    revision_configured=configured, revision_source=source,
+                    reason=type(reported).__name__)
+        return REVISION_UNREADABLE
+
+    actual = reported.strip().lower()
+    if actual != str(configured).strip().lower():
+        raise CrossEncoderRevisionMismatchError(
+            f"config.CROSS_ENCODER_REVISION is {configured!r} and was passed "
+            f"to from_pretrained as `revision=`, but the loaded checkpoint "
+            f"{checkpoint!r} came back reporting {actual!r} "
+            f"(read from {source}). Every Stage 3 score this process would "
+            f"produce comes from a set of weights the record does not name, "
+            f"and nothing downstream would report it -- the model loads, the "
+            f"ranker ranks, and only the ordering moves. Either the installed "
+            f"transformers stopped honouring `revision=` on this path, or the "
+            f"cache holds a different snapshot under that id. Do not widen "
+            f"this check to accept what came back: the constant is the "
+            f"checkpoint version every score this project has recorded was "
+            f"produced by, and changing it means recapturing the twelve "
+            f"characterization fixtures (see "
+            f"oncotriage/config.py:CROSS_ENCODER_REVISION)."
+        )
+
+    log.info("the cross-encoder revision matches the pinned one",
+             event="cross_encoder_revision_verified", status=REVISION_VERIFIED,
+             model=checkpoint, revision_configured=configured,
+             revision_reported=actual, revision_source=source)
+    return REVISION_VERIFIED
+
+
+#------------------------------------------------------------------------------
+
+
 # ---------------------------------------------------------------------------
 # Factories
 # ---------------------------------------------------------------------------
@@ -964,7 +1101,12 @@ def _build_medcpt_tokenizer():
     # itself appears exactly once in the package.
     log.info("loading the MedCPT cross-encoder tokenizer",
              event="local_model_load_started", model=config.CROSS_ENCODER_MODEL)
+    # `revision=` PINS WHICH COMMIT THE NAME RESOLVES TO. Without it this
+    # resolves the repository's `main`, which is a third party's branch pointer
+    # -- see config.CROSS_ENCODER_REVISION and the verifier block above for what
+    # an unpinned pair costs and why nothing would raise.
     tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL,
+                                              revision=config.CROSS_ENCODER_REVISION,
                                               **_cache_kwargs)
     log.info("MedCPT cross-encoder tokenizer loaded",
              event="local_model_load_finished", model=config.CROSS_ENCODER_MODEL)
@@ -981,6 +1123,20 @@ def _build_medcpt_tokenizer():
     _verify_cross_encoder_sequence_limit(
         getattr(tokenizer, "model_max_length", None),
         "tokenizer.model_max_length",
+        config.CROSS_ENCODER_MODEL)
+
+    # AND WHICH COMMIT ANSWERED. transformers stores the resolved revision on
+    # the tokenizer's init_kwargs when it has one; the shipped slow
+    # BertTokenizer leaves it None, MEASURED, so this call is expected to return
+    # REVISION_UNREPORTED and the load-bearing check is the one in
+    # _build_medcpt_model below. It is kept for the reason the sequence-limit
+    # call above it is kept: a tokenizer that DOES report, and reports a
+    # different commit from the weights, is a real divergent pair that nothing
+    # else in this project would see.
+    _verify_cross_encoder_revision(
+        (tokenizer.init_kwargs.get("_commit_hash")
+         if isinstance(getattr(tokenizer, "init_kwargs", None), dict) else None),
+        "tokenizer.init_kwargs._commit_hash",
         config.CROSS_ENCODER_MODEL)
     return tokenizer
 
@@ -1011,8 +1167,13 @@ def _build_medcpt_model():
     # third-party file the decision that sets every Stage 3 score's precision.
     # The string form is used because this module must not import torch; see
     # config.CROSS_ENCODER_DTYPE for the whole argument and the release note.
+    # `revision=` for the tokenizer's reason, and it MUST be the same constant:
+    # a cross-encoder tokenizes with the tokenizer trained beside the weights,
+    # so pinning one half and letting the other follow `main` reintroduces the
+    # divergent-pair failure the note above describes, on the version axis.
     model = AutoModelForSequenceClassification.from_pretrained(
         config.CROSS_ENCODER_MODEL, dtype=config.CROSS_ENCODER_DTYPE,
+        revision=config.CROSS_ENCODER_REVISION,
         **_cache_kwargs)
     model.eval()
     log.info("MedCPT cross-encoder weights loaded",
@@ -1034,6 +1195,18 @@ def _build_medcpt_model():
     # deferral return, unreachable behind an override, and reading an attribute
     # off an object the caller already built.
     _verify_cross_encoder_dtype(model, config.CROSS_ENCODER_MODEL)
+
+    # AND THE REVISION, against what the loaded config says it came from rather
+    # than against what `revision=` asked for. THIS IS THE CALL THAT VERIFIES
+    # config.CROSS_ENCODER_REVISION: the weights are the half of this checkpoint
+    # that reports a commit hash at all, measured, exactly as they are the half
+    # that declares a sequence limit. Reading an attribute off an object the
+    # caller has just built adds no load to any path and issues no request --
+    # `_commit_hash` is filled from the CACHE transformers resolved out of.
+    _verify_cross_encoder_revision(
+        getattr(getattr(model, "config", None), "_commit_hash", None),
+        "weights.config._commit_hash",
+        config.CROSS_ENCODER_MODEL)
     return model
 
 

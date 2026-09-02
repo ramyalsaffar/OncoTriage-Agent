@@ -519,12 +519,13 @@ check("...and it is NOT the UNKNOWN sentinel (non-degeneracy: an unreadable "
       "module answers UNKNOWN, and every check below would then be comparing "
       "one sentinel with another)",
       at(_now) == _fp.UNKNOWN, False)
-check("the stamp's version says this field set is version 4. It was 2 until "
-      "`matching_call_mode` was gated and 3 until the cohort pass gated "
-      "`campaign_cohort_size` and `campaign_cohort_seed`; each bump is what "
-      "makes every older artifact answer FP_VERSION once rather than have its "
-      "missing field compared against a live value",
-      _fp.FINGERPRINT_VERSION, 4)
+check("the stamp's version says this field set is version 5. It was 2 until "
+      "`matching_call_mode` was gated, 3 until the cohort pass gated "
+      "`campaign_cohort_size` and `campaign_cohort_seed`, and 4 until the "
+      "environment-record pass gated `cross_encoder_revision`; each bump is "
+      "what makes every older artifact answer FP_VERSION once rather than have "
+      "its missing field compared against a live value",
+      _fp.FINGERPRINT_VERSION, 5)
 
 # --- (b) the module set is DERIVED, not trusted ---------------------------
 # A static closure from the two render entry points over every module-level
@@ -1416,6 +1417,16 @@ try:
         # computed across two cohorts presented as one.
         ("campaign_cohort_size", 7, _fp.FP_CHANGED),
         ("campaign_cohort_seed", 999999, _fp.FP_CHANGED),
+        # THE RERANKER'S HUB COMMIT, DRIVEN THROUGH THE REAL GATE. The concrete
+        # harm: config.CROSS_ENCODER_MODEL is a REPOSITORY, so an unpinned load
+        # resolves whatever `main` pointed at when the cache was filled -- and a
+        # campaign resumed after that pointer moved has half its patients ranked
+        # by one set of weights and half by another, in one table, with every
+        # artifact naming the identical checkpoint string and nothing raising.
+        # The value is a well-formed 40-hex id that is not the pinned one, so
+        # the case is a real mismatch whatever the pin is set to.
+        ("cross_encoder_revision",
+         "ffffffffffffffffffffffffffffffffffffffff", _fp.FP_CHANGED),
     )
     # EVERY GATED FIELD IS EITHER IN THIS TABLE OR HAS ITS OWN SECTION, and the
     # round trip is closed here so a field gated in a later pass cannot be added

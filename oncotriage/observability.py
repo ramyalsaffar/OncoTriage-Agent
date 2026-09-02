@@ -540,6 +540,27 @@ LOGGABLE_FIELDS = frozenset({
     # this project makes rather than one the library forced; see
     # config.CROSS_ENCODER_DTYPE.
     "dtype_configured", "dtype_reported",
+    # The cross-encoder's HUB COMMIT -- what was pinned, what came back, and
+    # which of the two loaded objects was asked. Same argument as the two groups
+    # above, on the VERSION axis: a git object id and an attribute path are
+    # model identity, and neither can carry a patient, a trial or a diagnosis.
+    # `revision_source` is load-bearing rather than decorative: an
+    # `unreported` from the tokenizer is EXPECTED on the shipped checkpoint and
+    # one from the weights is not, and the record is unreadable without the
+    # field that separates them. See
+    # oncotriage/agent/deps.py:_verify_cross_encoder_revision.
+    "revision_configured", "revision_reported", "revision_source",
+    # THE RUN ENVIRONMENT: the resolved-package-list digest, how many
+    # distributions it covers, the git commit and whether the tree was dirty,
+    # and the image identity with WHICH channel supplied it. Every one is a
+    # fact about the machine and the build rather than about a patient -- a
+    # truncated sha256, a count, a git object id, a boolean, an image digest or
+    # tag, and a closed vocabulary member. The image identity is the one worth
+    # arguing: it is a name an operator chose for a build, not a hostname or a
+    # path, and `image_identity_source` is what says whether it is a digest (an
+    # identity) or a tag (a label that can move). See oncotriage/environment.py.
+    "environment_hash", "package_count", "git_commit", "git_dirty",
+    "image_identity", "image_identity_source",
     # How many of the trials a render pass covered were changed by it, beside
     # `total` (how many it covered) and `count` (how many sequences it
     # rewrote). Three numbers rather than one because they answer three

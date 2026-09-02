@@ -368,9 +368,15 @@ print()
 
 _FRESH = fresh_db("fresh.db")
 
-check("a fresh database carries all five tables",
+# SIX at the environment-record pass, which added `run_environment` -- the
+# resolved package list, keyed by its own digest so one row serves every run
+# that saw that environment. EXACT rather than a subset test, deliberately:
+# exact is what makes this fail when a table is introduced under any name,
+# which is how this line came to be edited.
+check("a fresh database carries all six tables",
       tables_of(_FRESH),
-      ["drift_metrics", "inferences", "run_metrics", "runs", "trial_matches"])
+      ["drift_metrics", "inferences", "run_environment", "run_metrics", "runs",
+       "trial_matches"])
 
 check("run_metrics carries exactly the narrow shape, plus its id",
       sorted(r["name"] for r in rows(_FRESH, "PRAGMA table_info(run_metrics)")),

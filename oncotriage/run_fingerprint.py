@@ -176,8 +176,45 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 4
+FINGERPRINT_VERSION = 5
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    4 -> 5  added ``cross_encoder_revision``. EVERY ARTIFACT STAMPED AT 4
+            THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE, for
+            the reason spelled out under 1 -> 2 below; the remediation is
+            identical and is printed on the refusal.
+
+            WHAT IT CLOSES. ``config.CROSS_ENCODER_MODEL`` is a REPOSITORY, not
+            a revision, and an unpinned ``from_pretrained`` resolves whatever
+            that repository's `main` branch pointed at on the day the cache was
+            filled. A third party can move `main`; a cold cache downloads what
+            is there now; a warm one keeps what it got. So two halves of one
+            resumed campaign could be ranked by two different sets of weights
+            while every artifact either wrote named the identical checkpoint
+            string, and NOTHING would raise -- the model loads, Stage 3 scores,
+            and only the ordering moves. That is the same silent class
+            ``llm_classifier_renderer_digest`` closed on the SOURCE axis,
+            arrived at from the third-party-artifact axis.
+
+            THE COMPANION CHANGE IS WHAT MAKES IT A FACT RATHER THAN A LABEL:
+            ``oncotriage/agent/deps.py`` now passes ``revision=`` this value to
+            both ``from_pretrained`` calls and verifies the loaded config's own
+            ``_commit_hash`` against it, raising at first load. Gating a value
+            nothing pinned would have refused resumes over a string that did
+            not decide anything.
+
+            WHAT IS DELIBERATELY *NOT* GATED WITH IT: the environment hash, the
+            git commit and the image identity, all three of which
+            ``oncotriage/environment.py`` records on the same run row. Each is
+            real provenance and none is a configuration the pipeline reads --
+            the environment hash moves for ``pip install ipython`` and the
+            commit moves for a comment -- so gating them would refuse resumes
+            for changes that cannot touch a verdict, which is how an operator
+            learns to pass --fresh without reading. That module's docstring
+            carries the whole argument and states the residual: a resume across
+            a dependency upgrade is PERMITTED, and what makes it recoverable is
+            that the two run rows differ in those columns, so the mixing is a
+            query rather than an unanswerable question.
 
     3 -> 4  added ``campaign_cohort_size`` and ``campaign_cohort_seed``. EVERY
             ARTIFACT STAMPED AT 3 THEREFORE ANSWERS FP_VERSION UNTIL AN
@@ -461,6 +498,7 @@ FINGERPRINT_FIELDS = (
     "data_snapshot_date",
     "campaign_cohort_size",
     "campaign_cohort_seed",
+    "cross_encoder_revision",
 )
 
 # How compare() answered. A CLOSED set, for the reason
@@ -835,6 +873,23 @@ def current(refresh: bool = False) -> dict:
                 # and its own stamp.
                 "campaign_cohort_size": config.CAMPAIGN_COHORT_SIZE,
                 "campaign_cohort_seed": config.CAMPAIGN_COHORT_SEED,
+                # WHICH BYTES RANK THE TRIALS. A plain `config` read, with no
+                # helper and no guard, on exactly the argument the two lines
+                # above make: it is a module-level string constant of a module
+                # already imported, so an exception here is an ImportError that
+                # already happened.
+                #
+                # NOT `renderer_digest()`'s SHAPE, and the distinction matters
+                # to anyone adding the next such field. That digest hashes
+                # SOURCE THIS REPOSITORY OWNS, so it can be recomputed from the
+                # tree; this names an artifact on a third party's hub, which
+                # cannot be, and which is why the pin plus the load-time
+                # verifier in oncotriage/agent/deps.py is the mechanism rather
+                # than a hash taken here. RENDERER_COVERAGE already records
+                # that the registries' DATA is outside this module's reach for
+                # the same reason; this field is the one third-party artifact
+                # that could be pinned and now is.
+                "cross_encoder_revision": config.CROSS_ENCODER_REVISION,
             }
         # A COPY. The consumers put this straight into a JSON payload they then
         # mutate around, and a shared dict would let one consumer's edit reach
@@ -872,7 +927,13 @@ def summary(fingerprint: dict) -> str:
             f"({get('collection_points', NOT_RECORDED)} points), "
             f"snapshot {get('data_snapshot_date', NOT_RECORDED)}, "
             f"cohort {get('campaign_cohort_size', NOT_RECORDED)}"
-            f"@{get('campaign_cohort_seed', NOT_RECORDED)}")
+            f"@{get('campaign_cohort_seed', NOT_RECORDED)}, "
+            # TRUNCATED TO TWELVE, matching the renderer digest above it and
+            # this project's standing width for a digest a human reads. The
+            # full forty characters are in the run row and in the refusal's
+            # field-by-field table; this line is a banner.
+            f"reranker "
+            f"{str(get('cross_encoder_revision', NOT_RECORDED))[:12]}")
 
 
 def is_resolved(fingerprint: dict) -> bool:

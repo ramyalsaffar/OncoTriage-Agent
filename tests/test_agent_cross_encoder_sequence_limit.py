@@ -659,10 +659,14 @@ _verify_calls = sorted(
     _n.func.id for _n in ast.walk(_deps_tree)
     if isinstance(_n, ast.Call) and isinstance(_n.func, ast.Name)
     and _n.func.id.startswith("_verify_cross_encoder"))
-check("7w  ...and BOTH verifiers are actually called from the factories -- the "
-      "sequence limit twice (tokenizer and weights) and the dtype once",
+check("7w  ...and ALL THREE verifiers are actually called from the factories "
+      "-- the sequence limit twice (tokenizer and weights), the REVISION twice "
+      "(same two, and it is the weights half that reports on this checkpoint), "
+      "and the dtype once (the tokenizer has no precision to check)",
       _verify_calls,
       ["_verify_cross_encoder_dtype",
+       "_verify_cross_encoder_revision",
+       "_verify_cross_encoder_revision",
        "_verify_cross_encoder_sequence_limit",
        "_verify_cross_encoder_sequence_limit"])
 

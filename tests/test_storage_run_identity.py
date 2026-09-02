@@ -522,6 +522,14 @@ _STAMP_VALUES = {
     # in every check below rather than the round trip they are about.
     "campaign_cohort_size": 300,
     "campaign_cohort_seed": 42,
+    # A REAL 40-HEX GIT OBJECT ID, on the two integers' reason one line up and
+    # on `matching_call_mode`'s: it is a TEXT column, so a generated
+    # "test-cross_encoder_revision" would round-trip perfectly and prove
+    # nothing about the shape the pipeline actually writes. This is not
+    # config.CROSS_ENCODER_REVISION -- a stamp literal must not be read off the
+    # module the round trip is checking, or the check agrees with the code by
+    # construction.
+    "cross_encoder_revision": "0123456789abcdef0123456789abcdef01234567",
 }
 # A FIELD WITH NO LITERAL ABOVE GETS A GENERATED ONE RATHER THAN A KeyError, and
 # that is a repair rather than a convenience. The comment above this dict has
@@ -562,11 +570,12 @@ check("RUN_FINGERPRINT_COLUMNS is exactly the stamp's keys, in order",
       list(_dl.RUN_FINGERPRINT_COLUMNS),
       ["fingerprint_version"] + list(_rf.FINGERPRINT_FIELDS))
 
-check("...and the stamp really has nine gated fields (non-degenerate: a check "
+check("...and the stamp really has ten gated fields (non-degenerate: a check "
       "against an empty tuple would pass for free). SIX until the call-mode "
       "pass gated `matching_call_mode`, SEVEN until the cohort pass gated "
-      "`campaign_cohort_size` and `campaign_cohort_seed`",
-      len(_rf.FINGERPRINT_FIELDS), 9)
+      "`campaign_cohort_size` and `campaign_cohort_seed`, NINE until the "
+      "environment-record pass gated `cross_encoder_revision`",
+      len(_rf.FINGERPRINT_FIELDS), 10)
 
 check("every gated field has a real literal in this file's stamp, so no check "
       "below is exercising a generated placeholder",
@@ -657,7 +666,8 @@ check("...and the de-duplication is really doing work here (non-degeneracy: "
       "with no overlap the two rules give the same answer and the check above "
       "cannot distinguish them)",
       sorted(set(_dl.RUN_FINGERPRINT_COLUMNS) & set(_dl.RUN_COLUMN_ADDITIONS)),
-      ["campaign_cohort_seed", "campaign_cohort_size", "matching_call_mode"])
+      ["campaign_cohort_seed", "campaign_cohort_size", "cross_encoder_revision",
+       "matching_call_mode"])
 # DERIVED, NOT `RUN_COLUMNS[-1] == "matching_call_mode"`. That form pinned the
 # overlapping column to the LAST position, which is only where ALTER TABLE puts
 # it for as long as it is the last entry in RUN_COLUMN_ADDITIONS -- so the
@@ -712,13 +722,17 @@ print()
 _FRESH = os.path.join(_TMP, "fresh.db")
 silence(_dl.initialize_database, _FRESH)
 
-# FIVE AT THE HEALTH-PERSISTENCE PASS, which added `run_metrics`. The set is
-# kept EXACT rather than widened to a subset test, for the reason the bedrock
-# adapter's copy of this assertion states: exact is what makes it fail when a
-# table is introduced under any name.
-check("a fresh database carries all five tables",
+# FIVE AT THE HEALTH-PERSISTENCE PASS, which added `run_metrics`; SIX at the
+# environment-record pass, which added `run_environment` -- the resolved package
+# list, keyed by its own digest so one row serves every run that saw that
+# environment. The set is kept EXACT rather than widened to a subset test, for
+# the reason the bedrock adapter's copy of this assertion states: exact is what
+# makes it fail when a table is introduced under any name, which is how this
+# line came to be edited.
+check("a fresh database carries all six tables",
       tables_of(_FRESH),
-      ["drift_metrics", "inferences", "run_metrics", "runs", "trial_matches"])
+      ["drift_metrics", "inferences", "run_environment", "run_metrics", "runs",
+       "trial_matches"])
 
 check("...and `runs` carries exactly RUN_COLUMNS plus its id",
       sorted(columns_of(_FRESH, "runs")),

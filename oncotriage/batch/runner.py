@@ -167,6 +167,7 @@ from oncotriage.agent.evaluation import (
 )
 from oncotriage.evaluation import cohort as campaign_cohort
 from oncotriage.fhir.parser import parse_fhir_bundle
+from oncotriage import environment as _environment
 from oncotriage.storage.database_logger import (
     RUN_METRICS_FLUSH_FAILURES,
     # THE THREE STOP REASONS BY NAME, for RUN_RECORD_STATUS_*'s reason:
@@ -3846,6 +3847,18 @@ def main():
             # size of each programme sample. The MEMBERSHIP is not stored --
             # see cohort.CohortSelection.record().
             cohort=_cohort.record(),
+            # WHAT PRODUCED THIS RUN, beside what it was configured to do.
+            # Resolved HERE rather than inside the writer, on the fingerprint's
+            # own argument one line up: the caller resolves once, on its main
+            # thread, and hands the reading over -- and this module may not make
+            # the storage layer import `oncotriage.environment`.
+            #
+            # RESOLVED AT THE CALL, NOT WARMED EARLIER. Unlike the fingerprint
+            # it gates nothing, so no earlier consumer needs it and there is no
+            # second reading it could disagree with; `environment.current()`
+            # caches for the process, so a second run in one process re-uses it
+            # unless it calls clear_cache().
+            environment=_environment.current(),
         )
 
         # ------------------------------------------------------------------

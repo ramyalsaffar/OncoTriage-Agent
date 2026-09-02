@@ -189,6 +189,7 @@ from typing import Dict, List
 from dateutil.relativedelta import relativedelta
 
 from oncotriage import config, paths
+from oncotriage.environment import current as current_environment_record
 from oncotriage.agent import deps
 from oncotriage.agent import models as _agent_models
 from oncotriage.agent.graph import build_initial_state, build_matching_graph
@@ -2220,6 +2221,11 @@ def _resolve_and_verify_collection() -> tuple:
 
 
 def build_environment_block() -> Dict:
+    # ONE READING, EIGHT FIELDS. `environment.current()` caches for the process,
+    # so the twelve captures of one session record the identical provenance --
+    # which is what makes a per-fixture difference in these fields mean
+    # something rather than mean the git tree was touched between captures.
+    _environment_record = current_environment_record()
     resolved, alias_resolved = _resolve_and_verify_collection()
     digest, elapsed = compute_collection_digest(resolved)
     console.out(f"  Collection digest: {digest['point_count']} points, "
@@ -2302,6 +2308,47 @@ def build_environment_block() -> Dict:
         # counts construction SITES by ast and is unaffected by a name import;
         # the count is still exactly one, in embedding.py.
         "cross_encoder_model": CROSS_ENCODER_MODEL,
+        # AND WHICH BYTES ANSWERED TO THAT NAME. `cross_encoder_model` is a
+        # REPOSITORY: unpinned, `from_pretrained` resolves whatever the
+        # repository's `main` pointed at on the day the cache was filled, so a
+        # fixture recording only the name records a checkpoint that can have
+        # been two different sets of weights. That is precisely the diff a
+        # replay would report as an unexplained cross_encoder miss with no
+        # cause attached -- the afternoon this block exists to save.
+        #
+        # THE WHOLE PROVENANCE BLOCK, ON THAT ONE ARGUMENT. The revision, the
+        # precision and the sequence budget are the three properties OF the
+        # checkpoint that change every Stage 3 score without changing its name,
+        # and the environment hash plus the git commit are what the score's
+        # SOFTWARE was. `git_dirty` is beside the commit because a commit
+        # identifies the code only if the tree matched it.
+        #
+        # FUTURE CAPTURES ONLY, on this block's standing doctrine: File 46's
+        # replay reads exactly three keys out of fixture["environment"]
+        # ("tunables", "qdrant_collection", "collection_digest"), so adding
+        # these cannot move, invalidate or re-report any fixture already on
+        # disk. They begin describing captures taken after this change.
+        #
+        # READ OFF `environment.current()` RATHER THAN OFF `config`, and the
+        # difference is not cosmetic for two of them: `environment_hash` and
+        # `git_commit` are RESOLVED facts about this machine that no constant
+        # carries, and taking the model identities from the same dict keeps one
+        # answer to "what ran" rather than two that can drift.
+        "cross_encoder_revision": _environment_record["cross_encoder_revision"],
+        "cross_encoder_dtype": _environment_record["cross_encoder_dtype"],
+        "environment_hash": _environment_record["environment_hash"],
+        "package_count": _environment_record["package_count"],
+        "git_commit": _environment_record["git_commit"],
+        "git_dirty": _environment_record["git_dirty"],
+        "image_identity": _environment_record["image_identity"],
+        "image_identity_source": _environment_record["image_identity_source"],
+        # DELIBERATELY NOT `package_snapshot`. It is ~15 kB of text that is
+        # identical across all twelve captures of a session, and a fixture is a
+        # gzipped record a human reads a diff of -- twelve copies of a package
+        # list would dominate every one of them. The HASH is here, and the
+        # snapshot itself lives once per distinct hash in `run_environment`;
+        # a fixture whose hash matches a run row's is a fixture whose
+        # environment is fully recoverable from the database.
         "sparse_model": BM25_SPARSE_MODEL_NAME,
         # The File 03 constants the prefix is a function of. A diff caused by
         # editing one of these is a configuration change, not a refactor

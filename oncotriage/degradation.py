@@ -115,6 +115,7 @@ from oncotriage import utils as _utils
 from oncotriage.registries import cancer_code_registry as _cancer_code_registry
 from oncotriage.registries import mesh as _mesh
 from oncotriage.storage import database_logger as _database_logger
+from oncotriage import environment as _environment
 from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage import spend as _spend
 from oncotriage import tracking as _tracking
@@ -272,6 +273,17 @@ _REGISTRY_SPEC = (
      "weights that were actually loaded and every Stage 3 score of this run "
      "was produced at a precision nothing confirmed; a genuine mismatch "
      "raises rather than counting"),
+    ("CROSS_ENCODER_REVISION_DEGRADATIONS",
+     _agent_deps.CROSS_ENCODER_REVISION_DEGRADATIONS,
+     "the loaded cross-encoder did not report which Hub COMMIT it came from, "
+     "so config.CROSS_ENCODER_REVISION went UNVERIFIED against the bytes that "
+     "were actually loaded and every Stage 3 score of this run was produced "
+     "by a checkpoint version nothing confirmed; a genuine mismatch raises "
+     "rather than counting. THE SHIPPED CHECKPOINT CONTRIBUTES EXACTLY ONE "
+     "`unreported:tokenizer.init_kwargs._commit_hash` PER PROCESS, measured, "
+     "which is the tokenizer half being informational and the weights half "
+     "being load-bearing -- so a total of 1 with that key is the healthy "
+     "reading and any `unreported:weights.` key is not"),
     ("DEID_REFUSALS", _deid.DEID_REFUSALS,
      "a rendered patient record carried a direct identifier and the prompt "
      "was NOT sent; keyed by deid.IDENTIFIER_CLASSES and never by the matched "
@@ -488,6 +500,14 @@ _REGISTRY_SPEC = (
      "collection or its point count came back unknown -- so every resume gate "
      "consulted afterwards REFUSED rather than skipping work it could not "
      "vouch for"),
+    ("ENVIRONMENT_DEGRADATIONS", _environment.ENVIRONMENT_DEGRADATIONS,
+     "this run's PROVENANCE could not be fully established -- the resolved "
+     "package list, the git commit, or the image identity of a containerised "
+     "run came back unknown -- so the run rows it wrote cannot answer what "
+     "produced them. IT SAYS NOTHING ABOUT THE NUMBERS, which are as sound as "
+     "any other run's; it says they are less reproducible. Sits directly above "
+     "TRACKING_DEGRADATIONS for that reason and below everything that "
+     "describes the pipeline itself"),
     # LAST, and after EMIT_FAILURES on purpose: it is the only counter here
     # that says nothing about the RUN. Every entry above it describes something
     # that happened to the pipeline; this one says the run was fine and its

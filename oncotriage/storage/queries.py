@@ -2324,9 +2324,16 @@ QUERIES = (
         # three modules away. THAT IS WHY THIS DECLARATION IS DERIVED-CHECKED
         # RATHER THAN TRUSTED: tests/test_storage_schema_guards.py section 1a
         # reads the rendered SQL, and it is what caught this pair.
+        # `runs.cross_encoder_revision` joins them at era 9, on exactly the
+        # same footing and found the same way: it is a RUN_FINGERPRINT_COLUMNS
+        # member as of FINGERPRINT_VERSION 5, so the GENERATED stitch predicate
+        # names it, and the derived-versus-declared check is what reported it
+        # before a pre-era-9 database could. Third time that mechanism has
+        # caught a stamp field widened three modules away.
         requires_columns=(("inferences", "run_id"),
                           ("runs", "campaign_cohort_seed"),
                           ("runs", "campaign_cohort_size"),
+                          ("runs", "cross_encoder_revision"),
                           ("runs", "matching_call_mode"), ("runs", "resumed")),
         notes=(
             "One row per CAMPAIGN, not per run. A campaign that never crashed",

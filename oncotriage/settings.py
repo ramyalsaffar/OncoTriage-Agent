@@ -922,6 +922,72 @@ def resolve_bedrock_region(fallback):
 #------------------------------------------------------------------------------
 
 
+ENV_IMAGE_DIGEST = "ONCOTRIAGE_IMAGE_DIGEST"
+"""The immutable content digest of the image this process is running in.
+
+WHY IT IS AN ENVIRONMENT VARIABLE AND NOT A PROBE. A container cannot read its
+own image digest: the digest is a fact the DAEMON holds, and nothing inside the
+namespace exposes it -- `/etc/hostname` is the container id, `/proc/self/cgroup`
+is the container id, and neither identifies the image those bytes came from.
+Every published answer to "what image am I" is the same answer: whoever starts
+the container tells it. So this is the channel, and a run that was not told
+records that it was not told rather than a plausible substitute.
+
+SET IT AT `docker run` / compose TIME, from `docker image inspect --format
+'{{index .RepoDigests 0}}'`, which is the only value that survives a tag being
+moved onto different bytes.
+
+DELIBERATELY NOT ``_from_env``: that helper appends ``os.sep``, and a digest
+with a trailing slash is a digest that matches nothing and looks like one.
+Seventh victim, after ENV_AIRFLOW_PASSWORD, ENV_INFERENCES_DB,
+ENV_ALLOW_DEGRADED_REGISTRIES, ENV_LOG_LEVEL, ENV_BEDROCK_API_KEY and the two
+Regions.
+"""
+
+ENV_IMAGE_TAG = "ONCOTRIAGE_IMAGE_TAG"
+"""The build tag of the image this process is running in, when no digest was given.
+
+STRICTLY WEAKER THAN THE DIGEST AND RECORDED AS SUCH. A tag is a NAME, and a
+name can be moved onto different bytes without changing -- which is exactly the
+failure `Dockerfile`'s pinned base-image digests exist to prevent one layer
+down. It is accepted because it is what an operator has when they built the
+image locally and never pushed it, and because a weak identity that says it is
+weak is worth more than none. `environment.image_identity()` reports WHICH of
+the two answered, and no reader may treat them as interchangeable.
+
+DELIBERATELY NOT ``_from_env``, for ENV_IMAGE_DIGEST's reason.
+"""
+
+
+def _resolve_image_field(name):
+    """One image-identity variable. Returns the stripped value, or ``None``.
+
+    NEVER RAISES. This runs at run-record time, after a run has been started
+    and before nothing -- there is no operator action gated on it and no cost
+    to continuing without it. An unset or blank value means "nobody told this
+    process what image it is", which `environment.image_identity()` records as
+    a state of its own rather than as a failure.
+    """
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    value = raw.strip()
+    return value or None
+
+
+def resolve_image_digest():
+    """The image digest an operator supplied, or ``None``."""
+    return _resolve_image_field(ENV_IMAGE_DIGEST)
+
+
+def resolve_image_tag():
+    """The image build tag an operator supplied, or ``None``."""
+    return _resolve_image_field(ENV_IMAGE_TAG)
+
+
+#------------------------------------------------------------------------------
+
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """

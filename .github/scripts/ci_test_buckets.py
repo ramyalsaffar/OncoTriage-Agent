@@ -1154,6 +1154,36 @@ BUCKETS = {
         "identifier-shaped fixture value is ASSEMBLED at run time from a "
         "prefix and an arithmetic, and section 11 scans this file with the "
         "scanner it tests to prove it"),
+    "test_run_environment_record.py": (
+        _A, None,
+        "ran green in 2s, 96 checks, against ONLY the provisioned directory "
+        "skeleton: the run environment record (the resolved package list and "
+        "its digest, the git commit and dirty flag, the image identity and "
+        "WHICH channel supplied it, and every configured model identity), its "
+        "storage as eight `runs` columns plus a `run_environment` table keyed "
+        "by the digest, the era-9 migration driven on a FABRICATED pre-era "
+        "database, and the cross-encoder revision pin. No network, no keys, "
+        "no spend, no live Qdrant, no corpus, no live server, no Docker "
+        "daemon. NO MODEL IS LOADED -- ONCOTRIAGE_DEFER_LOCAL_MODELS is set "
+        "above the imports and section 2 asserts torch and transformers never "
+        "enter sys.modules; the revision verifier is a PURE FUNCTION OF ITS "
+        "ARGUMENT, which is the natural control for one, and the two "
+        "from_pretrained pins are checked by ast. IT DOES SPAWN `git` "
+        "(section 1 drives the real git_commit()) and it reads dist-info off "
+        "disk, both inside functions -- and it needs NEITHER: 1n/1o/1p assert "
+        "the CONTRACT (three states, the dirty flag None exactly when the "
+        "commit is UNKNOWN), so a tree with no .git records UNKNOWN and passes "
+        "rather than failing or skipping. Every database is inside a "
+        "tempfile.mkdtemp it removes and asserts gone, with paths._RESOLVED "
+        "seeded and restored so nothing can resolve to the production tree. "
+        "It EXECS NOTHING and loads no module by location -- the one plant is "
+        "an ast walk over an EDITED STRING, which is the right instrument "
+        "because the property it defeats (check 2c) is itself static -- so it "
+        "needs no _EXEC_ALLOWLIST entry. NOT in the collision matrix: the two "
+        "repository files it reads (oncotriage/agent/deps.py, "
+        "oncotriage/environment.py) are written by neither of the suite's two "
+        "writers and are sha256-compared at the end, with a non-degeneracy "
+        "probe that the two hashes differ."),
     "test_degradation_counter_readers.py": (
         _A, None,
         "ran green in 3s, 138 checks, against ONLY the directory skeleton: "

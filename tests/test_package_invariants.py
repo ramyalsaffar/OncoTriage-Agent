@@ -3276,10 +3276,43 @@ check("...and it is a plain positive integer literal, not an expression that "
 
 _model_index = _config_assigns.get("CROSS_ENCODER_MODEL", (None, None))[0]
 _limit_index = _config_assigns.get("CROSS_ENCODER_MAX_LENGTH", (None, None))[0]
-check("...and it is the module-level statement IMMEDIATELY after "
-      "CROSS_ENCODER_MODEL, so a checkpoint edit cannot miss it",
-      (_model_index is not None and _limit_index is not None
-       and _limit_index == _model_index + 1), True)
+_revision_index = _config_assigns.get("CROSS_ENCODER_REVISION",
+                                      (None, None))[0]
+
+# THE BLOCK, NOT THE PAIR, AND THAT IS A WIDENING RATHER THAN A RELAXATION.
+# This was `_limit_index == _model_index + 1` -- the limit is the statement
+# immediately after the name -- and the environment-record pass added a THIRD
+# property of the same checkpoint, its pinned Hub revision, which had to go
+# somewhere. Putting it after the limit would have satisfied the old check and
+# left the new constant reachable only by searching, which is the exact failure
+# the adjacency argument names.
+#
+# So the property asserted is stronger than the one it replaces: the statements
+# following CROSS_ENCODER_MODEL are EXACTLY these two, in this order, with
+# nothing between them and nothing else admitted. A fourth property of the
+# checkpoint fails here and has to be declared, which is the point -- and the
+# ORDER is pinned deliberately (revision, then limit), because the revision
+# says WHICH BYTES and the limit says HOW MUCH OF EACH TRIAL those bytes read:
+# a reader meets the identity before its geometry.
+check("...and CROSS_ENCODER_REVISION and CROSS_ENCODER_MAX_LENGTH are the two "
+      "module-level statements IMMEDIATELY after CROSS_ENCODER_MODEL, in that "
+      "order, so a checkpoint edit cannot miss either",
+      (None not in (_model_index, _revision_index, _limit_index)
+       and _revision_index == _model_index + 1
+       and _limit_index == _model_index + 2), True)
+
+# AND THE REVISION IS A 40-HEX GIT OBJECT ID, not a branch name and not a tag.
+# `revision=` accepts all three, and the two this refuses are exactly the two
+# that can be MOVED onto different bytes -- which is the entire failure the pin
+# exists to close, so accepting one would leave a pin that pins nothing.
+_revision_node = _config_assigns.get("CROSS_ENCODER_REVISION", (None, None))[1]
+_revision_value = (_revision_node.value.value
+                   if isinstance(getattr(_revision_node, "value", None),
+                                 ast.Constant) else None)
+check("...and CROSS_ENCODER_REVISION is a 40-hex commit id literal, never a "
+      "branch or a tag, which could be moved onto different bytes",
+      (isinstance(_revision_value, str) and len(_revision_value) == 40
+       and all(c in "0123456789abcdef" for c in _revision_value)), True)
 
 # EVERY TOKENIZER CALL IN THE PACKAGE IS HANDED THAT NAME. Two sites today --
 # the Stage 3 scorer and the validator's smoke test -- and the second is the

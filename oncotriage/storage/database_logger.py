@@ -229,6 +229,26 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 9: THE `run_environment` TABLE AND THE EIGHT `runs` PROVENANCE COLUMNS,
+#        added together -- one era, one table and eight columns, on era 8's and
+#        era 5's precedent that the number counts SCHEMA CHANGES rather than
+#        objects, and here more strongly than either: an environment hash whose
+#        snapshot is not stored is a key into nothing, and a snapshot with no
+#        run naming it is an orphan. They record WHAT PRODUCED the run, which
+#        the stamp columns do not: `runs.fingerprint_version` and the nine
+#        fields under it say what the pipeline was CONFIGURED to do, and two
+#        runs agreeing on every one of them can still come from two builds of
+#        this project, two resolved dependency sets and two container images.
+#        The columns are `environment_hash` (a 16-hex digest of the resolved
+#        package list, which is the FOREIGN KEY into `run_environment`),
+#        `package_count`, `git_commit`, `git_dirty`, `image_identity`,
+#        `image_identity_source`, `cross_encoder_dtype` and
+#        `cross_encoder_max_length`. `cross_encoder_revision` arrives in the
+#        same commit and is NOT in this list because it is a STAMP field --
+#        RUN_FINGERPRINT_COLUMNS carries it, and `matching_call_mode`'s note
+#        below records why a column can be named by both sources.
+#        All additive, NULL on every existing row and on every run whose caller
+#        passed no environment record, and none backfilled.
 # ERA 8: THE EIGHT `runs` COHORT COLUMNS, added together with
 #        RUN_COLUMN_ADDITIONS and its migration loop -- one era, eight columns,
 #        on era 5's precedent: the number counts schema changes, not columns,
@@ -284,7 +304,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 8
+SCHEMA_USER_VERSION = 9
 
 
 #------------------------------------------------------------------------------
@@ -1681,6 +1701,82 @@ RUN_COLUMN_ADDITIONS = {
     # judge's own artifact to record.
     "judge_sample_seed": "INTEGER",
     "judge_sample_size": "INTEGER",
+    # ── WHAT PRODUCED THIS RUN (era 9) ────────────────────────────────────
+    #
+    # THE QUESTION THEY ANSWER, AND WHY THE STAMP DOES NOT. The ten stamp
+    # columns above say what the pipeline was CONFIGURED to do. Two runs
+    # agreeing on every one of them can still have been produced by two
+    # builds of this project, against two resolved dependency sets, in two
+    # container images, and nothing in this table could tell them apart --
+    # so "why did these two campaigns disagree" had no answer below the
+    # configuration layer. These are that layer.
+    #
+    # NULL MEANS "THIS CALLER RECORDED NO ENVIRONMENT", WHICH IS A VALUE,
+    # exactly as the cohort block above it. Every row written before era 9
+    # is in that class and so is every future caller that passes nothing.
+    #
+    # `environment_hash` IS A FOREIGN KEY INTO `run_environment` AND THE
+    # SNAPSHOT IS NOT HERE. That is the size decision, and it is the same
+    # one the cohort block took for the membership: a resolved package list
+    # is several kilobytes of text that is IDENTICAL across every run of a
+    # campaign, so a column would store one campaign's worth of duplicates
+    # and a reader diffing two runs would still have to diff two blobs
+    # rather than compare two digests. The snapshot lands ONCE PER DISTINCT
+    # HASH in its own table; see RUN_ENVIRONMENT_COLUMNS.
+    #
+    # THE KEY IS UNENFORCED, on `run_id`'s own four-part argument at the
+    # `runs` CREATE TABLE: `PRAGMA foreign_keys` is per CONNECTION and this
+    # module opens only some of the connections that touch this file, so a
+    # constraint honoured by one writer and ignored by six other openers
+    # reads like an invariant and is not one. What replaces it is that the
+    # writer inserts the snapshot row BEFORE the run row, in the same
+    # transaction-free sequence under the same lock -- see
+    # `_store_environment_snapshot`.
+    "environment_hash": "TEXT",
+    # HOW MANY DISTRIBUTIONS THAT HASH COVERS. Denormalised from the
+    # snapshot on purpose and for `cohort_size`'s reason one block up: it is
+    # the number a reader wants in the same row as the hash ("this run saw
+    # 701 packages, that one saw 340"), and getting it any other way is a
+    # join plus a line count over a blob.
+    "package_count": "INTEGER",
+    # THE COMMIT, AND WHETHER THE TREE MATCHED IT. Two columns rather than
+    # one, because a commit identifies the code ONLY if the tree was clean
+    # -- which is the argument `oncotriage/tracking.py` already makes for
+    # its own `git_dirty` tag, promoted here from a tag on an index nobody
+    # queries to a column beside the commit it qualifies. `git_dirty` is
+    # 0/1/NULL on `resumed`'s three-value rule: NULL is "nobody measured
+    # this" (git absent, not a repository), which is a different fact from
+    # a measured clean tree.
+    "git_commit": "TEXT",
+    "git_dirty": "INTEGER",
+    # WHICH IMAGE, AND WHICH CHANNEL SAID SO. The source is a column and not
+    # a prefix on the identity because the two identities are not
+    # interchangeable: a digest names BYTES and a tag names a NAME that can
+    # be moved onto different bytes. A reader that cannot tell them apart
+    # would treat two runs of a re-pushed `:latest` as one build. The
+    # vocabulary is closed at
+    # `oncotriage/environment.py:IMAGE_IDENTITY_SOURCES`, which also records
+    # why a container cannot read its own digest and must be told.
+    "image_identity": "TEXT",
+    "image_identity_source": "TEXT",
+    # THE TWO CROSS-ENCODER PROPERTIES THAT ARE NOT ITS NAME AND NOT ITS
+    # REVISION. Both were added by earlier passes and left out of every
+    # record: the dtype is the arithmetic every Stage 3 score is computed
+    # in, and the max length is how much of each trial the ranker actually
+    # reads. A row naming the checkpoint and its revision but neither of
+    # these names less than it appears to -- two runs of the identical
+    # revision at float32 and bfloat16 rank differently and nothing here
+    # could say so. `cross_encoder_revision` is NOT in this dict because it
+    # is a STAMP field; see `matching_call_mode` above for why a column may
+    # be named by RUN_FINGERPRINT_COLUMNS and by this dict at once, and
+    # RUN_COLUMNS/_last_wins for what reconciles them.
+    "cross_encoder_dtype": "TEXT",
+    "cross_encoder_max_length": "INTEGER",
+    # THE STAMP FIELD THAT ARRIVED IN THE SAME ERA. It is in this dict for
+    # exactly `matching_call_mode`'s reason and it is written from the
+    # FINGERPRINT rather than from the environment record: two orthogonal
+    # facts about one column, and neither implies the other.
+    "cross_encoder_revision": "TEXT",
 }
 
 
@@ -2288,6 +2384,14 @@ RUN_FINGERPRINT_COLUMNS = (
     "data_snapshot_date",
     "campaign_cohort_size",
     "campaign_cohort_seed",
+    # WHICH BYTES RANK THE TRIALS -- the cross-encoder's pinned Hub commit,
+    # gated since FINGERPRINT_VERSION 5. It is here rather than in
+    # RUN_COLUMN_ADDITIONS' era-9 provenance group for `matching_call_mode`'s
+    # reason: this tuple says what a column MEANS and what fills it at the
+    # INSERT, and a gated field is filled from the stamp. It is ALSO in that
+    # dict, because that is what migrates an existing database -- see the
+    # note there.
+    "cross_encoder_revision",
 )
 """The configuration stamp, as columns, in ``run_fingerprint``'s own order.
 
@@ -3362,6 +3466,41 @@ CREATE TABLE IF NOT EXISTS runs (
             cursor.execute(f"ALTER TABLE runs ADD COLUMN {_column} {_sql_type}")
             console.out(f"Schema migration: added runs.{_column}")
 
+    # THE RESOLVED PACKAGE LIST, ONCE PER DISTINCT ENVIRONMENT (era 9).
+    #
+    # WHY A TABLE AND NOT A `runs` COLUMN. The snapshot is a `pip freeze`-shaped
+    # text of every installed distribution -- measured at 701 lines and ~15 kB
+    # on the development machine -- and it is IDENTICAL across every run of a
+    # campaign and usually across every run of a month. A column would store one
+    # copy per run of a blob that changes when somebody upgrades a linter, and
+    # would still leave a reader diffing two blobs rather than comparing two
+    # digests. Keyed by the digest, it is stored once and every run that saw
+    # that environment names it in sixteen characters.
+    #
+    # THE HASH IS THE PRIMARY KEY, WHICH IS WHAT MAKES "ONCE" TRUE BY
+    # CONSTRUCTION rather than by the writer remembering to check. The insert is
+    # `INSERT OR IGNORE`: two runs sharing an environment race to write the same
+    # row and the loser is a no-op, with no read-then-write window between them.
+    #
+    # `captured_at` IS THE FIRST SIGHTING AND NOT THE LATEST, and that follows
+    # from OR IGNORE rather than being chosen: the row is written once and never
+    # updated. It answers "when did this project first run under this
+    # environment", which is the question a row keyed by content can answer at
+    # all; "when did it last" is `MAX(runs.started_at)` over the runs naming it.
+    #
+    # NOT A `drift_metrics`-SHAPED NARROW TABLE. That shape exists so a new
+    # counter needs no migration; here the columns are fixed by what a package
+    # list IS, and one row per package would turn a 15 kB text into 701 rows per
+    # environment for no query anyone asks.
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS run_environment (
+    environment_hash TEXT PRIMARY KEY,
+    captured_at TEXT NOT NULL,
+    package_count INTEGER,
+    package_snapshot TEXT NOT NULL
+)
+''')
+
     # Inferences table
     # candidates_filtered INTEGER is for trials sent to GPT-4o (after quality threshold + cost cap)
     cursor.execute('''
@@ -3804,8 +3943,130 @@ def _run_fingerprint_value(column, fingerprint):
     return str(raw)
 
 
+RUN_ENVIRONMENT_COLUMNS = {
+    "environment_hash":      "environment_hash",
+    "package_count":         "package_count",
+    "git_commit":            "git_commit",
+    "git_dirty":             "git_dirty",
+    "image_identity":        "image_identity",
+    "image_identity_source": "image_identity_source",
+    "cross_encoder_dtype":   "cross_encoder_dtype",
+    "cross_encoder_max_length": "cross_encoder_max_length",
+}
+"""``runs`` column -> the key it is read from an environment record.
+
+A MAPPING EVEN THOUGH EVERY PAIR IS CURRENTLY IDENTICAL, and that is deliberate
+rather than lazy. ``RUN_COHORT_COLUMNS`` next door is a mapping because its two
+vocabularies genuinely differ; this one is a mapping because the two vocabularies
+are ALLOWED to differ -- ``oncotriage/environment.py`` names things after the
+machine and this table names them after a run row -- and a writer that assumed
+they match would have to be rewritten the first time one of them needs a
+qualifier. The translation is DATA, so ``start_run_record`` writes every column
+by walking it and a column added to ``RUN_COLUMN_ADDITIONS`` without an entry
+here fails the "every declared column has a value" guard BY NAME.
+
+THE STORAGE LAYER MAY NOT IMPORT ``oncotriage.environment``, which is why this is
+a dict of strings: that module imports ``oncotriage.embedding``, and a storage
+module reaching sideways for a name inverts the layering the same way importing
+``run_fingerprint`` would. Same arrangement, same round trip closed by a test.
+
+``cross_encoder_revision`` IS NOT IN THIS MAPPING even though the environment
+record carries it. It is a STAMP field, written from the fingerprint by
+``_run_fingerprint_value``; writing it from here as well would be two writers for
+one column that can disagree, and the one that could drift is the one nothing
+gates. The environment record carries it so that ONE dict answers "what ran",
+which is a property of that module's contract rather than of this table's.
+"""
+
+RUN_ENVIRONMENT_INTEGER_COLUMNS = frozenset({
+    "package_count", "git_dirty", "cross_encoder_max_length",
+})
+"""Which provenance columns are numbers, and therefore NULLed when the value is
+not one. ``RUN_FINGERPRINT_INTEGER_COLUMNS``' argument applied to a third group,
+and ``git_dirty`` is the member that needs it most: it arrives as a ``bool``,
+and a bool stored raw is fine while a STRING "True" stored in an INTEGER-affinity
+column orders above every real value and makes ``WHERE git_dirty = 1`` miss it."""
+
+
+def _run_environment_value(column, environment):
+    """One provenance field, coerced for the column it is going into.
+
+    ``environment`` of ``None`` -- every caller that records none, which is all
+    of them but the batch runner -- leaves all eight columns NULL, the "this
+    caller recorded no environment" state.
+
+    ``bool`` IS ACCEPTED FOR THE INTEGER COLUMNS HERE AND REFUSED IN THE TWO
+    SIBLING HELPERS, and the asymmetry is the point rather than an inconsistency.
+    There, a ``True`` reaching ``collection_points`` would be a measurement
+    nobody took wearing the shape of one. Here ``git_dirty`` IS a boolean by
+    nature and ``int(bool)`` is its honest storage -- ``resumed``'s own
+    treatment, one column group over.
+    """
+    if not isinstance(environment, dict):
+        return None
+    raw = environment.get(RUN_ENVIRONMENT_COLUMNS[column])
+    if raw is None:
+        return None
+    if column in RUN_ENVIRONMENT_INTEGER_COLUMNS:
+        if isinstance(raw, bool):
+            return int(raw)
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return None
+    return str(raw)
+
+
+def _store_environment_snapshot(cursor, environment):
+    """Write the resolved package list once per distinct hash. Returns nothing.
+
+    CALLED INSIDE ``start_run_record``'s CONNECTION AND BEFORE ITS INSERT, so
+    the row a ``runs.environment_hash`` points at exists by the time anything
+    can read the run row. There is no window in which a run names a snapshot
+    that is not there.
+
+    ``INSERT OR IGNORE`` ON A PRIMARY KEY, which is what makes "once per hash"
+    a property of the schema rather than of this function remembering to look
+    first. A read-then-write would be a check-then-act race between two
+    processes running the same campaign, and the loser of that race raises
+    ``IntegrityError`` -- which ``_is_retryable`` classes as TERMINAL, so the
+    row would be GIVEN UP ON rather than retried. OR IGNORE has no such window.
+
+    A RECORD WITH NO SNAPSHOT WRITES NOTHING AND IS NOT AN ERROR: it is what
+    ``environment.package_snapshot()`` returning ``None`` produces, the
+    environment hash then reads ``"unknown"``, and a run row pointing at a
+    snapshot nobody could take is honest as long as no row claims otherwise.
+    A hash of ``"unknown"`` is deliberately not stored -- it is not a digest of
+    anything and a table keyed by content must not hold a key that names none.
+    """
+    if not isinstance(environment, dict):
+        return
+    snapshot = environment.get("package_snapshot")
+    env_hash = environment.get("environment_hash")
+    if not snapshot or not env_hash or env_hash == RUN_ENVIRONMENT_UNKNOWN_HASH:
+        return
+    cursor.execute(
+        "INSERT OR IGNORE INTO run_environment "
+        "(environment_hash, captured_at, package_count, package_snapshot) "
+        "VALUES (?, ?, ?, ?)",
+        (str(env_hash), datetime.now().isoformat(),
+         _run_environment_value("package_count", environment), str(snapshot)))
+
+
+RUN_ENVIRONMENT_UNKNOWN_HASH = "unknown"
+"""The value ``environment.snapshot_hash`` returns when there was no snapshot.
+
+RESTATED HERE RATHER THAN IMPORTED, for ``RUN_COHORT_COLUMNS``' layering reason,
+and the round trip is closed by a test exactly as that mapping's is. It is
+checked so that a "hash" that is not a digest of anything never becomes a primary
+key in a table whose whole premise is that its key names its content -- the run
+row still records the string, because "the package list could not be read" is a
+fact worth carrying, and the snapshot table simply has no row for it.
+"""
+
+
 def start_run_record(invocation_source, db_path=None, fingerprint=None,
-                     resumed=None, cohort=None):
+                     resumed=None, cohort=None, environment=None):
     """Open a run row at db_path and return its ``runs.id``.
 
     Args:
@@ -3851,6 +4112,16 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
             ``RUN_COHORT_COLUMNS`` and imports nothing from
             ``oncotriage.evaluation``. The same shape ``fingerprint`` takes one
             argument up, for the same reason.
+        environment: what produced this run, as
+            ``oncotriage/environment.py:current()`` produces it. ``None`` --
+            what every caller that records no provenance passes -- writes NULL
+            to all eight provenance columns and stores no snapshot.
+
+            A DICT AND NOT AN OBJECT, for ``cohort``'s layering reason one
+            argument up. Its one LARGE member, ``package_snapshot``, does not go
+            in the run row: it is written to ``run_environment`` keyed by
+            ``environment_hash``, once per distinct hash, before the run row is
+            inserted. See ``_store_environment_snapshot``.
 
     Returns:
         The integer ``runs.id``. Never ``None``.
@@ -3931,6 +4202,14 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     for _column in RUN_COHORT_COLUMNS:
         values[_column] = _run_cohort_value(_column, cohort)
 
+    # WHAT PRODUCED THIS RUN. `environment` is None for every caller that
+    # records no provenance, and all eight columns are then NULL -- see
+    # RUN_COLUMN_ADDITIONS' era-9 block for why that is a value. Written by
+    # walking the declared mapping, so a column added there is written here
+    # without a second edit, exactly as the cohort loop above.
+    for _column in RUN_ENVIRONMENT_COLUMNS:
+        values[_column] = _run_environment_value(_column, environment)
+
     # EVERY DECLARED COLUMN HAS A VALUE, CHECKED BEFORE THE INSERT.
     #
     # `RUN_COLUMNS` is derived from `RUN_COLUMN_ADDITIONS`, so adding an entry
@@ -3966,6 +4245,12 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
         conn = _open_connection(db_path)
         try:
             cursor = conn.cursor()
+            # THE SNAPSHOT FIRST, THE RUN ROW SECOND, AND BOTH IN ONE COMMIT.
+            # Order, because a run row naming a snapshot that is not there yet
+            # is a dangling reference for however long the window is; one
+            # commit, because the alternative is a snapshot row that survives a
+            # failed run insert and is then a row nothing names.
+            _store_environment_snapshot(cursor, environment)
             cursor.execute(
                 f"INSERT INTO runs ({columns}) VALUES ({placeholders})",
                 tuple(values[c] for c in RUN_COLUMNS))
