@@ -4474,6 +4474,21 @@ _DECORATOR_INVENTORY = {
     # does not.
     "oncotriage/ablation/study.py::exclusive_run_lock":
         ["contextlib.contextmanager"],
+    # The MMR redundancy measurement (oncotriage/evaluation/mmr_redundancy.py).
+    # A MEASUREMENT-ONLY module: it drives Stages 1-4, never Stage 5, and
+    # writes nothing back into the pipeline. The context manager lifts
+    # config.MAX_TRIALS_FOR_EVALUATION for ONE call so the pre-slice pool can be
+    # read, and restores it in a `finally`.
+    #
+    # THE DECORATOR IS WHAT MAKES THE RESTORE UNCONDITIONAL, which is the whole
+    # of its safety argument: strip it and `with unlimited_evaluation_cap():`
+    # raises AttributeError on a bare generator -- loudly, but only for whoever
+    # runs the measurement. Worse, a hand-rolled try/finally that someone
+    # "simplified" it into could leave this process with an UNCAPPED Stage 4 for
+    # every later caller in the same interpreter, which is a silently changed
+    # pipeline rather than a failure. This entry fails in bucket A instead.
+    "oncotriage/evaluation/mmr_redundancy.py::unlimited_evaluation_cap":
+        ["contextlib.contextmanager"],
     "oncotriage/retrieval/indexer.py::get_embeddings_batch._call": [
         "retry(reraise=True, stop=stop_after_attempt(5), "
         "wait=wait_exponential(multiplier=1, min=2, max=60), "

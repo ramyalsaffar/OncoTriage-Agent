@@ -485,6 +485,25 @@ BUCKETS = {
         "Every fixture is a literal dict and every control is a different "
         "INPUT to a pure function -- no network, no keys, no spend, no model "
         "call, no live Qdrant, no corpus, no database, no git history"),
+    "test_mmr_redundancy_measurement.py": (
+        _A, None,
+        "ran green in 1.3s, 66 checks, against ONLY the directory skeleton "
+        "with OPENAI_API_KEY, QDRANT_URL and QDRANT_API_KEY unset -- the "
+        "arithmetic behind the MMR redundancy measurement, and its refusals. "
+        "Every fixture is a fabricated similarity matrix or a synthetic "
+        "corpus summary and every control is a different INPUT to a pure "
+        "function, so no network, no keys, no spend, no live Qdrant, no "
+        "corpus, no database and no git history. NO MODEL IS LOADED: "
+        "ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports and section 8 "
+        "asserts torch and transformers never entered sys.modules. It writes "
+        "NOTHING anywhere, not even a temp directory, so it is NOT in the "
+        "collision matrix -- the one repository file it reads, "
+        "oncotriage/evaluation/mmr_redundancy.py, is written by neither of "
+        "the suite's two writers and is sha256-compared at the end. It EXECS "
+        "NOTHING and loads no module by location, so it needs no "
+        "_EXEC_ALLOWLIST entry: the two module-attribute rebinds (the cap "
+        "context manager, and section 3d's deliberately WRONG patch point) "
+        "are inside try/finally with the restore asserted"),
     "test_agent_rrf_config_ownership.py": (
         _A, None,
         "ran green in 0.8s, 31 checks, against ONLY the directory skeleton and "
