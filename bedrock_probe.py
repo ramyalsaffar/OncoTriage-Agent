@@ -415,6 +415,28 @@ def main(argv=None):
              "Render a real one and point this at it before drawing any "
              "conclusion about A12.")
     parser.add_argument(
+        "--probe-output-tokens", action="store_true",
+        help="bedrock_anthropic only, with --per-trial-prefix-file and one or "
+             "more --per-trial-user-file: issue ONE REAL TRIAL-SHAPED CALL PER "
+             "USER FILE over that shared prefix and report usage.outputTokens "
+             "for each. THIS IS THE MEASUREMENT MATCHING_OUTPUT_TOKENS_PER_"
+             "TRIAL NEEDS AND HAS NEVER HAD ON THIS MODEL: that constant was "
+             "derived on gpt-5.6-terra and is the input to the pre-split "
+             "guard, so on Claude Sonnet 4.6 it is a number nobody measured. "
+             "IT ISSUES NO WARMUP OF ITS OWN -- run it directly after "
+             "--probe-per-trial so the prefix is still inside "
+             "BEDROCK_ANTHROPIC_CACHE_TTL, and read the per-call cacheRead "
+             "figures below to see whether it was.")
+    parser.add_argument(
+        "--per-trial-user-file", action="append", default=None,
+        metavar="PATH",
+        help="bedrock_anthropic only, with --probe-output-tokens: a rendered "
+             "Stage 5 trial USER message, repeatable, one call each. Render "
+             "them with render_per_trial_probe_inputs.py, which writes them "
+             "from a real patient's real kept trials through the real "
+             "de-identified path -- a hand-written stand-in would measure a "
+             "response to a prompt Stage 5 does not send.")
+    parser.add_argument(
         "--max-rpm", type=float, default=10.0,
         help="Requests-per-minute ceiling this probe holds itself under. "
              "DEFAULT 10, WHICH IS THIS ACCOUNT'S MEASURED APPLIED QUOTA for "
@@ -479,6 +501,8 @@ def main(argv=None):
     _CONVERSE_ONLY = (("--probe-truncation", args.probe_truncation),
                       ("--probe-per-trial", args.probe_per_trial),
                       ("--per-trial-prefix-file", args.per_trial_prefix_file),
+                      ("--probe-output-tokens", args.probe_output_tokens),
+                      ("--per-trial-user-file", args.per_trial_user_file),
                       ("--probe-throttle", args.probe_throttle))
     if args.provider != "bedrock_anthropic":
         _misused = [name for name, given in _CONVERSE_ONLY if given]
@@ -491,11 +515,46 @@ def main(argv=None):
                   f"{'' if len(_misused) == 1 else 's'}.")
             print("         Nothing was called. Nothing was billed.")
             return 2
-    if args.per_trial_prefix_file and not args.probe_per_trial:
-        print("REFUSED: --per-trial-prefix-file only has an effect with "
-              "--probe-per-trial, which is the phase that reads it.")
+    # TWO PHASES READ IT NOW, so the refusal names both. Written as a
+    # membership test over the phases rather than as `not A and not B`: a
+    # third reader added to one and not the other is how a flag silently
+    # starts being ignored again.
+    _PREFIX_READERS = (("--probe-per-trial", args.probe_per_trial),
+                       ("--probe-output-tokens", args.probe_output_tokens))
+    if args.per_trial_prefix_file and not any(g for _, g in _PREFIX_READERS):
+        print(f"REFUSED: --per-trial-prefix-file only has an effect with "
+              f"{' or '.join(n for n, _ in _PREFIX_READERS)}, which are the "
+              f"phases that read it.")
         print("         Nothing was called. Nothing was billed.")
         return 2
+    if args.per_trial_user_file and not args.probe_output_tokens:
+        print("REFUSED: --per-trial-user-file only has an effect with "
+              "--probe-output-tokens, which is the phase that reads it.")
+        print("         Nothing was called. Nothing was billed.")
+        return 2
+    # BELOW THE PROVIDER CHECK ON PURPOSE. A wrong --provider is the more
+    # fundamental mistake and has to be the refusal an operator is told first;
+    # reported the other way round, a reader fixes the missing input and meets
+    # the provider refusal on the next run. THE PROVIDER RULE IS NOT RESTATED
+    # HERE EITHER -- `_CONVERSE_ONLY` above owns it for every Converse-only
+    # flag, and a second copy is a second thing to forget.
+    if args.probe_output_tokens:
+        # Both inputs are required and neither has a defensible default:
+        # without a prefix there is no shared cache to read and the
+        # measurement is of a request Stage 5 does not make, and without user
+        # files there is nothing to measure.
+        if not args.per_trial_prefix_file:
+            print("REFUSED: --probe-output-tokens needs "
+                  "--per-trial-prefix-file. Measuring output tokens against "
+                  "this probe's tiny built-in prefix would measure a request "
+                  "Stage 5 never sends.")
+            print("         Nothing was called. Nothing was billed.")
+            return 2
+        if not args.per_trial_user_file:
+            print("REFUSED: --probe-output-tokens needs at least one "
+                  "--per-trial-user-file.")
+            print("         Nothing was called. Nothing was billed.")
+            return 2
 
     global _PACER
     _PACER = _Pacer(args.max_rpm, args.rpm_margin)
@@ -798,6 +857,13 @@ def _probe_bedrock_anthropic(args):
                                  "the Bedrock Converse client")
     if client is None:
         return 1
+    # FREE, AND ABOVE EVERY PAID CALL. See _preflight_sdk_shape for what this
+    # cost to learn. It runs after the client is built because it needs that
+    # client's own service model, and before the pacer's first wait because a
+    # request the SDK cannot express cannot be sent by waiting longer.
+    if not _preflight_sdk_shape(client, kwargs, config):
+        return _summary()
+
     schema = build_response_schema()
 
     raw_responses = []
@@ -1137,10 +1203,409 @@ def _probe_bedrock_anthropic(args):
     # per throttling retry and stops retrying when it drains -- so any cache
     # reading taken after it could have been taken through a request that never
     # reached the service.
+    # BEFORE THE THROTTLE PHASE AND AFTER EVERYTHING ELSE, for the reason
+    # stated above it: the throttle phase provokes 429s on purpose and drains
+    # botocore's retry quota, so a measurement taken after it could have been
+    # taken through requests that never reached the service. It runs after A6
+    # so its own cost is reported separately and cannot be confused with the
+    # baseline calls' -- this phase's per-call output token count is the
+    # finding, and folding it into a total would hide it.
+    if args.probe_output_tokens:
+        _probe_output_tokens(args, config, adapter, client)
+
     if args.probe_throttle:
         _probe_throttle_ceiling(args, config, adapter)
 
     return _summary()
+
+
+# ===========================================================================
+# THE SDK SHAPE PREFLIGHT — FREE, AND IT RUNS ABOVE EVERY PAID CALL
+# ===========================================================================
+
+# THE MINIMUM botocore THAT CAN EXPRESS THIS REQUEST AT ALL. MEASURED
+# 2026-09-03 by bisecting the released wheels and reading each one's
+# `bedrock-runtime/2023-09-30/service-2.json` -- not read off a changelog and
+# not inferred from a release date:
+#
+#     botocore              outputConfig   cachePoint.ttl   usage.cacheDetails
+#     <= 1.42.20                 no              no                no
+#     1.42.21 .. 1.42.41         no             yes               yes
+#     1.42.42 and later         YES             YES               YES
+#
+# So structured output on Converse -- A1, the item the adapter ranks first
+# because its failure makes the branch useless rather than degraded -- is
+# expressible from 1.42.42 and from no earlier release.
+MIN_BOTOCORE_FOR_CONVERSE_REQUEST = (1, 42, 42)
+MIN_BOTOCORE_MEASURED_ON = "2026-09-03"
+
+# Response members the adapter READS. These raise nothing when absent -- the
+# field simply never arrives, `.get` returns None, and the shipped code records
+# 'not_reported' and fails the patient. That is cache-or-nothing working, and
+# from the outside it is indistinguishable from a provider that did not cache.
+# So they are checked separately from the request members and reported as their
+# own finding.
+_RESPONSE_MEMBERS_READ = (("TokenUsage", "cacheReadInputTokens"),
+                          ("TokenUsage", "cacheWriteInputTokens"),
+                          ("TokenUsage", "cacheDetails"))
+
+
+def _botocore_version_tuple():
+    """The installed botocore's version as a tuple, or None if unreadable."""
+    try:
+        import botocore
+        return tuple(int(x) for x in str(botocore.__version__).split(".")[:3])
+    except Exception:                                  # noqa: BLE001
+        return None
+
+
+def _preflight_sdk_shape(client, kwargs, config):
+    """Can the INSTALLED SDK express this request at all? Free. Returns bool.
+
+    WHY THIS EXISTS, AND IT IS THE MOST EXPENSIVE LESSON THIS FILE HAS LEARNED.
+    Run on 2026-09-03 without it, this probe built the adapter's real request,
+    waited out its pacer, called `converse`, and got
+
+        ParamValidationError: Unknown parameter in input: "outputConfig"
+        Unknown parameter in system[1].cachePoint: "ttl"
+
+    -- botocore's OWN validator, refusing locally. Nothing was signed, nothing
+    was sent, nothing was billed. The probe then printed "A ValidationException
+    naming outputConfig is A1", which points a reader at the PROVIDER and at an
+    AWS support case for a request that never left the machine. THE TWO
+    FAILURES ARE OPPOSITE FINDINGS WITH OPPOSITE REMEDIES: a
+    ValidationException from the service means Bedrock refused the shape and
+    the ADAPTER must change; a ParamValidationError from botocore means THIS
+    MACHINE'S SDK PREDATES THE FEATURE and the DEPENDENCY must change. Only one
+    of them is about this project's code.
+
+    IT USES BOTOCORE'S OWN VALIDATOR RATHER THAN A WALK OF ITS SERVICE MODEL.
+    `ParamValidator` is the exact object that raises inside `client.converse`,
+    so running it here cannot disagree with what a real call would do -- which
+    a hand-written "are these keys in the shape" check could, in either
+    direction, and would then be a preflight that passes a request the SDK
+    refuses.
+
+    IT IS bedrock_anthropic ONLY. The Responses branch reaches Bedrock through
+    the OpenAI SDK and has no botocore service model to validate against.
+    """
+    import botocore
+
+    section("SDK PREFLIGHT — can the installed botocore express this request")
+    ver = _botocore_version_tuple()
+    floor = ".".join(str(n) for n in MIN_BOTOCORE_FOR_CONVERSE_REQUEST)
+    print(f"  botocore installed : {botocore.__version__}")
+    print(f"  minimum that can   : {floor}  (measured "
+          f"{MIN_BOTOCORE_MEASURED_ON} by bisecting released wheels; see "
+          f"MIN_BOTOCORE_FOR_CONVERSE_REQUEST)")
+
+    try:
+        from botocore.validate import ParamValidator
+        op = client.meta.service_model.operation_model("Converse")
+        report = ParamValidator().validate(kwargs, op.input_shape)
+        errors = report.generate_report() if report.has_errors() else ""
+    except Exception as exc:                           # noqa: BLE001
+        print(f"  the preflight itself could not run ({type(exc).__name__}: "
+              f"{exc}); falling through to the live call, which is the "
+              f"authority anyway.")
+        return True
+
+    # THE RESPONSE SIDE, WHICH RAISES NOTHING AND IS THEREFORE THE HALF THAT
+    # WOULD OTHERWISE GO UNNOTICED.
+    #
+    # `_shape_resolver._shape_map` IS A BOTOCORE PRIVATE and this is the one
+    # place here that reaches for one. So the failure is a THIRD state rather
+    # than an empty list: `[]` means "checked, nothing missing" and None means
+    # "could not check", and collapsing them would make a renamed botocore
+    # internal read as a clean bill of health -- silence looking like success,
+    # which is the shape this project removes.
+    try:
+        shapes = client.meta.service_model._shape_resolver._shape_map
+        missing_response = [
+            f"{shape}.{member}" for shape, member in _RESPONSE_MEMBERS_READ
+            if member not in (shapes.get(shape, {}).get("members") or {})]
+    except Exception as exc:                           # noqa: BLE001
+        missing_response = None
+        print(f"  the response-model check could not run "
+              f"({type(exc).__name__}: {exc}) -- botocore's shape map is a "
+              f"private and may have moved. NOT reported as clean.")
+
+    if not errors:
+        check_true("the installed botocore can express the adapter's request "
+                   "(botocore's own ParamValidator, run offline)", True)
+        if missing_response:
+            print(f"  BUT the response model is missing {missing_response}. "
+                  f"Those fields raise nothing when absent -- they simply "
+                  f"never arrive -- so a 'not_reported' cache reading below "
+                  f"would be about this SDK and not about the provider.")
+        elif missing_response == []:
+            check_true("...and every response member the adapter reads exists "
+                       "in the model", True)
+        return True
+
+    check("the installed botocore can express the adapter's request",
+          False, True)
+    print("\n  botocore's own validator REFUSES it, offline:\n")
+    for line in errors.strip().splitlines():
+        print(f"    {line}")
+    if missing_response:
+        print(f"\n  ...and the response model is also missing "
+              f"{missing_response}.")
+    print("\n  THIS IS NOT A FINDING ABOUT AMAZON BEDROCK OR ABOUT THIS "
+          "ACCOUNT.")
+    print("  No request was signed and none was sent. The shape the adapter "
+          "builds is")
+    print("  newer than the service model this botocore ships, so EVERY "
+          "Stage 5 call on")
+    print(f"  provider {config.MATCHING_PROVIDER!r} fails here, locally, "
+          f"before the wire.")
+    if ver is None:
+        # THE VERSION COULD NOT BE PARSED, so neither remedy can be asserted.
+        # Saying "at or above the floor" here would be a claim about a number
+        # nobody read.
+        print(f"\n  REMEDY: botocore >= {floor}. The installed version string "
+              f"({botocore.__version__!r}) could not be")
+        print("          parsed, so whether it is below that floor is NOT "
+              "established here --")
+        print("          the refusal above is, and it is the authority.")
+    elif ver < MIN_BOTOCORE_FOR_CONVERSE_REQUEST:
+        print(f"\n  REMEDY: botocore >= {floor}. The installed "
+              f"{botocore.__version__} predates it.")
+        print("          boto3 is pinned in pyproject.toml and botocore is "
+              "NOT, so the floor")
+        print("          has to be stated for botocore itself: a boto3 pin "
+              "alone carries none.")
+    else:
+        print("\n  REMEDY: the installed botocore is at or above the "
+              "measured floor, so this is")
+        print("          a DIFFERENT refusal from the one that floor "
+              "describes. Read the lines")
+        print("          above and fix the request the adapter builds.")
+    print("\n  REFUSING. Nothing was called. Nothing was billed.")
+    return False
+
+
+# ===========================================================================
+# THE PER-TRIAL OUTPUT-TOKEN MEASUREMENT
+# ===========================================================================
+
+def _probe_output_tokens(args, config, adapter, client):
+    """One real trial-shaped call per rendered user message. THE MEASUREMENT.
+
+    WHAT IT ANSWERS. `MATCHING_OUTPUT_TOKENS_PER_TRIAL` is 1,100, derived on
+    gpt-5.6-terra over 27 runs at reasoning_effort='none', and it is the input
+    to Stage 5's pre-split guard. Claude Sonnet 4.6 has never been measured
+    against it, so on the shipped provider that constant is a GUARD CALIBRATED
+    ON ANOTHER MODEL. This issues one call per supplied trial message over one
+    shared prefix and reports `usage.outputTokens` for each.
+
+    WHY THE REQUESTS ARE THE ADAPTER'S AND NOT THIS FILE'S. Every one is built
+    by `adapter.build_converse_request(prefix, user)` -- the same builder the
+    node calls -- so maxTokens is `MATCHING_MAX_TOKENS`, `outputConfig` carries
+    the real schema and the system block carries the real cachePoint. A
+    hand-built request would measure the model's verbosity under a shape Stage
+    5 does not send, which is the number the guard would then be set from.
+
+    NO WARMUP OF ITS OWN, DELIBERATELY. The brief's step 3 is five calls, and a
+    sixth would be a second cache write nobody asked for. It relies on a
+    `--probe-per-trial` run inside `BEDROCK_ANTHROPIC_CACHE_TTL` and REPORTS
+    each call's `cacheReadInputTokens` so a reader can see whether it got one.
+    A zero read costs money and costs the measurement NOTHING: outputTokens is
+    unaffected by whether the input was cached.
+    """
+    from oncotriage.agent.response_schema import (
+        EVALUATIONS_KEY, build_response_schema)
+    from oncotriage.utils import get_model_cost
+
+    section("OUTPUT TOKENS — one real trial-shaped call per rendered message")
+
+    try:
+        prefix = open(args.per_trial_prefix_file, encoding="utf-8").read()
+    except OSError as exc:
+        print(f"  REFUSED: could not read {args.per_trial_prefix_file!r}: "
+              f"{exc}")
+        print("  Nothing extra was called. Nothing extra was billed.")
+        return
+
+    messages = []
+    for path in args.per_trial_user_file:
+        try:
+            messages.append((path, open(path, encoding="utf-8").read()))
+        except OSError as exc:
+            print(f"  REFUSED: could not read {path!r}: {exc}")
+            print("  Nothing extra was called. Nothing extra was billed.")
+            return
+
+    print(f"  prefix   : {args.per_trial_prefix_file!r} "
+          f"({len(prefix):,} chars, "
+          f"~{len(prefix) // config.CHARS_PER_TOKEN:,} tokens)")
+    print(f"  messages : {len(messages)}")
+    print(f"  ceiling  : maxTokens = MATCHING_MAX_TOKENS = "
+          f"{config.MATCHING_MAX_TOKENS:,}")
+    print(f"  the constant under measurement: "
+          f"MATCHING_OUTPUT_TOKENS_PER_TRIAL = "
+          f"{config.MATCHING_OUTPUT_TOKENS_PER_TRIAL:,}")
+
+    schema = build_response_schema()
+    rows = []
+    _first_system = None
+    for i, (path, user) in enumerate(messages, start=1):
+        label = f"message {i}/{len(messages)}"
+        # BUILT INSIDE THE GUARD, not above it. `build_converse_request`
+        # validates its own inputs and raises; outside a handler that raise
+        # would leave this phase with no summary and the run with a traceback
+        # where it owed a recorded failure -- the abort shape this project has
+        # shipped more times than any other.
+        try:
+            kwargs = adapter.build_converse_request(prefix, user)
+        except Exception as exc:                       # noqa: BLE001
+            print(f"\n  --- {label}: {path} ---")
+            print(f"  REFUSED before the call: {type(exc).__name__}: {exc}")
+            _RESULTS["failed"] += 1
+            _FAILURES.append(f"{label} could not be built: "
+                             f"{type(exc).__name__}: {exc}")
+            continue
+        # FREE, AND IT IS THE ONE THING THAT WOULD INVALIDATE EVERY CACHE READ
+        # BELOW: a system block that differs between two calls is a prefix
+        # neither of them shares.
+        if _first_system is None:
+            _first_system = json.dumps(kwargs["system"], sort_keys=True)
+        else:
+            check(f"({label}) carries the SAME system block as the first one "
+                  f"built -- a system block that differs between two calls is "
+                  f"a prefix neither of them shares",
+                  json.dumps(kwargs["system"], sort_keys=True), _first_system)
+
+        print(f"\n  --- {label}: {path} ---")
+        print(f"  user message: {len(user):,} chars")
+        _PACER.wait(label)
+        _t0 = time.monotonic()
+        try:
+            raw = client.converse(**kwargs)
+        except Exception as exc:                       # noqa: BLE001
+            category = adapter.classify_error(exc)
+            print(f"  RAISED  {type(exc).__name__} [{category}]")
+            print(f"          {exc}")
+            print_aws_error(exc)
+            _RESULTS["failed"] += 1
+            _FAILURES.append(f"{label} raised {type(exc).__name__} "
+                             f"[{category}]: {exc}")
+            break
+        latency = time.monotonic() - _t0
+        u = raw.get("usage") or {}
+        derived = adapter._usage_block(u)
+        # THE TRANSLATION CAN RAISE -- the adapter has a whole error category
+        # for it -- and it is the LAST thing that should be able to end this
+        # phase: the call is already paid for and `usage` is already in hand,
+        # so a translation fault must cost the TEXT and not the MEASUREMENT.
+        # outputTokens is read off `u`, never off the translated object.
+        try:
+            translated = adapter.translate_response(raw)
+            text = (translated.choices[0].message.content or "")
+            translation_error = None
+        except Exception as exc:                       # noqa: BLE001
+            text, translation_error = "", f"{type(exc).__name__}: {exc}"
+            print(f"  translate_response RAISED ({translation_error}); the "
+                  f"usage block below is still this call's own.")
+            _RESULTS["failed"] += 1
+            _FAILURES.append(f"{label} could not be translated: "
+                             f"{translation_error}")
+
+        # PARSE VALIDITY, REPORTED IN THE TWO PIECES IT IS MADE OF. A fenced
+        # response is not malformed -- the node strips fences before parsing --
+        # so a fence is recorded and reported rather than counted as a failure,
+        # and the parse is then attempted on the same text the node would have
+        # parsed.
+        fenced = text.strip().startswith("```")
+        body = text.strip()
+        if fenced:
+            body = body.split("```")[1]
+            if body.startswith("json"):
+                body = body[4:]
+        if translation_error is not None:
+            problems, n_evals = [f"not translated: {translation_error}"], None
+        else:
+            try:
+                parsed = json.loads(body)
+                problems = validate_against_schema(parsed, schema)
+                n_evals = (len(parsed.get(EVALUATIONS_KEY) or [])
+                           if isinstance(parsed, dict) else None)
+            except Exception as exc:                   # noqa: BLE001
+                problems, n_evals = [f"json.loads: {exc}"], None
+
+        print(f"  elapsed {latency:.1f}s   stopReason "
+              f"{raw.get('stopReason')!r}")
+        print(f"  outputTokens={u.get('outputTokens')}  "
+              f"inputTokens={u.get('inputTokens')}  "
+              f"cacheRead={u.get('cacheReadInputTokens')}  "
+              f"cacheWrite={u.get('cacheWriteInputTokens')}")
+        check(f"({label}) the response is well-formed under the shipped "
+              f"schema{' (fenced; fence stripped first)' if fenced else ''}",
+              problems, [])
+        rows.append({
+            "path": path,
+            "user_chars": len(user),
+            "output_tokens": u.get("outputTokens"),
+            "input_tokens": u.get("inputTokens"),
+            "cache_read": u.get("cacheReadInputTokens"),
+            "cache_write": u.get("cacheWriteInputTokens"),
+            "prompt_tokens_derived": derived["prompt_tokens"],
+            "stop_reason": raw.get("stopReason"),
+            "latency_s": round(latency, 2),
+            "parsed_ok": problems == [],
+            "fenced": fenced,
+            "translation_error": translation_error,
+            "evaluations": n_evals,
+            "text_chars": len(text),
+        })
+
+    if not rows:
+        print("\n  nothing was measured.")
+        return
+
+    section("OUTPUT TOKENS — the finding")
+    print(f"  {'#':>2} {'user chars':>10} {'outputTokens':>13} "
+          f"{'cacheRead':>10} {'stopReason':>12} {'parsed':>7} {'USD':>9}")
+    print(f"  {'-' * 2} {'-' * 10} {'-' * 13} {'-' * 10} {'-' * 12} "
+          f"{'-' * 7} {'-' * 9}")
+    model = config.matching_wire_model()
+    phase_cost = 0.0
+    for i, r in enumerate(rows, start=1):
+        try:
+            cost = get_model_cost(model, r["prompt_tokens_derived"] or 0,
+                                  r["output_tokens"] or 0)
+        except Exception:                              # noqa: BLE001
+            cost = float("nan")
+        phase_cost += 0.0 if cost != cost else cost
+        print(f"  {i:>2} {r['user_chars']:>10,} {(r['output_tokens'] or 0):>13,} "
+              f"{(r['cache_read'] or 0):>10,} {str(r['stop_reason']):>12} "
+              f"{str(r['parsed_ok']):>7} {cost:>9.4f}")
+
+    observed = [r["output_tokens"] for r in rows
+                if isinstance(r["output_tokens"], int)]
+    if observed:
+        lo, hi = min(observed), max(observed)
+        mean = sum(observed) / len(observed)
+        print(f"\n  n={len(observed)}  min {lo:,}  mean {mean:,.0f}  "
+              f"max {hi:,}  spread {hi - lo:,}")
+        print(f"  MATCHING_OUTPUT_TOKENS_PER_TRIAL is "
+              f"{config.MATCHING_OUTPUT_TOKENS_PER_TRIAL:,}; the measured max "
+              f"is {hi:,} "
+              f"({hi / config.MATCHING_OUTPUT_TOKENS_PER_TRIAL:.2f}x it).")
+        print(f"  the largest measured response used "
+              f"{hi / config.MATCHING_MAX_TOKENS:.4%} of MATCHING_MAX_TOKENS "
+              f"({config.MATCHING_MAX_TOKENS:,}).")
+        # THE CORRELATION THE gpt-5.6-terra CALIBRATION FOUND TO BE ABSENT,
+        # re-asked on this model. Reported, never used to fit anything: five
+        # points cannot support a regression and this file does not pretend
+        # otherwise.
+        print(f"  user-message chars vs outputTokens, in the order supplied: "
+              f"{[(r['user_chars'], r['output_tokens']) for r in rows]}")
+    print(f"\n  THIS PHASE COST ${phase_cost:.4f} at PRICING_CONFIG's "
+          f"uncached rates (an OVER-estimate wherever cacheRead is non-zero).")
+    print("  n IS SMALL AND STATED: five trials of ONE patient. It bounds "
+          "what one verdict costs on this model; it is not a distribution.")
+    return rows
 
 
 # ===========================================================================

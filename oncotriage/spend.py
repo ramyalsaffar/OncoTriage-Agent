@@ -1420,6 +1420,18 @@ BILLED_SITES = {
     "bedrock_probe.py::_probe_throttle_ceiling::_one": (
         DISPOSITION_EXEMPT, None,
         "The probe's throttling measurement. See `bedrock_probe.py::main`."),
+    "bedrock_probe.py::_probe_output_tokens": (
+        DISPOSITION_EXEMPT, None,
+        "THE PER-TRIAL OUTPUT-TOKEN MEASUREMENT, and it is exempt for "
+        "`bedrock_probe.py::main`'s reason with one of its own on top. It is "
+        "behind BOTH `--i-understand-this-bills` and `--probe-output-tokens`, "
+        "it issues exactly one call per `--per-trial-user-file` and refuses "
+        "before any of them when either input is missing, and what it MEASURES "
+        "is `MATCHING_OUTPUT_TOKENS_PER_TRIAL` -- the constant Stage 5's "
+        "pre-split guard is built from, derived on gpt-5.6-terra and never "
+        "measured on the shipped judge. A cap able to refuse it would be a cap "
+        "refusing the measurement that tells an operator how big one verdict "
+        "is."),
 }
 """Every site in this repository that touches a billed provider endpoint, with
 its disposition and the argument for it. CLOSED, and derived-against.
