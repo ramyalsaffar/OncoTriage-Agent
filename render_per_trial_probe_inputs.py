@@ -487,8 +487,37 @@ def main(argv=None) -> int:
     print("\n--- PROJECTED COST, STEPS 2 AND 3 ---")
     projected = project_costs(prefix_tokens, user_tokens)
 
+    # THE ONE FIELD THAT MAKES "HAS THE PIPELINE MOVED UNDER THIS ARTEFACT" A
+    # COMPARISON RATHER THAN AN ARCHAEOLOGY EXERCISE.
+    #
+    # WHAT IT COST TO NOT HAVE IT. The 6b probe pass was told to re-render "only
+    # if the prefix files are absent or the renderer says the pipeline moved" --
+    # and the renderer could not say. `prompt_version` below covers the TEMPLATE
+    # and nothing else, so establishing that the rendered bytes were still
+    # current took a `git log` over the six modules in
+    # `run_fingerprint.RENDERER_MODULES` and an argument about which commits had
+    # touched them. That is a manual derivation a reader can get wrong, and it
+    # gets harder rather than easier as history grows.
+    #
+    # `renderer_digest()` IS EXACTLY THE RIGHT INSTRUMENT AND IT ALREADY EXISTS.
+    # It is the AST-normalised digest of every module that shapes rendered Stage
+    # 5 text -- the same field the resume fingerprint gates on, for the same
+    # reason -- so a prefix rendered under one digest and compared under another
+    # is a prefix whose renderer moved, whatever `prompt_version` says. The two
+    # are NOT redundant: `PROMPT_VERSION` is hand-maintained and this is
+    # derived, which is precisely why the resume gate carries both.
+    #
+    # SCHEMA_VERSION GOES 1 -> 2 WITH IT. A v1 manifest carries no digest, and a
+    # reader must be able to tell "rendered before this field existed" from
+    # "rendered by a renderer that has since changed" -- an absent key read as
+    # a mismatch would condemn every artefact written before today.
+    _renderer_digest = __import__(
+        "oncotriage.run_fingerprint", fromlist=["renderer_digest"]
+    ).renderer_digest()
+
     index = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "renderer_digest": _renderer_digest,
         "patient_stem": stem,
         "patient_selection": how,
         "prefix_file": ARTEFACT_PREFIX,
