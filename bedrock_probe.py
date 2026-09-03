@@ -1416,9 +1416,15 @@ def _probe_output_tokens(args, config, adapter, client):
     reasoning_effort='none' -- a guard calibrated on a model the shipped
     provider does not call. THIS PHASE IS WHAT RE-DERIVED IT: run on
     2026-09-03 over eight real trial blocks of one real patient, it measured a
-    maximum of 1,356 output tokens per verdict and the constant is now 1,450.
-    The table, the window the value was chosen from and what the run did NOT
-    settle are all at the constant in `oncotriage/config.py`.
+    maximum of 1,356 output tokens per verdict and the constant became 1,450.
+    IT IS 2,500 NOW, and the correction is worth reading before trusting this
+    phase's n: the empty-verdict investigation of the same day resent ONE of
+    those eight trials twelve times and measured 2,234 -- 1.65x this phase's
+    maximum, from the SAME judge on the SAME prefix. Eight calls over eight
+    trials is a wide sample of INPUTS and a sample of one per input; twelve
+    calls over one input is the reverse, and the tail this phase could not see
+    is the one that moved the constant. Both tables, and the reason the value
+    is marked INTERIM, are at the constant in `oncotriage/config.py`.
 
     IT IS NOT A ONE-OFF. The constant's own block says to re-derive it whenever
     the model, the provider or the thinking/effort configuration changes, and

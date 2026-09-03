@@ -1055,6 +1055,182 @@ which is the opposite of what this sentence said while grouped was the default.
 """
 
 
+# ---------------------------------------------------------------------------
+# THE EMPTY-VERDICT RETRY: a reply that PARSED and carried nothing
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS IS ABOUT, AND IT IS NOT A FAILURE OF ANYTHING THIS FILE ALREADY
+# HANDLES. The judge can return ``{"evaluations": []}``: well-formed under
+# ``build_response_schema()``, which puts no ``minItems`` on the array;
+# ``stopReason`` ``end_turn``; 20 to 30 output tokens against a 32,000 ceiling.
+# It is not a refusal, not a truncation, not malformed JSON and not a non-list
+# body -- every one of those has its own branch above and its own budget, and
+# none of them fires. The response is simply empty, so the reconciliation at the
+# end of this node finds the trial has no entry and records it
+# ``omitted_from_model_response``. ``MAX_LLM_CLASSIFIER_RETRIES`` does NOT cover
+# it: that budget fires on a parse failure, and this parses.
+#
+# WHY IT IS WORTH A SECOND ASK, MEASURED RATHER THAN ASSUMED. The 2026-09-03
+# empty-verdict investigation resent the byte-identical call ten times and got
+# ten clean verdicts -- 0/10 -- so the condition is a stochastic
+# constrained-decoding degeneracy at the first array-element decision point and
+# NOT a property of the input. Halving the trial's criteria changed nothing, and
+# the same trial bytes under a different patient prefix answered cleanly. On the
+# one hard pair it was seen on the rate is 2/12, 16.7%, Wilson 95% CI
+# [4.7%, 44.8%], so one retry recovers ~83% of occurrences. Under the previous
+# belief -- deterministic, input-driven -- a retry was pure waste; that belief
+# is disproven.
+#
+# WHY EXACTLY ONE. The marginal recovery of a second retry at p ~ 0.17 is ~3%,
+# and two empty replies on one pair is evidence the pair is genuinely hard, at
+# which point ``not_evaluable`` is the honest record. The budget is
+# ``config.MATCHING_PER_TRIAL_EMPTY_RETRIES``, which accepts 0 or 1 and nothing
+# else; 0 leaves the behaviour that shipped, verbatim.
+#
+# WHY IT IS NOT THE PARSE-RETRY BUDGET, AND MUST NOT BECOME IT.
+# ``MAX_LLM_CLASSIFIER_RETRIES`` re-enters the WHOLE NODE -- every trial of the
+# patient, at N billed calls a time. This is one call for one trial. Sharing the
+# budget would either fail a patient for a defect in one trial's decoding or
+# re-bill fourteen trials to recover one, and ``retry_count`` is deliberately
+# left unincremented for exactly the reason the refusal branch states.
+#
+# THE SELECTION BIAS IS REAL, IS ARGUED IN BOTH DIRECTIONS IN THE INVESTIGATION
+# NOTE, AND IS WHAT THE RECORD IS FOR. Retrying only the calls that returned
+# nothing resamples a non-random subset -- the pairs the judge found hardest --
+# and nothing re-examines the calls that answered badly. Not retrying is also a
+# selection rule and a worse-founded one: it drops those pairs from the
+# denominator entirely, and on the pair measured the model, when it speaks,
+# states a true and quotable disqualifier 12 times out of 12. So the no-retry
+# policy discards ``not_eligible`` verdicts and keeps ``eligible`` ones, which
+# biases a campaign toward over-reporting eligibility. The two biases are not
+# symmetric in AUDITABILITY, and that asymmetry is the whole argument: a
+# recovered verdict can be EXCLUDED from any first-pass-only statistic, and a
+# dropped verdict cannot be recovered after the campaign. Which is why the
+# retry's own ledger row carries EMPTY_RETRY_OF_FIELD and every verdict it
+# produced carries that row's ``call_index``, so
+# ``trial_matches.call_index`` joins a recovered verdict to the fact that it was
+# recovered, with no new column and no new vocabulary.
+
+EMPTY_RETRY_OF_FIELD = "empty_retry_of"
+"""The ledger key naming the call this one is the empty-verdict retry OF.
+
+PRESENT ON THE RETRY'S ROW AND ON NO OTHER, which is the absent-rather-than-
+empty convention ``warmup`` and ``unconsumed`` already follow in the same
+ledger: a row without it is an ordinary call, and a reader does not have to
+distinguish "not a retry" from "a retry of nothing".
+
+ITS VALUE IS THE 1-BASED ``call_index`` OF THE EMPTY FIRST ATTEMPT, so the two
+rows join to each other inside one ``llm_classifier_call_details`` list. The
+first attempt's row is UNCHANGED and stays in the ledger carrying
+``entries_emitted: 0`` -- it was issued and billed, and deleting or amending it
+would understate what the patient cost.
+"""
+
+EMPTY_RETRY_DECISION_QUEUED = "retry_queued"
+EMPTY_RETRY_DECISION_DISABLED = "retry_disabled"
+EMPTY_RETRY_DECISIONS = (EMPTY_RETRY_DECISION_QUEUED,
+                         EMPTY_RETRY_DECISION_DISABLED)
+"""Closed. What this node DECIDED to do about an empty first attempt.
+
+The decision, not the outcome, and the two are counted apart on purpose: the
+decision is known at the moment the empty reply is read, so keying on it keeps
+``PER_TRIAL_EMPTY_FIRST_ATTEMPTS`` to exactly one increment per event and
+therefore keeps its TOTAL an honest count of the phenomenon -- which is the
+number ``run_metrics`` persists. What the retry then DID is the other two
+counters' subject.
+"""
+
+
+PER_TRIAL_EMPTY_FIRST_ATTEMPTS = Counter()
+"""A per-trial call whose reply PARSED to an empty list, keyed by the decision.
+
+THE TOTAL IS THE PHENOMENON'S RATE, which is the number nobody has: the
+investigation measured 2/12 on ONE (prefix, trial) pair and could not give a
+population rate at n = 20. A campaign's own total, read against its
+``candidates_evaluated``, is that measurement.
+
+ONE INCREMENT PER EMPTY FIRST ATTEMPT, at the moment the empty reply is read,
+keyed by ``EMPTY_RETRY_DECISIONS``. It is NOT keyed by the retry's outcome:
+that is not known here, and counting the same event again later would make the
+total -- the one figure ``run_metrics`` keeps -- a number of nothing.
+
+A RETRY'S OWN EMPTY REPLY DOES NOT LAND HERE. It is a second attempt, and
+``PER_TRIAL_EMPTY_AFTER_RETRY`` is its counter; without that separation the
+total would double-count the pairs this mechanism failed to recover.
+
+IT IS A DEGRADATION AND NOT A CENSUS: a trial the judge answered with nothing
+is a verdict the campaign paid for and did not get, whether or not a retry
+recovered it.
+
+INCREMENTED ON THE NODE THREAD ONLY, on PER_TRIAL_CALL_FAILURES' footing.
+"""
+
+
+PER_TRIAL_EMPTY_AFTER_RETRY = Counter()
+"""A per-trial RETRY whose reply parsed to an empty list too, keyed by model.
+
+THE TOTAL IS WHAT THE MECHANISM DID NOT RECOVER. Every one of these trials is
+recorded ``omitted_from_model_response`` by the reconciliation, exactly as it
+would have been with no retry at all -- the retry buys the chance, not the
+outcome, and this is the count of the times the chance did not pay.
+
+READ IT AGAINST ``PER_TRIAL_EMPTY_FIRST_ATTEMPTS[retry_queued]`` AND
+``PER_TRIAL_EMPTY_RETRY_RECOVERIES``. Those three are the campaign's own
+estimate of p, which is the figure that decides whether one retry is the right
+budget -- at the RUN-END REPORT, where all three are printed. Only the two
+degradation counters reach ``run_metrics``; see the recoveries counter for why,
+and for the durable route to the third. They do not sum: a queued retry can also be declined by the shutdown or
+spend gate, or raise, and those are ``STAGE5_SHUTDOWN_SKIPS``,
+``spend.SPEND_GATE_SKIPS`` and ``PER_TRIAL_CALL_FAILURES`` respectively -- no
+new vocabulary was invented for states that already have one.
+
+KEYED BY THE ANSWERING MODEL rather than by the nct_id. The key space of a
+counter reaches the run-end console block, and one key per trial would be up to
+MAX_TRIALS_FOR_EVALUATION keys per patient over a campaign; the model is
+bounded, and WHICH trial is in the log line and in the record.
+
+INCREMENTED ON THE NODE THREAD ONLY, on PER_TRIAL_CALL_FAILURES' footing.
+"""
+
+
+PER_TRIAL_EMPTY_RETRY_RECOVERIES = Counter()
+"""A per-trial retry that came back WITH verdicts, keyed by the answering model.
+
+NOT A DEGRADATION, AND THAT IS WHY IT IS IN ``oncotriage/degradation.py``'s
+CENSUS rather than in its registry -- ``TEMPORAL_CONFLICT_RESOLVED_MARKERS``'
+argument, applied here. A recovery is the mechanism WORKING: a verdict the
+campaign would have lost and did not.
+
+IT IS COUNTED RATHER THAN SUBTRACTED, and that is the point of it existing at
+all. Recoveries are NOT ``queued - after_retry``: a queued retry can be declined
+by a gate or raise in transport, so the subtraction is wrong by exactly the
+number of those, silently. The investigation note's second condition for
+adopting a retry at all is "count both the attempts and the recoveries"; this is
+the second half.
+
+WHAT A RECOVERED VERDICT LOOKS LIKE IN THE RECORD, because a statistic that
+needs first-pass-only data has to be able to exclude it: the verdict carries the
+RETRY's ``call_index``, and that call's row in
+``inferences.llm_classifier_call_details`` carries ``empty_retry_of``. So
+``trial_matches.call_index`` joined against that list identifies every recovered
+verdict, with no new column.
+
+THIS COUNTER IS PRINTED AND NOT PERSISTED, AND THAT ASYMMETRY IS STATED RATHER
+THAN LEFT TO BE FOUND. ``RUN_METRIC_CATEGORIES`` is CLOSED at ``degradation``
+and ``meta``, so ``run_metrics`` carries the two counters above and NOT this
+one -- a census row would need a third category the three ``runs`` queries and
+the Run Health tab do not know, and folding a recovery into the degradation
+registry to gain durability would report the mechanism WORKING as a fault and
+inflate the ``counters_nonzero`` those consumers read as "this run degraded".
+
+SO THE DURABLE ANSWER IS THE JOIN, NOT THIS COUNTER. Recoveries are recoverable
+from the database for the life of the campaign through ``empty_retry_of``, as
+above; this is the convenient reading an operator gets at the end of a run,
+beside the two totals it has to be read against. A reader who needs the number
+after the fact takes it from the ledger.
+"""
+
+
 PER_TRIAL_WARMUP_DEGRADATIONS = Counter()
 """The per-trial cache warmup did not do its job, keyed by what happened.
 
@@ -1468,7 +1644,27 @@ class Stage5SpendStopped(Stage5ShutdownRequested):
     two counters exist to keep apart. What is shared is the HANDLING, which is
     identical, and the alternative was two exception classes with two identical
     handling branches kept in step by hand.
+
+    ``limit`` IS THE ONE THING A CALLER MAY BRANCH ON, and it is an attribute
+    rather than a sentence in the message because branching on prose is not
+    branching. It is a ``spend.SPEND_LIMITS`` member -- the CAP, which is a
+    threshold a healthy run can cross, or the CALL CEILING, which is a defect
+    report about one invocation. The empty-verdict retry's handler is the caller
+    that needs the difference: a retry the CAP declined leaves the first
+    attempt's already-paid-for result standing, and a retry the CEILING declined
+    does not, because the ceiling firing means this invocation issued more
+    billed calls than its configuration can produce and a patient completed on
+    the strength of that is a patient checkpointed over a defect.
+
+    ``None`` IS A REACHABLE VALUE AND MEANS "NOT STATED", for a caller that
+    constructs this class without one -- a test stand-in, or a future gate. Such
+    a caller gets the conservative handling, which is the fall-through that
+    fails the patient.
     """
+
+    def __init__(self, message, limit=None):
+        super().__init__(message)
+        self.limit = limit
 
 
 def _spend_gate(phase, counter, *, where, count=None):
@@ -1541,7 +1737,8 @@ def _spend_gate(phase, counter, *, where, count=None):
         return Stage5SpendStopped(
             f"the request was not issued: the campaign has spent "
             f"${spend.active_spend(spend.SPEND_SOURCE_STAGE5):.2f} and "
-            f"config.SPEND_CAP_USD is the limit")
+            f"config.SPEND_CAP_USD is the limit",
+            limit=spend.SPEND_LIMIT_CAP)
     _granted, _first = counter.take()
     if not _granted:
         spend.SPEND_GATE_SKIPS[
@@ -1574,7 +1771,8 @@ def _spend_gate(phase, counter, *, where, count=None):
         return Stage5SpendStopped(
             f"the request was not issued: this Stage 5 invocation has already "
             f"issued {counter.issued} billed calls, which is the ceiling "
-            f"call mode {counter.call_mode!r} permits")
+            f"call mode {counter.call_mode!r} permits",
+            limit=spend.SPEND_LIMIT_CALL_CEILING)
     return None
 
 
@@ -2647,12 +2845,24 @@ def estimate_output_tokens(trials: List[Dict]) -> int:
 
     with a residual standard deviation of 1,935 tokens, identical to the
     trial-count-only model. The criteria-length term is negative, negligible,
-    and carries no signal. That is not what one would assume: the response is
-    one verdict block per trial with a bounded number of criteria in it, so a
-    trial with 4,000 characters of criteria costs about the same to answer as
-    one with 800. The estimate is therefore linear in trial count alone, and
-    the CHARS_PER_TOKEN proxy is applied to the criteria only as a tie-breaker
-    for pathological inputs, not as a driver.
+    and carries no signal. The estimate is therefore linear in trial count
+    alone, and the CHARS_PER_TOKEN proxy is applied to the criteria only as a
+    tie-breaker for pathological inputs, not as a driver.
+
+    THE SENTENCE THAT USED TO FOLLOW IS WITHDRAWN, and it is left named rather
+    than deleted because the estimate still rests on the half of it that
+    survives. It read: "a trial with 4,000 characters of criteria costs about
+    the same to answer as one with 800". The 2026-09-03 empty-verdict
+    investigation measured a 31-criterion trial that ANSWERED -- 19 to 24
+    inclusion rows and 10 to 13 exclusion rows per verdict, 1,565 to 2,234
+    output tokens -- against 269 to 1,356 for the 2 to 19-criterion trials the
+    fit above was drawn from. Output scales with criterion COUNT, which no
+    point in the calibration set exercised. What survives is the CHARACTER-
+    length claim: halving that same trial's criteria TEXT at a criteria
+    boundary changed nothing detectable. So trial count remains the driver and
+    the character term remains a capped tie-breaker, and the term this estimate
+    does not have is a per-trial CRITERION count -- named here rather than
+    invented, because adding it is a recalibration and not a comment.
 
     Returns the estimated output tokens for this batch.
     """
@@ -5283,6 +5493,26 @@ CLINICAL TRIALS:
         return tuple(t["trial"]["nct_id"] for t in chunk_)
 
     _prefetched = None
+    # ── THE EMPTY-VERDICT RETRY'S ONE PIECE OF STATE ──────────────────────
+    #
+    # ``_chunk_key(chunk) -> the 1-based call_index of the empty first
+    # attempt``. It answers two questions with one entry and that is why it is a
+    # dict and not a set: "has this trial already been asked again" (the
+    # at-most-once guard, which is membership) and "which call is this retry a
+    # retry OF" (the ledger field, which is the value).
+    #
+    # KEYED BY ``_chunk_key`` AND THEREFORE SAFE ONLY BECAUSE THE KEY IS
+    # UNIQUE. Per-trial dispatch refuses a batch carrying one nct_id twice --
+    # PackingBlockMismatchError, above, before a cent is spent -- so one key
+    # names one trial. Nothing writes to this dict outside per-trial mode, so in
+    # grouped mode it stays empty and the two reads below are a `.get` and a
+    # membership test against `{}`.
+    #
+    # NOT A COUNT. ``config.MATCHING_PER_TRIAL_EMPTY_RETRIES`` accepts 0 or 1
+    # and refuses anything else at import precisely so that this can be a
+    # boolean question; a larger budget would need a per-chunk counter and an
+    # argument nobody has made for attempt 3.
+    _empty_retry_of = {}
     # The warmup's transport failure, when there was one. Not a boolean: the
     # floor below names the exception type and message in the error string it
     # hands the retry router, exactly as the grouped path does for a raised
@@ -5409,9 +5639,17 @@ CLINICAL TRIALS:
         # keys unique, every dispatched chunk is filed and popped exactly once,
         # and every per-trial chunk is a SINGLETON -- which the reactive
         # splitter refuses to halve (`len(chunk) == 1` is its floor, above the
-        # split). So no chunk `_obtain` has not already got a response for can
-        # ever reach it in this mode. tests/test_agent_stage5_per_trial_calls.py
+        # split). So the SPLITTER can never hand `_obtain` a chunk it has no
+        # response for in this mode. tests/test_agent_stage5_per_trial_calls.py
         # section 2b asserts that rather than leaving it as reasoning.
+        #
+        # THAT IS NOW A CLAIM ABOUT THE SPLITTER AND NOT ABOUT THE LOOP, and
+        # the narrowing is deliberate: the empty-verdict retry re-queues a chunk
+        # whose prefetched entry has already been POPPED, so it reaches
+        # `_obtain` with nothing filed and is issued live -- on purpose, so that
+        # the shutdown gate, the spend gate and the ledger apply to it exactly
+        # as they do to any billed call. `_empty_retry_of` bounds how often that
+        # can happen at one per trial.
         _dispatch_keys = [_chunk_key(_c) for _c in _dispatch_order]
         if len(set(_dispatch_keys)) != len(_dispatch_keys):
             _dupes = sorted(_id for _k, _n in Counter(_dispatch_keys).items()
@@ -6019,7 +6257,28 @@ CLINICAL TRIALS:
                                where="a Stage 5 send loop", count=len(chunk))
         if _refusal is not None:
             raise _refusal
-        _live = call_matching_model(system_prompt, _user_prompt_for(chunk))
+        # ── THE ROUTING HINT TRAVELS WITH A LIVE PER-TRIAL CALL ───────────
+        #
+        # `_cache_key` OR NOTHING, and the "or nothing" is what makes this line
+        # identical to the one it replaced in grouped mode: that key is None on
+        # every path but per-trial dispatch (see `per_trial_prompt_cache_key`),
+        # and `call_matching_model` expands an absent key into no wire field at
+        # all -- so the grouped request is byte-identical to what it was before
+        # this argument existed.
+        #
+        # WHY IT MATTERS FOR THE LIVE PATH, WHICH IS NEW. Until the
+        # empty-verdict retry there WAS no live per-trial call: every wave
+        # request went through `_issue`, which passes the key. A retry issued
+        # here without it asks the provider to route a request that shares
+        # 9,281 tokens of prefix with the wave WITHOUT the hint that says so --
+        # which is the difference between a cache read and a full-price input
+        # on the very call the mechanism exists to make cheap, and it would
+        # show up as nothing but a zero in `cached_tokens`. Passing it is also
+        # what makes the retry the IDENTICAL request the design says it is:
+        # tests/test_agent_stage5_per_trial_calls.py section 7b compares the
+        # two requests as bytes rather than taking that on trust.
+        _live = call_matching_model(system_prompt, _user_prompt_for(chunk),
+                                    prompt_cache_key=_cache_key)
         _charge_spend(_live)
         return _live
 
@@ -6285,6 +6544,63 @@ CLINICAL TRIALS:
             # below fails the patient instead, which is what the batch
             # checkpoint, the retry router and `runs.status` already know how
             # to handle. See the exception's own docstring.
+            # ── A DECLINED EMPTY-VERDICT RETRY IS NOT A LOST TRIAL ─────────
+            #
+            # THE ONE NARROW EXCEPTION TO THE PARAGRAPH BELOW, and it is narrow
+            # in three ways at once: per-trial mode, a chunk that already has an
+            # entry in `_empty_retry_of` (so it can only be a retry -- the
+            # marker is written after a FIRST attempt returned), and a refusal
+            # by the shutdown gate or the spend CAP.
+            #
+            # WHY IT DOES NOT FAIL THE PATIENT. The c33 argument that
+            # `Stage5ShutdownRequested` must not be isolated is about trials
+            # that were NEVER JUDGED: isolating those completes a patient whose
+            # cohort has a hole, `_on_done` checkpoints it, and a resume skips
+            # it forever. This trial WAS asked and DID answer -- with an empty
+            # array, which before this mechanism existed was the end of the
+            # matter and is still the outcome the reconciliation records. So
+            # letting the first attempt stand restores EXACTLY the behaviour of
+            # a pipeline with no retry at all, and failing the patient instead
+            # would make a run WORSE for having a recovery mechanism it could
+            # not use. A patient is not failed for declining an enhancement.
+            #
+            # IT IS ALSO WHAT THIS ARM ALREADY DID. Every other per-trial
+            # response is prefetched, so a shutdown arriving mid-loop declines
+            # nothing and the patient completes; before the retry existed there
+            # was no live call in this loop for a gate to refuse at all.
+            #
+            # THE CALL CEILING IS DELIBERATELY EXCLUDED. It is a DEFECT report
+            # -- this invocation asked for more billed calls than its
+            # configuration can produce -- and it latches the run. Completing a
+            # patient on the strength of one checkpoints it over a defect, so
+            # that case falls through and fails the patient, which is what it
+            # did before. `Stage5SpendStopped.limit` is how the two are told
+            # apart; a shutdown carries no limit and is covered by the first
+            # disjunct.
+            #
+            # NOTHING IS COUNTED HERE THAT IS NOT ALREADY COUNTED. `_obtain`'s
+            # own gates have already incremented `STAGE5_SHUTDOWN_SKIPS` under
+            # `send:` or `spend.SPEND_GATE_SKIPS` under the same phase, with
+            # their own log lines, and `PER_TRIAL_EMPTY_FIRST_ATTEMPTS` already
+            # holds this event under `retry_queued`. Inventing a fourth key for
+            # a state three counters describe is what the WARMUP_SOURCE
+            # vocabulary's own note warns against; what is added is a line
+            # saying which trial's first attempt now stands.
+            if (_per_trial_calls
+                    and isinstance(e, Stage5ShutdownRequested)
+                    and _chunk_key(chunk) in _empty_retry_of
+                    and getattr(e, "limit", None)
+                    != spend.SPEND_LIMIT_CALL_CEILING):
+                log.warning(
+                    "the empty-verdict retry was not issued; the first "
+                    "attempt's empty response stands and the trial is "
+                    "recorded as not evaluable, exactly as it would have been "
+                    "with no retry at all", stage=5, status="stopped",
+                    event="per_trial_empty_verdict_retry_declined",
+                    error_type=type(e).__name__,
+                    empty_retry_of=_empty_retry_of[_chunk_key(chunk)],
+                    nct_id=chunk[0]["trial"]["nct_id"], degraded=True)
+                continue
             if _per_trial_calls and not isinstance(e, Stage5ShutdownRequested):
                 PER_TRIAL_CALL_FAILURES[type(e).__name__] += 1
                 per_trial_failed_calls += 1
@@ -6309,12 +6625,17 @@ CLINICAL TRIALS:
             # nothing to account.
             #
             # WHAT IT ACTUALLY FOLDS TODAY, MEASURED RATHER THAN CLAIMED: only
-            # skips, which carry no usage object and contribute no tokens. Pop
-            # order IS dispatch order in this mode (`pending` is a LIFO seeded
-            # reversed, and a singleton chunk cannot split), and a shutdown
-            # declines a SUFFIX of the dispatch order -- so every PAID response
-            # has already been popped and counted by the loop before the first
-            # declined one is reached. The fold is not therefore decoration:
+            # skips, which carry no usage object and contribute no tokens. Every
+            # PREFETCHED response is popped in dispatch order (`pending` is a
+            # LIFO seeded reversed, and a singleton chunk cannot split), and a
+            # shutdown declines a SUFFIX of that order -- so every PAID
+            # prefetched response has already been popped and counted by the
+            # loop before the first declined one is reached. An empty-verdict
+            # retry re-queues a chunk and so pops it TWICE, which does not
+            # disturb that: it is appended to the end of the LIFO and popped
+            # immediately, before any chunk it did not already precede, and its
+            # own prefetched entry was consumed by the first pop -- so it never
+            # files into `_prefetched` and never appears here. The fold is not therefore decoration:
             # `_account_unconsumed` is what decides those entries contribute
             # nothing, and without the call they would simply be dropped -- the
             # same outcome by accident rather than by decision, and one that
@@ -6532,6 +6853,22 @@ CLINICAL TRIALS:
             "finish_reason": getattr(choice, "finish_reason", None),
             "entries_emitted": None,
         }
+        # ── AND, IF THIS CALL IS AN EMPTY-VERDICT RETRY, WHOSE ───────────
+        #
+        # WRITTEN AFTER THE LITERAL RATHER THAN INSIDE IT, so the key is ABSENT
+        # on an ordinary call rather than present and None -- the convention
+        # `warmup` and `unconsumed` already follow in this same ledger, and the
+        # one that lets a reader test presence instead of distinguishing "not a
+        # retry" from "a retry of nothing".
+        #
+        # THE READ IS UNCONDITIONAL AND IS SAFE IN BOTH ARMS: nothing writes
+        # `_empty_retry_of` outside per-trial mode, so in grouped mode this is a
+        # `.get` against an empty dict. It is placed BEFORE the append only so
+        # the row is complete when it enters the list; the row is held by
+        # reference either way.
+        _retry_of = _empty_retry_of.get(_chunk_key(chunk))
+        if _retry_of is not None:
+            _this_call[EMPTY_RETRY_OF_FIELD] = _retry_of
         call_details.append(_this_call)
 
         # ── The model declined ─────────────────────────────────────────────
@@ -6907,6 +7244,126 @@ CLINICAL TRIALS:
         # one row per billed call and this is a field of that row rather than a
         # second parallel list to keep in step.
         _this_call["entries_emitted"] = len(parsed)
+
+        # ── THE MODEL ANSWERED, AND ANSWERED WITH NOTHING ──────────────────
+        #
+        # THE CONDITION IS EXACTLY "THE PARSE SUCCEEDED AND THE LIST IS EMPTY",
+        # and the placement is what makes that true rather than approximately
+        # true. Every other shape has already left this iteration: an API error
+        # raised into the `except` above, a refusal returned, a truncation
+        # `continue`d into the splitter or the floor, malformed JSON returned,
+        # a non-list body returned. Reaching this line means `parsed` is a list;
+        # `not parsed` means it is empty. None of the other shapes can be
+        # mistaken for this one and none of their budgets is spent here --
+        # `retry_count` is untouched, `truncation_splits` is untouched, and
+        # `_empty_retry_of` is a budget of its own.
+        #
+        # PER-TRIAL ONLY. In grouped mode an empty array is a whole CHUNK's
+        # worth of trials unanswered, the re-ask would be a multi-trial request,
+        # and the arm is the dormant comparison arm whose behaviour this pass
+        # may not move. The reconciliation records those trials exactly as it
+        # did before.
+        #
+        # AT MOST ONCE PER TRIAL, and the guard is membership in
+        # `_empty_retry_of` rather than a flag on the chunk: the chunk is a list
+        # this function built and the dict is keyed by content, so a retry that
+        # came back empty finds its own entry and falls through to the code
+        # below -- which is today's behaviour, verbatim.
+        #
+        # WHY `pending.append` AND NOT AN INLINE CALL. Re-queuing sends the
+        # retry back through `_obtain` and then through every line of this loop:
+        # the shutdown gate, the spend gate, `_charge_spend`, the usage
+        # accumulators, the answering-model check, the cache-read check and its
+        # own ledger row. An inline call would have to reproduce all of that or
+        # silently skip it. `pending` is a LIFO and this appends to the end, so
+        # the retry is the NEXT chunk popped -- while the shared prefix is at
+        # its warmest and before any other trial's response is read.
+        #
+        # `continue` SKIPS ONLY NO-OPS, and they are named rather than assumed:
+        # everything between here and the end of the loop body operates on
+        # `parsed`, which is empty. The reasoning-order probe searches
+        # `chunk_text` for two key names an 18-character body cannot contain,
+        # `_partition_response_entries([])` is `([], [])`,
+        # `_partition_out_of_set([], ...)` is `([], [], [])`,
+        # `_collapse_duplicate_entries([])` is `([], [])` and
+        # `evaluations.extend([])` adds nothing. The retry's own pass runs every
+        # one of them for real.
+        if (_per_trial_calls and not parsed
+                and _chunk_key(chunk) not in _empty_retry_of):
+            # READ LIVE OFF `config`, NEVER AS A FROM-IMPORT, and the first
+            # draft of this line got it wrong. `from oncotriage.config import
+            # X` BINDS the value into this module at import, so setting
+            # `config.X` afterwards reaches nothing -- the patch-point lesson
+            # tests/test_agent_rrf_config_ownership.py exists for. Here it is
+            # not only a test-seam question: `spend.stage5_call_ceiling` reads
+            # this constant LIVE to derive the per-trial ceiling, so a frozen
+            # copy here could disagree with the ceiling built for it -- a
+            # process that had moved the budget would get one arm's behaviour
+            # bounded by the other arm's number, silently. Every other per-trial
+            # knob this node reads is live for the same reason:
+            # `config.matching_call_mode()`, `config.per_trial_parallel_bound()`
+            # and `config.MATCHING_MAX_TRIALS_PER_PATIENT`.
+            if config.MATCHING_PER_TRIAL_EMPTY_RETRIES:
+                PER_TRIAL_EMPTY_FIRST_ATTEMPTS[
+                    EMPTY_RETRY_DECISION_QUEUED] += 1
+                _empty_retry_of[_chunk_key(chunk)] = calls_made
+                log.warning(
+                    "a Stage 5 per-trial call returned a well-formed response "
+                    "carrying no evaluations; asking once more before "
+                    "recording the trial as not evaluable",
+                    stage=5, event="per_trial_empty_verdict",
+                    reason=EMPTY_RETRY_DECISION_QUEUED, depth=depth,
+                    index=calls_made,
+                    nct_id=chunk[0]["trial"]["nct_id"], degraded=True)
+                pending.append((chunk, depth))
+                continue
+            # THE MECHANISM IS OFF, AND THE PHENOMENON IS STILL COUNTED. A
+            # campaign run at MATCHING_PER_TRIAL_EMPTY_RETRIES = 0 is exactly
+            # the campaign that most needs the rate measured, because turning
+            # the retry back on is the decision it informs.
+            PER_TRIAL_EMPTY_FIRST_ATTEMPTS[EMPTY_RETRY_DECISION_DISABLED] += 1
+            log.warning(
+                "a Stage 5 per-trial call returned a well-formed response "
+                "carrying no evaluations; the empty-verdict retry is disabled "
+                "so the trial is recorded as not evaluable",
+                stage=5, event="per_trial_empty_verdict",
+                reason=EMPTY_RETRY_DECISION_DISABLED, depth=depth,
+                index=calls_made,
+                nct_id=chunk[0]["trial"]["nct_id"], degraded=True)
+        elif _per_trial_calls and _chunk_key(chunk) in _empty_retry_of:
+            # THE SECOND ATTEMPT CAME BACK. Two outcomes and both are counted
+            # here, on the node thread, because this is the one line that knows
+            # which it was: a retry that recovered verdicts is folded on by the
+            # code below exactly as any other response, and a retry that is
+            # empty again falls through to the same code, which does nothing
+            # with an empty list -- so the trial reaches the reconciliation and
+            # is recorded `omitted_from_model_response`, which is the behaviour
+            # that shipped before this mechanism existed.
+            # THE WIRE MODEL AS THE FALLBACK, NOT `MATCHING_MODEL`. The
+            # latter is the OpenAI arm's PRICED identity and is the same
+            # string only on that provider, so on Bedrock a response that
+            # carried no echo would key this counter with a model that did
+            # not serve the call. It is the same value the answering-model
+            # check above compares the echo against.
+            _answered_by = model_answered or config.matching_wire_model()
+            if parsed:
+                PER_TRIAL_EMPTY_RETRY_RECOVERIES[_answered_by] += 1
+                log.info(
+                    "the empty-verdict retry recovered a verdict the first "
+                    "attempt did not produce", stage=5,
+                    event="per_trial_empty_verdict_recovered",
+                    index=calls_made,
+                    empty_retry_of=_empty_retry_of[_chunk_key(chunk)],
+                    count=len(parsed), nct_id=chunk[0]["trial"]["nct_id"])
+            else:
+                PER_TRIAL_EMPTY_AFTER_RETRY[_answered_by] += 1
+                log.warning(
+                    "the empty-verdict retry also returned no evaluations; the "
+                    "trial is recorded as not evaluable", stage=5,
+                    event="per_trial_empty_verdict_unrecovered",
+                    index=calls_made,
+                    empty_retry_of=_empty_retry_of[_chunk_key(chunk)],
+                    nct_id=chunk[0]["trial"]["nct_id"], degraded=True)
 
         # ── The reasoning-first design, checked on the bytes ────────────────
         #

@@ -323,6 +323,19 @@ CONFIGURATION_PARAM_NAMES = (
     "MATCHING_MAX_TOKENS",
     "MAX_LLM_CLASSIFIER_RETRIES",
     "MAX_TRUNCATION_SPLITS",
+    # WHETHER AN EMPTY VERDICT IS ASKED AGAIN. It qualifies under this tuple's
+    # stated rule -- nothing at any command line overrides it -- and it is
+    # UNLIKE `MATCHING_PER_TRIAL_CALLS_ENABLED` two paragraphs down: that flag
+    # is excluded because a FUNCTION owns the flag-to-arm mapping and logging
+    # the raw bool would put a second derivation of it in the store. There is
+    # no mapping here. The constant is an int the node reads through
+    # `config.` and the value IS the fact, so `getattr(config, name)` logs
+    # exactly what Stage 5 did. It belongs in the index for the reason the
+    # index exists: it decides how many billed calls a patient costs and which
+    # trials leave Stage 5 with a verdict, so two runs disagreeing on it are
+    # two configurations and the tracking store is what says which produced
+    # which number.
+    "MATCHING_PER_TRIAL_EMPTY_RETRIES",
     # --- retrieval (Stage 2) ------------------------------------------------
     "COLLECTION_NAME",
     "EMBEDDING_MODEL",

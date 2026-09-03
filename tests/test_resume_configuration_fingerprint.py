@@ -544,13 +544,14 @@ check("...and it is NOT the UNKNOWN sentinel (non-degeneracy: an unreadable "
       "module answers UNKNOWN, and every check below would then be comparing "
       "one sentinel with another)",
       at(_now) == _fp.UNKNOWN, False)
-check("the stamp's version says this field set is version 5. It was 2 until "
+check("the stamp's version says this field set is version 6. It was 2 until "
       "`matching_call_mode` was gated, 3 until the cohort pass gated "
-      "`campaign_cohort_size` and `campaign_cohort_seed`, and 4 until the "
-      "environment-record pass gated `cross_encoder_revision`; each bump is "
-      "what makes every older artifact answer FP_VERSION once rather than have "
-      "its missing field compared against a live value",
-      _fp.FINGERPRINT_VERSION, 5)
+      "`campaign_cohort_size` and `campaign_cohort_seed`, 4 until the "
+      "environment-record pass gated `cross_encoder_revision`, and 5 until the "
+      "empty-verdict retry pass gated `matching_per_trial_empty_retries`; each "
+      "bump is what makes every older artifact answer FP_VERSION once rather "
+      "than have its missing field compared against a live value",
+      _fp.FINGERPRINT_VERSION, 6)
 
 # --- (b) the module set is DERIVED, not trusted ---------------------------
 # A static closure from the two render entry points over every module-level
@@ -1452,6 +1453,19 @@ try:
         # the case is a real mismatch whatever the pin is set to.
         ("cross_encoder_revision",
          "ffffffffffffffffffffffffffffffffffffffff", _fp.FP_CHANGED),
+        # THE EMPTY-VERDICT RETRY BUDGET, DRIVEN THROUGH THE REAL GATE. The
+        # concrete harm: a per-trial call whose reply parses to an EMPTY array
+        # is recorded `omitted_from_model_response` at 0 and asked again -- and
+        # recovered ~83% of the time -- at 1. A campaign resumed across that
+        # change carries two verdict-production policies in one inferences
+        # table, so its not_evaluable rate is a number about two policies
+        # presented as one. The stored value is whichever of the two legal
+        # settings this process is NOT in, so the case is a real mismatch on
+        # either, and it is derived rather than typed so a future budget above
+        # 1 does not turn this into a pin on today's value.
+        ("matching_per_trial_empty_retries",
+         0 if _config.MATCHING_PER_TRIAL_EMPTY_RETRIES else 1,
+         _fp.FP_CHANGED),
     )
     # EVERY GATED FIELD IS EITHER IN THIS TABLE OR HAS ITS OWN SECTION, and the
     # round trip is closed here so a field gated in a later pass cannot be added

@@ -639,13 +639,43 @@ spend.SPEND_LEDGER_FAULTS.clear()
 # SECTION 3 -- THE DERIVED CALL CEILING
 # ===========================================================================
 
+_SAVED_EMPTY_RETRIES = config.MATCHING_PER_TRIAL_EMPTY_RETRIES
+
 section("SECTION 3 -- the ceiling is derived from configuration, not chosen")
 
-check("3a  per-trial: one warmup plus one call per candidate trial, and "
-      "nothing else -- a per-trial chunk is a singleton and the splitter "
-      "refuses to halve one",
+
+def _ceiling_at_retries(n):
+    """The per-trial ceiling with MATCHING_PER_TRIAL_EMPTY_RETRIES forced to n.
+
+    RESTORED IN A ``finally`` AND THE RESTORE IS ASSERTED BELOW (3a-iii). The
+    constant is validated at config import and accepts only 0 or 1, so both
+    values driven here are legal configurations rather than probes at a shape
+    the module refuses.
+    """
+    saved = config.MATCHING_PER_TRIAL_EMPTY_RETRIES
+    try:
+        config.MATCHING_PER_TRIAL_EMPTY_RETRIES = n
+        return spend.stage5_call_ceiling(config.MATCHING_CALL_MODE_PER_TRIAL)
+    finally:
+        config.MATCHING_PER_TRIAL_EMPTY_RETRIES = saved
+
+
+check("3a  per-trial: one warmup plus one call per candidate trial, TIMES the "
+      "empty-verdict retry budget -- a per-trial chunk is a singleton and the "
+      "splitter refuses to halve one, so the retry is the only other billed "
+      "call the arm can make. WITHOUT THAT TERM THE FIRST EMPTY VERDICT OF A "
+      "FULL-CAP PATIENT IS THE 17th CALL OF A 16-CALL CEILING, which latches "
+      "the whole run over a call the configuration permits",
       spend.stage5_call_ceiling(config.MATCHING_CALL_MODE_PER_TRIAL),
-      1 + config.MAX_TRIALS_FOR_EVALUATION)
+      1 + config.MAX_TRIALS_FOR_EVALUATION
+      * (1 + config.MATCHING_PER_TRIAL_EMPTY_RETRIES))
+check("3a-i non-degeneracy: the retry term is actually IN the derivation "
+      "rather than agreeing with it by arithmetic accident -- moving the "
+      "budget moves the ceiling",
+      _ceiling_at_retries(0) != _ceiling_at_retries(1), True)
+check("3a-ii ...and at a budget of 0 -- the mechanism off -- it is exactly the "
+      "expression it was before the empty-verdict retry existed",
+      _ceiling_at_retries(0), 1 + config.MAX_TRIALS_FOR_EVALUATION)
 check("3b  grouped: the packer's chunk ceiling times the reactive splitter's "
       "own 2**(D+1)-1, the identical expression "
       "HARNESS_POST_READ_TIMEOUT_SECONDS is written over",
@@ -664,13 +694,17 @@ _saved_trials = config.MAX_TRIALS_FOR_EVALUATION
 try:
     config.MAX_TRIALS_FOR_EVALUATION = _saved_trials + 7
     check("3d-i driven: raising MAX_TRIALS_FOR_EVALUATION raises the per-trial "
-          "ceiling by exactly the same amount",
+          "ceiling by that amount times the retry budget, which is what makes "
+          "the trial term the term rather than a coincidence",
           spend.stage5_call_ceiling(config.MATCHING_CALL_MODE_PER_TRIAL),
-          1 + _saved_trials + 7)
+          1 + (_saved_trials + 7)
+          * (1 + config.MATCHING_PER_TRIAL_EMPTY_RETRIES))
 finally:
     config.MAX_TRIALS_FOR_EVALUATION = _saved_trials
 check("3d-ii ...and it was restored",
       config.MAX_TRIALS_FOR_EVALUATION, _saved_trials)
+check("3a-iii ...and so was the retry budget the helper above forces",
+      config.MATCHING_PER_TRIAL_EMPTY_RETRIES, _SAVED_EMPTY_RETRIES)
 
 check("3e  with no argument it asks the owner, so a caller that has not read "
       "the mode still gets the right ceiling",
@@ -932,16 +966,26 @@ section("SECTION 6 -- the per-invocation billed-call ceiling")
 # The ceiling is derived from configuration, so it is driven by MOVING the
 # configuration rather than by patching the ceiling: with room for two trials a
 # six-trial patient must be declined at the third.
+# THE EXPECTED CALL COUNT IS DERIVED FROM THE CEILING RATHER THAN RETYPED, and
+# that is not tidiness: the retry term made the old literal wrong by exactly the
+# budget, and a section whose whole subject is "derived from configuration, not
+# chosen" cannot state its own expectation as a number. `_SIX` stays larger than
+# the ceiling's trial capacity, so the decline is still reached.
 _saved_max = config.MAX_TRIALS_FOR_EVALUATION
 try:
-    config.MAX_TRIALS_FOR_EVALUATION = 2      # ceiling = 1 warmup + 2 trials
+    config.MAX_TRIALS_FOR_EVALUATION = 2
+    _CEIL_N = spend.stage5_call_ceiling(config.MATCHING_CALL_MODE_PER_TRIAL)
     _ceil, _ceil_stub = run_node(_SIX, cap=None, parallel=1)
 finally:
     config.MAX_TRIALS_FOR_EVALUATION = _saved_max
+check("6a-0 non-degeneracy: the batch really is bigger than the ceiling's "
+      "trial capacity, so a decline is reachable at all",
+      len(_SIX) > _CEIL_N - 1, True)
 check("6a  *** a Stage 5 invocation that asks for more billed calls than its "
       "configuration can produce is declined at the ceiling, with NO cap set "
       "at all -- so this is not the budget firing ***",
-      (len(_ceil_stub.warmups), len(_ceil_stub.trial_requests)), (1, 2))
+      (len(_ceil_stub.warmups), len(_ceil_stub.trial_requests)),
+      (1, _CEIL_N - 1))
 check("6a-i ...and it is counted under its OWN limit, never as a spend event: "
       "the campaign may be nowhere near its cap and an operator sent to "
       "config.SPEND_CAP_USD would be sent to the wrong file",
@@ -949,7 +993,8 @@ check("6a-i ...and it is counted under its OWN limit, never as a spend event: "
       [f"{spend.SPEND_SKIP_WAVE_KEY_PREFIX}{spend.SPEND_LIMIT_CALL_CEILING}"])
 check("6a-ii ...with its own counter, keyed by the mode the ceiling was "
       "derived for and the ceiling itself",
-      dict(spend.SPEND_CEILING_TRIPS), {"per_trial:3": 1})
+      dict(spend.SPEND_CEILING_TRIPS),
+      {f"{config.MATCHING_CALL_MODE_PER_TRIAL}:{_CEIL_N}": 1})
 check("6a-iii ...the latch records the CEILING, so the run's stop_reason is "
       "not spend_cap",
       spend.SPEND_STOP.limit, spend.SPEND_LIMIT_CALL_CEILING)

@@ -2330,11 +2330,19 @@ QUERIES = (
         # names it, and the derived-versus-declared check is what reported it
         # before a pre-era-9 database could. Third time that mechanism has
         # caught a stamp field widened three modules away.
+        # `runs.matching_per_trial_empty_retries` joins them at era 11, on the
+        # same footing and found the same way for the FOURTH time: it is a
+        # RUN_FINGERPRINT_COLUMNS member as of FINGERPRINT_VERSION 6, so the
+        # GENERATED stitch predicate names it. That this mechanism has now
+        # caught four consecutive stamp widenings is the argument for the
+        # derived check rather than for a bigger comment.
         requires_columns=(("inferences", "run_id"),
                           ("runs", "campaign_cohort_seed"),
                           ("runs", "campaign_cohort_size"),
                           ("runs", "cross_encoder_revision"),
-                          ("runs", "matching_call_mode"), ("runs", "resumed")),
+                          ("runs", "matching_call_mode"),
+                          ("runs", "matching_per_trial_empty_retries"),
+                          ("runs", "resumed")),
         notes=(
             "One row per CAMPAIGN, not per run. A campaign that never crashed",
             "is a campaign of one, and `stitched` is 0 for it -- which is what",

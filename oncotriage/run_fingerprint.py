@@ -59,6 +59,19 @@ WHAT IS IN THE STAMP, AND WHY EACH FIELD IS THERE
                                     and their patients must not be summed.
                                     Nothing else in this stamp moves with it:
                                     the wire model is the same id in both.
+    matching_per_trial_empty_retries
+                                    whether a per-trial call that answered with
+                                    an EMPTY array is asked once more (1) or
+                                    recorded not-evaluable on the spot (0). It
+                                    decides which trials leave Stage 5 with a
+                                    verdict at all and how many billed calls a
+                                    patient costs, on the identical footing as
+                                    the call mode above; per-trial only, and
+                                    inert in the grouped arm -- which does not
+                                    make it safe to leave ungated, because the
+                                    ARM is gated beside it and a resume that
+                                    straddles both is the case this stamp
+                                    reports field by field.
     qdrant_collection               the RESOLVED backing collection, never the
                                     alias. The alias is a constant -- that is
                                     what an alias is for -- so a gate on it is a
@@ -176,8 +189,42 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 5
+FINGERPRINT_VERSION = 6
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    5 -> 6  added ``matching_per_trial_empty_retries``. EVERY ARTIFACT STAMPED
+            AT 5 THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE,
+            for the reason spelled out under 1 -> 2 below; the remediation is
+            identical and is printed on the refusal.
+
+            WHAT IT CLOSES, AND THE ARGUMENT IS 2 -> 3's, VERBATIM. Stage 5
+            re-asks a per-trial call whose reply PARSED to an empty array --
+            well-formed under the response schema, `end_turn`, 20 to 30 output
+            tokens -- because the 2026-09-03 investigation measured that
+            condition as a stochastic decoding degeneracy rather than a
+            property of the input (0/10 on a resend of the identical bytes).
+            ``config.MATCHING_PER_TRIAL_EMPTY_RETRIES`` is 1 or 0, and it meets
+            every clause of the test the call-mode field was gated under: it
+            changes how many billed calls a patient costs, it changes WHICH
+            TRIALS CAN BE OMITTED FROM A RESPONSE AT ALL -- an empty-answering
+            trial is recorded `omitted_from_model_response` at 0 and recovered
+            ~83% of the time at 1 -- and therefore it changes the verdicts. And
+            nothing else in this stamp moves with it: it is a bool no other
+            gated field is a function of, and the judge, the arm, the prompt
+            and the collection are identical on both sides of it.
+
+            SO A CHECKPOINT WRITTEN WITH THE RETRY ON, RESUMED WITH IT OFF,
+            WOULD HAVE ANSWERED FP_MATCH -- and the resulting `inferences`
+            table would carry two verdict-production policies with nothing in
+            it saying which patients got which. Every `not_evaluable` rate over
+            that artifact is then a number about two policies presented as one,
+            which is the harm this module exists for.
+
+            IT IS GATED EVEN THOUGH THE MECHANISM IS RARE, and the rarity is
+            the argument FOR rather than against: the population rate is not
+            known (n = 20, on one pair), so nobody can say in advance how much
+            of a mixed artifact is affected -- which is exactly the state in
+            which a stamp is worth more than a judgement.
 
     4 -> 5  added ``cross_encoder_revision``. EVERY ARTIFACT STAMPED AT 4
             THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE, for
@@ -499,6 +546,7 @@ FINGERPRINT_FIELDS = (
     "campaign_cohort_size",
     "campaign_cohort_seed",
     "cross_encoder_revision",
+    "matching_per_trial_empty_retries",
 )
 
 # How compare() answered. A CLOSED set, for the reason
@@ -890,6 +938,15 @@ def current(refresh: bool = False) -> dict:
                 # the same reason; this field is the one third-party artifact
                 # that could be pinned and now is.
                 "cross_encoder_revision": config.CROSS_ENCODER_REVISION,
+                # A PURE `config` READ, like the call mode beside it: it opens
+                # nothing, so `current()` still answers offline for the three
+                # harnesses that need it to. Recorded as the INT the node
+                # reads, not as a bool -- the constant is validated to 0 or 1
+                # at config import, and storing the value the pipeline read is
+                # what makes a stamp comparable with a future budget the
+                # mechanism grows.
+                "matching_per_trial_empty_retries":
+                    config.MATCHING_PER_TRIAL_EMPTY_RETRIES,
             }
         # A COPY. The consumers put this straight into a JSON payload they then
         # mutate around, and a shared dict would let one consumer's edit reach
@@ -922,7 +979,9 @@ def summary(fingerprint: dict) -> str:
     return (f"prompt {get('llm_classifier_prompt_version', NOT_RECORDED)} "
             f"(renderer {digest[:12]}), "
             f"model {get('matching_model_configured', NOT_RECORDED)} "
-            f"({get('matching_call_mode', NOT_RECORDED)}), "
+            f"({get('matching_call_mode', NOT_RECORDED)}, "
+            f"empty-retries "
+            f"{get('matching_per_trial_empty_retries', NOT_RECORDED)}), "
             f"collection {get('qdrant_collection', NOT_RECORDED)} "
             f"({get('collection_points', NOT_RECORDED)} points), "
             f"snapshot {get('data_snapshot_date', NOT_RECORDED)}, "

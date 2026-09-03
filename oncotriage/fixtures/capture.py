@@ -2496,6 +2496,27 @@ def build_environment_block() -> Dict:
             # the keys this dict declares, so the twelve fixtures on disk are
             # unmoved and replay clean without recapture. Verified by running.
             "MATCHING_INPUT_TOKEN_BUDGET": config.MATCHING_INPUT_TOKEN_BUDGET,
+            # WHETHER AN EMPTY VERDICT IS ASKED AGAIN, on this dict's own
+            # doctrine. It decides which trials leave Stage 5 with a verdict at
+            # all, so a fixture whose replay reported a trial as
+            # `omitted_from_model_response` where the recording has a verdict
+            # would otherwise be an unexplained Stage 5 difference with no
+            # cause attached -- which is the exact failure the two constants
+            # above it were added for.
+            #
+            # INERT FOR EVERY FIXTURE THIS HARNESS CAN PRODUCE TODAY, AND
+            # RECORDED ANYWAY. `pin_call_mode_for_fixture_process` pins Stage 5
+            # to the GROUPED arm for both entry points, and the mechanism is
+            # per-trial only -- so it cannot move a capture made now. It is
+            # here for the per-trial capture the migration item owes, where it
+            # is the difference between a diff that names its cause and one
+            # that does not.
+            #
+            # FUTURE CAPTURES ONLY, on this block's standing doctrine: File
+            # 46's diff_tunables() iterates the keys the FIXTURE recorded, not
+            # the keys this dict declares, so nothing on disk moves.
+            "MATCHING_PER_TRIAL_EMPTY_RETRIES":
+                config.MATCHING_PER_TRIAL_EMPTY_RETRIES,
             # WHICH PROVIDER SERVED STAGE 5. On this dict's own doctrine: a
             # provider flip changes the endpoint, the request FORM (Responses
             # rather than Chat Completions), the wire model id and -- because

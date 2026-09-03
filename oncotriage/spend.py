@@ -1491,14 +1491,33 @@ def stage5_call_ceiling(call_mode=None) -> int:
 
     DERIVED FROM CONFIGURATION, NOT CHOSEN. Both arms:
 
-      PER-TRIAL MODE -- one cache warmup, then one call per candidate trial:
+      PER-TRIAL MODE -- one cache warmup, then one call per candidate trial,
+        each of which may be asked again once if it answered with an empty
+        array:
 
-          1 + MAX_TRIALS_FOR_EVALUATION
+          1 + MAX_TRIALS_FOR_EVALUATION x (1 + MATCHING_PER_TRIAL_EMPTY_RETRIES)
 
         and nothing else, because a per-trial chunk is a SINGLETON and
         ``_split_in_half`` refuses to halve one. Measured rather than assumed:
         driving every response to ``finish_reason == "length"`` produces four
         wave calls and ZERO truncation splits.
+
+        THE EMPTY-VERDICT RETRY TERM IS NOT DECORATION AND IT IS NOT A MARGIN.
+        ``oncotriage/agent/evaluation.py`` re-queues a per-trial chunk whose
+        reply PARSED to an empty list, so that trial's second request is a call
+        the configuration permits -- and without this term it would be the
+        17th call of a 16-call ceiling on a full-cap patient. That refusal
+        LATCHES THE WHOLE RUN (see ``SPEND_LIMIT_CALL_CEILING``), so the first
+        empty verdict of a campaign would stop the campaign, reported as a
+        pipeline defect, for a call nothing was wrong with. At
+        ``MATCHING_PER_TRIAL_EMPTY_RETRIES = 0`` the term vanishes and this is
+        the expression it was before the mechanism existed.
+
+        WHAT IT COSTS AS A DEFECT DETECTOR, STATED. The ceiling doubles, 16 to
+        31, so a loop inside one invocation has twice as far to run before it
+        trips. That is the price of the ceiling staying EXACT: a margin would
+        be a literal, and a ceiling below what the configuration permits is a
+        false defect report, which is strictly worse than a later true one.
 
       GROUPED MODE -- the packer emits at most
         ``MATCHING_MAX_INPUT_PACKED_CHUNKS`` chunks and the reactive splitter
@@ -1512,7 +1531,7 @@ def stage5_call_ceiling(call_mode=None) -> int:
 
           MATCHING_MAX_INPUT_PACKED_CHUNKS x (2 ** (MAX_TRUNCATION_SPLITS + 1) - 1)
 
-    AT THE SHIPPED CONSTANTS: 16 per-trial, 75 grouped.
+    AT THE SHIPPED CONSTANTS: 31 per-trial (1 + 15 x 2), 75 grouped.
 
     IT IS PER INVOCATION AND NOT PER PATIENT, and that grain is the point. A
     retry re-enters the node with fresh state, and re-entry is already bounded
@@ -1530,7 +1549,8 @@ def stage5_call_ceiling(call_mode=None) -> int:
     if call_mode is None:
         call_mode = config.matching_call_mode()
     if call_mode == config.MATCHING_CALL_MODE_PER_TRIAL:
-        return 1 + config.MAX_TRIALS_FOR_EVALUATION
+        return (1 + config.MAX_TRIALS_FOR_EVALUATION
+                * (1 + config.MATCHING_PER_TRIAL_EMPTY_RETRIES))
     return (config.MATCHING_MAX_INPUT_PACKED_CHUNKS
             * (2 ** (config.MAX_TRUNCATION_SPLITS + 1) - 1))
 

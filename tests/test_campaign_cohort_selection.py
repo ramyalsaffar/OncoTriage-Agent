@@ -610,12 +610,15 @@ check("4a the two cohort facts are GATED FIELDS of the shared stamp",
 # bumping pass runs this file. That is the trade, and it is the same one
 # `RUN_FINGERPRINT_COLUMNS`' round trip in
 # tests/test_storage_run_identity.py makes in the other direction.
-check("4b ...and the stamp's version was bumped with them. LIVE VALUE IS 5: "
+check("4b ...and the stamp's version was bumped with them. LIVE VALUE IS 6: "
       "3 -> 4 added the two cohort fields (the cohort-selection pass), "
       "4 -> 5 added cross_encoder_revision (the reranker-pinning pass, "
-      "1f657ca). A v4 artifact answers FP_VERSION once rather than having a "
-      "missing field compared against a live value",
-      _fp.FINGERPRINT_VERSION, 5)
+      "1f657ca), 5 -> 6 added matching_per_trial_empty_retries (the "
+      "empty-verdict retry pass, which gated it on the call mode's own test: "
+      "it changes how many billed calls a patient costs and which trials can "
+      "leave Stage 5 with no verdict). A v5 artifact answers FP_VERSION once "
+      "rather than having a missing field compared against a live value",
+      _fp.FINGERPRINT_VERSION, 6)
 # THE TWO COHORT FIELDS ARE STILL GATED, which is what 4b was really about --
 # without this, a later bump that DROPPED them would keep 4b green by moving
 # the version alone.

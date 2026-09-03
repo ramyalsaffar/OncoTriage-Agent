@@ -530,6 +530,14 @@ _STAMP_VALUES = {
     # module the round trip is checking, or the check agrees with the code by
     # construction.
     "cross_encoder_revision": "0123456789abcdef0123456789abcdef01234567",
+    # AN INT, on `campaign_cohort_size`'s reason: the column is INTEGER and it
+    # is in RUN_FINGERPRINT_INTEGER_COLUMNS, so a generated
+    # "test-matching_per_trial_empty_retries" would exercise the NULL arm in
+    # every check below rather than the round trip they are about. 1 rather
+    # than a read of config.MATCHING_PER_TRIAL_EMPTY_RETRIES, on
+    # `cross_encoder_revision`'s: a stamp literal read off the module the round
+    # trip is checking agrees with the code by construction.
+    "matching_per_trial_empty_retries": 1,
 }
 # A FIELD WITH NO LITERAL ABOVE GETS A GENERATED ONE RATHER THAN A KeyError, and
 # that is a repair rather than a convenience. The comment above this dict has
@@ -570,12 +578,13 @@ check("RUN_FINGERPRINT_COLUMNS is exactly the stamp's keys, in order",
       list(_dl.RUN_FINGERPRINT_COLUMNS),
       ["fingerprint_version"] + list(_rf.FINGERPRINT_FIELDS))
 
-check("...and the stamp really has ten gated fields (non-degenerate: a check "
-      "against an empty tuple would pass for free). SIX until the call-mode "
-      "pass gated `matching_call_mode`, SEVEN until the cohort pass gated "
-      "`campaign_cohort_size` and `campaign_cohort_seed`, NINE until the "
-      "environment-record pass gated `cross_encoder_revision`",
-      len(_rf.FINGERPRINT_FIELDS), 10)
+check("...and the stamp really has eleven gated fields (non-degenerate: a "
+      "check against an empty tuple would pass for free). SIX until the "
+      "call-mode pass gated `matching_call_mode`, SEVEN until the cohort pass "
+      "gated `campaign_cohort_size` and `campaign_cohort_seed`, NINE until the "
+      "environment-record pass gated `cross_encoder_revision`, TEN until the "
+      "empty-verdict retry pass gated `matching_per_trial_empty_retries`",
+      len(_rf.FINGERPRINT_FIELDS), 11)
 
 check("every gated field has a real literal in this file's stamp, so no check "
       "below is exercising a generated placeholder",
@@ -667,7 +676,7 @@ check("...and the de-duplication is really doing work here (non-degeneracy: "
       "cannot distinguish them)",
       sorted(set(_dl.RUN_FINGERPRINT_COLUMNS) & set(_dl.RUN_COLUMN_ADDITIONS)),
       ["campaign_cohort_seed", "campaign_cohort_size", "cross_encoder_revision",
-       "matching_call_mode"])
+       "matching_call_mode", "matching_per_trial_empty_retries"])
 # DERIVED, NOT `RUN_COLUMNS[-1] == "matching_call_mode"`. That form pinned the
 # overlapping column to the LAST position, which is only where ALTER TABLE puts
 # it for as long as it is the last entry in RUN_COLUMN_ADDITIONS -- so the
@@ -776,7 +785,7 @@ _c = sqlite3.connect(f"file:{_FRESH}?mode=ro", uri=True)
 _RUN_DECL = {r[1]: r[2] for r in _c.execute("PRAGMA table_info(runs)")}
 _c.close()
 
-check("the two integer stamp columns are declared INTEGER in the real schema",
+check("every integer stamp column is declared INTEGER in the real schema",
       {c: _RUN_DECL.get(c) for c in sorted(_dl.RUN_FINGERPRINT_INTEGER_COLUMNS)},
       {c: "INTEGER" for c in sorted(_dl.RUN_FINGERPRINT_INTEGER_COLUMNS)})
 

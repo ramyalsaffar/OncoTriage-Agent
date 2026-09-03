@@ -1243,21 +1243,30 @@ MATCHING_REASONING_EFFORT = "none"
 # WHOLE RESPONSE, so no split fires for a chunk of one -- which the reactive
 # splitter could not honour anyway, since `len(chunk) == 1` is its floor and a
 # truncated single trial is a LOST verdict recorded `truncation_floor`.
-# Measured on the shipped judge over eight real trial-shaped calls (the table
-# at MATCHING_OUTPUT_TOKENS_PER_TRIAL): the largest response was 1,356 output
-# tokens, 4.2% of this ceiling, and every one of the eight reported stopReason
-# 'end_turn'. 32,000 covers the worst observed single response 23.6x over.
+# Measured on the shipped judge: the 6b-3 probe's eight trial-shaped calls
+# topped out at 1,356 output tokens, and the 2026-09-03 empty-verdict
+# investigation's twelve verdicts on a 31-criterion trial topped out at 2,234
+# (both tables at MATCHING_OUTPUT_TOKENS_PER_TRIAL). Every one of the twenty
+# reported stopReason 'end_turn'. 32,000 covers the worst observed single
+# response 14.3x over -- 23.6x on the 6b-3 set alone, which is the figure this
+# paragraph carried before the second measurement existed.
 #
 # LOWERING IT WAS CONSIDERED AND IS REFUSED, on two measured grounds rather
 # than on caution.
 #
-#   1. IT WOULD ARM A SPLITTER IN THE ARM THE MIGRATION MEASURES AGAINST. The
-#      grouped proactive splitter stays dead only while
+#   1. IT WOULD DRIVE THE GROUPED ARM INTO DEEPER SPLITS. That arm's proactive
+#      splitter is ARMED as of the 2,500 recalibration --
 #      1.25 x MATCHING_OUTPUT_TOKENS_PER_TRIAL x MAX_TRIALS_FOR_EVALUATION
-#      <= MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS. At the adopted
-#      1,450 the left side is 27,187.5, so any ceiling below 30,209 arms it.
-#      That is a silent behaviour change to the retained comparison arm, made
-#      while it is the thing being compared against.
+#      = 46,875 against MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS
+#      = 28,800 -- so a full-cap grouped batch already halves once, into
+#      chunks of 8 and 7 whose estimates (20,000 and 17,500) are under the
+#      threshold. Lowering this ceiling lowers the threshold with it and buys
+#      a second halving, then a third, each one sending the shared system
+#      prefix again. That is a behaviour change to the retained comparison arm,
+#      made while it is the thing being compared against. THE SENTENCE THIS
+#      REPLACES SAID THE SPLITTER WAS DEAD AND THAT ANY CEILING BELOW 30,209
+#      WOULD ARM IT; that was true at K = 1,450 and is not true now, and the
+#      figure is left here so the change is legible rather than silent.
 #   2. A HIGH CEILING IS FREE UNLESS IT IS REACHED. Bedrock bills tokens
 #      GENERATED, not the ceiling requested -- confirmed on every call of that
 #      run, which asked for 32,000 and was billed 269 to 1,356. So the only
@@ -3271,114 +3280,145 @@ def _assert_bedrock_anthropic_credential_is_visible():
 # should be split BEFORE it is sent.
 #
 # ===========================================================================
-# RE-DERIVED 2026-09-03 ON THE SHIPPED JUDGE, us.anthropic.claude-sonnet-4-6.
+# INTERIM. RAISED TO 2,500 ON 2026-09-03 FROM A MEASURED MAX OF 2,234, AND A
+# RE-DERIVATION IS OWED. THE PROACTIVE SPLITTER NOW ARMS IN THE GROUPED ARM.
 # ===========================================================================
 #
-# THE VALUE IT REPLACES WAS 1,100 AND WAS CALIBRATED ON A DIFFERENT MODEL.
-# That figure came from 27 gpt-5.6-terra runs at reasoning_effort='none' (the
-# history is kept below, because that arm is retained and this constant is
-# shared with it). MATCHING_PROVIDER has shipped 'bedrock_anthropic' since the
-# provider flip, so from that day until this measurement the pre-split guard on
-# the arm that actually runs was calibrated on a judge it never called.
+# WHAT WAS MEASURED, AND IT IS A SECOND MEASUREMENT ON THE SAME JUDGE THE SAME
+# DAY. The empty-verdict investigation
+# (09- Testing/empty_verdict_investigation_20260903/) spent $0.5072 over 15
+# billed calls against us.anthropic.claude-sonnet-4-6, of which 12 produced a
+# verdict -- ten resends of one byte-identical per-trial call, one at half the
+# trial's criteria length, and one of the same trial under a different
+# patient prefix. Per-trial mode, `thinking` disabled, `stopReason` `end_turn`
+# on every one of them.
 #
-# WHAT WAS MEASURED. `bedrock_probe.py --probe-output-tokens`, eight real Stage
-# 5 trial-shaped calls over ONE real rendered system prefix (32,495 chars;
-# 9,281 tokens as the model counted them, cached and read back on every call
-# after the first). The prefix and the trial blocks are one real cohort
-# patient's, rendered by `render_per_trial_probe_inputs.py` through the real
-# de-identified path, so every byte is what Stage 5 would have sent:
+#     max outputTokens over those 12 verdicts:  2,234
+#     range:                                    401 - 2,234
+#
+# 2,500 IS THE MEASURED MAX PLUS ~12% (2,500 / 2,234 = 1.119), rounded to the
+# nearest 50. The rule is unchanged -- the measured max plus a margin -- and
+# only the measurement moved.
+#
+# IT SUPERSEDES THE n = 7 WINDOW-MIDPOINT DERIVATION OF 1,450, whose admissible
+# window [measured max, splitter-still-dead] is EMPTY at this measurement:
+# 2,234 is already above that window's upper bound of 1,536, so no value can
+# both bound the observed output and keep the grouped splitter dormant.
+#
+# ---------------------------------------------------------------------------
+# THE PROACTIVE SPLITTER ARMS IN THE GROUPED ARM, AND THAT IS THE SPLITTER
+# WORKING AS DESIGNED RATHER THAN A COST OF THIS CHANGE.
+# ---------------------------------------------------------------------------
+#
+#     largest grouped estimate at MAX_TRIALS_FOR_EVALUATION = 15
+#         = 1.25 x K x 15 = 18.75 x 2,500          = 46,875
+#     threshold
+#         = MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS
+#         = 0.90 x 32,000                          = 28,800
+#     46,875 > 28,800  ->  the pre-split fires
+#
+# The count term alone clears it (2,500 x 15 = 37,500), so it fires on a
+# full-cap grouped batch whatever the criteria length; the first N at which it
+# can fire is 10 with the criteria term at its cap and 12 without it.
+#
+# THIS IS THE GUARD DOING ITS JOB. If one verdict really costs up to 2,234
+# output tokens then fifteen of them is 33,510, which is ABOVE
+# MATCHING_MAX_TOKENS = 32,000 -- a 15-trial grouped request genuinely cannot
+# be answered in one response, and a splitter that stayed dormant would be
+# waiting for the reactive path to discover that by truncating. What arms here
+# is the mechanism that exists for exactly this, reached because the
+# measurement it reads finally says so.
+#
+# WHAT IT COSTS THE RETAINED ARM, STATED RATHER THAN GLOSSED. A grouped
+# full-cap patient becomes two requests instead of one: the pre-split halves
+# 15 into 8 and 7 (estimates 20,000 and 17,500, both under the threshold), so
+# `llm_classifier_truncation_splits` reads 1 where it read 0 and the shared
+# system prefix is SENT TWICE, which is the real cost -- output is unchanged
+# and input roughly doubles for that arm. Grouped is the dormant comparison arm
+# (MATCHING_PER_TRIAL_CALLS_ENABLED is True), so no shipped campaign pays it,
+# and a comparison run against the retained arm should be read knowing its
+# request count moved. The grouped call ceiling is unaffected: it is
+# MATCHING_MAX_INPUT_PACKED_CHUNKS x (2 ** (MAX_TRUNCATION_SPLITS + 1) - 1),
+# which bounds this many times over.
+#
+# PER-TRIAL, THE SHIPPED ARM, IS UNAFFECTED AND CANNOT BE AFFECTED BY ANY VALUE
+# IN THIS RANGE: the estimate for one trial is 1.25 x 2,500 = 3,125 against the
+# same 28,800, and the reactive splitter's floor refuses to halve a singleton
+# anyway.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS IS INTERIM AND WHAT DISCHARGES IT
+# ---------------------------------------------------------------------------
+#
+# n = 12, ON ONE (patient prefix, trial) PAIR, AND THAT PAIR IS THE HARDEST ONE
+# THE PROJECT HAS SEEN. It is the trial that produced both empty replies: the
+# largest rendered block of its patient's fifteen and the most complex, 31
+# criteria against 16 / 19 / 13 / 2 for the others, and its verdicts run 19-24
+# inclusion rows and 10-13 exclusion rows. So 2,234 is a maximum drawn from the
+# tail of the input distribution rather than from the middle of it, which is
+# the right direction for an upper bound and is not a distribution.
+#
+# THE RE-DERIVATION OWED IS FROM THE ITEM 7 SAMPLE-RUN DISTRIBUTION -- a real
+# cohort sample of patients rather than one pair -- and it should replace this
+# figure with a percentile of a population rather than a maximum of a sample of
+# 12. Until then this constant is an INTERIM upper bound and the splitter arming
+# in the grouped arm is a consequence of it.
+#
+# THE "OUTPUT IS FLAT IN CRITERIA LENGTH" CLAIM DID NOT SURVIVE, and it is the
+# claim `estimate_output_tokens`'s own docstring rests on. It was drawn from at
+# most eight points, none of which was a 31-criterion trial that ANSWERED; this
+# pair emits a row per criterion, so its output scales with criterion COUNT.
+# The count term remains the driver of the estimate and the criteria-CHARACTER
+# term remains a capped tie-breaker, but "a trial with 4,000 characters of
+# criteria costs about the same to answer as one with 800" is now known to be
+# false for a trial that carries four times the criteria.
+#
+# RE-DERIVE THIS WHENEVER MATCHING_MODEL, MATCHING_PROVIDER,
+# BEDROCK_ANTHROPIC_THINKING OR BEDROCK_ANTHROPIC_EFFORT CHANGES. It is a
+# measurement of one judge in one configuration, and the same sentence stood
+# above the gpt-5.6-terra numbers that 1,450 replaced -- which is exactly how a
+# constant comes to be calibrated on a model nobody calls any more.
+#
+# ---------------------------------------------------------------------------
+# THE 6b-3 MEASUREMENT, KEPT BECAUSE IT IS THE ONLY DURABLE RECORD OF IT
+# ---------------------------------------------------------------------------
+#
+# `bedrock_probe.py --probe-output-tokens`, 2026-09-03, eight real Stage 5
+# trial-shaped calls over ONE real rendered system prefix (32,495 chars; 9,281
+# tokens as the model counted them, cached and read back on every call after
+# the first), rendered by `render_per_trial_probe_inputs.py` through the real
+# de-identified path. That probe persisted nothing; this table is the record.
 #
 #     nct_id         user chars   outputTokens   evaluations
 #     NCT06107920         3,504       30 / 20              0   <- see below
 #     NCT06567782         2,904        1,038               1
 #     NCT07143487         2,627          649               1
 #     NCT05855200         2,304        1,076               1
-#     NCT03026140         1,939        1,356               1   <- the max
+#     NCT03026140         1,939        1,356               1
 #     NCT05789433         1,571          986               1
 #     NCT04185272         1,175          888               1
 #     NCT06270017           255          269               1
 #
 #     n = 7 verdicts:  min 269   median 986   mean 895   max 1,356
 #
-# All eight responses were well-formed under the shipped schema, and all eight
-# reported stopReason 'end_turn' -- nothing truncated at the 32,000 ceiling; the
-# largest reached 4.2% of it.
+# All eight were well-formed under the shipped schema and all eight reported
+# stopReason 'end_turn'.
 #
-# THE ADMISSIBLE WINDOW IS [1,356, 1,536] AND BOTH BOUNDS ARE REAL.
-#
-#   lower  1,356 -- the measured max. Below it this constant is not an upper
-#          bound and a guard built on it is not a guard. The shipped 1,100 was
-#          BELOW it, by 23%.
-#   upper  1,536 -- the largest value for which the PROACTIVE splitter stays
-#          dead in the retained grouped arm. That arm's largest possible
-#          estimate at MAX_TRIALS_FOR_EVALUATION = 15 is the count term plus the
-#          capped criteria term, 1.25 x K x 15 = 18.75 K, against a threshold of
-#          MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS = 0.90 x 32,000
-#          = 28,800. 18.75 K <= 28,800 gives K <= 1,536.
-#
-# 1,450 IS THE MIDPOINT OF THAT WINDOW (1,446), ROUNDED UP TO THE NEAREST 50.
-# The midpoint rather than a fixed percentage, because the window is only 13%
-# wide and a conventional margin does not fit inside it: +25% over the measured
-# max is 1,695 and leaves the window entirely, arming a splitter that is
-# currently dead. Stated as the two things it buys:
-#
-#   +6.9% over the measured max. A margin is REQUIRED and is not decoration:
-#       n = 7, on ONE patient, is a weak estimate of the maximum over the
-#       ~4,500 trial-verdicts a 300-patient campaign produces.
-#   -5.6% under the constraint ceiling. Refusing to press that bound either,
-#       because what lies past it is a silent behaviour change to the arm the
-#       migration measures AGAINST.
-#
-# WHY THE MIDPOINT AND NOT THE TOP OF THE WINDOW -- THE TWO ERRORS ARE NOT
-# SYMMETRIC. Too LOW: the proactive guard under-fires, a batch is sent that
-# should have been split, and the REACTIVE splitter catches the truncation --
-# which is confirmed live on this model, not assumed: the same probe run
-# reported stopReason 'max_tokens' on a deliberate truncation (A7), which is the
-# single string that arms it. Bounded, handled, and it costs one extra call.
-# Too HIGH: past 1,536 the proactive splitter arms in grouped mode, silently,
-# and nothing in a grouped run would say so.
-#
-# NEITHER ARM'S BEHAVIOUR MOVES AT 1,450, and that is arithmetic rather than
-# hope. 18.75 x 1,450 = 27,187.5 <= 28,800, so the proactive splitter stays dead
-# in grouped mode -- and 1,450 is also above the gpt-5.6-terra measured max of
-# 1,138, so it remains a valid upper bound for the dormant arm this constant is
-# shared with. In PER-TRIAL mode the estimate for one trial is 1.25 x 1,450 =
-# 1,812 against the same 28,800, so the proactive splitter cannot fire there at
-# any value in this window at all.
-#
-# THE FLAT-IN-CRITERIA-LENGTH CLAIM WAS RE-CONFIRMED ON THIS MODEL, and it is
-# the claim `_estimate_output_tokens`'s own docstring rests on. The three
-# LARGEST inputs (2,904 / 2,627 / 2,304 chars) produced 1,038 / 649 / 1,076 --
-# every one of them BELOW the 1,356 that a 1,939-char trial produced. Output is
-# driven by the verdict's SHAPE, not by how much criteria text it was handed, so
-# the count term remains the driver and the criteria term remains a tie-breaker.
-# This was measured rather than assumed: a linear extrapolation from the first
-# five points predicted ~2,365 tokens for the largest trial and was wrong.
-#
-# THE ONE NON-ANSWER, RECORDED BECAUSE IT BOUNDS WHAT THIS MEASUREMENT IS.
-# NCT06107920 -- the LARGEST trial block of the eight -- returned
-# `{"evaluations": []}` on two separate calls (30 and 20 output tokens, 18
-# characters of body). That is WELL-FORMED under the shipped schema, which has
-# no `minItems` on the array, and it is not a verdict. It is excluded from the
-# seven above; excluding it cannot raise the max, because an empty answer is
-# short. Stage 5 absorbs it and it costs a verdict rather than money: driven
-# through the real node in the shipped arm, it produces one `not_evaluable`
-# verdict carrying reason `omitted_from_model_response`, zero retries and no
-# extra billed call. What it means for THIS constant is that one point of the
-# input range -- the top of it -- has no verdict measurement at all.
+# NCT06107920 IS THE PAIR THE 2026-09-03 INVESTIGATION THEN RESENT. It returned
+# `{"evaluations": []}` on two separate probe invocations -- well-formed, since
+# `build_response_schema()` puts no `minItems` on the array, and not a verdict.
+# Ten resends of the identical bytes returned ten verdicts, so the empty answer
+# is a stochastic decoding degeneracy rather than a property of the input; see
+# MATCHING_PER_TRIAL_EMPTY_RETRIES for what the pipeline now does about it, and
+# the investigation note for the evidence. The 1,356 above is the max of a set
+# that did NOT include this pair answering; 2,234 is the max of a set that did.
 #
 # WHAT WAS NOT RE-DERIVED, stated rather than left to be discovered. The
 # residual standard deviation quoted at MATCHING_OUTPUT_SPLIT_FRACTION below
 # (~1,398 tokens, 1 sd) is a per-BATCH figure from the 27-run gpt-5.6-terra set.
-# This measurement is per-TRIAL, taken in per-trial mode, and produced no batch
-# estimates at all, so that sd is NOT a figure about this model. Re-deriving it
-# needs grouped-arm runs on this judge.
-#
-# RE-DERIVE THIS WHENEVER MATCHING_MODEL, MATCHING_PROVIDER,
-# BEDROCK_ANTHROPIC_THINKING OR BEDROCK_ANTHROPIC_EFFORT CHANGES. It is a
-# measurement of one judge in one configuration, and the same sentence stood
-# above the gpt-5.6-terra numbers it replaced -- which is exactly how a constant
-# comes to be calibrated on a model nobody calls any more.
+# Both 2026-09-03 measurements are per-TRIAL, taken in per-trial mode, and
+# produced no batch estimates at all, so that sd is NOT a figure about this
+# model. Re-deriving it needs grouped-arm runs on the shipped judge.
 #
 # ---------------------------------------------------------------------------
 # THE SUPERSEDED gpt-5.6-terra CALIBRATION, kept because the OpenAI arm is
@@ -3408,17 +3448,22 @@ def _assert_bedrock_anthropic_credential_is_visible():
 # of one patient. THAT RULE IS NOT THE ONE THIS PASS APPLIED, and the difference
 # is n: 27 runs support a p95, 7 do not, so the shipped rule is now "the
 # measured max plus a margin" rather than "between p95 and the max".
-MATCHING_OUTPUT_TOKENS_PER_TRIAL = 1450
+MATCHING_OUTPUT_TOKENS_PER_TRIAL = 2500
 
 # Fraction of MATCHING_MAX_TOKENS the estimate may reach before a batch is
 # split pre-emptively. 0.90 leaves 3,200 tokens between the threshold (28,800)
 # and the ceiling (32,000) for the estimate's own error.
 #
 # THE FRACTION DID NOT MOVE WHEN MATCHING_OUTPUT_TOKENS_PER_TRIAL WAS
-# RE-DERIVED ON 2026-09-03, AND WHAT THAT COSTS IS STATED. The headroom
-# BETWEEN the largest possible grouped estimate and the threshold DID move:
-# 1.25 x 1,450 x 15 = 27,187.5 against 28,800 leaves 1,612 tokens, where at the
-# previous 1,100 it left 8,175.
+# RAISED TO 2,500, AND WHAT THAT COSTS IS STATED. There is no longer any
+# headroom between the largest possible grouped estimate and this threshold:
+# 1.25 x 2,500 x 15 = 46,875 against 28,800, so the estimate is OVER the
+# threshold by 63% and the proactive splitter fires on every full-cap grouped
+# batch. That is the guard working -- fifteen verdicts at the measured maximum
+# of 2,234 is 33,510 tokens, above MATCHING_MAX_TOKENS -- and it is argued in
+# full at the constant. The two earlier readings, kept so the trend is legible:
+# at 1,450 the estimate was 27,187.5 and left 1,612 tokens of headroom, and at
+# 1,100 it left 8,175.
 #
 # THE '2.3 sd OF MARGIN' CLAIM THAT STOOD HERE IS DELETED RATHER THAN RESCALED.
 # The ~1,398-token residual sd it rested on is a per-BATCH figure from the
@@ -3946,6 +3991,77 @@ MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4
 # no margin is needed. A multiplier would be a magic number bounding nothing in
 # particular.
 MATCHING_MAX_TRIALS_PER_PATIENT = MAX_TRIALS_FOR_EVALUATION
+
+
+# ---------------------------------------------------------------------------
+# The empty-verdict retry
+# ---------------------------------------------------------------------------
+#
+# HOW MANY TIMES A PER-TRIAL CALL THAT ANSWERED WITH AN EMPTY ARRAY IS ASKED
+# AGAIN. 1 is the ruled policy; 0 turns the mechanism off and leaves today's
+# behaviour verbatim. Nothing else is accepted -- see the guard below.
+#
+# WHAT IT IS FOR, AND THE MEASUREMENT THAT CHANGED THE ANSWER. The shipped
+# judge can return `{"evaluations": []}` -- well-formed under the response
+# schema, which puts no `minItems` on the array; `stopReason` `end_turn`; 20 to
+# 30 output tokens against a 32,000 ceiling. Nothing raises, nothing is
+# truncated, nothing fails to parse. The reconciliation at the end of Stage 5
+# then finds the trial has no entry and records it
+# `omitted_from_model_response`, so the patient-trial pair leaves the stage with
+# no verdict at all. `MAX_LLM_CLASSIFIER_RETRIES` does NOT cover it: that budget
+# fires on a parse failure, and this parses.
+#
+# The 2026-09-03 empty-verdict investigation
+# (09- Testing/empty_verdict_investigation_20260903/) measured what it is:
+#
+#   * NOT deterministic -- the byte-identical call, resent 10 times, returned
+#     10 clean verdicts. 0/10.
+#   * NOT input-driven -- halving the trial's criteria text changed nothing
+#     detectable, and the same trial bytes under a different 36,179-char
+#     patient prefix answered cleanly.
+#   * A stochastic constrained-decoding degeneracy at the first array-element
+#     decision point, at the provider's default sampling temperature
+#     (MATCHING_TEMPERATURE is None and is not sent).
+#   * On the one hard (prefix, trial) pair it was seen on: 2 of 12 attempts,
+#     16.7%, Wilson 95% CI [4.7%, 44.8%].
+#
+# SO A RETRY HAS REAL RECOVERY PROBABILITY, which is exactly what was NOT true
+# under the previous belief. At p ~ 0.17 one retry recovers ~83% of
+# occurrences; a second recovers a further ~3%, which is why this is 1 and not
+# MAX_LLM_CLASSIFIER_RETRIES.
+#
+# WHAT IT COSTS, AND IT IS NOT NOTHING. A retry is one more per-trial call over
+# an already-warm prefix -- measured at $0.036 on the investigation's own pair.
+# At a 10% population rate over a 300-patient campaign (4,500 per-trial calls)
+# that is ~450 retries, about $16 against SPEND_CAP_USD's $300; at the 16.7%
+# pair rate, ~$27. Both are inside the cap and neither is negligible. THE
+# POPULATION RATE IS NOT KNOWN -- n = 20, on one pair -- and the two counters
+# `PER_TRIAL_EMPTY_FIRST_ATTEMPTS` and `PER_TRIAL_EMPTY_RETRY_RECOVERIES` in
+# oncotriage/agent/evaluation.py are what let the campaign measure it.
+#
+# IT MOVES THE DERIVED CALL CEILING AND THAT IS WHY IT IS A CONSTANT RATHER
+# THAN A LITERAL IN THE NODE. `spend.stage5_call_ceiling` is derived from
+# configuration with NO margin, so a mechanism that can issue a second call per
+# trial has to be visible to it or the first retry of a full-cap patient is
+# refused by the ceiling -- which LATCHES THE WHOLE RUN, a defect report for a
+# call the configuration does in fact permit. See that function.
+#
+# ONLY 0 AND 1, AND THE REFUSAL IS HONEST ABOUT WHY. The seam in the node is a
+# per-chunk marker dict -- "has this trial already been asked again" -- which is
+# a boolean question. Supporting N would need a per-chunk COUNT and a spend
+# argument for the marginal recovery of attempt 3, and neither exists. A value
+# above 1 is therefore refused at load rather than silently capped, because a
+# silent cap would let an operator believe a budget they did not get.
+MATCHING_PER_TRIAL_EMPTY_RETRIES = 1
+
+if (not isinstance(MATCHING_PER_TRIAL_EMPTY_RETRIES, int)
+        or isinstance(MATCHING_PER_TRIAL_EMPTY_RETRIES, bool)
+        or MATCHING_PER_TRIAL_EMPTY_RETRIES not in (0, 1)):
+    raise RuntimeError(
+        "MATCHING_PER_TRIAL_EMPTY_RETRIES must be 0 (the mechanism off) or 1 "
+        "(the ruled policy); the node's seam is a boolean marker and a larger "
+        "budget is not implemented. It is "
+        f"{MATCHING_PER_TRIAL_EMPTY_RETRIES!r}")
 
 
 # ---------------------------------------------------------------------------

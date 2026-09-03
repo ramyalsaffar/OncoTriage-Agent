@@ -394,6 +394,34 @@ _REGISTRY_SPEC = (
      "and the batch checkpoint see it. LIVE ON AN ORDINARY CAMPAIGN, because "
      "per-trial is the SHIPPED arm; it stays at zero only in the retained "
      "GROUPED arm (MATCHING_PER_TRIAL_CALLS_ENABLED False)"),
+    ("PER_TRIAL_EMPTY_FIRST_ATTEMPTS",
+     _agent_evaluation.PER_TRIAL_EMPTY_FIRST_ATTEMPTS,
+     "a Stage 5 PER-TRIAL call returned a well-formed response carrying NO "
+     "evaluations -- not a refusal, not a truncation, not malformed JSON: the "
+     "model answered with an empty array, which the response schema permits "
+     "because it puts no minItems on it. The 2026-09-03 investigation measured "
+     "this as a stochastic constrained-decoding degeneracy (0/10 on a resend "
+     "of the identical bytes), so the trial is asked once more. Keyed by what "
+     "was DECIDED: 'retry_queued' means a second request was queued, "
+     "'retry_disabled' means MATCHING_PER_TRIAL_EMPTY_RETRIES is 0 and the "
+     "trial went straight to not-evaluable. THE TOTAL IS THE PHENOMENON'S "
+     "RATE, which is the number no measurement has yet given -- read it "
+     "against the campaign's candidates_evaluated, and against "
+     "PER_TRIAL_EMPTY_RETRY_RECOVERIES in the census block above and "
+     "PER_TRIAL_EMPTY_AFTER_RETRY below. LIVE ON AN ORDINARY CAMPAIGN, because "
+     "per-trial is the SHIPPED arm; it stays at zero in the retained GROUPED "
+     "arm, where nothing reaches the branch"),
+    ("PER_TRIAL_EMPTY_AFTER_RETRY",
+     _agent_evaluation.PER_TRIAL_EMPTY_AFTER_RETRY,
+     "the empty-verdict RETRY came back empty too, keyed by the answering "
+     "model. Every one of these trials is recorded "
+     "'omitted_from_model_response' by the reconciliation, exactly as it would "
+     "have been with no retry -- the retry buys the chance and not the "
+     "outcome, and this counts the times the chance did not pay. IT DOES NOT "
+     "SUM WITH THE RECOVERIES to the queued total: a queued retry can also be "
+     "declined by the shutdown or spend gate (STAGE5_SHUTDOWN_SKIPS, "
+     "SPEND_GATE_SKIPS) or raise (PER_TRIAL_CALL_FAILURES), which is why "
+     "recoveries are counted rather than subtracted"),
     ("PER_TRIAL_CACHE_READ_MISSES",
      _agent_evaluation.PER_TRIAL_CACHE_READ_MISSES,
      "a Stage 5 PER-TRIAL wave call reported NO cache read, so it paid the "
@@ -776,6 +804,17 @@ _CENSUS_SPEC = (
      "and rendered as deid.AGE_CAP_LABEL instead of a number. NOT a "
      "degradation -- a capped age is the stage working -- which is why it is "
      "here and DEID_REFUSALS is not"),
+    ("PER_TRIAL_EMPTY_RETRY_RECOVERIES",
+     _agent_evaluation.PER_TRIAL_EMPTY_RETRY_RECOVERIES,
+     "a Stage 5 PER-TRIAL empty-verdict retry that came back WITH verdicts, "
+     "keyed by the answering model: a verdict the campaign would otherwise "
+     "have lost to a decoding degeneracy. NOT a degradation -- it is the "
+     "mechanism working, which is why it is here and "
+     "PER_TRIAL_EMPTY_FIRST_ATTEMPTS is not. A recovered verdict is "
+     "IDENTIFIABLE in the record rather than merely counted: it carries the "
+     "retry's call_index, and that call's row in "
+     "inferences.llm_classifier_call_details carries 'empty_retry_of', so any "
+     "statistic that needs first-pass-only data can exclude it by a join"),
     ("TEMPORAL_CONFLICT_RESOLVED_MARKERS",
      _agent_evaluation.TEMPORAL_CONFLICT_RESOLVED_MARKERS,
      "which resolved-state markers fired across the run; a member at zero is "

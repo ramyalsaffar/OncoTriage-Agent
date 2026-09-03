@@ -1039,6 +1039,44 @@ check("4k  ...and no packing record is published on that path, because the "
 
 section("SECTION 5 -- packing composes with the output pre-split")
 
+# ── THE GROUPED PROACTIVE SPLITTER IS ARMED, AND THAT IS THE DOCUMENTED STATE ─
+#
+# IT WAS DORMANT AND IT IS NOT ANY MORE. Raising
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL to 2,500 from the 2026-09-03 measured max of
+# 2,234 put the largest possible grouped estimate -- 1.25 x K x
+# MAX_TRIALS_FOR_EVALUATION -- above MATCHING_OUTPUT_SPLIT_FRACTION x
+# MATCHING_MAX_TOKENS, so a full-cap grouped batch now pre-splits where it used
+# to be sent whole. `oncotriage/config.py` states that at the constant, at
+# MATCHING_MAX_TOKENS and at MATCHING_OUTPUT_SPLIT_FRACTION, in prose.
+#
+# THIS IS THE ARITHMETIC BEHIND THAT PROSE, WHICH IS THE HALF PROSE CANNOT
+# HOLD. A pass that lowers the constant back under the threshold fails here and
+# is sent to those three blocks -- which is the point: a config file arguing
+# that a splitter arms while the numbers say it does not is exactly the stale
+# claim this project keeps having to correct.
+#
+# IT IS THE SPLITTER WORKING RATHER THAN A COST OF THE RECALIBRATION: fifteen
+# verdicts at the measured maximum of 2,234 is 33,510 tokens, which is ABOVE
+# MATCHING_MAX_TOKENS, so a full-cap grouped request genuinely cannot be
+# answered in one response.
+_FULL_CAP = [trial(i) for i in range(config.MAX_TRIALS_FOR_EVALUATION)]
+check("5-0 the grouped full-cap batch's output estimate is OVER the pre-split "
+      "threshold, so the proactive splitter arms -- the state config.py's "
+      "MATCHING_OUTPUT_TOKENS_PER_TRIAL block asserts in prose",
+      _evaluation.estimate_output_tokens(_FULL_CAP)
+      > int(config.MATCHING_MAX_TOKENS * config.MATCHING_OUTPUT_SPLIT_FRACTION),
+      True)
+check("5-0-i ...and the COUNT term alone clears it, so it arms whatever the "
+      "criteria length: the capped criteria term is not what carries it",
+      config.MATCHING_OUTPUT_TOKENS_PER_TRIAL * config.MAX_TRIALS_FOR_EVALUATION
+      > int(config.MATCHING_MAX_TOKENS * config.MATCHING_OUTPUT_SPLIT_FRACTION),
+      True)
+check("5-0-ii ...while PER-TRIAL mode cannot reach it at any value in this "
+      "range: one trial's estimate is a fifteenth of the same figure",
+      _evaluation.estimate_output_tokens(_FULL_CAP[:1])
+      > int(config.MATCHING_MAX_TOKENS * config.MATCHING_OUTPUT_SPLIT_FRACTION),
+      False)
+
 # SIZED SO THAT A PACKED CHUNK IS STILL TOO BIG TO ANSWER. With the chunk cap
 # at 2 and the input budget at one token, the packer relaxes to exactly half the
 # batch per chunk -- and half of this batch is over the OUTPUT pre-split
@@ -1090,9 +1128,25 @@ _CUT_OFF = [trial(i) for i in range(2 * _FLOOR_SIZE)]
 check("5e  non-degeneracy: the truncation batch is sized to the split budget, "
       "so one level either way changes the recorded reason",
       (len(_CUT_OFF), config.MAX_TRUNCATION_SPLITS), (16, 3))
-check("5e  ...and its own output estimate is UNDER the pre-split threshold, so "
-      "this measures the reactive splitter alone",
-      _evaluation.estimate_output_tokens(_CUT_OFF) > _threshold, False)
+# THE PREMISE THIS SECTION NEEDS IS ABOUT THE CHUNKS, NOT ABOUT THE BATCH, and
+# it used to be stated as the batch because the two agreed. They stopped
+# agreeing when MATCHING_OUTPUT_TOKENS_PER_TRIAL was raised to 2,500: the whole
+# 16-trial batch is now over the threshold, so the node ENTERS the proactive
+# branch -- and its `while` loop halves NOTHING, because every chunk the packer
+# produced is under the threshold, so `depth` is still 0 and the chunks still
+# reach the loop with the full truncation budget. What 5e measures is unmoved;
+# what changed is which line of the node delivered the 0. Asserting the chunk
+# estimate says the thing the scenario actually depends on, and it is true at
+# both values of the constant rather than pinning today's.
+check("5e  ...and every chunk the packer produced has an output estimate UNDER "
+      "the pre-split threshold, so the proactive splitter halves nothing "
+      "whatever the WHOLE batch's estimate is -- the chunks enter at depth 0 "
+      "and this measures the reactive splitter alone",
+      _evaluation.estimate_output_tokens(
+          _CUT_OFF[:len(_CUT_OFF) // 2]) > _threshold, False)
+check("5e  ...non-degeneracy: the packer really did produce half-batches, so "
+      "the reading above is about the chunks this run sent",
+      len(_CUT_OFF) // 2, _FLOOR_SIZE)
 
 _r5e, _s5e = run_node(_CUT_OFF, budget=1, max_chunks=2, truncate=True)
 check("5e  packed chunks enter the loop at depth 0, so every trial in a "
@@ -1485,10 +1539,21 @@ control(
     # call_matching_model(...)` this keyed on is now an assignment. The defect
     # planted is unchanged: the prefix stops being shared across the chunks of
     # one patient.
-    [("        _live = call_matching_model(system_prompt, _user_prompt_for(chunk))",
+    # AND A THIRD TIME WITH THE EMPTY-VERDICT RETRY, which gave that live call
+    # `prompt_cache_key=_cache_key` and wrapped it over two lines: the retry is
+    # the first per-trial request ever issued through this path, and without
+    # the routing hint it would ask the provider to route a prefix-sharing
+    # request without saying so. The needle is the two-line form now, and the
+    # planted defect is unchanged. THREE MOVES IS THE ARGUMENT FOR AN ANCHOR
+    # THAT IS NOT A LINE OF SOURCE, and it is left as a recorded cost rather
+    # than fixed here: what makes this plant work is that it is exactly the
+    # line the prefix is handed over on, and every less brittle key -- a
+    # function name, a regex -- would stop being that.
+    [("        _live = call_matching_model(system_prompt, _user_prompt_for(chunk),\n"
+      "                                    prompt_cache_key=_cache_key)",
       "        _live = call_matching_model(\n"
       "            system_prompt + chunk[0]['trial']['nct_id'],\n"
-      "            _user_prompt_for(chunk))")],
+      "            _user_prompt_for(chunk), prompt_cache_key=_cache_key)")],
     lambda m: len({r["messages"][0]["content"]
                    for r in run_node(_SIX, budget=1,
                                      node=m.node_llm_classifier_evaluation)[1].requests}),
@@ -1633,8 +1698,20 @@ control(
 control(
     "c16 charging packing a truncation-split level is CAUGHT [5e]",
     _EVAL_SRC,
+    # BOTH SEEDING LINES ARE PLANTED, and that is what keeps this control
+    # discriminating rather than a statement about which branch today's
+    # constants happen to take. `depth` reaches the loop from the ELSE branch
+    # (the batch estimate is under the threshold) or from the IF branch (it is
+    # over, and the proactive `while` halved nothing) -- the property under test
+    # is "a packed chunk is charged no truncation level", which both lines
+    # implement. Planting only the ELSE line was VACUOUS the moment
+    # MATCHING_OUTPUT_TOKENS_PER_TRIAL rose to 2,500 and the IF branch started
+    # being taken: the plant reached nothing, the run behaved normally, and the
+    # control reported the fix as broken.
     [("        pending = [(c, 0) for c in reversed(initial_chunks)]",
-      "        pending = [(c, 1) for c in reversed(initial_chunks)]")],
+      "        pending = [(c, 1) for c in reversed(initial_chunks)]"),
+     ("        pending = [(c, depth) for c in reversed(initial_chunks)]",
+      "        pending = [(c, depth + 1) for c in reversed(initial_chunks)]")],
     lambda m: sorted({e.get("not_evaluable_reason")
                       for e in (run_node(_CUT_OFF, budget=1, max_chunks=2,
                                          truncate=True,

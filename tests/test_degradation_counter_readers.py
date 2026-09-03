@@ -1037,19 +1037,29 @@ print("\n" + "=" * 74)
 print("7. the census counters have a reader, and it is not the degradation one")
 print("=" * 74)
 
-check("the census registry holds exactly the five counters the degradation "
-      "registry excludes for moving on correct behaviour. DEID_CENSUS is the "
-      "fifth: a capped age is oncotriage/deid.py's stage working, not a fault, "
-      "so it is here and DEID_REFUSALS -- which counts patients that were NOT "
-      "evaluated -- is in the degradation block instead",
+check("the census registry holds exactly the six counters the degradation "
+      "registry excludes for moving on correct behaviour. DEID_CENSUS: a "
+      "capped age is oncotriage/deid.py's stage working, not a fault, so it is "
+      "here and DEID_REFUSALS -- which counts patients that were NOT evaluated "
+      "-- is in the degradation block instead. "
+      "PER_TRIAL_EMPTY_RETRY_RECOVERIES is the sixth, on the identical "
+      "argument: a verdict the empty-verdict retry RECOVERED is a verdict the "
+      "campaign would have lost, so it is the mechanism working, and the two "
+      "counters that name the fault -- PER_TRIAL_EMPTY_FIRST_ATTEMPTS and "
+      "PER_TRIAL_EMPTY_AFTER_RETRY -- are in the degradation block instead. "
+      "EXACT rather than a superset, so a counter added to either registry "
+      "without an argument fails here",
       sorted(degradation.census_names()),
-      ["DEID_CENSUS", "PROCEDURE_RENDER_COUNTS",
+      ["DEID_CENSUS", "PER_TRIAL_EMPTY_RETRY_RECOVERIES",
+       "PROCEDURE_RENDER_COUNTS",
        "TEMPORAL_CONFLICT_ACTIVE_MARKERS",
        "TEMPORAL_CONFLICT_RESOLVED_MARKERS", "TEMPORAL_RENDER_COUNTS"])
 
 for _name, _obj in (("DEID_CENSUS", _deid.DEID_CENSUS),
                     ("PROCEDURE_RENDER_COUNTS", _patient.PROCEDURE_RENDER_COUNTS),
                     ("TEMPORAL_RENDER_COUNTS", _patient.TEMPORAL_RENDER_COUNTS),
+                    ("PER_TRIAL_EMPTY_RETRY_RECOVERIES",
+                     _evaluation.PER_TRIAL_EMPTY_RETRY_RECOVERIES),
                     ("TEMPORAL_CONFLICT_RESOLVED_MARKERS",
                      _evaluation.TEMPORAL_CONFLICT_RESOLVED_MARKERS),
                     ("TEMPORAL_CONFLICT_ACTIVE_MARKERS",

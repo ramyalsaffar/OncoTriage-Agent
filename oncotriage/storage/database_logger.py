@@ -229,6 +229,16 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 11: `runs.matching_per_trial_empty_retries`, added with
+#        RUN_COLUMN_ADDITIONS and its migration loop. It is a STAMP field --
+#        FINGERPRINT_VERSION 6 gates it -- and it records whether Stage 5 asked
+#        a per-trial call again when its reply parsed to an EMPTY array. That
+#        decides which trials leave the stage with a verdict at all: an
+#        empty-answering trial is recorded `omitted_from_model_response` at 0
+#        and recovered ~83% of the time at 1, so two campaigns disagreeing on
+#        it are not commensurable and the resume gate refuses across it.
+#        Additive INTEGER, NULL on every existing row and on every run whose
+#        caller stamped no fingerprint, never backfilled.
 # ERA 10: `inferences.conditions_missing_status` and
 #        `inferences.medications_missing_status`, added together with
 #        INFERENCE_COLUMN_ADDITIONS and its migration loop -- one era, two
@@ -320,7 +330,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 10
+SCHEMA_USER_VERSION = 11
 
 
 #------------------------------------------------------------------------------
@@ -1823,6 +1833,20 @@ RUN_COLUMN_ADDITIONS = {
     # FINGERPRINT rather than from the environment record: two orthogonal
     # facts about one column, and neither implies the other.
     "cross_encoder_revision": "TEXT",
+    # ── ERA 11 ────────────────────────────────────────────────────────────
+    #
+    # THE STAMP FIELD FOR THE EMPTY-VERDICT RETRY. In this dict for
+    # `matching_call_mode`'s and `cross_encoder_revision`'s reason -- that is
+    # what migrates an existing database -- and written from the FINGERPRINT,
+    # like every other member of RUN_FINGERPRINT_COLUMNS.
+    #
+    # INTEGER RATHER THAN TEXT, and rather than a bool masquerading as one:
+    # `config.MATCHING_PER_TRIAL_EMPTY_RETRIES` is a COUNT the pipeline reads,
+    # validated to 0 or 1 today, and storing the number is what keeps a row
+    # comparable with a future budget the mechanism grows into. It is the one
+    # stamp column that is not TEXT, which is why the INSERT's int guard --
+    # the `collection_points` one -- is the shape to copy if a third arrives.
+    "matching_per_trial_empty_retries": "INTEGER",
 }
 
 
@@ -2438,6 +2462,12 @@ RUN_FINGERPRINT_COLUMNS = (
     # dict, because that is what migrates an existing database -- see the
     # note there.
     "cross_encoder_revision",
+    # WHETHER AN EMPTY VERDICT WAS ASKED AGAIN -- gated since
+    # FINGERPRINT_VERSION 6, and in RUN_COLUMN_ADDITIONS as well for
+    # `cross_encoder_revision`'s reason one line up: this tuple says what fills
+    # the column at the INSERT, that dict is what migrates a database that
+    # predates it, and `_last_wins` reconciles a column named by both.
+    "matching_per_trial_empty_retries",
 )
 """The configuration stamp, as columns, in ``run_fingerprint``'s own order.
 
@@ -2477,6 +2507,16 @@ RUN_FINGERPRINT_INTEGER_COLUMNS = frozenset({
     # pretending to hold a number.
     "campaign_cohort_size",
     "campaign_cohort_seed",
+    # THE EMPTY-VERDICT RETRY BUDGET. An int in `oncotriage/config.py`,
+    # validated there to 0 or 1, and gated since FINGERPRINT_VERSION 6. It is
+    # here for this frozenset's whole reason rather than because it is
+    # currently unfailable: `current()` resolves it with a plain attribute
+    # read that cannot degrade today, but a stamp is DATA read back out of an
+    # artifact, and `start_run_record` writes whatever its caller's dict
+    # holds. A hand-built or future stamp carrying "unknown" in a column a
+    # reader groups and orders on is the trap above, and the guard costs one
+    # set member.
+    "matching_per_trial_empty_retries",
 })
 """Which stamp fields are stored as numbers, and therefore NULLed when unknown.
 

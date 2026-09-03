@@ -151,6 +151,7 @@ except ImportError:
     del _candidate, _how
 
 import ast
+import collections
 import hashlib
 import json
 import re
@@ -165,6 +166,7 @@ import types
 from oncotriage import config
 from oncotriage.agent import deps
 from oncotriage import degradation as _degradation
+from oncotriage import spend as _spend
 from oncotriage.agent import evaluation as _evaluation
 from oncotriage.fixtures import capture as _capture
 from oncotriage.storage import database_logger as _dl
@@ -2938,6 +2940,429 @@ check("7h  ...and a grouped run whose provider reports nothing is still NULL, "
 
 
 # ===========================================================================
+# SECTION 7b -- THE EMPTY-VERDICT RETRY
+# ===========================================================================
+#
+# WHAT IT IS. The judge can return `{"evaluations": []}` -- well-formed under
+# the response schema, `stopReason` `end_turn`, 20 to 30 output tokens against
+# a 32,000 ceiling. It is not a refusal, not a truncation, not malformed JSON
+# and not a non-list body, so none of this node's existing budgets fires and the
+# reconciliation records the trial `omitted_from_model_response`. The
+# 2026-09-03 investigation measured the condition as a stochastic
+# constrained-decoding degeneracy -- 0/10 on a resend of the identical bytes --
+# so the trial is asked ONCE more.
+#
+# WHAT THIS SECTION HAS TO SHOW, and the third is the one that is easy to get
+# wrong: that the retry fires on an empty parse and on NOTHING ELSE; that it
+# fires at most once; and that a retry the shutdown or spend gate DECLINES
+# leaves the first attempt's result standing rather than failing the patient --
+# because failing it would make a run worse for having a recovery mechanism it
+# could not use, and would checkpoint nothing where before there was nothing to
+# checkpoint.
+
+section("SECTION 7b -- an empty verdict is asked once more")
+
+_EMPTY_BODY = json.dumps({"evaluations": []})
+
+
+class _EmptyStub(_Stub):
+    """Answers ``{"evaluations": []}`` for the first N attempts at a trial.
+
+    PER ATTEMPT AND NOT PER TRIAL, which is the whole point: a stub whose
+    ``answer`` for a trial is fixed cannot tell "the retry fired" from "the
+    retry fired and got the same thing", and both of those are scenarios here.
+    ``empty_attempts`` is how many of a trial's attempts answer empty -- 1 for
+    the recovery case, a large number for the never-recovers case.
+
+    IT REWRITES THE BODY OF THE RESPONSE THE BASE STUB BUILT rather than
+    seeding ``_Stub.answer``, and that is not a style choice: ``_Stub.create``
+    consults ``answer`` only for a SINGLE-trial chunk (``if len(ids) == 1``), so
+    an ``answer``-based version could not make a GROUPED call answer empty at
+    all -- and the grouped arm not retrying is one of the things this section
+    has to show. Everything else about the response is the base stub's: the
+    recording, the barrier, the usage object, the model.
+
+    ``attempts`` IS KEYED ON THE FIRST TARGET ID IN THE CHUNK, so a grouped
+    chunk carrying the target counts as one attempt at it.
+    """
+
+    def __init__(self, *, empty_for=(), empty_attempts=1, **kw):
+        super().__init__(**kw)
+        self._empty_for = set(empty_for)
+        self._empty_attempts = empty_attempts
+        self.attempts = collections.Counter()
+        self._attempt_lock = threading.Lock()
+
+    def _target_in(self, ids):
+        for i in ids:
+            if i in self._empty_for:
+                return i
+        return None
+
+    def create(self, **kwargs):
+        resp = super().create(**kwargs)
+        target = self._target_in(ids_in(kwargs))
+        if target is not None:
+            with self._attempt_lock:
+                self.attempts[target] += 1
+                nth = self.attempts[target]
+            if nth <= self._empty_attempts:
+                resp.choices[0].message.content = _EMPTY_BODY
+        return resp
+
+
+def _empty_counters():
+    """A snapshot of the three empty-verdict counters, as plain dicts."""
+    return (dict(_evaluation.PER_TRIAL_EMPTY_FIRST_ATTEMPTS),
+            dict(_evaluation.PER_TRIAL_EMPTY_AFTER_RETRY),
+            dict(_evaluation.PER_TRIAL_EMPTY_RETRY_RECOVERIES))
+
+
+def _delta(before, after):
+    """``after - before``, key by key, dropping the keys that did not move."""
+    return {k: after.get(k, 0) - before.get(k, 0)
+            for k in set(before) | set(after)
+            if after.get(k, 0) != before.get(k, 0)}
+
+
+def _ledger(result):
+    """The TRIAL rows of ``llm_classifier_call_details``, warmup excluded.
+
+    THE WARMUP IS A ROW IN THAT LIST AND IT IS NOT A TRIAL CALL. It carries
+    ``warmup: True``, ``trials: 0`` and ``entries_emitted: None`` -- it
+    evaluates nothing -- so a check that means "one row per trial request"
+    cannot be allowed to count it. It is excluded BY ITS OWN MARKER rather than
+    by position, so a schedule change that stopped issuing it, or issued it
+    somewhere else, does not silently re-point these readings.
+    """
+    rows = at(result, "llm_classifier_call_details")
+    if isinstance(rows, _Absent):
+        return rows
+    return [r for r in rows if not r.get("warmup")]
+
+
+def _retry_rows(rows):
+    """The rows marked as an empty-verdict retry."""
+    if isinstance(rows, _Absent):
+        return []
+    return [r for r in rows if _evaluation.EMPTY_RETRY_OF_FIELD in r]
+
+
+def _reason_for(result, nct_id):
+    """The stored ``not_evaluable_reason`` for one trial, or an _Absent."""
+    evals = at(result, "evaluations")
+    if isinstance(evals, _Absent):
+        return evals
+    for e in evals:
+        if e.get("nct_id") == nct_id:
+            return e.get("not_evaluable_reason")
+    return _Absent(f"no evaluation for {nct_id}")
+
+
+_TARGET = trial(0)["trial"]["nct_id"]
+
+# --- 7b-a: it fires, and the retry recovers ---------------------------------
+_c0 = _empty_counters()
+_R7a, _S7a = run_node(_SIX, per_trial=True, parallel=4,
+                      stub=_EmptyStub(empty_for=[_TARGET], empty_attempts=1))
+_c1 = _empty_counters()
+
+check("7b-a  an empty parse is asked ONCE more: seven wave calls for six "
+      "trials, and the extra one carries the trial that answered with nothing",
+      (len(_S7a.wave_requests()),
+       [ids_in(r)[0] for r in _S7a.wave_requests()].count(_TARGET)),
+      (7, 2))
+# THE LEDGER IS THE INSTRUMENT HERE AND THE STUB'S ARRIVAL ORDER IS NOT.
+# `wave_requests()` records requests as they ENTER the stub, and the wave is
+# dispatched to a pool, so arrival order is the executor's. `call_details` is
+# appended by the send loop in POP order, one row per response as it is read --
+# so "the retry was the very next call handled" is the integer statement
+# `retry.call_index == empty_first_attempt.call_index + 1`, over numbers this
+# node produced rather than over a scheduler's.
+_rows7a = _ledger(_R7a)
+_retry7a = _retry_rows(_rows7a)
+check("7b-a  ...the retry is handled IMMEDIATELY after the empty response, "
+      "before any other trial's -- `pending` is a LIFO and the re-queue "
+      "appends to it, so the prefix is at its warmest",
+      (len(_retry7a),
+       _retry7a[0]["call_index"] - _retry7a[0][
+           _evaluation.EMPTY_RETRY_OF_FIELD] if _retry7a else None),
+      (1, 1))
+# THE RETRY IS THE IDENTICAL REQUEST, COMPARED AS BYTES RATHER THAN ASSUMED.
+# The first attempt is served from `_prompts`, pre-rendered before dispatch;
+# the retry is issued live and re-renders from the chunk. Those are two code
+# paths and "identical" is a claim about them, so it is measured -- system
+# message, user message AND the routing hint that decides whether the provider
+# reuses the 9,281-token prefix. Without the last of those a retry would be a
+# full-price uncached call on the one request the mechanism exists to make
+# cheap, and the only trace would be a zero in `cached_tokens`.
+_t7a = [r for r in _S7a.wave_requests() if ids_in(r)[0] == _TARGET]
+check("7b-a  ...and the retry is the IDENTICAL request: same system message, "
+      "same user message, same prompt_cache_key",
+      (len(_t7a),
+       _t7a[0]["messages"] == _t7a[1]["messages"] if len(_t7a) == 2 else None,
+       (_t7a[0].get("prompt_cache_key") == _t7a[1].get("prompt_cache_key")
+        if len(_t7a) == 2 else None)),
+      (2, True, True))
+check("7b-a  ...non-degeneracy: the two requests really carry a rendered trial "
+      "block, a system message AND a non-None routing hint, so the comparison "
+      "above is not three absences agreeing",
+      (len(_t7a[0]["messages"]) if _t7a else 0,
+       _TARGET in _t7a[0]["messages"][1]["content"] if _t7a else False,
+       _t7a[0].get("prompt_cache_key") is not None if _t7a else False),
+      (2, True, True))
+check("7b-a  ...and the verdict is RECOVERED: the trial carries a real "
+      "evaluation rather than a not-evaluable reason",
+      _reason_for(_R7a, _TARGET), None)
+check("7b-a  ...non-degeneracy: every one of the six trials came back, so the "
+      "reading above is over a full batch",
+      len(at(_R7a, "evaluations")), 6)
+check("7b-a  ...the recovery is COUNTED, in the census rather than in the "
+      "degradation registry: a recovered verdict is the mechanism working",
+      (_delta(_c0[0], _c1[0]),
+       _delta(_c0[1], _c1[1]),
+       sum(_delta(_c0[2], _c1[2]).values())),
+      ({_evaluation.EMPTY_RETRY_DECISION_QUEUED: 1}, {}, 1))
+
+# --- 7b-b: the ledger says which call was the retry OF what ------------------
+_named7a = ([r for r in _rows7a
+             if r["call_index"] == _retry7a[0][_evaluation.EMPTY_RETRY_OF_FIELD]]
+            if _retry7a else [])
+check("7b-b  BOTH calls are in the ledger -- the first attempt's row is not "
+      "amended or removed, because it was issued and billed",
+      len(_rows7a), 7)
+check("7b-b  ...the first attempt's row records entries_emitted 0, which is a "
+      "MEASUREMENT and not the None every failure shape leaves",
+      sorted(r["entries_emitted"] for r in _rows7a), [0, 1, 1, 1, 1, 1, 1])
+check("7b-b  ...exactly one row is marked a retry, and the row it NAMES is the "
+      "one that came back empty -- so the two join to each other inside one "
+      "call_details list",
+      (len(_retry7a), [r["entries_emitted"] for r in _named7a],
+       [r["trials"] for r in _named7a]),
+      (1, [0], [1]))
+check("7b-b  ...and the key is ABSENT on every ordinary call rather than "
+      "present and None, which is the convention `warmup` already follows",
+      sum(1 for r in _rows7a if _evaluation.EMPTY_RETRY_OF_FIELD in r), 1)
+check("7b-b  ...call_index is still contiguous with no gaps across the whole "
+      "list, warmup included, so the join key trial_matches.call_index uses is "
+      "unmoved",
+      [r["call_index"] for r in at(_R7a, "llm_classifier_call_details")],
+      list(range(1, 9)))
+check("7b-b  ...and a recovered verdict carries the RETRY's call_index, which "
+      "is what lets a first-pass-only statistic exclude it by a join",
+      [e.get("call_index") for e in at(_R7a, "evaluations")
+       if e.get("nct_id") == _TARGET],
+      [_retry7a[0]["call_index"] if _retry7a else None])
+
+# --- 7b-c: at most once -----------------------------------------------------
+_c0 = _empty_counters()
+_R7c, _S7c = run_node(_SIX, per_trial=True, parallel=4,
+                      stub=_EmptyStub(empty_for=[_TARGET], empty_attempts=99))
+_c1 = _empty_counters()
+check("7b-c  a trial that answers empty TWICE is asked exactly twice and no "
+      "more: the marker is membership, so the retry finds its own entry",
+      (len(_S7c.wave_requests()),
+       [ids_in(r)[0] for r in _S7c.wave_requests()].count(_TARGET)),
+      (7, 2))
+check("7b-c  ...and it is then recorded exactly as it would have been with no "
+      "retry at all -- omitted_from_model_response, by the reconciliation",
+      _reason_for(_R7c, _TARGET), NOT_EVALUABLE_MODEL_OMITTED)
+check("7b-c  ...counted as an unrecovered empty, with NO recovery and only "
+      "ONE first-attempt increment: the retry's own empty reply is a second "
+      "attempt and must not inflate the phenomenon's rate",
+      (_delta(_c0[0], _c1[0]),
+       sum(_delta(_c0[1], _c1[1]).values()),
+       _delta(_c0[2], _c1[2])),
+      ({_evaluation.EMPTY_RETRY_DECISION_QUEUED: 1}, 1, {}))
+check("7b-c  ...the patient still COMPLETES -- five verdicts and one "
+      "not-evaluable, with no error -- because one hard trial is not an outage",
+      (len(at(_R7c, "evaluations")), at(_R7c, "error")), (6, ""))
+
+# --- 7b-d: it fires on NOTHING else -----------------------------------------
+#
+# EACH OF THE FOUR OTHER SHAPES HAS ITS OWN BUDGET AND ITS OWN BRANCH, and none
+# of them may spend this one. A transport failure is isolated to its trial; a
+# refusal, malformed JSON and a non-list body all end the node. The reading is
+# the REQUEST COUNT, because that is what a spurious retry would move.
+_NOFIRE = (
+    ("a transport failure", _Stub(fail_for=[_TARGET]), 6),
+    ("a refusal", _Stub(refuse_for=[_TARGET]), None),
+    ("malformed JSON", _Stub(bad_json_for=[_TARGET]), None),
+    ("a truncated response", _Stub(truncate_for=[_TARGET]), 6),
+)
+for _what, _stub, _expected_calls in _NOFIRE:
+    _c0 = _empty_counters()
+    _r, _s = run_node(_SIX, per_trial=True, parallel=4, stub=_stub)
+    _c1 = _empty_counters()
+    _ids = [ids_in(x)[0] for x in _s.wave_requests()]
+    check(f"7b-d  {_what} does NOT spend the empty-verdict retry: the trial is "
+          f"asked exactly once and no counter of this mechanism moves",
+          (_ids.count(_TARGET),
+           _delta(_c0[0], _c1[0]), _delta(_c0[1], _c1[1]),
+           _delta(_c0[2], _c1[2])),
+          (1, {}, {}, {}))
+    if _expected_calls is not None:
+        check(f"7b-d  ...non-degeneracy: {_what} still produced the whole "
+              f"wave, so the count above is not a run that stopped early",
+              len(_s.wave_requests()), _expected_calls)
+
+# --- 7b-e: grouped mode is untouched ----------------------------------------
+_c0 = _empty_counters()
+_R7e, _S7e = run_node(_SIX, per_trial=False,
+                      stub=_EmptyStub(empty_for=[_TARGET], empty_attempts=99))
+_c1 = _empty_counters()
+check("7b-e  GROUPED mode does not retry an empty response and does not count "
+      "one: an empty array there is a whole CHUNK unanswered, the re-ask would "
+      "be a multi-trial request, and the arm is the dormant comparison arm",
+      (_delta(_c0[0], _c1[0]), _delta(_c0[1], _c1[1]), _delta(_c0[2], _c1[2])),
+      ({}, {}, {}))
+check("7b-e  ...non-degeneracy: the grouped run really did meet an empty "
+      "response -- its one call carried the target trial and answered nothing, "
+      "and every trial in that chunk is recorded omitted",
+      (len(_S7e.requests),
+       sorted({e.get("not_evaluable_reason")
+               for e in at(_R7e, "evaluations")})),
+      (1, [NOT_EVALUABLE_MODEL_OMITTED]))
+check("7b-e  ...and no ledger row in grouped mode carries the retry field",
+      sum(1 for r in _ledger(_R7e)
+          if _evaluation.EMPTY_RETRY_OF_FIELD in r), 0)
+
+# --- 7b-f: the mechanism can be turned off ----------------------------------
+_saved_retries = config.MATCHING_PER_TRIAL_EMPTY_RETRIES
+try:
+    config.MATCHING_PER_TRIAL_EMPTY_RETRIES = 0
+    _c0 = _empty_counters()
+    _R7f, _S7f = run_node(_SIX, per_trial=True, parallel=4,
+                          stub=_EmptyStub(empty_for=[_TARGET],
+                                          empty_attempts=1))
+    _c1 = _empty_counters()
+finally:
+    config.MATCHING_PER_TRIAL_EMPTY_RETRIES = _saved_retries
+check("7b-f  at MATCHING_PER_TRIAL_EMPTY_RETRIES = 0 nothing is re-asked and "
+      "the behaviour is the one that shipped before the mechanism existed",
+      (len(_S7f.wave_requests()),
+       _reason_for(_R7f, _TARGET)), (6, NOT_EVALUABLE_MODEL_OMITTED))
+check("7b-f  ...and the PHENOMENON is still counted, under its own key: a "
+      "campaign run with the retry off is exactly the campaign that needs the "
+      "rate measured, because turning it on is the decision that reads it",
+      (_delta(_c0[0], _c1[0]), _delta(_c0[1], _c1[1]), _delta(_c0[2], _c1[2])),
+      ({_evaluation.EMPTY_RETRY_DECISION_DISABLED: 1}, {}, {}))
+check("7b-f  ...and the constant was restored",
+      config.MATCHING_PER_TRIAL_EMPTY_RETRIES, _saved_retries)
+
+_SHUTDOWN_REASON_7G = "test: an operator asked to stop"
+
+# --- 7b-g: a retry the shutdown gate declines leaves the first result standing
+#
+# THE GATE IS ASKED AT THE MOMENT THE REQUEST WOULD GO OUT, so the flag is set
+# from inside the stub -- on the wave call that is about to answer empty, which
+# is the only place in this scenario where "after dispatch, before the retry"
+# exists. A flag set before `run_node` would decline the WAVE instead and this
+# would be section 8B's scenario rather than this one.
+class _ShutdownAfterWaveStub(_EmptyStub):
+    """Asks for a shutdown once every wave request has ENTERED the stub.
+
+    THE MOMENT IS THE WHOLE SCENARIO AND IT IS DETERMINISTIC RATHER THAN
+    TIMED. ``_issue`` reads the shutdown flag as its FIRST statement, so a flag
+    set while wave tasks are still queued declines those tasks -- which is
+    section 8B's subject and would make this scenario a measurement of the wave
+    gate instead of the retry gate. Every wave task is submitted before any
+    response is read, so once the stub has recorded ``expect`` requests
+    (1 warmup + one per trial) every one of them has already started and none
+    can be declined. The only request left for the gate to meet is the retry,
+    which the send loop issues afterwards, on the node thread.
+
+    ``module`` IS WHICH MODULE'S FLAG TO SET, AND IT IS NOT OPTIONAL DRESSING.
+    The flag is a MODULE GLOBAL, and section 9's controls drive an exec'd COPY
+    of evaluation.py with its own namespace and therefore its own
+    ``_SHUTDOWN_REQUESTED``. A stub that always set the real module's flag would
+    leave a planted copy running with the flag clear -- the control would report
+    the shipped behaviour, i.e. the plant as uncaught, which is the shape this
+    project treats as worse than no control at all. Measured rather than
+    reasoned about: that is exactly what the first version of c40 did.
+    """
+
+    def __init__(self, *, expect, reason, module=None, **kw):
+        super().__init__(**kw)
+        self._expect = expect
+        self._reason = reason
+        self._module = module or _evaluation
+
+    def create(self, **kwargs):
+        resp = super().create(**kwargs)
+        with self._lock:
+            entered = len(self.requests)
+        if entered >= self._expect:
+            self._module.request_stage5_shutdown(self._reason)
+        return resp
+
+
+_c0 = _empty_counters()
+_shutdown_before = dict(_evaluation.STAGE5_SHUTDOWN_SKIPS)
+try:
+    _R7g, _S7g = run_node(
+        _SIX, per_trial=True, parallel=4,
+        stub=_ShutdownAfterWaveStub(
+            expect=1 + len(_SIX), reason=_SHUTDOWN_REASON_7G,
+            empty_for=[_TARGET], empty_attempts=1))
+finally:
+    _evaluation.clear_stage5_shutdown()
+_c1 = _empty_counters()
+_shutdown_after = dict(_evaluation.STAGE5_SHUTDOWN_SKIPS)
+
+check("7b-g  a shutdown DECLINES the retry: six wave calls, not seven, and the "
+      "declined request never reached the provider",
+      len(_S7g.wave_requests()), 6)
+check("7b-g  ...and the PATIENT COMPLETES rather than failing. The c33 rule "
+      "that a shutdown must not be isolated is about trials that were NEVER "
+      "JUDGED; this one was asked and answered, so letting the first attempt "
+      "stand restores exactly the behaviour of a pipeline with no retry at all",
+      (at(_R7g, "error"), len(at(_R7g, "evaluations"))), ("", 6))
+check("7b-g  ...the trial is recorded omitted_from_model_response, which is "
+      "what the empty first attempt always produced",
+      _reason_for(_R7g, _TARGET), NOT_EVALUABLE_MODEL_OMITTED)
+check("7b-g  ...the decline is counted under the EXISTING send-phase shutdown "
+      "key rather than under new vocabulary invented for it",
+      sorted(_delta(_shutdown_before, _shutdown_after)),
+      [f"{_evaluation.SHUTDOWN_SKIP_SEND_KEY_PREFIX}{_SHUTDOWN_REASON_7G}"])
+check("7b-g  ...and the queued decision is still the only empty-verdict "
+      "counter that moved: no recovery, and no unrecovered-empty either, "
+      "because the retry never answered",
+      (_delta(_c0[0], _c1[0]), _delta(_c0[1], _c1[1]), _delta(_c0[2], _c1[2])),
+      ({_evaluation.EMPTY_RETRY_DECISION_QUEUED: 1}, {}, {}))
+check("7b-g  ...and the shutdown flag was cleared, so no later scenario in "
+      "this file inherits it",
+      _evaluation.stage5_shutdown_requested(), False)
+
+# --- 7b-h: the derived call ceiling covers the retry -------------------------
+#
+# WITHOUT THE RETRY TERM IN `_spend.stage5_call_ceiling` THE FIRST EMPTY VERDICT
+# OF A FULL-CAP PATIENT IS THE 17th CALL OF A 16-CALL CEILING -- and a ceiling
+# trip LATCHES THE WHOLE RUN, so one empty array would stop a campaign, reported
+# as a pipeline defect, for a call the configuration permits. This drives a
+# patient at MAX_TRIALS_FOR_EVALUATION with every trial answering empty once, so
+# every retry the mechanism can issue is issued.
+_FULL = [trial(i) for i in range(config.MAX_TRIALS_FOR_EVALUATION)]
+_ceiling_before = dict(_spend.SPEND_CEILING_TRIPS)
+_R7h, _S7h = run_node(_FULL, per_trial=True, parallel=4,
+                      stub=_EmptyStub(
+                          empty_for=[t["trial"]["nct_id"] for t in _FULL],
+                          empty_attempts=1))
+check("7b-h  a full-cap patient in which EVERY trial answers empty once issues "
+      "1 warmup + 2N calls and trips no ceiling -- which is exactly the number "
+      "_spend.stage5_call_ceiling derives",
+      (len(_S7h.warmup_requests()) + len(_S7h.wave_requests()),
+       _spend.stage5_call_ceiling(config.MATCHING_CALL_MODE_PER_TRIAL),
+       _delta(_ceiling_before, dict(_spend.SPEND_CEILING_TRIPS))),
+      (1 + 2 * config.MAX_TRIALS_FOR_EVALUATION,
+       1 + 2 * config.MAX_TRIALS_FOR_EVALUATION, {}))
+check("7b-h  ...and every trial recovered, so the run is a success rather than "
+      "a patient that hit a limit",
+      (len(at(_R7h, "evaluations")), at(_R7h, "error")),
+      (config.MAX_TRIALS_FOR_EVALUATION, ""))
+
+
+# ===========================================================================
 # SECTION 8 -- THE RETAINED GROUPED ARM, AS BYTES
 # ===========================================================================
 #
@@ -4412,6 +4837,209 @@ control(
       '                f"{SHUTDOWN_SKIP_SEND_KEY_PREFIX}"')],
     _grouped_probe,
     (_BASE_CHUNKS, False, 15),
+)
+
+
+
+
+# --- c37..c41: the empty-verdict retry ---------------------------------------
+#
+# EVERY ONE OF THESE PLANTS GOES INTO AN IN-MEMORY COPY, and every probe drives
+# the copy's own node through the same `run_node` the section-7b scenarios use,
+# so a control and the check it controls differ in one edit and nothing else.
+
+_RETRY_BRANCH = (
+    "        if (_per_trial_calls and not parsed\n"
+    "                and _chunk_key(chunk) not in _empty_retry_of):")
+
+
+def _retry_probe(module, *, empty_attempts=1, trials=None):
+    """``(wave calls carrying the target, its stored reason)``.
+
+    THE TWO NUMBERS TOGETHER ARE WHAT SEPARATES THE ARMS. A count alone cannot
+    tell a retry that fired from one that fired and was thrown away, and a
+    reason alone cannot tell "never retried" from "retried and still empty".
+    """
+    result, stub = run_node(
+        trials or _SIX, per_trial=True, parallel=4,
+        node=node_of(module),
+        stub=_EmptyStub(empty_for=[_TARGET], empty_attempts=empty_attempts))
+    ids = [ids_in(r)[0] for r in stub.wave_requests()]
+    return (ids.count(_TARGET), _reason_for(result, _TARGET))
+
+
+control(
+    "c37 *** A NODE THAT DOES NOT RE-ASK AN EMPTY VERDICT IS CAUGHT [7b-a]. "
+    "*** The trial is asked once, answers nothing, and is recorded "
+    "omitted_from_model_response -- a confident not_eligible silently "
+    "converted into 'we did not look', which is the direction that inflates "
+    "apparent eligibility",
+    [(_RETRY_BRANCH, "        if False:")],
+    lambda m: _retry_probe(m, empty_attempts=1),
+    (1, NOT_EVALUABLE_MODEL_OMITTED),
+)
+control(
+    "c37 ...and the SHIPPED node on the identical scenario recovers the "
+    "verdict, which is the clean control without which the reading above is "
+    "consistent with a probe that always reports one call",
+    [],
+    lambda m: _retry_probe(m, empty_attempts=1),
+    (2, None),
+)
+control(
+    "c38 *** A NODE WITH NO AT-MOST-ONCE GUARD IS CAUGHT [7b-c]. *** The "
+    "marker is what stops a hard pair being re-asked until the derived call "
+    "ceiling stops it, so a trial answering empty twice is asked a THIRD time "
+    "and its verdict enters the campaign from an attempt the budget never "
+    "authorised",
+    [(_RETRY_BRANCH,
+      "        if (_per_trial_calls and not parsed\n"
+      "                and True):")],
+    lambda m: _retry_probe(m, empty_attempts=2),
+    (3, None),
+)
+control(
+    "c38 ...and the SHIPPED node stops at two and records the trial as not "
+    "evaluable, which is the honest record for a pair that failed twice",
+    [],
+    lambda m: _retry_probe(m, empty_attempts=2),
+    (2, NOT_EVALUABLE_MODEL_OMITTED),
+)
+control(
+    "c39 *** A RETRY THAT IS NOT MARKED IN THE LEDGER IS CAUGHT [7b-b]. *** "
+    "Without the field a recovered verdict is indistinguishable from a "
+    "first-pass one, which is exactly the unauditable selection bias the "
+    "argument for retrying at all depends on being able to exclude",
+    [("        _retry_of = _empty_retry_of.get(_chunk_key(chunk))\n"
+      "        if _retry_of is not None:\n"
+      "            _this_call[EMPTY_RETRY_OF_FIELD] = _retry_of\n",
+      "")],
+    lambda m: sum(
+        1 for r in (_ledger(run_node(_SIX, per_trial=True, parallel=4,
+                                     node=node_of(m),
+                                     stub=_EmptyStub(empty_for=[_TARGET]))[0])
+                    or [])
+        if _evaluation.EMPTY_RETRY_OF_FIELD in r),
+    0,
+)
+control(
+    "c39 ...and the SHIPPED node marks exactly one row",
+    [],
+    lambda m: sum(
+        1 for r in (_ledger(run_node(_SIX, per_trial=True, parallel=4,
+                                     node=node_of(m),
+                                     stub=_EmptyStub(empty_for=[_TARGET]))[0])
+                    or [])
+        if _evaluation.EMPTY_RETRY_OF_FIELD in r),
+    1,
+)
+
+
+def _cache_keys_of_target(module):
+    """"same" / "differ" / a named absence, for the target's two requests.
+
+    A WORD RATHER THAN THE KEY ITSELF, because the key is a sha256 of the
+    system prompt and comparing two of them is what the probe is FOR; returning
+    them would put a 64-character digest in a failure line and say nothing more
+    than this does. ``absent:N`` names how many requests carried the target when
+    the answer is neither, which is what a defect that stopped issuing the retry
+    at all would produce -- and which must not be reported as "same".
+    """
+    _, stub = run_node(_SIX, per_trial=True, parallel=4, node=node_of(module),
+                       stub=_EmptyStub(empty_for=[_TARGET], empty_attempts=1))
+    reqs = [r for r in stub.wave_requests() if ids_in(r)[0] == _TARGET]
+    if len(reqs) != 2:
+        return f"absent:{len(reqs)}"
+    a, b = (r.get("prompt_cache_key") for r in reqs)
+    if a is None and b is None:
+        return "absent:both"
+    return "same" if a == b else "differ"
+
+
+def _declined_probe(module):
+    """``(error text is empty, evaluations, the target's reason)``.
+
+    The shutdown flag is cleared in a ``finally`` whatever the copy does, so a
+    planted node that leaves it set cannot poison the controls after it.
+    """
+    try:
+        result, _ = run_node(
+            _SIX, per_trial=True, parallel=4, node=node_of(module),
+            stub=_ShutdownAfterWaveStub(
+                expect=1 + len(_SIX), reason=_SHUTDOWN_REASON_7G,
+                module=module, empty_for=[_TARGET], empty_attempts=1))
+    finally:
+        module.clear_stage5_shutdown()
+        _evaluation.clear_stage5_shutdown()
+    evals = at(result, "evaluations")
+    return (at(result, "error") == "",
+            len(evals) if not isinstance(evals, _Absent) else -1,
+            type(_reason_for(result, _TARGET)).__name__)
+
+
+control(
+    "c40 *** A NODE THAT FAILS THE PATIENT WHEN THE RETRY IS DECLINED IS "
+    "CAUGHT [7b-g]. *** Five verdicts that were issued, answered and BILLED "
+    "are discarded and the whole patient is re-run, because a request the "
+    "pipeline did not have to make could not be made -- a run made strictly "
+    "worse by having a recovery mechanism it could not use",
+    [("            if (_per_trial_calls\n"
+      "                    and isinstance(e, Stage5ShutdownRequested)\n"
+      "                    and _chunk_key(chunk) in _empty_retry_of\n"
+      "                    and getattr(e, \"limit\", None)\n"
+      "                    != spend.SPEND_LIMIT_CALL_CEILING):",
+      "            if False:")],
+    _declined_probe,
+    (False, 0, "_Absent"),
+)
+control(
+    "c40 ...and the SHIPPED node on the identical scenario completes the "
+    "patient with all six trials accounted for and the declined one recorded "
+    "omitted_from_model_response -- the clean control, without which the "
+    "reading above is consistent with a probe that always reports a failure",
+    [],
+    _declined_probe,
+    (True, 6, "str"),
+)
+control(
+    "c41 *** A RETRY CONDITION WIDENED PAST 'THE PARSE SUCCEEDED AND THE LIST "
+    "IS EMPTY' IS CAUGHT [7b-d]. *** With the emptiness test dropped, EVERY "
+    "per-trial call is re-asked once: the patient's Stage 5 bill doubles and "
+    "nothing anywhere says so, because every verdict is still produced",
+    [(_RETRY_BRANCH,
+      "        if (_per_trial_calls\n"
+      "                and _chunk_key(chunk) not in _empty_retry_of):")],
+    lambda m: len(run_node(_SIX, per_trial=True, parallel=4, node=node_of(m),
+                           stub=_Stub())[1].wave_requests()),
+    2 * len(_SIX),
+)
+control(
+    "c42 *** A RETRY ISSUED WITHOUT THE ROUTING HINT IS CAUGHT [7b-a]. *** The "
+    "wave carries `prompt_cache_key` and the retry would not, so the provider "
+    "is asked to route a request sharing thousands of tokens of prefix with "
+    "the wave WITHOUT the hint that says so -- a full-price uncached call on "
+    "the one request the mechanism exists to make cheap, whose only trace is a "
+    "zero in `cached_tokens`",
+    [("        _live = call_matching_model(system_prompt, _user_prompt_for(chunk),"
+      "\n                                    prompt_cache_key=_cache_key)",
+      "        _live = call_matching_model(system_prompt, _user_prompt_for(chunk))")],
+    lambda m: _cache_keys_of_target(m),
+    "differ",
+)
+control(
+    "c42 ...and the SHIPPED node sends the same hint on both, which is what "
+    "makes the retry the identical request",
+    [],
+    lambda m: _cache_keys_of_target(m),
+    "same",
+)
+control(
+    "c41 ...and the SHIPPED node issues exactly one call per trial when no "
+    "response is empty",
+    [],
+    lambda m: len(run_node(_SIX, per_trial=True, parallel=4, node=node_of(m),
+                           stub=_Stub())[1].wave_requests()),
+    len(_SIX),
 )
 
 

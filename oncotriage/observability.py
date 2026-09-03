@@ -522,6 +522,21 @@ LOGGABLE_FIELDS = frozenset({
     # bound is the one thing a reader comparing two per-trial campaigns has to
     # group by.
     "parallel",
+    # WHICH CALL AN EMPTY-VERDICT RETRY IS A RETRY OF: the 1-based ordinal of
+    # the request whose reply parsed to an empty array, inside ONE patient's
+    # Stage 5 ledger. An integer this pipeline assigned, so it can carry no
+    # patient, trial or diagnosis -- the trial is already `nct_id`, which is
+    # public ClinicalTrials.gov data and is on this list above.
+    #
+    # A FIELD OF ITS OWN RATHER THAN `total`, which was the first draft and is
+    # the reason this entry exists. That field means "the denominator" in every
+    # other line of this pipeline, and a reader meeting it beside `index` on a
+    # retry line has to guess which of the two ordinals is which. It is also
+    # not `retry`: that names the PARSE-retry budget, which this mechanism
+    # deliberately does not spend, and re-using it would put two budgets in one
+    # column. See oncotriage/agent/evaluation.py:EMPTY_RETRY_OF_FIELD, which is
+    # the same fact in the stored ledger under the same name.
+    "empty_retry_of",
     # The cross-encoder's sequence limit, both sides of the comparison plus
     # WHICH declaration was consulted. All three are model geometry -- a token
     # count and an attribute path -- and none of them can carry a patient, a
