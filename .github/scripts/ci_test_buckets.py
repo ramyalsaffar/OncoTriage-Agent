@@ -515,6 +515,27 @@ BUCKETS = {
         "collision matrix -- the one repository file it reads, "
         "oncotriage/agent/retrieval.py, is written by neither of the suite's "
         "two writers. It execs nothing, so it needs no _EXEC_ALLOWLIST entry"),
+    "test_matching_temperature_policy.py": (
+        _A, None,
+        "ran green in 0.8s, 72 checks, against ONLY the directory skeleton: "
+        "the pipeline-level Stage 5 temperature rule -- config.MATCHING_"
+        "TEMPERATURE is requested on any arm whose model DECLARES it accepts "
+        "the parameter, omitted where it does not, and recorded either way. No "
+        "network, no keys, NO SPEND -- no provider client of any kind is built, "
+        "the one call site driven is handed a recorder through "
+        "oncotriage/agent/deps.py, and deps.is_resolved is asserted False for "
+        "all three client keys at the end, so a real client that HAD been built "
+        "is caught. No model load (ONCOTRIAGE_DEFER_LOCAL_MODELS above the "
+        "imports; torch and transformers asserted absent), no live Qdrant -- "
+        "run_fingerprint._resolve_collection is replaced so current() probes no "
+        "index -- no corpus, no database, no git history and no live server. It "
+        "writes NOTHING anywhere, not even a temp directory, and EXECS NOTHING: "
+        "every control is a different INPUT to a pure function or a module "
+        "attribute rebound inside try/finally with the restore asserted. NOT in "
+        "the collision matrix, though the two repository files it READS are "
+        "sha256-compared at the end and one of them is config.py, which "
+        "tests/test_config_snapshot_date_rot.py rewrites in place -- so an "
+        "interleaved serial run is visible rather than silent"),
     "test_agent_retrieval_observability.py": (
         _A, None, "ran green in 3.5s; needs .env to EXIST, makes no live call"),
     "test_agent_stage5_input_packing.py": (

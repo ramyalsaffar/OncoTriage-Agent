@@ -446,11 +446,21 @@ print("=" * 78)
 # `MATCHING_PER_TRIAL_CALLS_ENABLED` is excluded for a stronger reason, argued at
 # the tuple: it would put a SECOND derivation of the flag-to-arm mapping in the
 # store, and every reader would then have to map True to "per_trial" for itself.
+#
+# `matching_temperature_sent` IS THE SECOND SUCH KEY AND ITS CONSTANT IS IN THE
+# TUPLE, which is not a contradiction. `MATCHING_TEMPERATURE` is what the
+# operator SET and is a named constant, so it goes through the enumeration;
+# this is what the judge was TOLD, which is a function of that constant AND the
+# live arm's declared capability AND the thinking mode, so it cannot. The two
+# differ on every arm whose model rejects the parameter, and a comparison of two
+# runs needs both -- otherwise a difference between "the policy changed" and
+# "the arm changed" is unreadable from the index.
 _DERIVED_PARAM_KEYS = {"prompt_version", "prompt_digest_probe",
                        "prompt_template_sha256_site_confirmed",
                        "prompt_template_sha256_site_unconfirmed",
                        "qdrant_collection_resolved",
-                       "matching_call_mode"}
+                       "matching_call_mode",
+                       "matching_temperature_sent"}
 
 _EXPECTED_PARAM_KEYS = sorted(
     set(tracking.CONFIGURATION_PARAM_NAMES)
@@ -517,6 +527,44 @@ check("2e-iii the arm is read at CALL time and follows the flag in BOTH "
       (config.MATCHING_CALL_MODE_PER_TRIAL, config.MATCHING_CALL_MODE_GROUPED))
 check("2e-iv ...and the flag was restored",
       config.MATCHING_PER_TRIAL_CALLS_ENABLED, _saved_arm)
+
+# --- THE TEMPERATURE, WHICH IS THE OTHER PARAMETER THAT IS NOT A CONSTANT ---
+#
+# Same shape as the arm above, and the both-directions drive is what separates
+# it from the CONSTANT logged three lines away in the enumeration: the constant
+# does not move when the provider does, and this does.
+check("2e-v  the temperature logged is the ONE owner's answer -- what the "
+      "judge was TOLD, not a second read of MATCHING_TEMPERATURE",
+      _RUN.data.params.get("matching_temperature_sent"),
+      str(config.matching_temperature_record()))
+check("2e-vi ...and the CONSTANT is logged too, under its own name, because "
+      "'what was set' and 'what was sent' are different facts and a reader "
+      "comparing two runs needs both",
+      _RUN.data.params.get("MATCHING_TEMPERATURE"),
+      str(config.MATCHING_TEMPERATURE))
+
+_saved_provider = config.MATCHING_PROVIDER
+try:
+    config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC
+    _temp_capable = drive(tracking.configuration_params, _STUB_COLLECTION)
+    config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_OPENAI
+    _temp_incapable = drive(tracking.configuration_params, _STUB_COLLECTION)
+finally:
+    config.MATCHING_PROVIDER = _saved_provider
+check("2e-vii the temperature is read at CALL time and follows the ARM -- an "
+      "arm whose model accepts the parameter logs the value, one whose model "
+      "rejects it logs the documented not_sent sentinel, and the CONSTANT is "
+      "the same on both sides of that",
+      ((_temp_capable or {}).get("matching_temperature_sent"),
+       (_temp_incapable or {}).get("matching_temperature_sent")),
+      (repr(float(config.MATCHING_TEMPERATURE)),
+       config.MATCHING_TEMPERATURE_NOT_SENT))
+check("2e-viii ...and the two really differ, so the check above is not two "
+      "readings of one value (non-degeneracy)",
+      (_temp_capable or {}).get("matching_temperature_sent")
+      != (_temp_incapable or {}).get("matching_temperature_sent"), True)
+check("2e-ix ...and the provider was restored",
+      config.MATCHING_PROVIDER, _saved_provider)
 
 check("2f  the collection was resolved ONCE for the whole start_run, not once "
       "per reader (two live calls can disagree across an alias swap)",

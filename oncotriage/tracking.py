@@ -673,6 +673,22 @@ def configuration_params(collection=None):
     # all spell it this way; a fourth spelling in the one index built for
     # cross-run comparison would be the thing that makes the comparison manual.
     out["matching_call_mode"] = config.matching_call_mode()
+    # WHAT SAMPLING TEMPERATURE STAGE 5 ASKED FOR. Derived, on
+    # `matching_call_mode`'s seam directly above and for its reason: the
+    # enumeration logs the value of a named CONSTANT, and this is the value of
+    # the one FUNCTION that combines three of them -- MATCHING_TEMPERATURE, the
+    # live arm's declared capability, and (on the Converse arm) the thinking
+    # mode. `MATCHING_TEMPERATURE` IS ALSO IN THE ENUMERATION, and the pair is
+    # not a duplicate: that one is what the operator SET and this is what the
+    # judge was TOLD, they differ on the two arms whose model rejects the
+    # parameter, and a comparison of two runs needs both to say whether a
+    # difference was a policy change or an arm change.
+    #
+    # THE KEY IS THE COLUMN'S NAME. `runs.matching_temperature_sent` and the
+    # `matching_temperature_sent` fingerprint field spell it this way; a third
+    # spelling in the one index built for cross-run comparison would be the
+    # thing that makes the comparison manual.
+    out["matching_temperature_sent"] = config.matching_temperature_record()
     if collection is None:
         collection, _warnings = qdrant_collection()
     out["qdrant_collection_resolved"] = collection

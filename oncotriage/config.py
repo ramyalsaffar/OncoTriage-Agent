@@ -402,24 +402,68 @@ RRF_WEIGHT_DENSE      = 1.0   # dense vector     (full expanded query)
 
 # Temperature settings
 #
-# MATCHING_TEMPERATURE is None because gpt-5.6-terra REJECTS the parameter.
-# Probed live 2026-08-04:
+# MATCHING_TEMPERATURE IS 0.0, AND IT IS A PIPELINE-LEVEL RULE RATHER THAN A
+# PER-PROVIDER SETTING: the classifier asks for temperature 0 on every arm
+# whose model accepts the parameter, omits it where the model does not, and
+# RECORDS which of the two happened. What decides that is
+# `matching_temperature_capability()` below -- a DECLARED capability per arm,
+# never a try-and-catch of a 400.
+#
+# WHY 0 IS THE VALUE. Stage 5 is a CLASSIFICATION task: it reads criteria and
+# emits a verdict per criterion under a strict schema. Both vendors this
+# project can reach say the same thing about that shape of task -- OpenAI's
+# API guidance puts analytical, deterministic work near 0 and reserves higher
+# values for generative variety, and Anthropic's documents temperature as
+# "amount of randomness injected", recommending values "closer to 0.0 for
+# analytical / multiple choice". Nothing here is a novel judgement; what is new
+# is that the pipeline now STATES the request rather than inheriting whatever a
+# provider's default sampler happens to be (1.0 on both).
+#
+# TEMPERATURE 0 IS NECESSARY, NOT SUFFICIENT, AND THAT CAVEAT IS THE REASON THE
+# k-RUN STABILITY MEASUREMENT STAYS MANDATORY. Greedy decoding still varies
+# with batching, kernel scheduling, hardware and any server-side change to the
+# model behind an alias; neither vendor promises bit-identical output at 0 and
+# neither returns a fingerprint this project could check. The dashboard's
+# reproducibility tab already says so in as many words ("LLM outputs with
+# temperature=0 are near-deterministic but not perfectly so"). So this constant
+# narrows the distribution the judge samples from; it does not replace
+# `CAMPAIGN_STABILITY_SAMPLE_SIZE`'s k=2 re-run, and a pass that reads it as
+# permission to drop that measurement has misread it.
+#
+# THE PREVIOUS VALUE WAS None AND THE REASON IT WAS None IS STILL TRUE OF THE
+# ARM IT WAS MEASURED ON. Probed live 2026-08-04 against gpt-5.6-terra:
 #
 #   temperature=0 -> 400 unsupported_value: "'temperature' does not support 0
 #   with this model. Only the default (1) value is supported."
 #
-# None means "not sent", and File 13 does not send it. It is kept as a named
-# constant rather than deleted because File 45 records it into every fixture's
-# environment block, where None is the honest record of a parameter the run did
-# not set. Do not set it to 1: that would claim the pipeline chose a sampling
-# temperature, when in fact it has no say in the matter.
+# That is a fact about THE MODEL, not about this pipeline, and it is exactly
+# what `MATCHING_TEMPERATURE_MODEL_ACCEPTS` records for the two Terra arms. The
+# old comment turned that model fact into a project-wide "not sent" -- which
+# was correct while Terra was the only judge and became wrong the moment the
+# shipped judge changed, because it left the pipeline with NO temperature
+# policy at all rather than with one the live arm could not honour.
 #
-# CONSEQUENCE FOR DETERMINISM. Determinism is a deliberate property of this
-# pipeline (see CLAUDE.md). Stages 1-4 are unaffected -- they are rule-based,
-# stable-argsorted, and seeded. Stage 5 is no longer temperature-pinned, so
-# identical input can now produce different verdicts across runs. MATCHING_SEED
-# below is the only remaining lever and it is best-effort.
-MATCHING_TEMPERATURE = None  # gpt-5.6-terra rejects any value but its default
+# None IS KEPT AS THE DELIBERATE OPT-OUT and means "send it nowhere", which is
+# the pre-2026-09-03 behaviour exactly. Setting it does not silence the record:
+# `matching_temperature_sent()` returns None, so the fingerprint field reads
+# the same `not_sent` a capability-NO arm produces, and nothing is counted --
+# because a parameter the operator asked not to send is not a degradation.
+#
+# WHAT IT COSTS. On the shipped Converse arm this CHANGES EVERY VERDICT'S
+# SAMPLING DISTRIBUTION, so it is gated by the resume fingerprint
+# (`matching_temperature_sent`, FINGERPRINT_VERSION 7) and recorded in the
+# tracking index and in every future fixture's tunables block. On the two Terra
+# arms nothing on the wire moves -- their request dicts are byte-identical to
+# what they were -- and the drop is counted once per process under
+# `temperature_not_expressible`.
+MATCHING_TEMPERATURE = 0.0
+
+# THE VALUE IS VALIDATED AT IMPORT, and the check lives beside the capability
+# table further down this file -- `validate_matching_temperature()`, called
+# unconditionally at that block's end. It is a FUNCTION rather than four lines
+# here so that a test can drive it with a table of inputs, which is the natural
+# control for a pure function of its argument; an `if` at this line would be
+# reachable only by exec'ing a patched copy of a 4,000-line module.
 #
 # EXPANSION_TEMPERATURE WAS HERE AND IS DELETED (pass 20f-2). It read
 # `EXPANSION_TEMPERATURE = 0  # Deterministic query expansion (Stage 1 uses no
@@ -2581,6 +2625,257 @@ def matching_wire_model():
     validate_matching_provider_config()          # raises, naming the constant
     raise RuntimeError(                          # unreachable; belt and braces
         f"MATCHING_PROVIDER is {MATCHING_PROVIDER!r}")
+
+
+# ---------------------------------------------------------------------------
+# THE TEMPERATURE CAPABILITY, DECLARED PER ARM
+# ---------------------------------------------------------------------------
+#
+# DECLARED, NEVER DISCOVERED BY SENDING. The alternative -- send temperature,
+# catch the 400, retry without it -- is refused here for the same reason
+# `validate_matching_provider_config()` refuses an unpriced model locally: a
+# discovery mechanism that costs a signed request costs it PER PROCESS at best
+# and per call at worst, it cannot distinguish "this model rejects the
+# parameter" from "this account is throttled", and on the shipped per-trial arm
+# the first request of a patient is the CACHE WARMUP, whose failure fails the
+# patient rather than degrading. A declaration is checkable offline by a test
+# and is what a reader of this file can act on.
+
+MATCHING_TEMPERATURE_MODEL_ACCEPTS = {
+    # gpt-5.6-terra. PROBED LIVE 2026-08-04, and the 400 is quoted at
+    # MATCHING_TEMPERATURE above: "'temperature' does not support 0 with this
+    # model. Only the default (1) value is supported."
+    MATCHING_PROVIDER_OPENAI: False,
+    # THE SAME MODEL over Bedrock's Responses API, so the same answer. This
+    # entry is not a second measurement and does not pretend to be: the
+    # restriction is the MODEL's, the endpoint does not change it, and
+    # `BEDROCK_MATCHING_MODEL` is the cross-Region profile id for the SAME
+    # model (`us.openai.gpt-5.6-terra`). If that constant is ever pointed at a
+    # different model this row is the one to re-derive.
+    MATCHING_PROVIDER_BEDROCK: False,
+    # Claude Sonnet 4.6 over Converse. `inferenceConfig.temperature` is a
+    # MODELED member of the Converse request shape (API_runtime_InferenceConfiguration:
+    # maxTokens / stopSequences / temperature / topP), and Anthropic's own
+    # parameter guidance recommends values near 0 for analytical work. TWO
+    # CONDITIONS RIDE WITH IT and both are enforced below rather than trusted:
+    # temperature is sent WITHOUT topP -- Anthropic's guidance is to alter one
+    # of the two and not both, and this pipeline sends neither today, so the
+    # rule is kept by the builder never sending topP at all -- and it is sent
+    # ONLY while extended thinking is off, because with thinking enabled the
+    # provider forces its own temperature and a value here would be a request
+    # the service overrides silently.
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: True,
+}
+"""Whether each arm's MODEL accepts a temperature parameter at all.
+
+A FACT ABOUT THE MODEL, not about the endpoint and not about this pipeline's
+preference. `matching_temperature_capability()` is what turns it into an answer
+about the LIVE arm, because one arm has a second condition on top of it.
+
+TOTAL OVER `MATCHING_PROVIDERS`, guarded at import below: an arm added to the
+vocabulary without a row here would fall through to a default, and every
+available default is a claim -- False silently stops asking for determinism on
+the new arm, True sends a parameter nobody checked.
+"""
+
+# ONE-SHOT TOTALITY GUARD, on `TRACKING_STATUS_FOR`'s and `BUDGET_FOR_SOURCE`'s
+# footing. A RuntimeError at import and not an `assert`: `python -O` deletes
+# those, and this file is imported by every entry point in the project.
+if set(MATCHING_TEMPERATURE_MODEL_ACCEPTS) != set(MATCHING_PROVIDERS):
+    raise RuntimeError(
+        "MATCHING_TEMPERATURE_MODEL_ACCEPTS must have exactly one row per "
+        f"member of MATCHING_PROVIDERS. Declared: "
+        f"{sorted(MATCHING_TEMPERATURE_MODEL_ACCEPTS)}; providers: "
+        f"{sorted(MATCHING_PROVIDERS)}. Add the missing row in "
+        "oncotriage/config.py, with the measurement or the citation behind it.")
+
+MATCHING_TEMPERATURE_SUPPORTED = "supported"
+MATCHING_TEMPERATURE_MODEL_REJECTS = "model_rejects_parameter"
+MATCHING_TEMPERATURE_THINKING_ENABLED = "thinking_enabled"
+
+MATCHING_TEMPERATURE_CAPABILITIES = (
+    MATCHING_TEMPERATURE_SUPPORTED,
+    MATCHING_TEMPERATURE_MODEL_REJECTS,
+    MATCHING_TEMPERATURE_THINKING_ENABLED,
+)
+"""Why the live arm does or does not carry a temperature. A CLOSED vocabulary.
+
+THREE MEMBERS RATHER THAN A BOOL, because the two refusals name different
+remediations and a reader of the degradation report is entitled to the
+difference: `model_rejects_parameter` is a property of the judge and the only
+fix is a different judge, while `thinking_enabled` is a setting in this file
+that an operator can turn off. A bool would collapse them into "not sent" and
+send both readers to the same wrong place.
+"""
+
+MATCHING_TEMPERATURE_NOT_SENT = "not_sent"
+"""What the RECORD reads when no temperature reached the wire.
+
+A DOCUMENTED SENTINEL, never an omitted field and never `UNKNOWN`: this is a
+determinate answer -- the pipeline asked nothing of the sampler -- where
+`run_fingerprint.UNKNOWN` means "could not be established", which would make
+the stamp UNRESOLVED and refuse a resume for a fault that did not happen.
+"""
+
+
+def matching_temperature_capability() -> str:
+    """Whether the LIVE arm will carry a temperature, and if not, why.
+
+    ONE OWNER, THREE KINDS OF CONSUMER -- the two request builders, the
+    degradation records, and the tests -- which is the whole reason this is a
+    function rather than a constant read at three sites. `matching_call_mode()`
+    and `matching_wire_model()` are the same shape for the same reason: a fact
+    that is DERIVED from more than one constant must be derived once, or the
+    request and the record can disagree about what was sent.
+
+    READ AT CALL TIME, NEVER CACHED, on `matching_call_mode()`'s argument: both
+    inputs are module attributes a process may move (a probe does; a test
+    does), and a cached answer would describe the configuration this module was
+    imported with rather than the one that served the request.
+
+    Returns:
+        A member of ``MATCHING_TEMPERATURE_CAPABILITIES``. Note that it answers
+        about the ARM ALONE and says nothing about ``MATCHING_TEMPERATURE``
+        itself -- an operator who set the constant to None still gets
+        ``supported`` here, and ``matching_temperature_sent()`` is what
+        combines the two. Keeping them apart is what lets the degradation
+        record distinguish "the judge cannot take it" from "the operator asked
+        for none".
+
+    Raises:
+        RuntimeError: through ``validate_matching_provider_config()``, on an
+            unrecognised provider. Never returns a default for one -- that is
+            the silent-wrong-provider failure the closed vocabulary exists to
+            prevent, and a temperature decision made for a provider nobody
+            recognises is exactly the shape of it.
+    """
+    accepts = MATCHING_TEMPERATURE_MODEL_ACCEPTS.get(MATCHING_PROVIDER)
+    if accepts is None:
+        validate_matching_provider_config()      # raises, naming the constant
+        raise RuntimeError(                      # unreachable; belt and braces
+            f"MATCHING_PROVIDER is {MATCHING_PROVIDER!r}")
+    if not accepts:
+        return MATCHING_TEMPERATURE_MODEL_REJECTS
+    # THE SECOND CONDITION, AND IT IS ARM-SPECIFIC BY CONSTRUCTION RATHER THAN
+    # BY AN `if provider ==`. `BEDROCK_ANTHROPIC_THINKING` is None on every arm
+    # that is not the Converse one -- it is that arm's constant -- so the test
+    # below is a no-op elsewhere and stays correct if a fourth arm is added
+    # whose model accepts the parameter unconditionally.
+    #
+    # WHY THINKING DISABLES IT. Extended thinking makes the provider fix its
+    # own sampling; a temperature sent alongside is not honoured, so sending
+    # one would put a value in the request, in the fixture and in the
+    # fingerprint that the service ignored -- a record that disagrees with what
+    # happened, which is worse than no record. "disabled" is the shipped value
+    # (see BEDROCK_ANTHROPIC_THINKING), so this branch is inert today and is
+    # here so that turning thinking on cannot silently start lying.
+    if (MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK_ANTHROPIC
+            and BEDROCK_ANTHROPIC_THINKING not in (None, "disabled")):
+        return MATCHING_TEMPERATURE_THINKING_ENABLED
+    return MATCHING_TEMPERATURE_SUPPORTED
+
+
+def matching_temperature_sent():
+    """The temperature value Stage 5 will actually SEND, or None for "nothing".
+
+    THE ONE FUNCTION THAT ANSWERS THAT QUESTION, and what both request builders
+    call. None means the field is OMITTED -- never sent as null, which is a
+    value a serializer would put on the wire, and never substituted with the
+    provider's default, which would claim the pipeline chose a sampling
+    temperature it has no say over.
+
+    TWO WAYS TO GET None AND THEY ARE DIFFERENT FINDINGS, which is why
+    `matching_temperature_capability()` is a separate function: the arm cannot
+    take it (counted as a degradation by the arm that dropped it), or the
+    operator set MATCHING_TEMPERATURE to None (counted by nobody -- an opt-out
+    is not a fault).
+
+    Returns:
+        float, or None.
+    """
+    if MATCHING_TEMPERATURE is None:
+        return None
+    if matching_temperature_capability() != MATCHING_TEMPERATURE_SUPPORTED:
+        return None
+    return MATCHING_TEMPERATURE
+
+
+def matching_temperature_record() -> str:
+    """What was sent, as the string every durable record uses. ONE SPELLING.
+
+    `run_fingerprint`'s gated `matching_temperature_sent` field, the
+    `runs.matching_temperature_sent` column, the tracking index's parameter and
+    the log lines all read THIS, so a stamp, a row and a report cannot spell one
+    fact three ways -- the `matching_call_mode` arrangement, applied to a value
+    that is a float rather than a member of a closed set.
+
+    A STRING RATHER THAN A FLOAT, and that is a storage decision with a reason.
+    The gated fields are compared with `!=` and stored in a column; a REAL
+    column plus float equality would make `0.0` and `-0.0` and a value that
+    round-tripped through JSON at a different precision three answers to one
+    question. `repr(float(...))` is stable, round-trips exactly in CPython, and
+    sorts and groups as text in SQL where nothing needs it to sort as a number.
+
+    Returns:
+        ``MATCHING_TEMPERATURE_NOT_SENT``, or the repr of the float sent.
+    """
+    value = matching_temperature_sent()
+    if value is None:
+        return MATCHING_TEMPERATURE_NOT_SENT
+    return repr(float(value))
+
+
+MATCHING_TEMPERATURE_MIN = 0.0
+MATCHING_TEMPERATURE_MAX = 1.0
+"""The bounds a configured temperature must fall inside.
+
+THE INTERSECTION OF WHAT THE ARMS THIS PIPELINE CAN REACH ACCEPT, not one
+vendor's range: OpenAI's chat `temperature` documents 0..2 and Anthropic's
+documents 0..1, so 1.0 is the highest value that is legal wherever it could be
+sent. Bounding at the intersection is what lets this constant stay a
+pipeline-level rule -- it does not have to know which arm is live to be
+checkable -- and nothing in a classification pipeline wants a value above 1
+anyway. A ceiling that admitted a value one arm would refuse would be a ceiling
+that did not do its job.
+"""
+
+
+def validate_matching_temperature(value=MATCHING_TEMPERATURE) -> None:
+    """Refuse a temperature this pipeline could not send. PURE; raises or not.
+
+    CALLED AT IMPORT with the module's own constant, immediately below, because
+    the failure a bad value produces is a 400 on every Stage 5 call of a
+    campaign and the right time to learn that is before the first one. The
+    ARGUMENT exists so a test can drive it over a table of inputs rather than
+    exec'ing a patched copy of this module -- the natural control for a pure
+    function of its argument, and what keeps the guard exercisable at all.
+
+    ``bool`` IS EXCLUDED EXPLICITLY because ``isinstance(True, int)`` is True,
+    so ``True`` would otherwise sail through as temperature 1.0 -- the provider
+    default, silently claimed as a choice, which is the one value
+    MATCHING_TEMPERATURE's own block says never to write here by accident.
+
+    Raises:
+        RuntimeError: naming the constant and the rule it broke. RuntimeError
+            rather than ValueError, on this module's standing precedent -- a
+            stray ``except ValueError`` around a model call must not eat it.
+    """
+    if value is None:
+        return                                  # the declared opt-out
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise RuntimeError(
+            "MATCHING_TEMPERATURE must be a number, or None to send it "
+            f"nowhere. It is {value!r}. Edit it in oncotriage/config.py.")
+    if not MATCHING_TEMPERATURE_MIN <= float(value) <= MATCHING_TEMPERATURE_MAX:
+        raise RuntimeError(
+            f"MATCHING_TEMPERATURE must be between "
+            f"{MATCHING_TEMPERATURE_MIN} and {MATCHING_TEMPERATURE_MAX} "
+            f"inclusive -- the intersection of what the arms this pipeline can "
+            f"reach accept -- or None to send it nowhere. It is {value!r}. "
+            f"Edit it in oncotriage/config.py.")
+
+
+validate_matching_temperature(MATCHING_TEMPERATURE)
 
 
 def get_bedrock_api_key():

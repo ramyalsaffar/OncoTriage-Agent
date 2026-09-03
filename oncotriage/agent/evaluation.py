@@ -405,6 +405,91 @@ class MatchingModelMismatchError(RuntimeError):
 # the truncation thresholds calibrated against the first of them.
 
 
+# ---------------------------------------------------------------------------
+# The OpenAI arm's dropped-parameter record
+# ---------------------------------------------------------------------------
+#
+# A MODULE-LEVEL Counter, on AGE_PARSE_FAILURES' footing (item 11a), and NOT a
+# key in any result dict: the twelve characterization fixtures diff Stage 5's
+# dict field by field, and a new field there means recapturing all twelve at
+# live model prices for something no stage reads.
+#
+# WHY IT IS HERE AND NOT IN AN ADAPTER. This module IS the OpenAI arm's request
+# builder -- there is no `openai_adapter.py`, because there was nothing to
+# translate -- so the arm that drops the parameter is the one that has to record
+# it. The two Bedrock arms have counters of their own, and a shared one was
+# rejected for the reason `degradation.py` already gives for keeping
+# BEDROCK_ADAPTER_DEGRADATIONS and BEDROCK_ANTHROPIC_DEGRADATIONS apart: a
+# shared total cannot say WHICH arm degraded, which is the only thing a reader
+# of this key wants to know.
+OPENAI_PARAMETER_DEGRADATIONS = Counter()
+
+DEGRADATION_TEMPERATURE_DROPPED = "temperature_not_expressible"
+
+OPENAI_PARAMETER_DEGRADATION_KEYS = (DEGRADATION_TEMPERATURE_DROPPED,)
+"""The closed vocabulary of this counter's keys.
+
+ONE MEMBER TODAY AND DECLARED AS A TUPLE ANYWAY, on
+``bedrock_adapter.DEGRADATION_KEYS``' argument: a reader may branch on it
+exhaustively, and a typo at a bump site is then catchable by test rather than by
+producing a counter nobody reads.
+
+REGISTERED IN ``oncotriage/degradation.py``'s ``_REGISTRY_SPEC`` rather than by
+a ``register()`` call here, for the cycle reason the two adapters record: that
+module imports this one.
+"""
+
+_TEMPERATURE_WARNED = False
+
+
+def _warn_temperature_once() -> None:
+    """One WARNING and one counter bump per process for the dropped temperature.
+
+    THE OPENAI ARM'S HALF OF THE PIPELINE-LEVEL TEMPERATURE RULE. Its two
+    counterparts are ``bedrock_adapter._warn_temperature_once`` and
+    ``bedrock_anthropic_adapter._warn_temperature_dropped_once``; all three read
+    ``config.matching_temperature_capability()`` rather than deciding for
+    themselves, so the request and its record cannot disagree.
+
+    Once per process rather than per call, on ``_finish_reason_warned``'s
+    argument in this file: a per-call line on a 22,000-patient run buries the
+    lines that matter, and the drop is a property of the CONFIGURATION -- 1 says
+    everything 45,000 would, and a counter guaranteed non-zero on every run of a
+    configuration makes the run-end report's CLEAN line worthless.
+
+    SILENT WHEN THE OPERATOR CHOSE THE OPT-OUT. ``MATCHING_TEMPERATURE = None``
+    is a declared setting and nothing was dropped, so nothing is counted; the
+    fingerprint's ``matching_temperature_sent`` records ``not_sent`` either way,
+    which is what keeps the two states distinguishable from the run row.
+    """
+    global _TEMPERATURE_WARNED
+    if _TEMPERATURE_WARNED:
+        return
+    if config.MATCHING_TEMPERATURE is None:
+        return                      # the declared opt-out; nothing was dropped
+    if (config.matching_temperature_capability()
+            == config.MATCHING_TEMPERATURE_SUPPORTED):
+        # UNREACHABLE ON THIS ARM AT THE SHIPPED DECLARATION, and asked anyway:
+        # this function must not count a drop that did not happen, and the only
+        # thing that decides whether one did is the owner. A branch keyed on
+        # "we are on the OpenAI arm, therefore it was dropped" would be a second
+        # copy of the capability table, which is the thing config's one owner
+        # exists to prevent.
+        return
+    _TEMPERATURE_WARNED = True
+    OPENAI_PARAMETER_DEGRADATIONS[DEGRADATION_TEMPERATURE_DROPPED] += 1
+    log.warning(
+        "MATCHING_TEMPERATURE is set and this arm's model rejects every value "
+        "but its default, so it is being dropped; Stage 5 samples at the "
+        "provider default here and no configuration can change that. Set "
+        "MATCHING_TEMPERATURE to None to declare the opt-out, or run an arm "
+        "whose model accepts the parameter.",
+        stage=5, event="matching_temperature_dropped", degraded=True,
+        provider=config.MATCHING_PROVIDER,
+        reason=(f"configured={config.MATCHING_TEMPERATURE!r} "
+                f"capability={config.matching_temperature_capability()!r}"))
+
+
 def call_matching_model(system_prompt: str, user_prompt: str, *,
                         prompt_cache_key: Optional[str] = None):
     """Issue the Stage 5 evaluation request and return the raw API response.
@@ -451,9 +536,23 @@ def call_matching_model(system_prompt: str, user_prompt: str, *,
                               not parse. File 03 states both, plus the
                               truncation-split budget, and the worst-case wall
                               time the three produce together.
-      temperature             NOT SENT. Rejected for every value but the
-                              provider default of 1, so there is nothing to
-                              send. MATCHING_TEMPERATURE is None.
+      temperature             NOT SENT, AND THAT IS NOW A DROP RATHER THAN AN
+                              ABSENCE OF POLICY. `config.MATCHING_TEMPERATURE`
+                              is 0.0 -- the pipeline's determinism rule -- and
+                              gpt-5.6-terra rejects every value but the
+                              provider default of 1, so this arm cannot carry
+                              it. The restriction is DECLARED per arm in
+                              `config.MATCHING_TEMPERATURE_MODEL_ACCEPTS` and
+                              never discovered by sending and catching a 400;
+                              the drop is counted once per process under
+                              `temperature_not_expressible` by
+                              `_warn_temperature_once` above, and the
+                              fingerprint's `matching_temperature_sent` field
+                              records `not_sent` for the run.
+                              THE REQUEST DICT IS UNCHANGED, which is what lets
+                              the twelve characterization fixtures replay
+                              without recapture: nothing was added to or
+                              removed from the kwargs below.
       response_format         SENT, as of the Structured Outputs pass, and it
                               is a strict `json_schema` built by
                               oncotriage/agent/response_schema.py. The note
@@ -570,6 +669,13 @@ def call_matching_model(system_prompt: str, user_prompt: str, *,
             system_prompt, user_prompt)
     if _provider != config.MATCHING_PROVIDER_OPENAI:
         config.validate_matching_provider_config()   # raises, naming the constant
+
+    # BELOW THE TWO BEDROCK RETURNS AND ABOVE THE REQUEST, which is what scopes
+    # it to this arm without an `if provider ==`: each arm records its own drop,
+    # and reaching this line IS the statement that the OpenAI arm is live. It
+    # touches no kwarg -- see `temperature` in the block above for why the
+    # request dict had to stay byte-identical.
+    _warn_temperature_once()
 
     return deps.get_openai_client().chat.completions.create(
         model=MATCHING_MODEL,
@@ -918,6 +1024,13 @@ def call_matching_model_warmup(system_prompt: str, *,
     _extra_kwargs = {}
     if prompt_cache_key is not None:
         _extra_kwargs["prompt_cache_key"] = prompt_cache_key
+
+    # THE WARMUP RECORDS THE DROP TOO, and it is not redundant with the trial
+    # call's: a patient's warmup is issued FIRST, so on a run whose every trial
+    # call then failed this is the only site that would have been reached. The
+    # once-flag is shared, so the pair costs one line and one counter bump per
+    # process however they interleave.
+    _warn_temperature_once()
 
     return deps.get_openai_client().chat.completions.create(
         model=MATCHING_MODEL,

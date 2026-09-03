@@ -217,7 +217,6 @@ from oncotriage.config import (
     MATCHING_OUTPUT_TOKENS_PER_TRIAL,
     MATCHING_REASONING_EFFORT,
     MATCHING_SEED,
-    MATCHING_TEMPERATURE,
     MAX_LLM_CLASSIFIER_RETRIES,
     MAX_TRIALS_FOR_EVALUATION,
     MAX_TRUNCATION_SPLITS,
@@ -2318,7 +2317,31 @@ def build_environment_block() -> Dict:
         # send it. Kept in the environment block because a fixture recorded
         # before that date carries 0 here, and the difference between the two
         # is precisely what a cross-era fixture diff should show.
-        "matching_temperature": MATCHING_TEMPERATURE,
+        # THE CONSTANT AS THE FILE HOLDS IT. `MATCHING_TEMPERATURE` is 0.0 as
+        # of the determinism pass; a fixture recorded before 2026-08-04 carries
+        # 0 here and one recorded between then and that pass carries None, and
+        # the difference between the three is precisely what a cross-era
+        # fixture diff should show.
+        #
+        # READ OFF THE MODULE rather than through the name imported at the top
+        # of this file, on `MATCHING_PROVIDER`'s argument in "tunables" below:
+        # a probe or a test may move it on the config module for its own run,
+        # and a bound copy would record the value this file was IMPORTED with
+        # rather than the one that served the capture.
+        "matching_temperature": config.MATCHING_TEMPERATURE,
+        # AND WHAT ACTUALLY REACHED THE WIRE, which is a different fact on two
+        # of the three arms: the pipeline asks for a temperature wherever the
+        # model accepts one and omits it where it does not, so this reads
+        # `not_sent` on either GPT-5.6 Terra arm however the constant is set.
+        # It is the same string `runs.matching_temperature_sent` and the resume
+        # fingerprint's gated field carry, so a fixture, a row and a stamp
+        # spell one fact one way.
+        #
+        # NOT IN "tunables" -- see the note on the entry there: that dict's
+        # keys must resolve through getattr(config, name), and this one's owner
+        # is a function. Recording a field nothing diffs is still worth doing;
+        # it is the provenance a human reads.
+        "matching_temperature_sent": config.matching_temperature_record(),
         "matching_max_tokens": MATCHING_MAX_TOKENS,
         "matching_reasoning_effort": MATCHING_REASONING_EFFORT,
         "matching_seed": MATCHING_SEED,
@@ -2480,6 +2503,31 @@ def build_environment_block() -> Dict:
             # never reported, and a reader would hunt a refactor for a verdict
             # difference that a one-line config edit caused.
             "MATCHING_REASONING_EFFORT": MATCHING_REASONING_EFFORT,
+            # THE SAMPLING TEMPERATURE, on the identical argument to the two
+            # around it: it shapes the Stage 5 request and therefore the
+            # verdicts, and only what is in "tunables" is compared by File 46's
+            # diff_tunables(). Without it, moving the constant reaches a replay
+            # as an unexplained Stage 5 difference with no cause attached --
+            # which for THIS constant is the worst case of that failure, since
+            # a temperature change is precisely the thing that makes a
+            # recording and a fresh call disagree for a reason that is not a
+            # bug.
+            #
+            # THE RAW CONSTANT, NOT `matching_temperature_sent()`, AND THAT IS
+            # THIS DICT'S OWN RULE RATHER THAN A PREFERENCE. diff_tunables()
+            # resolves every recorded key with getattr(config, name), so a key
+            # must be the NAME OF A MODULE ATTRIBUTE; "MATCHING_TEMPERATURE_SENT"
+            # is not one -- the owner is a function -- and would be reported
+            # "<no longer defined>" on every future fixture, forever. That is
+            # the `MATCHING_CALL_MODE` trap recorded in the environment block
+            # above, and the resolution is the same: the EFFECTIVE value is
+            # recorded in `matching_temperature_sent` beside it, which nothing
+            # diffs, and the CONSTANT is what this dict compares.
+            #
+            # FUTURE CAPTURES ONLY, on this block's standing doctrine:
+            # diff_tunables() iterates the keys the FIXTURE recorded, not the
+            # keys this dict declares, so nothing on disk moves.
+            "MATCHING_TEMPERATURE": config.MATCHING_TEMPERATURE,
             "MATCHING_MAX_TOKENS": MATCHING_MAX_TOKENS,
             # THE INPUT GUARD'S BUDGET, ON EXACTLY THE ARGUMENT ABOVE. Both of
             # the OUTPUT guard's denominators are already here -- MATCHING_MAX_

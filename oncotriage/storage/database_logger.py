@@ -229,6 +229,16 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 12: `runs.matching_temperature_sent`, added with RUN_COLUMN_ADDITIONS and
+#        its migration loop. A STAMP field -- FINGERPRINT_VERSION 7 gates it --
+#        recording the sampling temperature Stage 5 actually ASKED FOR, or the
+#        documented `not_sent` when the arm's model cannot carry one. It is the
+#        effective wire fact rather than `config.MATCHING_TEMPERATURE`, so a row
+#        says what the judge was told and not what the file was set to. Two
+#        campaigns sampling at 0 and at a provider default are not
+#        commensurable, and the resume gate refuses across it. Additive TEXT,
+#        NULL on every existing row and on every run whose caller stamped no
+#        fingerprint, never backfilled.
 # ERA 11: `runs.matching_per_trial_empty_retries`, added with
 #        RUN_COLUMN_ADDITIONS and its migration loop. It is a STAMP field --
 #        FINGERPRINT_VERSION 6 gates it -- and it records whether Stage 5 asked
@@ -330,7 +340,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 11
+SCHEMA_USER_VERSION = 12
 
 
 #------------------------------------------------------------------------------
@@ -1847,6 +1857,22 @@ RUN_COLUMN_ADDITIONS = {
     # stamp column that is not TEXT, which is why the INSERT's int guard --
     # the `collection_points` one -- is the shape to copy if a third arrives.
     "matching_per_trial_empty_retries": "INTEGER",
+    # -- ERA 12 ------------------------------------------------------------
+    #
+    # THE STAMP FIELD FOR THE SAMPLING TEMPERATURE. In this dict for
+    # `matching_call_mode`'s reason -- that is what migrates an existing
+    # database -- and written from the FINGERPRINT, like every other member of
+    # RUN_FINGERPRINT_COLUMNS.
+    #
+    # TEXT RATHER THAN REAL, and that is the storage decision the value's own
+    # owner argues at `config.matching_temperature_record()`. The column has to
+    # hold "no temperature was sent" as well as a number, and the two candidate
+    # ways to do that in a REAL column are both worse: NULL would collide with
+    # "this row predates the column", and a sentinel number would be a
+    # temperature nobody asked for. Storing the repr of the float keeps one
+    # value per state, groups exactly, and needs no float-equality question --
+    # nothing sorts or aggregates this column as a number.
+    "matching_temperature_sent": "TEXT",
 }
 
 
@@ -2449,6 +2475,17 @@ RUN_FINGERPRINT_COLUMNS = (
     "llm_classifier_renderer_digest",
     "matching_model_configured",
     "matching_call_mode",
+    # WHAT SAMPLING TEMPERATURE STAGE 5 ASKED FOR -- gated since
+    # FINGERPRINT_VERSION 7, and in RUN_COLUMN_ADDITIONS as well for
+    # `cross_encoder_revision`'s reason above: this tuple says what fills the
+    # column at the INSERT, that dict is what migrates a database that predates
+    # it, and `_last_wins` reconciles a column named by both.
+    #
+    # NOT IN RUN_FINGERPRINT_INTEGER_COLUMNS, unlike the two cohort fields and
+    # the retry budget: the value is TEXT by design and its "nothing was sent"
+    # state is a documented string rather than a NULL, so the int guard those
+    # three need would blank exactly the answer this column exists to record.
+    "matching_temperature_sent",
     "qdrant_collection",
     "collection_points",
     "data_snapshot_date",

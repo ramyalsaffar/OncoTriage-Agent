@@ -72,6 +72,23 @@ WHAT IS IN THE STAMP, AND WHY EACH FIELD IS THERE
                                     ARM is gated beside it and a resume that
                                     straddles both is the case this stamp
                                     reports field by field.
+    matching_temperature_sent       WHAT SAMPLING TEMPERATURE STAGE 5 ACTUALLY
+                                    ASKED FOR, or ``not_sent``. The pipeline
+                                    requests 0 on any arm whose model accepts
+                                    the parameter and omits it where the model
+                                    does not, so this is the EFFECTIVE fact and
+                                    not ``config.MATCHING_TEMPERATURE`` -- the
+                                    same choice ``matching_model_configured``
+                                    makes in reading the WIRE model. A
+                                    temperature that reached the wire moves the
+                                    distribution every verdict is sampled from;
+                                    two halves of one artifact judged at 0 and
+                                    at the provider default of 1 are not
+                                    commensurable. Reading the effective value
+                                    is also what stops it OVER-gating: on an arm
+                                    that cannot carry the parameter, editing the
+                                    constant moves nothing on the wire and this
+                                    field does not move either.
     qdrant_collection               the RESOLVED backing collection, never the
                                     alias. The alias is a constant -- that is
                                     what an alias is for -- so a gate on it is a
@@ -189,8 +206,50 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 6
+FINGERPRINT_VERSION = 7
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    6 -> 7  added ``matching_temperature_sent``. EVERY ARTIFACT STAMPED AT 6
+            THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE, for
+            the reason spelled out under 1 -> 2 below; the remediation is
+            identical and is printed on the refusal.
+
+            WHAT IT CLOSES. ``config.MATCHING_TEMPERATURE`` became 0.0 as a
+            pipeline-level determinism rule, and the shipped Converse arm's
+            model ACCEPTS the parameter -- so Stage 5 now sends
+            ``inferenceConfig.temperature`` where it previously sent nothing and
+            sampled at the provider default of 1. That is the largest single
+            change to the judge's output distribution this stamp has ever been
+            asked to see: every verdict is drawn from a different sampler, on
+            every patient, and NOT ONE other gated field moves with it. The
+            prompt, the renderer, the wire model, the arm, the collection and
+            the cohort are all identical on both sides of it. So a checkpoint
+            written at temperature 0 and resumed at the provider default -- or
+            the reverse -- would have answered FP_MATCH, and the resulting
+            ``inferences`` table would hold two sampling regimes with nothing in
+            it saying which patients got which. Every rate, every mean and the
+            whole k-run stability measurement over that artifact would be a
+            number about two judges presented as one. It meets every clause of
+            the test the call-mode field was gated under.
+
+            IT GATES THE EFFECTIVE VALUE, NOT THE CONSTANT, and that is what
+            keeps it from over-refusing. ``config.matching_temperature_sent()``
+            answers what reaches the WIRE: on the two GPT-5.6 Terra arms the
+            model rejects the parameter, so the field reads ``not_sent``
+            whatever the constant says and a resume across a constant edit is
+            permitted -- correctly, because nothing on the wire moved and no
+            verdict can differ. ``matching_model_configured`` made exactly this
+            choice for the same reason, and the residual is stated the same way:
+            the RAW constant is recorded in the tracking index and in every
+            future fixture's tunables block, so an edit that this gate lets
+            through is still visible in the record rather than invisible.
+
+            AND IT COVERS A SECOND MOVE NO OTHER FIELD SEES. Turning
+            ``BEDROCK_ANTHROPIC_THINKING`` on makes the provider fix its own
+            sampling, so the arm's capability becomes ``thinking_enabled``, the
+            temperature is dropped, and this field moves from ``0.0`` to
+            ``not_sent`` -- a change to what the judge does that no other gated
+            field can express, because the thinking mode itself is not one.
 
     5 -> 6  added ``matching_per_trial_empty_retries``. EVERY ARTIFACT STAMPED
             AT 5 THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE,
@@ -540,6 +599,7 @@ FINGERPRINT_FIELDS = (
     "llm_classifier_renderer_digest",
     "matching_model_configured",
     "matching_call_mode",
+    "matching_temperature_sent",
     "qdrant_collection",
     "collection_points",
     "data_snapshot_date",
@@ -845,6 +905,49 @@ def _call_mode() -> str:
         return UNKNOWN
 
 
+def _temperature_record() -> str:
+    """``config.matching_temperature_record()``, degraded to UNKNOWN not raised.
+
+    THROUGH THE ONE OWNER, NEVER THROUGH ``MATCHING_TEMPERATURE``, on
+    ``_call_mode``'s argument directly above and for a sharper version of it:
+    the constant is only HALF the fact. What decides whether a temperature
+    reaches the wire is the constant AND the live arm's declared capability AND,
+    on the Converse arm, whether extended thinking is on -- three inputs, one
+    derivation, in ``config``. A read of the constant here would be a second
+    derivation of that rule, and it would be WRONG in the ordinary case rather
+    than merely fragile: it would report 0.0 on the two arms that cannot send
+    it, so a resume across a constant edit would refuse for a change no request
+    ever made.
+
+    ``UNKNOWN`` AND ``MATCHING_TEMPERATURE_NOT_SENT`` ARE DIFFERENT ANSWERS AND
+    BOTH ARE REACHABLE. ``not_sent`` is determinate -- the pipeline asked
+    nothing of the sampler, and a resume against another ``not_sent`` run is a
+    resume against the same regime, so it MATCHES. ``UNKNOWN`` means the
+    question could not be answered at all, which makes the stamp UNRESOLVED and
+    answers FP_UNRESOLVED -- "this run's own configuration did not establish" --
+    rather than sending an operator to clear a good checkpoint. Collapsing the
+    two would let an unresolvable configuration resume against a healthy one.
+
+    NEVER RAISES, on ``_wire_model``'s and ``_call_mode``'s footing: this
+    module's contract is that ``current()`` never raises, and the owner CAN
+    raise today -- ``matching_temperature_capability()`` calls
+    ``validate_matching_provider_config()`` on an unrecognised provider, which
+    is right at a call site about to build a request and wrong here.
+    """
+    try:
+        return config.matching_temperature_record()
+    except Exception as exc:                                   # noqa: BLE001
+        FINGERPRINT_DEGRADATIONS[
+            f"matching_temperature_sent:{type(exc).__name__}"] += 1
+        log.warning("the configured matching provider did not resolve to a "
+                    "temperature decision; the run fingerprint records it as "
+                    "unknown",
+                    event="fingerprint_temperature_unresolved",
+                    error_type=type(exc).__name__, error_message=str(exc),
+                    degraded=True)
+        return UNKNOWN
+
+
 def current(refresh: bool = False) -> dict:
     """This run's configuration stamp. Resolved once per process, then cached.
 
@@ -898,6 +1001,17 @@ def current(refresh: bool = False) -> dict:
                 # 2 -> 3 for what a resume across the two arms silently
                 # produced before it.
                 "matching_call_mode": _call_mode(),
+                # WHAT THE SAMPLER WAS ASKED FOR, beside HOW and WHICH model,
+                # because those three together are what a Stage 5 request IS.
+                # THROUGH THE OWNER AND AS THE EFFECTIVE VALUE: see
+                # `_temperature_record` for why a read of MATCHING_TEMPERATURE
+                # here would over-refuse on the two arms that cannot send it,
+                # and FINGERPRINT_VERSION 6 -> 7 for what the field closes.
+                #
+                # A PURE `config` READ underneath, like the call mode above it:
+                # it opens nothing, so `current()` still answers offline for the
+                # three harnesses that need it to.
+                "matching_temperature_sent": _temperature_record(),
                 "qdrant_collection": name,
                 "collection_points": points,
                 "data_snapshot_date": config.DATA_SNAPSHOT_DATE,
@@ -980,6 +1094,8 @@ def summary(fingerprint: dict) -> str:
             f"(renderer {digest[:12]}), "
             f"model {get('matching_model_configured', NOT_RECORDED)} "
             f"({get('matching_call_mode', NOT_RECORDED)}, "
+            f"temperature "
+            f"{get('matching_temperature_sent', NOT_RECORDED)}, "
             f"empty-retries "
             f"{get('matching_per_trial_empty_retries', NOT_RECORDED)}), "
             f"collection {get('qdrant_collection', NOT_RECORDED)} "

@@ -483,11 +483,27 @@ _REGISTRY_SPEC = (
      "{call_mode}:{ceiling}, and the ceiling is derived in "
      "spend.stage5_call_ceiling() rather than chosen -- so a non-zero value "
      "here is a defect in this pipeline, not a campaign that ran long"),
+    ("OPENAI_PARAMETER_DEGRADATIONS",
+     _agent_evaluation.OPENAI_PARAMETER_DEGRADATIONS,
+     "Stage 5 ran on the OpenAI arm and a parameter this pipeline asked for "
+     "could not be sent. ONE KEY TODAY -- `temperature_not_expressible`, which "
+     "moves when config.MATCHING_TEMPERATURE is set and gpt-5.6-terra rejects "
+     "every value but its default. It is the OpenAI half of the same rule the "
+     "two BEDROCK_*_DEGRADATIONS counters below record for their own arms: the "
+     "classifier asks for temperature 0 wherever the model accepts it, omits "
+     "it where the model does not, and says which happened. NOT A FAULT AN "
+     "OPERATOR CAN FIX ON THIS ARM -- the restriction is the judge's -- so a "
+     "non-zero value here means Stage 5 sampled at the provider default and "
+     "the run is less reproducible than the configuration asks for. Zero means "
+     "either that this arm was not live or that MATCHING_TEMPERATURE is None, "
+     "which is the declared opt-out and is not a degradation; the run row's "
+     "`matching_temperature_sent` is what tells those two apart"),
     ("BEDROCK_ADAPTER_DEGRADATIONS",
      _bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS,
      "Stage 5 ran on Amazon Bedrock and the request or the response was not "
      "what the adapter was built against -- a parameter that could not be "
-     "expressed (seed), a response shape that had to be interpreted, or an "
+     "expressed (seed, temperature), a response shape that had to be "
+     "interpreted, or an "
      "error class the taxonomy does not name. Every key is a VERIFY-AT-GO-LIVE "
      "item in oncotriage/agent/bedrock_adapter.py that did not hold. STAYS AT "
      "ZERO WHILE MATCHING_PROVIDER IS 'openai', because nothing in that "

@@ -544,14 +544,17 @@ check("...and it is NOT the UNKNOWN sentinel (non-degeneracy: an unreadable "
       "module answers UNKNOWN, and every check below would then be comparing "
       "one sentinel with another)",
       at(_now) == _fp.UNKNOWN, False)
-check("the stamp's version says this field set is version 6. It was 2 until "
+check("the stamp's version says this field set is version 7. It was 2 until "
       "`matching_call_mode` was gated, 3 until the cohort pass gated "
       "`campaign_cohort_size` and `campaign_cohort_seed`, 4 until the "
-      "environment-record pass gated `cross_encoder_revision`, and 5 until the "
-      "empty-verdict retry pass gated `matching_per_trial_empty_retries`; each "
-      "bump is what makes every older artifact answer FP_VERSION once rather "
-      "than have its missing field compared against a live value",
-      _fp.FINGERPRINT_VERSION, 6)
+      "environment-record pass gated `cross_encoder_revision`, 5 until the "
+      "empty-verdict retry pass gated `matching_per_trial_empty_retries`, and "
+      "6 until the determinism pass gated `matching_temperature_sent` -- which "
+      "moves the distribution EVERY verdict is sampled from while no other "
+      "gated field moves with it; each bump is what makes every older artifact "
+      "answer FP_VERSION once rather than have its missing field compared "
+      "against a live value",
+      _fp.FINGERPRINT_VERSION, 7)
 
 # --- (b) the module set is DERIVED, not trusted ---------------------------
 # A static closure from the two render entry points over every module-level
@@ -1465,6 +1468,26 @@ try:
         # 1 does not turn this into a pin on today's value.
         ("matching_per_trial_empty_retries",
          0 if _config.MATCHING_PER_TRIAL_EMPTY_RETRIES else 1,
+         _fp.FP_CHANGED),
+        # THE SAMPLING TEMPERATURE, DRIVEN THROUGH THE REAL GATE. The concrete
+        # harm: `config.MATCHING_TEMPERATURE` is 0.0 and the shipped Converse
+        # arm's model accepts the parameter, so Stage 5 sends
+        # `inferenceConfig.temperature` where it previously sampled at the
+        # provider default of 1. A campaign resumed across that change carries
+        # two sampling regimes in one inferences table -- every rate, every mean
+        # and the k-run stability measurement over it is a number about two
+        # judges presented as one -- and NOT ONE other gated field moves with
+        # it, which is what makes the stamp the only thing that can see it.
+        #
+        # THE STORED VALUE IS DERIVED AS "whatever this process is NOT", so the
+        # case is a real mismatch at any setting: `not_sent` when a temperature
+        # IS being sent, and the shipped constant's repr when it is not. A typed
+        # literal would pin today's value and would silently stop being a
+        # mismatch the day the constant moved.
+        ("matching_temperature_sent",
+         (_config.MATCHING_TEMPERATURE_NOT_SENT
+          if _config.matching_temperature_sent() is not None
+          else repr(float(_config.MATCHING_TEMPERATURE or 0.0))),
          _fp.FP_CHANGED),
     )
     # EVERY GATED FIELD IS EITHER IN THIS TABLE OR HAS ITS OWN SECTION, and the

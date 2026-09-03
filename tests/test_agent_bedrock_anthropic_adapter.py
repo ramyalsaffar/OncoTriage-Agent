@@ -643,8 +643,108 @@ check("NO cachePoint sits in `messages` -- the per-trial text differs on every "
 
 check("maxTokens is MATCHING_MAX_TOKENS, not recomputed",
       at(_req, "inferenceConfig", "maxTokens"), config.MATCHING_MAX_TOKENS)
-check("...and nothing else is in inferenceConfig -- temperature is still not "
-      "sent", sorted(at(_req, "inferenceConfig", default={})), ["maxTokens"])
+
+# --- the temperature, which is THIS arm's alone ----------------------------
+#
+# THE PIN USED TO READ "nothing else is in inferenceConfig -- temperature is
+# still not sent" AND IT WAS TRUE OF A PIPELINE WITH NO TEMPERATURE POLICY. The
+# determinism pass gave it one: `config.MATCHING_TEMPERATURE` is 0.0 and this is
+# the one arm whose model accepts the parameter, so the field IS sent here and
+# the two Terra arms drop and count it. The pin is not weakened -- it still
+# names the EXACT key set -- it is derived from the owner instead of from a
+# literal, so it fails both ways: on a temperature that stopped being sent, and
+# on a THIRD key nobody declared.
+#
+# EVERY OWNER READ BELOW IS INSIDE `provider(...)`, AND THAT IS NOT BELT AND
+# BRACES. `matching_temperature_capability()` reads MATCHING_PROVIDER live, and
+# the ambient provider at this point in the file is NOT this arm -- the
+# `matching_wire_model()` check above leaves it set to OpenAI, deliberately
+# (see the note there). A bare read here would answer about the arm this
+# section is not testing, and would answer `None`, which is exactly the shape
+# that makes a check pass for the wrong reason.
+with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC):
+    _temp_sent = config.matching_temperature_sent()
+    _temp_capability = config.matching_temperature_capability()
+    _warm = drive(bac.build_converse_request, "SYSTEM TEXT", "WARM",
+                  warmup=True)
+
+check("...and inferenceConfig carries EXACTLY maxTokens plus the temperature "
+      "when this arm is sending one -- derived from the owner, so a key added "
+      "without a declaration fails here",
+      sorted(at(_req, "inferenceConfig", default={})),
+      sorted(["maxTokens"] + (["temperature"] if _temp_sent is not None else [])))
+check("...and the expectation is not degenerate: at the shipped configuration "
+      "this arm DOES send a temperature, so the check above is about a key "
+      "that is really there",
+      _temp_sent is not None, True)
+check("the temperature on the wire is the owner's answer, as a float -- not a "
+      "second read of MATCHING_TEMPERATURE and not a string",
+      (at(_req, "inferenceConfig", "temperature"),
+       isinstance(at(_req, "inferenceConfig", "temperature"), float)),
+      (float(_temp_sent) if _temp_sent is not None else None, True))
+check("...and it is 0.0 at the shipped constant, which is the determinism rule "
+      "reaching the wire rather than a value this test chose",
+      at(_req, "inferenceConfig", "temperature"), 0.0)
+check("...and the capability that put it there is `supported`, named rather "
+      "than inferred from the absence of a refusal",
+      _temp_capability, config.MATCHING_TEMPERATURE_SUPPORTED)
+
+# THE WARMUP CARRIES IT TOO, and the builder's own contract is why: "the warmup
+# is this request with TWO differences and no others". `inferenceConfig` sits
+# outside `system`, so this cannot move the cached prefix -- which is asserted
+# rather than argued, immediately below.
+check("the WARMUP carries the same temperature -- a trial request and the "
+      "request that warms its cache must not differ in a field neither the "
+      "prefix nor the ceiling needs",
+      at(_warm, "inferenceConfig", "temperature"),
+      at(_req, "inferenceConfig", "temperature"))
+check("...and the warmup still differs from the trial request in the TWO "
+      "places the builder's contract names and nowhere else, so the "
+      "temperature did not become a third difference",
+      sorted(k for k in set(_req) | set(_warm)
+             if json.dumps(_req.get(k), sort_keys=True, default=str)
+             != json.dumps(_warm.get(k), sort_keys=True, default=str)),
+      ["inferenceConfig", "messages"])
+check("...and the CACHED PREFIX is byte-identical across the two, which is "
+      "what makes carrying the temperature free rather than merely harmless",
+      json.dumps(at(_warm, "system"), sort_keys=True),
+      json.dumps(at(_req, "system"), sort_keys=True))
+
+# `topP` IS THE SECOND CONDITION AND IT IS PINNED AS AN ABSENCE. Anthropic's own
+# parameter guidance is to adjust temperature OR top_p and not both; this
+# builder names neither field anywhere else, so the rule holds by construction
+# and this is what stops a later pass adding one beside the temperature without
+# meeting the argument.
+check("NO topP anywhere in the request -- temperature and topP must not be "
+      "sent together, and this builder sends only the first",
+      "topP" in json.dumps(_req), False)
+
+# --- and the two ways it is NOT sent ---------------------------------------
+with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC,
+              MATCHING_TEMPERATURE=None):
+    _req_optout = drive(bac.build_converse_request, "S", "U")
+    _optout_capability = config.matching_temperature_capability()
+check("the OPT-OUT omits the field entirely rather than sending null: "
+      "MATCHING_TEMPERATURE = None is a declared setting, and a null on the "
+      "wire is a value botocore would serialize",
+      sorted(at(_req_optout, "inferenceConfig", default={})), ["maxTokens"])
+check("...and the ARM's capability is unchanged by it -- the opt-out is the "
+      "operator's answer, not the judge's, and the two are recorded "
+      "differently",
+      _optout_capability, config.MATCHING_TEMPERATURE_SUPPORTED)
+
+with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC,
+              BEDROCK_ANTHROPIC_THINKING="adaptive"):
+    _req_thinking = drive(bac.build_converse_request, "S", "U")
+    _thinking_capability = config.matching_temperature_capability()
+check("EXTENDED THINKING TAKES THE TEMPERATURE OFF THE WIRE, because the "
+      "provider fixes its own sampling then -- a value sent alongside would be "
+      "recorded and ignored, which is a record that disagrees with what "
+      "happened",
+      sorted(at(_req_thinking, "inferenceConfig", default={})), ["maxTokens"])
+check("...and the capability names WHY, so the degradation report sends a "
+      "reader to a setting in config rather than to the judge",
+      _thinking_capability, config.MATCHING_TEMPERATURE_THINKING_ENABLED)
 
 # --- the structured-output mapping, which is the risky one -----------------
 _fmt = at(_req, "outputConfig", "textFormat", default={})
@@ -699,8 +799,14 @@ check("NO reasoning_effort -- the OpenAI vocabulary is not Anthropic's",
 check("NO store -- the Converse API states it retains nothing, so the "
       "Responses branch's retention parameter has no analogue to send",
       "store" in _flat, False)
-check("NO temperature -- MATCHING_TEMPERATURE is None and the field is optional",
-      "temperature" in _flat, False)
+# NOTE THE INVERSION AGAINST THE THREE CHECKS ABOVE IT. Seed, reasoning_effort
+# and store are absent because this API has no such field; temperature is
+# PRESENT because it does, and because this is the one arm whose model takes it.
+# The pin stays here rather than moving out with the block above so that the
+# four "what is on the wire" answers are read in one place.
+check("temperature IS on the wire -- unlike seed, reasoning_effort and store, "
+      "this one is expressible here, and config.MATCHING_TEMPERATURE is 0.0",
+      "temperature" in _flat, _temp_sent is not None)
 check("NO toolConfig -- Stage 5 defines no tools, which is why stopReason "
       "tool_use raises", "toolConfig" in _flat, False)
 check("NO timeout kwarg -- botocore takes it on the CLIENT, not per call",

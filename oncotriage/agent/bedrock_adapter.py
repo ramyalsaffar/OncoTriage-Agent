@@ -116,8 +116,24 @@ module sends. Sources read 2026-08-21 and named by page.
       READ VERIFY-AT-GO-LIVE (3) BEFORE TRUSTING THIS ONE.
 
   temperature
-      -> STILL NOT SENT. MATCHING_TEMPERATURE is None; the model rejects any
-      value but its default. Unchanged.
+      -> NOT EXPRESSIBLE ON THIS MODEL. DROPPED, COUNTED, LOGGED.
+      THE REQUEST IS UNCHANGED and this entry is not: ``config.MATCHING_TEMPERATURE``
+      is 0.0 now, as the pipeline's determinism rule, and gpt-5.6-terra rejects
+      every value but its default -- probed live 2026-08-04, quoted at that
+      constant: "'temperature' does not support 0 with this model. Only the
+      default (1) value is supported." So the sentence that used to stand here
+      ("MATCHING_TEMPERATURE is None") described a project-wide policy that no
+      longer exists; the restriction is the MODEL's and is declared as such in
+      ``config.MATCHING_TEMPERATURE_MODEL_ACCEPTS``.
+      THE DECISION IS DECLARED, NEVER DISCOVERED BY SENDING, which is why this
+      branch does not try the parameter and fall back on a 400: a 400 here
+      fails a Stage 5 call that has already been signed, and it cannot tell a
+      model restriction from a throttled account. The drop is counted once per
+      process under ``temperature_not_expressible``, beside the seed's.
+      WHAT IT COSTS: Stage 5 on this arm samples at the provider default of 1
+      and no configuration can change that, so its verdicts are less
+      reproducible than the shipped Converse arm's by construction. That is a
+      property of the judge, and the only remedy is a different one.
 
   timeout=config.get_matching_request_timeout()
       -> the same object, passed the same way. Client-side, never on the wire,
@@ -362,6 +378,7 @@ log = get_logger(__name__)
 BEDROCK_ADAPTER_DEGRADATIONS = Counter()
 
 DEGRADATION_SEED_DROPPED = "seed_not_expressible"
+DEGRADATION_TEMPERATURE_DROPPED = "temperature_not_expressible"
 DEGRADATION_UNKNOWN_INCOMPLETE = "incomplete_reason_unrecognised"
 DEGRADATION_NO_USAGE = "response_carried_no_usage"
 DEGRADATION_NO_MESSAGE_ITEM = "response_carried_no_message_item"
@@ -369,6 +386,12 @@ DEGRADATION_UNKNOWN_ERROR = "error_class_unrecognised"
 
 DEGRADATION_KEYS = (
     DEGRADATION_SEED_DROPPED,
+    # THE TEMPERATURE THIS PIPELINE ASKS FOR AND THIS MODEL WILL NOT TAKE. It
+    # moves whenever `config.MATCHING_TEMPERATURE` is set and this arm is live,
+    # which at the shipped constant is EVERY run of it -- so a non-zero value
+    # here is the configuration working, exactly as the seed's is, and zero
+    # means the operator set the constant to None.
+    DEGRADATION_TEMPERATURE_DROPPED,
     DEGRADATION_UNKNOWN_INCOMPLETE,
     DEGRADATION_NO_USAGE,
     DEGRADATION_NO_MESSAGE_ITEM,
@@ -819,6 +842,55 @@ def classify_error(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 _SEED_WARNED = False
+_TEMPERATURE_WARNED = False
+
+
+def _warn_temperature_once() -> None:
+    """One WARNING and one counter bump per process for the dropped temperature.
+
+    A SECOND FUNCTION BESIDE ``_warn_seed_once`` RATHER THAN A LINE INSIDE IT,
+    because the two are not the same event and are not gated by the same
+    condition: the seed's drop is unconditional on this arm, and this one fires
+    only while ``MATCHING_TEMPERATURE`` is set -- an operator who chose the
+    documented opt-out asked for nothing and has degraded nothing. Folding them
+    would make the seed's warning conditional on a temperature or the
+    temperature's unconditional; both are wrong.
+
+    Once rather than per call, and the counter bumped HERE rather than in
+    ``build_bedrock_request``, on ``_warn_seed_once``'s arguments verbatim: the
+    builder is documented PURE and driven directly by the tests, and the drop
+    is a property of the CONFIGURATION rather than of each request, so 1 says
+    everything 45,000 would.
+
+    THE CAPABILITY IS READ FROM ITS OWNER rather than re-derived from
+    ``MATCHING_PROVIDER``. ``config.matching_temperature_capability()`` is the
+    one function that decides what the live arm sends, and a second copy of
+    that decision here is how a request and its own record come to disagree.
+    """
+    global _TEMPERATURE_WARNED
+    if _TEMPERATURE_WARNED:
+        return
+    if config.MATCHING_TEMPERATURE is None:
+        return                      # the declared opt-out; nothing was dropped
+    if (config.matching_temperature_capability()
+            == config.MATCHING_TEMPERATURE_SUPPORTED):
+        # UNREACHABLE ON THIS ARM AT THE SHIPPED DECLARATION, and asked anyway,
+        # on the argument in the docstring: the owner is what decides whether a
+        # drop happened, and a branch keyed on "this is a Terra arm, therefore
+        # it was dropped" would be a second copy of the capability table.
+        return
+    _TEMPERATURE_WARNED = True
+    BEDROCK_ADAPTER_DEGRADATIONS[DEGRADATION_TEMPERATURE_DROPPED] += 1
+    log.warning(
+        "MATCHING_TEMPERATURE is set and gpt-5.6-terra rejects every value but "
+        "its default, so it is being dropped; Stage 5 samples at the provider "
+        "default on this arm and no configuration can change that. Set "
+        "MATCHING_TEMPERATURE to None to declare the opt-out, or run the "
+        "Converse arm, whose model accepts the parameter.",
+        stage=5, event="bedrock_temperature_dropped", degraded=True,
+        provider=config.MATCHING_PROVIDER,
+        reason=(f"configured={config.MATCHING_TEMPERATURE!r} "
+                f"capability={config.matching_temperature_capability()!r}"))
 
 
 def _warn_seed_once() -> None:
@@ -871,6 +943,10 @@ def call_matching_model_bedrock(system_prompt: str, user_prompt: str):
 
     if not config.BEDROCK_SEND_SEED_IN_EXTRA_BODY:
         _warn_seed_once()
+    # AFTER THE BUILD, on the seed's argument one line up: building validates
+    # the provider configuration, and a run about to be refused for naming an
+    # unsupported service tier should not first be told about a temperature.
+    _warn_temperature_once()
 
     try:
         raw = deps.get_bedrock_client().responses.create(**kwargs)

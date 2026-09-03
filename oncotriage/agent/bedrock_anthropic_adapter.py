@@ -234,8 +234,27 @@ module sends.
       introduced one fails here rather than as a 400 mid-campaign.
 
   temperature
-      -> STILL NOT SENT. MATCHING_TEMPERATURE is None and
-      ``inferenceConfig.temperature`` is optional. Unchanged.
+      -> inferenceConfig.temperature=config.matching_temperature_sent()
+      SENT ON THIS ARM, AND THIS IS THE ONLY ARM THAT CAN TAKE IT.
+      ``config.MATCHING_TEMPERATURE`` is 0.0 as the pipeline's determinism
+      rule; the two GPT-5.6 Terra arms drop it because that MODEL rejects any
+      value but its default (probed 2026-08-04, quoted at the constant), and
+      Claude Sonnet 4.6 does not -- ``temperature`` is a modeled member of
+      ``inferenceConfig`` (API_runtime_InferenceConfiguration: maxTokens /
+      stopSequences / temperature / topP) and Anthropic's parameter guidance
+      recommends values near 0 for analytical work.
+      THE DECISION IS DECLARED, NEVER DISCOVERED BY SENDING: see
+      ``config.MATCHING_TEMPERATURE_MODEL_ACCEPTS`` and
+      ``config.matching_temperature_capability()``. It is OMITTED, never sent
+      as null, when the operator sets the constant to None or when extended
+      thinking is on -- with thinking enabled the provider fixes its own
+      sampling, so a value would be recorded and ignored, and the arm's
+      capability becomes ``thinking_enabled`` and is COUNTED under
+      ``temperature_not_expressible``.
+      ``topP`` IS NOT SENT ALONGSIDE, deliberately: Anthropic's guidance is to
+      adjust one of the two, and this builder names neither field anywhere else.
+      TEMPERATURE 0 IS NECESSARY AND NOT SUFFICIENT for determinism -- see the
+      constant's own block -- so the k-run stability measurement stays.
 
   timeout=config.get_matching_request_timeout()
       -> a ``botocore.config.Config`` on the CLIENT, not a per-call argument.
@@ -756,6 +775,7 @@ BEDROCK_ANTHROPIC_DEGRADATIONS = Counter()
 
 DEGRADATION_SEED_DROPPED = "seed_not_expressible"
 DEGRADATION_EFFORT_DROPPED = "reasoning_effort_not_expressible"
+DEGRADATION_TEMPERATURE_DROPPED = "temperature_not_expressible"
 DEGRADATION_NO_MODEL_ECHO = "model_echo_unavailable"
 DEGRADATION_MODEL_ECHO_ALIAS = "model_echo_normalised_from_alias"
 DEGRADATION_MALFORMED_OUTPUT = "model_output_malformed"
@@ -767,6 +787,13 @@ DEGRADATION_UNKNOWN_ERROR = "error_class_unrecognised"
 DEGRADATION_KEYS = (
     DEGRADATION_SEED_DROPPED,
     DEGRADATION_EFFORT_DROPPED,
+    # THE ONE KEY HERE THAT IS NOT UNCONDITIONAL. Seed and effort are dropped
+    # on every run of this arm; a temperature is dropped only when
+    # `BEDROCK_ANTHROPIC_THINKING` is on -- because the provider then fixes its
+    # own sampling -- which is the state `config.matching_temperature_capability()`
+    # names `thinking_enabled`. Zero here on the shipped configuration is the
+    # answer "the arm sent what the pipeline asked for", not "nobody looked".
+    DEGRADATION_TEMPERATURE_DROPPED,
     DEGRADATION_NO_MODEL_ECHO,
     DEGRADATION_MODEL_ECHO_ALIAS,
     DEGRADATION_MALFORMED_OUTPUT,
@@ -1010,6 +1037,41 @@ def build_converse_request(system_prompt: str, user_prompt: str, *,
             "maxTokens": (config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS
                           if warmup else config.MATCHING_MAX_TOKENS)},
     }
+
+    # ── THE TEMPERATURE, WHICH THIS ARM CAN EXPRESS AND THE OTHER TWO CANNOT ─
+    #
+    # `inferenceConfig.temperature` is a MODELED member of the Converse request
+    # shape, and `config.matching_temperature_sent()` is the ONE function that
+    # says whether a value reaches it -- combining the operator's constant with
+    # the arm's declared capability, so this builder holds no second copy of
+    # either rule and cannot disagree with the record.
+    #
+    # OMITTED, NEVER SENT AS None, on this module's standing rule that an
+    # omitted field and a field set to nothing are different requests. It is
+    # omitted when the operator set MATCHING_TEMPERATURE to None (the declared
+    # opt-out) and when extended thinking is on (the provider fixes its own
+    # sampling then, so a value here would be recorded and ignored).
+    #
+    # `topP` IS NOT SENT, HERE OR ANYWHERE, AND THAT IS THE SECOND CONDITION
+    # RATHER THAN AN OMISSION NOBODY THOUGHT ABOUT. Anthropic's parameter
+    # guidance is to adjust temperature OR top_p and not both; this builder
+    # names neither field except the one line below, so the rule holds by
+    # construction and `tests/test_agent_bedrock_anthropic_adapter.py` pins the
+    # absence so a later pass cannot add topP beside it without meeting it.
+    #
+    # THE WARMUP CARRIES IT TOO, AND THAT IS A DECISION. This function's own
+    # contract is "the warmup is this request with TWO differences and no
+    # others, both AFTER the cached prefix"; a temperature present on the trial
+    # calls and absent on the warmup would make that sentence false and would
+    # leave the request that establishes the cache in a shape no trial call
+    # uses. `inferenceConfig` sits outside `system`, so it cannot move the
+    # cached prefix either way -- Converse's checkpoint chain is
+    # `tools` -> `system` -> `messages` -- which is what makes carrying it free
+    # rather than merely harmless. Its output is never parsed (maxTokens is 1),
+    # so the sampler has nothing to change there.
+    temperature = config.matching_temperature_sent()
+    if temperature is not None:
+        kwargs["inferenceConfig"]["temperature"] = float(temperature)
 
     # OMITTED WHEN EMPTY rather than sent as `{}` or None -- see
     # `_output_config`. Reachable only on a warmup that drops the schema with
@@ -1544,6 +1606,7 @@ def classify_error(exc: BaseException) -> str:
 # ---------------------------------------------------------------------------
 
 _DROPPED_WARNED = False
+_TEMPERATURE_WARNED = False
 _MODEL_ECHO_WARNED = False
 _MODEL_ECHO_ALIAS_WARNED = False
 
@@ -1587,6 +1650,50 @@ def _warn_dropped_parameters_once() -> None:
         reason=(f"configured={config.MATCHING_REASONING_EFFORT!r} "
                 f"sent_thinking={config.BEDROCK_ANTHROPIC_THINKING!r} "
                 f"sent_effort={config.BEDROCK_ANTHROPIC_EFFORT!r}"))
+
+    _warn_temperature_dropped_once()
+
+
+def _warn_temperature_dropped_once() -> None:
+    """One WARNING and one counter bump per process for a dropped temperature.
+
+    A SEPARATE LATCH FROM THE TWO DROPS ABOVE, and that is the whole reason it
+    is a function of its own. Seed and effort are dropped on EVERY run of this
+    arm, so one flag set on the first call is the whole story. This one is
+    CONDITIONAL -- it fires only while ``BEDROCK_ANTHROPIC_THINKING`` puts the
+    arm's capability out of ``supported`` -- so sharing ``_DROPPED_WARNED``
+    would latch the shared flag on a first call that had nothing to report and
+    silence a drop that started later in the process. Nothing in a campaign
+    flips that mode mid-run, and a guard whose correctness depends on nobody
+    doing so is a guard that will be wrong the first time a probe does.
+
+    THE CONDITION IS NOT "the operator asked for none".
+    ``MATCHING_TEMPERATURE = None`` is a declared opt-out and is not a
+    degradation; what IS one is a temperature this pipeline asked for and this
+    arm could not carry. Reading ``matching_temperature_capability()`` rather
+    than re-deriving the condition keeps the one owner in ``config``.
+    """
+    global _TEMPERATURE_WARNED
+    if _TEMPERATURE_WARNED:
+        return
+    if config.MATCHING_TEMPERATURE is None:
+        return                      # the declared opt-out; nothing was dropped
+    if (config.matching_temperature_capability()
+            == config.MATCHING_TEMPERATURE_SUPPORTED):
+        return                      # the shipped state: it IS on the wire
+    _TEMPERATURE_WARNED = True
+    BEDROCK_ANTHROPIC_DEGRADATIONS[DEGRADATION_TEMPERATURE_DROPPED] += 1
+    log.warning(
+        "MATCHING_TEMPERATURE is set and is NOT being sent on this arm: with "
+        "extended thinking enabled the provider fixes its own sampling, so a "
+        "temperature would be recorded and ignored. Stage 5 is less "
+        "reproducible than the configuration asks for. Set "
+        "BEDROCK_ANTHROPIC_THINKING to 'disabled' to send it.",
+        stage=5, event="bedrock_converse_temperature_dropped",
+        degraded=True, provider=config.MATCHING_PROVIDER,
+        reason=(f"configured={config.MATCHING_TEMPERATURE!r} "
+                f"capability={config.matching_temperature_capability()!r} "
+                f"thinking={config.BEDROCK_ANTHROPIC_THINKING!r}"))
 
 
 def _warn_model_echo_once() -> None:

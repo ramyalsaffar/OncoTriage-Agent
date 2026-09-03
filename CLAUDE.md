@@ -662,7 +662,7 @@ python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on
 # of its argument -- including a control MODULE written to that temp directory
 # and PARSED, never imported -- an ast walk, or a registry entry removed inside
 # try/finally with the restore asserted. Bucket A, ~3 s.
-python tests/test_degradation_counter_readers.py                    # 157 (was 155; the pre-diagnosis ECOG pass added ECOG_ANCHOR_COUNTS to _READER_EXEMPTIONS on the parser's other four counters' footing -- a census read by load_all_patients(), whose own pass has an end where oncotriage/degradation.py's does not -- and the table drives its own follow-up checks. Before that 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
+python tests/test_degradation_counter_readers.py                    # 158 (UNCHANGED across the determinism pass, which added a counter -- OPENAI_PARAMETER_DEGRADATIONS -- and no check: section 1's registration scan is ONE aggregate check over every module-level Counter it discovers, so a registered addition moves nothing and an UNregistered one fails there. Was 157, was 155; the pre-diagnosis ECOG pass added ECOG_ANCHOR_COUNTS to _READER_EXEMPTIONS on the parser's other four counters' footing -- a census read by load_all_patients(), whose own pass has an end where oncotriage/degradation.py's does not -- and the table drives its own follow-up checks. Before that 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -748,7 +748,7 @@ python tests/test_agent_patient_hash_coverage.py                    #  73 (was 7
 # matrix, and it execs nothing -- the missing-package control masks
 # sys.modules['mlflow'], which drives the SHIPPED function because the import is
 # deferred into it. ~1.4 s.
-python tests/test_tracking_mlflow_index.py                          # 104 (was 99; the call-mode pass added the arm parameter and its both-directions drive)
+python tests/test_tracking_mlflow_index.py                          # 109 (was 104; the determinism pass added matching_temperature_sent to _DERIVED_PARAM_KEYS and drove it BOTH DIRECTIONS across the arm -- 'what was set' and 'what was sent' are different facts and both are in the index. Before that 99; the call-mode pass added the arm parameter and its both-directions drive)
 
 # The token-persistence pass's BEHAVIOURAL half -- the structural half is
 # Test 2 of tests/test_storage_inference_logging_contract.py, and neither
@@ -793,7 +793,7 @@ python tests/test_storage_run_metrics_flush.py                      # 124 (was 1
 # neither of the suite's two writers. It EXECS NOTHING: every control is a
 # different INPUT to a pure function, a real failing condition created on disk,
 # or an ast walk over an in-memory copy. Bucket A, ~1.5 s.
-python tests/test_storage_run_identity.py                           # 159 (was 155; the cohort-selection pass gated `campaign_cohort_size` and `campaign_cohort_seed`, and four of this file's section-1 and section-4 checks are PER-STAMP-FIELD loops, so two more fields is four more checks. It also caught the pass's own defect: RUN_FINGERPRINT_COLUMNS had not been widened with the stamp, so two gated fields would never have reached a run row. Before that 142; the duplicated-derivation pass added F7's checks -- one derivation of the terminal status, read by BOTH the row and the console line, and the declared MLflow mapping -- and had to widen the status walk past ast.Constant, which would otherwise have passed VACUOUSLY over a main() that writes no status at all. Before that 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
+python tests/test_storage_run_identity.py                           # 159 (UNCHANGED across the determinism pass, which gated a twelfth field: the three checks it moved are the field COUNT, the overlap set and the stamp literal, all in place. Was 155; the cohort-selection pass gated `campaign_cohort_size` and `campaign_cohort_seed`, and four of this file's section-1 and section-4 checks are PER-STAMP-FIELD loops, so two more fields is four more checks. It also caught the pass's own defect: RUN_FINGERPRINT_COLUMNS had not been widened with the stamp, so two gated fields would never have reached a run row. Before that 142; the duplicated-derivation pass added F7's checks -- one derivation of the terminal status, read by BOTH the row and the console line, and the declared MLflow mapping -- and had to widen the status walk past ast.Constant, which would otherwise have passed VACUOUSLY over a main() that writes no status at all. Before that 139; the stop-switch pass replaced the terminal-status EQUALITY check with the composition tracking.RUN_STATUSES + RUN_RECORD_STATUSES_BEYOND_TRACKING, which still fails on a status added to one side and named in neither)
 
 # The schema-guards pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, no live
@@ -1015,7 +1015,7 @@ python tests/test_fixture_call_mode_pin.py                          #  87 (uncha
 # copies of oncotriage/agent/bedrock_adapter.py, one mapping broken in each,
 # argued at _EXEC_ALLOWLIST (the module is new, so `git show` has no revision
 # carrying a version with one mapping missing). ~2 s.
-python tests/test_agent_bedrock_adapter.py                          # 284 (was 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
+python tests/test_agent_bedrock_adapter.py                          # 292 (was 284; the determinism pass added the temperature drop's own warn-once -- counted on the first CALL, silent on the second, and silent under the declared opt-out -- and two checks that the arm's refusal is DECLARED rather than discovered by sending. Before that 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
 
 # The Converse pass: the SECOND Bedrock branch, Claude Sonnet 4.6. Same shape,
 # same directory. NO AWS CALL AND NO BILLED CALL OF ANY KIND -- every client is
@@ -1031,7 +1031,7 @@ python tests/test_agent_bedrock_adapter.py                          # 284 (was 2
 # visible rather than silent. It DOES exec: ten in-memory copies of
 # oncotriage/agent/bedrock_anthropic_adapter.py, one plant each, argued at
 # _EXEC_ALLOWLIST. Bucket A, ~0.8 s.
-python tests/test_agent_bedrock_anthropic_adapter.py                # 411 (was 393; the 6b probe pass added section 7e over the credential publisher, with four reverts all caught. This line said 274 and was stale by 119 -- the botocore-pin commit moved it and did not say so; MEASURED 2026-09-03)
+python tests/test_agent_bedrock_anthropic_adapter.py                # 423 (was 411; the determinism pass INVERTED the two temperature pins -- this is the one arm whose model accepts the parameter, so inferenceConfig carries it -- and added the warmup's identical value, the byte-identical cached prefix, the topP absence, and the two ways it is NOT sent. Before that 393; the 6b probe pass added section 7e over the credential publisher, with four reverts all caught. This line said 274 and was stale by 119 -- the botocore-pin commit moved it and did not say so; MEASURED 2026-09-03)
 
 # The Bedrock go-live probe. NOT a test, NOT in tests/, NOT in any bucket, and
 # it REFUSES to do anything without its flag (exit 2, nothing called, nothing
@@ -5214,7 +5214,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 482 (was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
+python tests/test_resume_configuration_fingerprint.py            # 494 (was 488; the determinism pass gated matching_temperature_sent as FINGERPRINT_VERSION 7 and added it to the mismatch table with its stored value DERIVED as 'whichever of the two states this process is not'. Before that 488, was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -11046,7 +11046,7 @@ files. Every other suite at its documented count.
 
 ## Conventions
 
-- **All tunables live in `oncotriage/config.py`, and every one of them has a reader.** (`03- Config.py` used to re-export them for the exec chain; pass 20e deleted it.) Retrieval sizes, thresholds, rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies. **The second half of that sentence is new in pass 20f-2 and it is enforced**, by `tests/test_package_invariants.py` check 2h: a constant here that nothing anywhere reads fails, and the exemption list is closed. That is what this promise is worth — an operator who sets a value in this file is entitled to an effect, and `BATCH_SIZE` and `EXPANSION_TEMPERATURE` were two that had none. Note the parenthesis that used to say "temperatures (both 0 for determinism)": `MATCHING_TEMPERATURE` is `None` because gpt-5.6-terra rejects the parameter, and `EXPANSION_TEMPERATURE` is deleted — so the phrase described neither of the two things it named.
+- **All tunables live in `oncotriage/config.py`, and every one of them has a reader.** (`03- Config.py` used to re-export them for the exec chain; pass 20e deleted it.) Retrieval sizes, thresholds, rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies. **The second half of that sentence is new in pass 20f-2 and it is enforced**, by `tests/test_package_invariants.py` check 2h: a constant here that nothing anywhere reads fails, and the exemption list is closed. That is what this promise is worth — an operator who sets a value in this file is entitled to an effect, and `BATCH_SIZE` and `EXPANSION_TEMPERATURE` were two that had none. Note the parenthesis that used to say "temperatures (both 0 for determinism)": `EXPANSION_TEMPERATURE` is deleted, and `MATCHING_TEMPERATURE` was `None` for a year because gpt-5.6-terra rejects the parameter — so the phrase described neither of the two things it named. **The second half of that correction has itself been superseded: `MATCHING_TEMPERATURE` is `0.0`**, a pipeline-level rule requested on any arm whose model accepts the parameter and omitted where it does not, with the drop counted. See "Determinism is a pipeline rule" below; the Terra restriction is unchanged and is now DECLARED per arm rather than turned into a project-wide absence of policy.
 - **The three model identities — `EMBEDDING_MODEL`, `MATCHING_MODEL`, `CROSS_ENCODER_MODEL` — live in `oncotriage/config.py` together**, and `BM25_SPARSE_MODEL_NAME` deliberately does not (it stays in `oncotriage/embedding.py`, beside the one construction site, with the "changing it rebuilds the index" warning it needs). The asymmetry is argued at both constants; the short version is that `storage` may not import `agent`, so the cross-encoder's name cannot live beside its loader.
 - **There is no `print` anywhere in `oncotriage/`, and there is no `builtins.print` monkey-patch.** Output goes to one of two channels in `oncotriage/observability.py`: `log = get_logger(__name__)` for anything machine-readable, `console.out(...)` for anything a human watches. Both write to **stderr** — stdout is the MCP server's protocol stream. See "Structured logging (the logging pass)" below.
 - `ENABLE_RATE_LIMITING = False` by default so batch evaluation isn't throttled; flip it for production.
@@ -13636,6 +13636,221 @@ AND TWO OF THEM BY THE REVERT MATRIX.**
    which cohort a deployment would run, and the API writes no `runs` row, so its
    eight cohort columns are NULL by construction.
 
+
+### Determinism is a pipeline rule, and the arms that cannot honour it say so (the determinism pass)
+
+**`config.MATCHING_TEMPERATURE` IS `0.0`.** Stage 5 requests temperature 0 on
+any arm whose model ACCEPTS the parameter, OMITS it where the model does not,
+and RECORDS which of the two happened. The decision is a **declared
+capability**, never a try-and-catch of a 400. **NO BILLED CALL AND NO AWS CALL
+OF ANY KIND WAS MADE**; the production `inferences.db` was never opened and no
+fixture was re-captured.
+
+**WHAT WAS WRONG WAS NOT THE VALUE, IT WAS THAT THERE WAS NO POLICY.**
+`MATCHING_TEMPERATURE` had been `None` since 2026-08-04, and the comment above
+it was right about WHY: gpt-5.6-terra rejects every value but its default,
+probed live, `400 unsupported_value`. What that comment then did was turn a fact
+about ONE MODEL into a project-wide "not sent" — correct while Terra was the
+only judge, and wrong from the provider flip onward, because the shipped judge
+changed and nothing re-asked the question. So the pipeline sampled Stage 5 at
+the provider default of **1.0** on the arm that ships, and no constant in the
+project said so.
+
+| | |
+|---|---|
+| `config.MATCHING_TEMPERATURE_MODEL_ACCEPTS` | one row per member of `MATCHING_PROVIDERS`, TOTAL and guarded at import. openai **False**, bedrock (Responses) **False** — the same MODEL, so the endpoint does not change the answer — bedrock_anthropic **True** |
+| `config.matching_temperature_capability()` | the live arm's answer, from a CLOSED three-member vocabulary |
+| `config.matching_temperature_sent()` | the value that reaches the wire, or `None` for "omit the field" |
+| `config.matching_temperature_record()` | the ONE spelling every durable record uses |
+| `config.validate_matching_temperature()` | the value guard, called at import with the module's own constant |
+
+**THREE MEMBERS RATHER THAN A BOOL, AND THAT IS THE PART A REPORT NEEDS.**
+`model_rejects_parameter` is a property of the judge and the only fix is a
+different judge; `thinking_enabled` is a setting in this file an operator can
+turn off. A bool would collapse them into "not sent" and send both readers to
+the same wrong place.
+
+**THE CONVERSE CONDITIONS ARE READ OFF THE DOCUMENTATION AND BOTH ARE
+ENFORCED.** `inferenceConfig.temperature` is a modeled member of the Converse
+request shape, and Anthropic's parameter guidance recommends values near 0 for
+analytical work — so temperature is sent **without `topP`** (the guidance is to
+adjust one of the two; this builder names neither field anywhere else, so the
+rule holds by construction and the test pins the ABSENCE) and **only while
+extended thinking is off** (with thinking on the provider fixes its own
+sampling, so a value would be recorded and IGNORED — a record that disagrees
+with what happened, which is worse than no record).
+
+**THE WARMUP CARRIES IT TOO, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT.**
+`build_converse_request`'s own contract is "the warmup is this request with TWO
+differences and no others, both AFTER the cached prefix". A temperature present
+on the trial calls and absent on the warmup would make that sentence false and
+would leave the request that ESTABLISHES the cache in a shape no trial call
+uses. `inferenceConfig` sits outside `system`, so it cannot move the cached
+prefix either way — Converse's checkpoint chain is `tools` -> `system` ->
+`messages` — which is what makes carrying it FREE rather than merely harmless,
+and the test asserts the cached prefix byte-identical across the two rather than
+arguing it.
+
+**TEMPERATURE 0 IS NECESSARY AND NOT SUFFICIENT, AND THE k-RUN MEASUREMENT
+STAYS.** Greedy decoding still varies with batching, kernel scheduling, hardware
+and any server-side change behind an alias; neither vendor promises
+bit-identical output at 0 and neither returns a fingerprint this project could
+check. The dashboard's reproducibility tab already says so in as many words.
+This constant narrows the distribution the judge samples from; it does not
+replace `CAMPAIGN_STABILITY_SAMPLE_SIZE`'s k=2 re-run, and a pass that reads it
+as permission to drop that measurement has misread it.
+
+**THE TWO DORMANT ARMS' REQUEST DICTS ARE BYTE-IDENTICAL TO HEAD'S, MEASURED
+RATHER THAN CLAIMED.** `build_bedrock_request` and both OpenAI call sites were
+compared against the functions lifted out of `git show HEAD:` and exec'd into
+the live modules' globals — the provider-flip pass's instrument — and all three
+agree key for key and value for value, `timeout` compared by IDENTITY. That is
+what the fixture claim rests on: `oncotriage/fixtures/capture.py` records the
+kwargs dict verbatim and `replay.py` looks a recording up by a digest OF THAT
+DICT, so a key added there costs a re-capture of all twelve at live prices.
+Driven end to end as well: the replay report, pinned to the OpenAI arm and
+normalised for timings and paths, is **IDENTICAL to HEAD's — zero differing
+lines**, same nine DIFFERS verdicts, same field counts, same twelve CONFIG MOVED
+lines. (The 0/12 is the standing recapture item the de-identification and
+pre-diagnosis-ECOG passes left; this pass adds nothing to it.)
+
+**THREE COUNTERS, ONE PER ARM THAT DROPS, ON THE `seed_not_expressible`
+PRECEDENT.** `temperature_not_expressible` in
+`bedrock_adapter.BEDROCK_ADAPTER_DEGRADATIONS`, in
+`bedrock_anthropic_adapter.BEDROCK_ANTHROPIC_DEGRADATIONS`, and in a new
+`evaluation.OPENAI_PARAMETER_DEGRADATIONS` — the **47th** member of
+`oncotriage/degradation.py`'s run-end registry (MEASURED with
+`degradation.registered_names()` rather than counted by eye; several earlier
+accounts in this file give ordinals that were true when written). A SHARED counter was rejected
+for the reason that file already gives for keeping the two Bedrock counters
+apart: a shared total cannot say WHICH arm degraded, which is the only thing a
+reader of this key wants to know. `evaluation.py` owns the OpenAI one because
+there is no `openai_adapter.py` — that arm's request builder IS this module.
+
+**THE OPT-OUT IS SILENT, AND THAT IS THE HALF THAT IS EASY TO GET WRONG.**
+`MATCHING_TEMPERATURE = None` is the documented pre-determinism behaviour, kept,
+and it degrades nothing — so no counter moves. Without that, the key would be
+non-zero on every run of an arm whatever the operator chose, and the run-end
+report's CLEAN line would mean less than it does. What separates the two Nones
+in the record is `matching_temperature_sent`, which reads the documented
+`not_sent` in both cases while the counter reads 0 in one and 1 in the other.
+
+**THE CONVERSE ARM'S LATCH IS ITS OWN, UNLIKE THE SEED'S AND THE EFFORT'S.**
+Those two are dropped on EVERY run of that arm, so one flag set on the first
+call is the whole story. This one is CONDITIONAL, so sharing `_DROPPED_WARNED`
+would latch the shared flag on a first call that had nothing to report and
+silence a drop that started later in the process. Nothing in a campaign flips
+the thinking mode mid-run, and a guard whose correctness depends on nobody doing
+so is a guard that will be wrong the first time a probe does.
+
+**FINGERPRINT_VERSION IS 6 -> 7 AND THE POLICY IS WHAT DECIDED IT, NOT A
+PREFERENCE.** The criterion the call-mode field was gated under has two clauses
+and this meets both: it changes the verdicts (every one of them, on every
+patient — this is the largest single move to the judge's output distribution the
+stamp has ever been asked to see), and NOTHING ELSE IN THE STAMP MOVES WITH IT.
+So a checkpoint written at temperature 0 and resumed at the provider default —
+or the reverse — would have answered FP_MATCH, and the artifact would hold two
+sampling regimes with nothing in it saying which patients got which. **Every
+artifact stamped at 6 answers FP_VERSION until an operator clears it once**,
+which is that constant's designed semantics for a shape change; the remediation
+is printed on the refusal.
+
+**IT GATES THE EFFECTIVE VALUE, NOT THE CONSTANT, AND THAT IS WHAT STOPS IT
+OVER-REFUSING.** `matching_temperature_sent` records what reaches the WIRE, so
+on the two Terra arms it reads `not_sent` whatever the constant says and a
+resume across a constant edit is PERMITTED — correctly, because nothing on the
+wire moved and no verdict can differ. `matching_model_configured` made exactly
+this choice for the same reason. The residual is stated the same way: the RAW
+constant is in the tracking index and in every future fixture's tunables block,
+so an edit this gate lets through is visible in the record rather than invisible.
+
+**THE CASCADE, IN FULL.** `FINGERPRINT_FIELDS` (12 members), `RUN_FINGERPRINT_
+COLUMNS` (in `run_fingerprint`'s own order, which the round trip pins),
+`RUN_COLUMN_ADDITIONS` (**TEXT**, so the column can hold a number AND the
+documented `not_sent` — a REAL column would have to spell one of them as a NULL,
+which collides with "this row predates the column", or as a sentinel number,
+which is a temperature nobody asked for), `SCHEMA_USER_VERSION` **11 -> 12** with
+its era record, and `queries.campaign_summary`'s `requires_columns` — the
+**FIFTH** consecutive stamp widening the derived-versus-declared check has
+caught, which is the argument for that check rather than for a bigger comment.
+
+**BOTH STEP-4 DECISIONS, REPORTED.** `tracking.CONFIGURATION_PARAM_NAMES`
+ALREADY carried `MATCHING_TEMPERATURE` and still does — it is a named constant
+and the tuple's mechanism is `getattr(config, name)`. What was ADDED is
+`matching_temperature_sent`, through `configuration_params`' derived seam, on
+`matching_call_mode`'s precedent: the owner is a FUNCTION, so the tuple cannot
+express it. The pair is not a duplicate — one is what the operator SET and the
+other is what the judge was TOLD, they differ on every arm whose model rejects
+the parameter, and a comparison of two runs needs both to tell a policy change
+from an arm change. In the FIXTURE block the same split is made and for the
+opposite reason: `MATCHING_TEMPERATURE` goes in `"tunables"` (the constant, so
+`diff_tunables()`'s `getattr(config, name)` resolves it) and
+`matching_temperature_sent` goes in the environment block beside it (the
+function's answer, which that dict's keys cannot be). **FUTURE CAPTURES ONLY**,
+on that block's standing doctrine, so nothing on disk moved.
+
+**THE VALUE GUARD IS A FUNCTION RATHER THAN AN `if` AT THE CONSTANT, and that is
+what makes it exercisable.** An import-time `if` in a 4,000-line module is
+reachable only by exec'ing a patched copy; `validate_matching_temperature(value)`
+is driven over an eleven-row table, which is the natural control for a pure
+function of its argument, with the import-time call passing the module's own
+constant. The bounds are the INTERSECTION of what the arms can accept (OpenAI
+documents 0..2, Anthropic 0..1), so **2.0 is refused** — legal on one arm and
+not the other, which is exactly what bounding at the intersection means. `bool`
+is excluded explicitly, because `isinstance(True, int)` is True and `True` would
+otherwise sail through as 1.0: the provider default, silently claimed as a
+choice.
+
+```bash
+# The determinism pass. Same shape, same directory. No network, no keys, NO
+# SPEND -- no provider client of any kind is built: the one call site driven is
+# handed a recorder through oncotriage/agent/deps.py, and deps.is_resolved is
+# asserted False for all three client keys at the end, so a real client that HAD
+# been built is caught. NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the
+# imports; torch and transformers asserted absent), no live Qdrant --
+# run_fingerprint._resolve_collection is replaced so current() probes no index
+# -- no corpus, no database, no git history, no live server. It writes NOTHING
+# anywhere, not even a temp directory, and EXECS NOTHING: every control is a
+# different INPUT to a pure function or a module attribute rebound inside
+# try/finally with the restore asserted. NOT in the collision matrix, though the
+# two repository files it READS are sha256-compared at the end and one is
+# config.py, which tests/test_config_snapshot_date_rot.py rewrites in place --
+# so an interleaved serial run is visible rather than silent. Bucket A, ~0.8 s
+# against ONLY the CI directory skeleton.
+python tests/test_matching_temperature_policy.py                    #  72
+```
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE 0.0 REQUEST HAS NEVER BEEN OBSERVED AGAINST THE LIVE PROVIDER.** The
+   Converse arm now sends a field it has never sent. AWS documents it as a
+   modeled member of `inferenceConfig` and botocore validates the request shape
+   LOCALLY — an unknown key is a `ParamValidationError` before a signed request
+   leaves the machine, which is the property the Converse choice was made for —
+   so a shape error cannot reach the wire. What has not been measured is
+   ACCEPTANCE of the VALUE and its effect: one `bedrock_probe.py --provider
+   bedrock_anthropic` call settles the first and nothing short of a k-run
+   settles the second. **This is the item to run first.**
+2. **NO RE-BASELINE.** Every calibrated number in this project — the 69.1%
+   agreement behind `MATCHING_REASONING_EFFORT`, `MEDCPT_SCORE_FLOOR`, the
+   empty-verdict recovery rate, `MATCHING_OUTPUT_TOKENS_PER_TRIAL` — was
+   measured at the provider default sampler. None of them carries across a
+   temperature change, and this pass measured none of them again.
+3. **THE TWELVE FIXTURES ARE STILL 0/12** and this pass did not recapture. It
+   provably adds nothing to what was already owed: the recorded request dict is
+   byte-identical and the replay report is unchanged line for line.
+4. **THE CONVERSE ARM HAS NO FIXTURE GATE AT ALL**, so the one arm that now
+   SENDS a temperature is covered by
+   `tests/test_agent_bedrock_anthropic_adapter.py`,
+   `tests/test_agent_bedrock_anthropic_per_trial.py` and
+   `tests/test_matching_temperature_policy.py` and by nothing else.
+5. **`GET /pipeline/info` DOES NOT REPORT IT**, so an operator asking the API
+   what sampler its judge runs under cannot see it over HTTP. A contract change
+   to a served response.
+6. **`topP` IS ABSENT BY CONSTRUCTION AND NOT BY A CONFIG DECISION.** There is
+   no `BEDROCK_ANTHROPIC_TOP_P`, so the "one of the two, never both" rule is
+   kept by the builder naming only one field. The test pins the absence; nothing
+   pins that a future constant would have to meet the rule.
 
 ### The Stage 5 provider default is Converse (the provider-flip pass)
 

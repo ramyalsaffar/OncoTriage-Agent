@@ -525,8 +525,18 @@ check("seed", at(_sent, "seed"), config.MATCHING_SEED)
 check("response_format", at(_sent, "response_format"), build_response_format())
 check("timeout is the STRUCTURED object, not a bare float",
       at(_sent, "timeout") is config.get_matching_request_timeout(), True)
-check("temperature is still not sent at all",
+# NOT SENT, AND SINCE THE DETERMINISM PASS THAT IS A DROP RATHER THAN AN
+# ABSENCE OF POLICY. `config.MATCHING_TEMPERATURE` is 0.0 and gpt-5.6-terra
+# rejects every value but its default, so this arm cannot carry it -- the
+# request dict is byte-identical to what it always was and the drop is COUNTED,
+# which is what section 1e below measures.
+check("temperature is still not sent at all -- the model rejects it, so the "
+      "pipeline's temperature rule cannot reach this arm's wire",
       "temperature" in _sent, False)
+check("...and that is the DECLARED capability rather than something this arm "
+      "discovered by sending and catching a 400",
+      config.MATCHING_TEMPERATURE_MODEL_ACCEPTS[
+          config.MATCHING_PROVIDER_OPENAI], False)
 
 # --- 1d. No Bedrock client was built, cached or reached --------------------
 #
@@ -640,8 +650,12 @@ check("...and no chat-shaped response_format survives",
       "response_format" in _req if isinstance(_req, dict) else True, False)
 
 # temperature / seed
-check("temperature is still not sent",
+check("temperature is still not sent -- SAME MODEL, same restriction, so the "
+      "Responses endpoint does not change the answer",
       "temperature" in _req if isinstance(_req, dict) else True, False)
+check("...and it is DECLARED per arm rather than discovered by sending",
+      config.MATCHING_TEMPERATURE_MODEL_ACCEPTS[
+          config.MATCHING_PROVIDER_BEDROCK], False)
 check("seed is NOT a top-level parameter (the Responses API has none)",
       "seed" in _req if isinstance(_req, dict) else True, False)
 check("...and by default it is not smuggled through extra_body either",
@@ -699,6 +713,65 @@ check("...and the second does not double-count a configuration fact",
 check("...and that counter is registered in oncotriage/degradation.py's "
       "run-end report",
       "BEDROCK_ADAPTER_DEGRADATIONS" in _degradation.registered_names(), True)
+
+# THE TEMPERATURE DROP IS RECORDED THE SAME WAY, and it is a SECOND warn-once
+# rather than a line inside the seed's because the two are not gated by the same
+# condition: the seed's drop is unconditional on this arm, and this one fires
+# only while MATCHING_TEMPERATURE is set. Both arms of that are driven.
+_before_temp = ba.BEDROCK_ADAPTER_DEGRADATIONS[
+    ba.DEGRADATION_TEMPERATURE_DROPPED]
+with provider(config.MATCHING_PROVIDER_BEDROCK):
+    drive(ba.build_bedrock_request, "S", "U")
+check("build_bedrock_request is PURE for this drop too: building moves no "
+      "counter",
+      ba.BEDROCK_ADAPTER_DEGRADATIONS[ba.DEGRADATION_TEMPERATURE_DROPPED],
+      _before_temp)
+
+_temp_stub = _BedrockStub(reply=BEDROCK_REPLY)
+ba._TEMPERATURE_WARNED = False                # a fresh process, for one block
+try:
+    with provider(config.MATCHING_PROVIDER_BEDROCK):
+        with overrides(bedrock_client=_temp_stub):
+            silence(ba.call_matching_model_bedrock, "S", "U")
+            _temp_after_one = ba.BEDROCK_ADAPTER_DEGRADATIONS[
+                ba.DEGRADATION_TEMPERATURE_DROPPED]
+            silence(ba.call_matching_model_bedrock, "S", "U")
+            _temp_after_two = ba.BEDROCK_ADAPTER_DEGRADATIONS[
+                ba.DEGRADATION_TEMPERATURE_DROPPED]
+finally:
+    ba._TEMPERATURE_WARNED = True
+check("the first Bedrock CALL records the dropped TEMPERATURE -- the pipeline "
+      "asked for one and this model will not take it, and that is never silent",
+      _temp_after_one, _before_temp + 1)
+check("...and the second does not double-count a configuration fact",
+      _temp_after_two, _temp_after_one)
+check("...and the key is the one this arm's closed vocabulary declares, so a "
+      "typo at the bump site fails here rather than producing a counter nobody "
+      "reads",
+      ba.DEGRADATION_TEMPERATURE_DROPPED in ba.DEGRADATION_KEYS, True)
+
+# THE OPT-OUT IS SILENT, AND THAT IS THE HALF THAT IS EASY TO GET WRONG.
+# MATCHING_TEMPERATURE = None is a declared setting; nothing was dropped, so
+# nothing is counted. Without this the counter would be non-zero on every run of
+# this arm whatever the operator chose, and the run-end report's CLEAN line
+# would mean less than it does.
+_optout_stub = _BedrockStub(reply=BEDROCK_REPLY)
+ba._TEMPERATURE_WARNED = False
+_before_optout = ba.BEDROCK_ADAPTER_DEGRADATIONS[
+    ba.DEGRADATION_TEMPERATURE_DROPPED]
+try:
+    with provider(config.MATCHING_PROVIDER_BEDROCK, MATCHING_TEMPERATURE=None):
+        with overrides(bedrock_client=_optout_stub):
+            silence(ba.call_matching_model_bedrock, "S", "U")
+finally:
+    ba._TEMPERATURE_WARNED = True
+check("the declared OPT-OUT records nothing -- an operator who asked for no "
+      "temperature has degraded nothing",
+      ba.BEDROCK_ADAPTER_DEGRADATIONS[ba.DEGRADATION_TEMPERATURE_DROPPED],
+      _before_optout)
+check("...and the request still went out, so that is a silent counter rather "
+      "than a call that never happened (non-degeneracy)",
+      len(_optout_stub.recorder.calls) >= 1, True)
 
 # store
 check("store is sent EXPLICITLY as False (the vendor default is True and the "
