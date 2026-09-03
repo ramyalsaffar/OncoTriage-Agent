@@ -145,8 +145,8 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/ablation/common.py` | **the one** `ABLATION_DB_FILENAME` / `ABLATION_SUMMARY_FILENAME` / `_require_writable_parent`, plus `CONFIG_ORDER` / `CONFIG_LABELS` / `BASELINE` and the analysis side's `output_dir()` / `ablation_db()` (pass 20f-4) | `paths` |
 | `oncotriage/ablation/figures.py` | File 27's **nine figures** — the one module-scope `matplotlib` import on the ablation side (pass 20f-4) | `ablation.common` |
 | `oncotriage/ablation/analysis.py` | File 27's statistics — the comparison table, the BH-FDR Wilcoxon family, the MDE, two reports, `main`. READS the database, never writes it. No matplotlib | `ablation.{common,figures}`, `config` |
-| `oncotriage/evaluation/sampling.py` | File 28 whole — the seeded 10/10/10 draw into a second database | `paths` |
-| `oncotriage/evaluation/cohort.py` | **WHICH patients a campaign runs** — the ruled 300-patient cohort, the 50-patient k=2 stability sample and the 100-patient judge sample, drawn by sha256 rank over the filename stem. `DRAW_ALGORITHM`, `draw`, `digest`, `CohortSelection`, `select`. The ONE reader of the six `CAMPAIGN_*` constants, which is what keeps the batch runner cohort-blind. Resolves no path and opens no file | `config` |
+| `oncotriage/evaluation/sampling.py` | File 28 whole — the seeded, PROPORTIONALLY STRATIFIED draw into a second database. **It was a fixed ten each from breast, colon and lung and the three-group vocabulary is deleted**; it is `sample_total` patients allocated across every cancer group the source holds, minimum one per non-empty group, through the one allocator `cohort.allocate_proportional` and the one grouper `registries/primary_cancer.py:cancer_group_key` | `paths` |
+| `oncotriage/evaluation/cohort.py` | **WHICH patients a campaign runs** — the ruled **500**-patient cohort, **stratified by primary cancer group** (`stratified_draw`, `allocate_proportional`, `MINIMUM_PER_GROUP`), plus the 50-patient k=2 stability sample and the 100-patient judge sample, which are still plain sha256-rank draws over the filename stem. The cohort section far below argues for a SIMPLE RANDOM draw of 300 and is a past-tense account; see the CURRENT STATE note on it. `DRAW_ALGORITHM`, `draw`, `digest`, `CohortSelection`, `select`. The ONE reader of the six `CAMPAIGN_*` constants, which is what keeps the batch runner cohort-blind. Resolves no path and opens no file | `config` |
 | `oncotriage/evaluation/cohort_diff.py` | File 34 whole — LEGACY vs CURRENT cohort selector, read only | `paths`, `config`, `fhir.{clean,parser}`, `registries.cancer_code_registry` |
 | `oncotriage/fixtures/capture.py` | File 45 whole — the schema, the sink, the four proxies, `build_deterministic_prefix`, the fixture I/O, the three recipes, the cohort scan | `paths`, `config`, `agent.*`, `extraction.stage`, `fhir.parser`, `storage.database_logger`, `utils` |
 | `oncotriage/fixtures/replay.py` | File 46 whole — the replay stand-ins, the OpenAI tripwire, the field diff, the five refusals | `config`, `paths`, `agent.{deps,graph,patient}`, `fhir.parser`, `fixtures.capture`, `utils` |
@@ -368,7 +368,7 @@ python "26- Ablation Study.py" --sample-size 30 --configs full_pipeline no_mesh_
 python "26- Ablation Study.py" --summary-only        # report from existing ablation_results.db
 python "27- Ablation Analysis.py"                    # tables + figures from ablation_results.db
 python "27- Ablation Analysis.py" --db <scratch>/ablation_results.db   # analyse an isolated study; outputs land beside it
-python "28- Select Evaluation Sample.py"             # 10 breast + 10 colon + 10 lung, seed 42
+python "28- Select Evaluation Sample.py"             # seeded proportional draw over every cancer group, seed 42
 python "28- Select Evaluation Sample.py" --output-db <scratch>/sample.db
 python "34- Cohort Selector Diff Read Only.py"       # LEGACY vs CURRENT selector, read only
 python fixture_capture.py --scan-only               # cohort scan + selection, captures nothing
@@ -560,7 +560,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 261/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 434 (was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 498 (this line said 434 and was stale by 64 -- the reason-coverage pass recorded 487 -> 498 five hundred lines below and this line never moved; MEASURED 2026-09-03. Before that 434, was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -579,7 +579,7 @@ python tests/test_paths_glob_determinism.py                        #  25
 # -- and check 8e requires every watched name to be restored to what it read
 # at import. Bucket A, ~0.6 s.
 python tests/test_env_key_allowlist.py                             #  48
-python tests/test_storage_wipe_all_tables.py                       #  22
+python tests/test_storage_wipe_all_tables.py                       #  28 (this line said 22; MEASURED 2026-09-03)
 python tests/test_fhir_parser_dict_input.py                        #  31 (was 28 passed / 1 FAILED on a developer tree -- bucket E, so CI never ran it. The API-shutdown-gate pass re-added `import os` to oncotriage/api/server.py for its async-signal-safe os.write(2, ...) and left this file asserting the server imports neither os nor tempfile. The import ban was a PROXY for 'no temp-file round trip'; the pre-diagnosis ECOG pass replaced it with the property itself -- no filesystem call is reached anywhere in the module -- which is strictly stronger and survives)
 python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
 
@@ -595,7 +595,7 @@ python tests/test_ablation_db_isolation.py                         #  72 (was 43
 # (paths.py, fixtures/capture.py, evaluation/run_harness.py, agent/deps.py,
 # embedding.py) are written by neither of the suite's two writers. It EXECS
 # NOTHING. Bucket A, ~2.6 s.
-python tests/test_paths_portability_roots.py                       # 103
+python tests/test_paths_portability_roots.py                       # 102 passed / 1 FAILED, and the failure is PRE-EXISTING rather than this line going stale: check 8j ('the control plant matched something') fails at HEAD, which the 6b probe pass already recorded as one of bucket A's two standing failures. 103 is the count when it is green; MEASURED 2026-09-03
 
 # The render-snapshot test (pass 20f-5, extended by 20f-6). Same shape, same
 # directory, no keys, no spend, and "no network" is now MEASURED rather than
@@ -783,7 +783,7 @@ python tests/test_storage_provenance_persistence.py                 # 128
 # alternative implementation written out for comparison, or an ast walk over a
 # parsed source file. Bucket A, ~12 s (section 7 drives MAX_WORKERS threads
 # through the flush behind a barrier while another inserts counter keys).
-python tests/test_storage_run_metrics_flush.py                      # 124 (was 123; the duplicated-derivation pass had to stop locating the KILLED crash handler by searching ast.dump for the string 'KILLED' -- runner.py names the constant now -- and added the non-degeneracy probe that the handler was found at all)
+python tests/test_storage_run_metrics_flush.py                      # 130 (this line said 124; MEASURED 2026-09-03. Before that 124, was 123; the duplicated-derivation pass had to stop locating the KILLED crash handler by searching ast.dump for the string 'KILLED' -- runner.py names the constant now -- and added the non-degeneracy probe that the handler was found at all)
 
 # The run-identity pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
@@ -808,7 +808,7 @@ python tests/test_storage_run_identity.py                           # 159 (UNCHA
 # control is a different INPUT to a pure function, a real database built into a
 # real failing shape, or a module constant rebound inside try/finally with the
 # restore asserted. Bucket A, ~1.6 s.
-python tests/test_storage_schema_guards.py                          # 110 (this line said 101 and was stale by 2 before the call-mode pass, which added the era-record staleness pin and the arm's round trip to section 3b; MEASURED 2026-08-23)
+python tests/test_storage_schema_guards.py                          # 135 (this line said 110 and was stale by 25 -- four schema eras have landed since it was measured, and this file's section 3b gains checks per era; MEASURED 2026-09-03. Before that 110; this line said 101 and was stale by 2 before the call-mode pass, which added the era-record staleness pin and the arm's round trip to section 3b; MEASURED 2026-08-23)
 
 # The crash-record / path-unification pass. Same shape, same directory. No
 # network, no keys, NO SPEND, no live Qdrant, no model load, no corpus, no git
@@ -867,7 +867,7 @@ python tests/test_runner_stop_switch.py                             # 140 (was 1
 # inside a tempfile.mkdtemp it removes and asserts gone, and the two repository
 # files it reads (batch/runner.py, "25- Batch Runner.py") are sha256-compared at
 # the end. It EXECS NOTHING. Bucket A, ~18 s alone / ~30 s under bucket-A load.
-python tests/test_runner_preflight_and_state_faults.py              # 120 (was 116; the CI-green pass rewrote 1e-e's non-degeneracy probe, which asserted realpath != abspath and so was a statement about macOS's /var -> /private/var rather than about the code -- it FAILED on every hosted Linux runner while its subject matched. It CONSTRUCTS the symlink now, on tests/test_serial_runner_lock.py section 2's pattern. Before that 116, unchanged across the consolidation pass, which repointed five structural checks at oncotriage/control.py -- their subject moved and a walk over the runner would have found nothing and passed. Was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
+python tests/test_runner_preflight_and_state_faults.py              # 121 (this line said 120; MEASURED 2026-09-03 running ALONE. Before that 120, was 116; the CI-green pass rewrote 1e-e's non-degeneracy probe, which asserted realpath != abspath and so was a statement about macOS's /var -> /private/var rather than about the code -- it FAILED on every hosted Linux runner while its subject matched. It CONSTRUCTS the symlink now, on tests/test_serial_runner_lock.py section 2's pattern. Before that 116, unchanged across the consolidation pass, which repointed five structural checks at oncotriage/control.py -- their subject moved and a walk over the runner would have found nothing and passed. Was 76; the lock-hardening pass added section 8 -- the symlink substitution, the unopenable lock, the UTC record and the stripped truncation guard -- and the symlinked two-process drive in section 5)
 
 # The CI-hygiene pair. Same shape, same directory. Neither imports anything
 # from the package -- their subjects are `.github/scripts/` and
@@ -906,7 +906,7 @@ python tests/test_agent_rrf_config_ownership.py                     #  31
 # two writers). It EXECS NOTHING: every control is a different INPUT to a pure
 # function, plus one override installed inside try/finally and asserted
 # removed. ~1.1 s.
-python tests/test_agent_cross_encoder_sequence_limit.py             #  42
+python tests/test_agent_cross_encoder_sequence_limit.py             #  70 (this line said 42 and was stale by 28: the reranker-revision and transformers-upgrade passes added section 7's dtype verifier -- `ncbi/MedCPT-Cross-Encoder`'s config.json declares float32, and a checkpoint loaded at another dtype ranks differently while raising nothing -- with its own sentinel for 'the model has no dtype attribute at all'. MEASURED 2026-09-03)
 
 # The per-trial-call pass, extended by the cache-warmup pass and turned ON by
 # the default-flip pass. Same shape, same directory. Stage 5 sends ONE billed
@@ -946,7 +946,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # agent/evaluation.py, one plant each, argued at _EXEC_ALLOWLIST. Bucket A,
 # ~1.6 s (MEASURED; the first version was 21.6 s because its own harness
 # deadlocked and a timeout hid it -- see the pass's own findings).
-python tests/test_spend_gate.py                                     # 158 (was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
+python tests/test_spend_gate.py                                     # 162 (this line said 158; the empty-verdict retry pass drove the gate against the retry's own extra call. MEASURED 2026-09-03. Before that 158, was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
 
 # The spend-coverage pass. Same shape, same directory. No network, no keys, NO
 # SPEND -- every provider client is a stand-in, the ablation study's
@@ -964,9 +964,9 @@ python tests/test_spend_gate.py                                     # 158 (was 1
 # evaluation/ragas_harness.py, config.py) are sha256-compared at the end. It
 # EXECS NOTHING and loads no module by location -- the plant is a COPY written
 # into the temp tree and PARSED, never imported. Bucket A, ~6 s.
-python tests/test_spend_coverage.py                                 # 161
+python tests/test_spend_coverage.py                                 # 165 (this line said 161; MEASURED 2026-09-03)
 
-python tests/test_agent_stage5_per_trial_calls.py                   # 322 (this line said 320 and was stale by one; MEASURED 2026-09-01 against HEAD in a git worktree as well as against the working tree, so the correction is about the note rather than about any change. Was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 371 (this line said 322 and was stale by 49: the empty-verdict retry pass added the whole retry surface -- the decision, the ledger's `empty_retry_of` join, the three counters and the fact that a RETRY's own empty reply is a different counter from a first attempt's. MEASURED 2026-09-03. Before that 322; this line said 320 and was stale by one; MEASURED 2026-09-01 against HEAD in a git worktree as well as against the working tree, so the correction is about the note rather than about any change. Was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -1050,10 +1050,13 @@ python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
     --probe-truncation                                   # + 1 more, settles A7
-# PER-TRIAL ON THE CONVERSE BRANCH -- three more calls, settling A11 (is the
-# warmup's `maxTokens = 1` shape accepted) and A12 (does the warmup's write get
-# reported, and do the calls behind it read it). READ THE ANSWER OUT OF THE
-# USAGE BLOCK, never the wall clock. The built-in prefix is BELOW Bedrock's
+# PER-TRIAL ON THE CONVERSE BRANCH -- three more calls. THIS SETTLED A11 (is
+# the warmup's `maxTokens = 1` shape accepted -- IT IS, on both warmup shapes)
+# and A12 (does the warmup's write get reported, and do the calls behind it
+# read it -- IT DOES, 9,281 written and 9,281 read back). The command is kept
+# because the constant's own block requires it to be RE-RUN on every model,
+# provider or thinking/effort change, at which point both are open again. READ
+# THE ANSWER OUT OF THE USAGE BLOCK, never the wall clock. The built-in prefix is BELOW Bedrock's
 # 1,024-token cache floor, so point --per-trial-prefix-file at a real rendered
 # system prompt before drawing any conclusion about the cache.
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
@@ -1126,11 +1129,41 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 #  tests/test_agent_stage5_per_trial_calls.py alone.
 
 # Fixture state, CURRENT rather than as of any pass below: SCHEMA_VERSION
-# is 8, the twelve recordings on disk are v8, and `python fixture_replay.py`
-# is 12/12 clean with no recapture. Two accounts further down state
+# is 8 and the twelve recordings on disk are v8. THE GATE DOES NOT RUN AT THE
+# SHIPPED PROVIDER: `capture.assert_provider_is_hookable` admits 'openai'
+# alone, so `python fixture_replay.py` raises UnsupportedMatchingProviderError
+# before any hook is installed and before any call -- naming `converse` on
+# deps.BEDROCK_ANTHROPIC_CLIENT as the seam the proxies do not wrap. VERIFIED
+# BY RUNNING, 2026-09-03. Behind that refusal the twelve are ALSO stale on
+# their own inputs (0/12 since the de-identification and pre-diagnosis-ECOG
+# passes), so a recapture is owed twice over and cannot be taken at this
+# default at all. This block said '12/12 clean with no recapture', which was
+# true before the provider flip. Two accounts further down state
 # `SCHEMA_VERSION` is 3 and one states the recordings are unreadable; both
 # were true when written and are kept as written, per the rule that a
 # past-tense account keeps its wording.
+
+# Version state, CURRENT rather than as of any pass below, and MEASURED from
+# source on 2026-09-03 rather than carried forward. Every pass account in this
+# file states the versions IT shipped and keeps that wording, so this block is
+# the only place to read the live numbers:
+#
+#     config.MATCHING_PROVIDER            'bedrock_anthropic'  (Converse)
+#     config.matching_wire_model()        'us.anthropic.claude-sonnet-4-6'
+#     config.matching_call_mode()         'per_trial'
+#     config.MATCHING_TEMPERATURE         0.0   -> sent, capability 'supported'
+#     config.MATCHING_PER_TRIAL_EMPTY_RETRIES  1
+#     config.MATCHING_OUTPUT_TOKENS_PER_TRIAL  2500  (INTERIM -- see below)
+#     config.CAMPAIGN_COHORT_SIZE         500, STRATIFIED by cancer group
+#     config.MEDCPT_SCORE_FLOOR           -11.6265
+#     agent.prompts.PROMPT_VERSION        '1.10.0'
+#     run_fingerprint.FINGERPRINT_VERSION 7   (12 gated fields)
+#     database_logger.SCHEMA_USER_VERSION 12
+#     fixtures.capture.SCHEMA_VERSION     8
+#     boto3 / botocore pin                1.42.42 / 1.42.42
+#
+# Sections below state 1.9.0, FINGERPRINT_VERSION 3, cohort 300 and a 1,450
+# output constant. Each was true when written and is kept as written.
 
 
 # The secret-gate pass. Same shape, same directory. No network, no keys, NO
@@ -1321,7 +1354,7 @@ audit record" below.
 3. **`node_cross_encoder_rerank`** — MedCPT cross-encoder, multi-query with RRF across queries, stable argsort for determinism. It fuses on the **same** `config.RRF_K` Stage 2 does — the module-level `RERANK_RRF_K` that used to hold a second literal `60`, under a comment asserting the two were equal, is deleted; one owner makes that claim true by construction. The four channel weights are Stage 2 only: this stage fuses queries, not fields, and weights none of them. It also **retains the raw MedCPT score**: `medcpt_score_max` (the best score across the rerank queries, `None` when no query scored the trial — never `0.0`) and `medcpt_queries_scored`. RRF keeps ranks and throws the scores away, which is right for fusion and leaves nothing calibrated for an absolute gate to read.
 4. **`node_rule_based_filter`** — MeSH site relevance, cancer stage ordinal, histology, age, sex + a **two-knob quality gate** and cost cap (`MAX_TRIALS_FOR_EVALUATION = 15`). Both knobs must pass: `QUALITY_THRESHOLD_PERCENTILE = 25` of the **unboosted fused** score within the pool, and `MEDCPT_SCORE_FLOOR` on `medcpt_score_max`. A trial with no MedCPT score is not dropped by the floor — absence of a score is not a low score. Each knob reports its own count (`quality_dropped_percentile` / `quality_dropped_floor` / `quality_dropped_floor_only`); they **overlap**, so they do not sum to `quality_dropped`.
 
-**`RERANK_SCORE_THRESHOLD` IS DELETED AND THE REASON IS THE POINT.** It was `-10`, a floor on the *fused RRF* score, under a comment describing MedCPT's `-25 .. +10` range — true of the code it was written for, false of the code it sat above. A fused RRF value runs about **0.01 .. 0.06** and is a function of pool size and query count, not of quality (a trial ranked first by all three queries scores ~0.050 however good it is). The gate took `max(percentile, floor)`, so the floor could never be selected — **not rarely, never** — and the relative percentile was doing 100% of the filtering, cutting one trial from a patient whose four survivors were all excellent. `MEDCPT_SCORE_FLOOR` is measured, not chosen: `python measure_medcpt_scores.py` (thin entry point over `oncotriage/evaluation/medcpt_calibration.py`) runs Stages 1–3 only over a seeded 10-breast/10-colon/10-lung sample and reports the distribution plus what the floor would drop *that the percentile does not*. Re-run it after an index rebuild, a rerank-query change, or a cross-encoder checkpoint change.
+**`RERANK_SCORE_THRESHOLD` IS DELETED AND THE REASON IS THE POINT.** It was `-10`, a floor on the *fused RRF* score, under a comment describing MedCPT's `-25 .. +10` range — true of the code it was written for, false of the code it sat above. A fused RRF value runs about **0.01 .. 0.06** and is a function of pool size and query count, not of quality (a trial ranked first by all three queries scores ~0.050 however good it is). The gate took `max(percentile, floor)`, so the floor could never be selected — **not rarely, never** — and the relative percentile was doing 100% of the filtering, cutting one trial from a patient whose four survivors were all excellent. `MEDCPT_SCORE_FLOOR` is measured, not chosen: `python measure_medcpt_scores.py` (thin entry point over `oncotriage/evaluation/medcpt_calibration.py`) runs Stages 1–3 only over a seeded sample drawn PROPORTIONALLY across every cancer group the corpus holds, minimum one per non-empty group (the three-group 10/10/10 rule it used to draw is retired, with `oncotriage/evaluation/medcpt_calibration.py` recording the retirement in place), and reports the distribution plus what the floor would drop *that the percentile does not*. Re-run it after an index rebuild, a rerank-query change, or a cross-encoder checkpoint change.
 5. **`node_llm_classifier_evaluation`** — `MATCHING_MODEL` calls producing per-criterion verdicts; JSON-parse failures loop back up to `MAX_LLM_CLASSIFIER_RETRIES = 3`. **HOW MANY CALLS IS THE SHIPPED ARM'S DEFINING FACT AND `MATCHING_PER_TRIAL_CALLS_ENABLED` DECIDES IT.** `True` (the default) is ONE call per patient-trial pair behind a dedicated cache warmup that is awaited alone — the packer is bypassed — and `False` is the retained comparison arm, where the input packer emits between one and `MATCHING_MAX_INPUT_PACKED_CHUNKS` calls per patient. `config.matching_call_mode()` is the ONE owner of that answer; every consumer (Stage 5's partition, `inferences.matching_call_mode`, the resume fingerprint, the tracking index) calls it rather than reading the constant. **The sentence that stood here — "one `MATCHING_MODEL` call" — had been false since input packing and was false twice over after the flip.** **As of `PROMPT_VERSION` 1.5.0 the STORED `assessment` of an `eligible` or `not_eligible` trial is composed from that trial's own criterion / patient_value / status rows** — so it cannot assert anything the arrays do not carry — **and the model's own prose is kept beside it as `assessment_draft`, in memory only, with no database column**; a `not_evaluable` trial's arrays are empty by contract, so it keeps the model's text unchanged.
 6. **`node_finalize`** — splits eligible/not_eligible, normalizes labels.
 
@@ -7850,6 +7883,12 @@ list in the round-two report; the ones that changed how this file reads are:
 
 ### Stage 5 can be served by Amazon Bedrock, and the flag is OFF (the Bedrock pass)
 
+> **HISTORY. The flag is ON now** -- `config.MATCHING_PROVIDER` ships
+> `"bedrock_anthropic"`, and the arm this section builds (`"bedrock"`, the
+> Responses API, GPT-5.6 Terra) is the one that is dormant. This section is
+> kept as written, per the rule that a past-tense account keeps its wording;
+> read "the flag is OFF" as true of the pass, not of the tree.
+
 **NOTHING IN THIS PASS RUNS.** `config.MATCHING_PROVIDER` is `"openai"`, and
 under that default `oncotriage/agent/evaluation.py:call_matching_model` costs
 two string comparisons and issues the byte-identical request it always did:
@@ -8614,6 +8653,14 @@ comparison arm**, and section 8 of
 0, with no recapture** UNDER THE NEW DEFAULT, the production `inferences.db`
 sha256 is unchanged (`ab1403e3…`, 90,185,728 bytes), and no migration was run.
 
+> **DISCHARGED 2026-09-03 -- the banner below is kept as this pass's own
+> conclusion rather than rewritten, per the rule that a past-tense account
+> keeps its wording.** The three-call probe HAS been run, on a real rendered
+> Stage 5 prefix. Both premises hold: the warmup's `maxTokens = 1` shape came
+> back 200, and the prefix warms (9,281 tokens written by the warmup, 9,281
+> read by both trial calls behind it). See "A11, A12 and A7 are settled" above
+> for the numbers.
+
 **═══ NO PAID PER-TRIAL RUN BEFORE THE THREE-CALL PROBE. IT IS THE MIGRATION
 WINDOW'S FIRST COMMAND. ═══** Two facts this arm rests on have never been
 observed against the live provider, and both fail in the expensive direction
@@ -8795,7 +8842,8 @@ exist and simply start carrying the other member.
    to a pass that can measure it.
 3. **The three-call probe has not been run** — it costs money and this pass made
    none. Nothing in the tree can turn per-trial mode's two live assumptions into
-   measurements without it.
+   measurements without it. **DISCHARGED 2026-09-03: it was run and both
+   assumptions hold.**
 4. **Per-trial fixtures** (above). The shipped arm has no characterization gate.
 5. **`MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 4` is still uncalibrated** and is
    still labelled one: it was derived from an ESTIMATED ~15 s single-trial
@@ -9976,7 +10024,7 @@ refuse a Region AWS adds next quarter.
 **operator-ruled campaign size** — a decision about how much one campaign
 spends, roughly $130–$170 of Stage 5 at the measured per-patient cost, not
 derived from any statistic and with nothing outstanding to re-derive it against.
-`ABLATION_SAMPLE_SIZE_DEFAULT = 75` and `EVALUATION_SELECTION_SIZE_DEFAULT = 10`
+`ABLATION_SAMPLE_SIZE_DEFAULT` (75 when that pass wrote this, **100 today**) and `EVALUATION_SELECTION_SIZE_DEFAULT = 10`
 are **uncalibrated holding values**, and each now names the instrument that
 would calibrate it: the Power/MDE block `27- Ablation Analysis.py` prints for the
 first, and — explicitly NOT that block — a precision calculation on an agreement
@@ -10032,7 +10080,10 @@ a check satisfied by the wrong evidence, which fails to fail. **17 → 30 checks
    API key is not wired into compose either — so nothing in the container reads
    a Region an operator could have set on the host. **It becomes a live gap the
    day `MATCHING_PROVIDER` flips**, and the fix is one `environment:` line on
-   `fastapi` beside the credential's, not a change here.
+   `fastapi` beside the credential's, not a change here. **THAT DAY HAS COME:
+   the provider flipped to `bedrock_anthropic`, so this is a LIVE gap rather
+   than a latent one, and the provider-flip pass's own follow-up 2 records it
+   as such.**
 2. **`BEDROCK_ENDPOINT` and `BEDROCK_REGION` are still not gated by the resume
    fingerprint.** Making the Region settable does not change that; it makes it
    easier to reach, which raises the rank of the follow-up already recorded at
@@ -10948,6 +10999,15 @@ IAM deployment still starts.
 | **A3** model echo | **ARRIVES** -- see the correction above |
 | cache economics | 3 calls $0.0500 with the cache against $0.0976 without: **48.7% saving**, and **4.2x** cheaper per patient extrapolated to 15 trials |
 
+> **SUPERSEDED, 2026-09-03 -- the constant is 2500 and is labelled INTERIM.**
+> The sentence below is kept as this pass's own measurement, per the rule that
+> a past-tense account keeps its wording. What moved it: the same day's
+> empty-verdict investigation resent the ONE pair that had answered empty and
+> got verdicts reaching **2,234** output tokens, so 1,450 was the max of a set
+> that did not include that pair answering. See "An empty verdict is asked once
+> more" at the end of this file, and the constant's own block for why n = 12 on
+> one pair makes 2500 an interim upper bound rather than a distribution.
+
 **`MATCHING_OUTPUT_TOKENS_PER_TRIAL` IS 1,450, RE-DERIVED FROM EIGHT REAL
 TRIAL-SHAPED CALLS.** It was 1,100, calibrated on gpt-5.6-terra over 27 runs --
 so from the provider flip until this measurement the guard on the arm that runs
@@ -11395,7 +11455,9 @@ migration was run.**
 binding design; `assert_per_trial_provider_supported()` admitted OpenAI alone,
 so `bedrock_anthropic` could only ever run GROUPED. A paid go-live probe would
 have validated a mode the campaign does not use. **NO AWS CALL AND NO BILLED
-CALL OF ANY KIND WAS MADE**, `MATCHING_PROVIDER` still ships `"openai"`, and
+CALL OF ANY KIND WAS MADE**, `MATCHING_PROVIDER` still ships `"openai"` (TRUE
+OF THIS PASS AND NOT OF THE TREE: the provider-flip pass below made
+`bedrock_anthropic` the shipped default), and
 the OpenAI request is **byte-identical to the one `git show HEAD:` builds** --
 `call_matching_model` with and without a cache key, and
 `call_matching_model_warmup`, all three compared by driving the HEAD functions
@@ -11613,7 +11675,7 @@ true as it was. Both the pin and the docstring it pins say so.
 # sentence). It DOES exec: nine in-memory copies
 # (evaluation.py, bedrock_anthropic_adapter.py and config.py), one plant each,
 # argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_agent_bedrock_anthropic_per_trial.py              # 198
+python tests/test_agent_bedrock_anthropic_per_trial.py              # 199 (this line said 198; MEASURED 2026-09-03)
 
 # The per-trial go-live probe for the Converse branch. NOT RUN by this pass.
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
@@ -13251,8 +13313,14 @@ is under 10% of the program and it moves no decision -- and an operator reading
 **NO PER-TRIAL RUN HAS EVER BEEN MEASURED**, which is why the derivation is
 arithmetic over grouped-arm token shapes rather than an average of recorded
 per-trial runs: all 21 evaluation-run manifests on disk (205 patient runs with a
-measured cost) predate the per-trial default, and the three-call probe has still
-not been run. The cache-absent column is what that probe settles.
+measured cost) predate the per-trial default, and the three-call probe had not
+been run when this table was computed. The cache-absent column is what that
+probe settles. **RUN 2026-09-03: the cache WARMS** (9,281 tokens written, 9,281
+read back), so the left-hand column is the live one and the right-hand column is
+the arithmetic for a provider that does not cache. The per-trial output constant
+in that arithmetic has since moved 1,450 -> 2500, which raises no INPUT figure
+here -- the cache saving is on the prefix -- but does raise what a trial's reply
+costs.
 
 ### WHAT THIS PASS FOUND IN ITS OWN WORK BY RUNNING RATHER THAN READING
 
@@ -13330,6 +13398,40 @@ not been run. The cache-absent column is what that probe settles.
 
 
 ### A campaign runs a drawn cohort, not the corpus (the cohort-selection pass)
+
+> **CURRENT STATE, 2026-09-03 -- THIS SECTION'S TWO HEADLINE DECISIONS WERE
+> BOTH OVERTURNED BY A LATER OPERATOR RULING, and the section is kept as
+> written, per the rule that a past-tense account keeps its wording.** Read it
+> as the argument that was made, not as what the code does.
+>
+> * **THE COHORT IS 500, NOT 300.** `config.CAMPAIGN_COHORT_SIZE` is 500. Every
+>   "300" below -- the section's own prose, the inherited-shares table and the
+>   cost rows in the spend-gate section above -- is that number.
+> * **THE DRAW IS STRATIFIED BY PRIMARY CANCER GROUP, NOT SIMPLE RANDOM.** The
+>   whole of "WHY THE DRAW IS SIMPLE RANDOM AND NOT STRATIFIED BY CANCER GROUP"
+>   below is superseded. **The deciding objection it makes is still true and is
+>   not answered away**: a group key needs the ICD-10-CM registry, whose DATA is
+>   outside this repository, so a stratified membership is NOT recomputable from
+>   the seed alone. **The operator overruled it for coverage.** The residual is
+>   recorded rather than argued away at `config.CAMPAIGN_COHORT_SIZE`: a reader
+>   recomputing a membership needs the same registry data as well as the seed,
+>   the size and the algorithm -- and what proves a GIVEN RUN used a GIVEN
+>   MEMBERSHIP is `runs.cohort_digest`, already on the row, already compared by
+>   the resume gate, and independent of the registry. Within a stratum the draw
+>   is still sha256 rank, so the part that can be machine-independent is.
+> * **THE NON-ZERO-DEVIATION CHECK BELOW INVERTED WITH IT.** That check required
+>   the cohort's group shares to differ from the corpus's, on the argument that
+>   a proportionally stratified draw matches every share EXACTLY and a zero
+>   would mean it was passing about a sampler the pass deliberately did not
+>   build. That sampler is now the shipped one.
+> * **WHAT DID NOT MOVE**: the two programme samples. The 50-patient stability
+>   draw and the 100-patient judge draw are still plain `draw()` calls over the
+>   cohort, still seeded 43 and 44, still guarded at import against sharing a
+>   seed. `allocate_proportional` and `MINIMUM_PER_GROUP = 1` are the
+>   stratified arm's owners, and `STRATIFIED_DRAW_ALGORITHM` is the one-line
+>   statement `CohortSelection.record()` writes into the artefact -- whichever
+>   of the two draws actually ran, so an artefact never claims an algorithm the
+>   draw did not use.
 
 **THE RULED EVALUATION PROGRAMME HAD NO MECHANISM AND THE RUNNER RAN EVERY
 BUNDLE ON DISK.** `oncotriage/batch/runner.py:main` did
@@ -13554,7 +13656,7 @@ global `MIN(id)` for that patient over the stitched run chain, not per run.
 # only inside a tempfile.mkdtemp it removes and asserts gone, paths._RESOLVED is
 # seeded and restored, and the three repository files it reads are
 # sha256-compared at the end. It EXECS NOTHING. Bucket A, ~4 s.
-python tests/test_campaign_cohort_selection.py   # 117 here; 115 passed / 0 failed / 1 SKIPPED against ONLY the CI skeleton
+python tests/test_campaign_cohort_selection.py   # 118 here (this line said 117; MEASURED 2026-09-03, 118/0/0 on the developer tree). The CI-skeleton arm read 115 passed / 0 failed / 1 SKIPPED when that was measured and has NOT been re-measured since; the one skip is the live-corpus section, which a runner does not have
 ```
 
 **TEN REVERTS, TEN CAUGHT**, each planted into a `copytree`'d copy with
@@ -13999,6 +14101,12 @@ in twenty-three files, and on the Converse path by
 the default-flip pass recorded for the retained grouped call-mode arm, and it is
 a real coverage gap rather than a formality.
 
+> **DISCHARGED 2026-09-03 -- the paragraph below is kept as this pass's own
+> conclusion rather than rewritten.** Both premises have now been observed and
+> both hold: the warmup shape came back 200 (A11, on both warmup shapes), and
+> the prefix warms -- 9,281 tokens written by the warmup and 9,281 read by both
+> trial calls behind it (A12).
+
 **AND TWO PREMISES OF THE SHIPPED ARM HAVE STILL NEVER BEEN OBSERVED AGAINST
 THE LIVE PROVIDER** -- A11 (is the per-trial warmup's `maxTokens = 1` request
 shape accepted) and A12 (does the `cachePoint` prefix actually warm). A12
@@ -14041,7 +14149,10 @@ moved by more, each argued in place: `test_agent_bedrock_adapter.py` 281 ->
    `oncotriage/fixtures/capture.py` is outside this pass's scope, and
    `tests/test_fixture_call_mode_pin.py` 4d deliberately does NOT pin the
    message, because pinning a wrong string is how a wrong string becomes a
-   contract. **Top follow-up.**
+   contract. **Top follow-up.** **DISCHARGED: the message names `converse` on
+   `deps.BEDROCK_ANTHROPIC_CLIENT` now, and says every Stage 5 call would be
+   REAL and BILLED while the run reported it had made none. VERIFIED BY DRIVING
+   IT, 2026-09-03. 4d still does not pin the string.**
 2. **`docker-compose.yml` PASSES NO AWS CREDENTIAL INTO ANY CONTAINER.** That
    was consistent while the flag shipped `"openai"` and is now a live gap: the
    `fastapi` service will build a Converse client with nothing for boto3 to
@@ -14064,6 +14175,246 @@ moved by more, each argued in place: `test_agent_bedrock_adapter.py` 281 ->
    fingerprint. Two runs against the same profile id in different Regions are
    indistinguishable to a resume gate. Unchanged by this pass and now one
    provider more reachable.
+
+### The Converse SDK floor is a preflight, not a discovery (the botocore-pin pass)
+
+**THE GO-LIVE PROBE WAS BLOCKED AT $0 BY botocore's OWN VALIDATOR, AND THAT IS
+THE FAILURE MODE RATHER THAN AN ESCAPE FROM IT.** On 2026-09-03
+`bedrock_probe.py --provider bedrock_anthropic` built the adapter's real
+request, waited out its pacer and called `converse`:
+
+```
+ParamValidationError: Unknown parameter in input: "outputConfig"
+Unknown parameter in system[1].cachePoint: "ttl"
+```
+
+Nothing was signed, nothing was sent, **nothing was billed** -- and that is
+exactly what makes it expensive. It costs $0 in provider spend and it fails
+EVERY Stage 5 call, so a campaign started against a too-old SDK opens a `runs`
+row, fails every patient, and the operator's first hypothesis is Amazon Bedrock
+or their AWS account -- neither of which the request ever reached. **A
+`ValidationException` FROM THE SERVICE and a `ParamValidationError` FROM
+botocore are opposite findings with opposite remedies**, and only one of them is
+about this project's code.
+
+**THE FLOOR IS MEASURED, NOT READ OFF A CHANGELOG AND NOT INFERRED FROM A
+RELEASE DATE.** Bisected by installing released wheels and reading each one's
+`bedrock-runtime/2023-09-30/service-2.json` through botocore's own shape map:
+
+| botocore | `outputConfig` | `cachePoint.ttl` | `usage.cacheDetails` |
+|---|---|---|---|
+| <= 1.42.20 | no | no | no |
+| 1.42.21 .. 1.42.41 | no | yes | yes |
+| **1.42.42 and later** | **yes** | **yes** | **yes** |
+
+So structured output on Converse -- **A1, the item the adapter ranks first
+because its failure makes the branch useless rather than degraded** -- is
+expressible from 1.42.42 and from no earlier release. The three boundary rows
+were re-derived against 1.42.20, 1.42.41 and 1.42.42 rather than inherited from
+the bisect that first reported them. `config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST`
+owns the number and `MIN_BOTOCORE_MEASURED_ON` owns its date, which is printed
+in every refusal.
+
+**BOTH DISTRIBUTIONS ARE PINNED AND THE SECOND IS NOT REDUNDANT: a boto3 pin
+does not merely fail to CARRY a botocore floor, it can FORBID one.** Read from
+the installed distribution metadata rather than assumed -- `boto3==1.40.14`, the
+pin that shipped, declares `botocore>=1.40.14,<1.41.0`, which EXCLUDES 1.42.42,
+so the pin made the floor uninstallable. Note the offset at the minor boundary:
+boto3 X.Y.Z does NOT in general require botocore X.Y.Z, so the pair cannot be
+derived from either number alone. **1.42.42 is the unique boto3 whose declared
+botocore floor EQUALS the measured one**, and it is the release AWS published
+alongside that botocore -- the pair they ship and test together. A lower boto3
+that merely ADMITS a botocore forty patches ahead of it would satisfy the
+resolver and pair two releases nobody released together. `pyproject.toml`
+carries both, and `s3transfer` follows boto3's own range.
+
+**THE PREFLIGHT RUNS IN `config.validate_matching_provider_config()`**, which
+is the function that already refuses a Region carrying whitespace or a `/` and
+an unpriced wire model -- so a configuration defect on this branch is refused in
+ONE place rather than discovered at the wire. That function runs at the top of
+**every** Converse request, not once per campaign, which is why the non-refusing
+states are REPORTED once per process rather than once per call: a per-request
+line would be one line per trial call per patient, and a counter is a named
+follow-up rather than a thing this pass built. It is still refused before the
+request is signed, so the refusal costs nothing.
+`botocore_sdk_state()` answers a **CLOSED four-member vocabulary** and
+`BOTOCORE_SDK_REFUSING_STATES` declares which of them raise, as a set rather
+than as an `if`, so the two non-refusing states are visibly a decision rather
+than an omission:
+
+| state | refuses | why |
+|---|---|---|
+| `ok` | no | at or above the measured floor |
+| `too_old` | **YES** | every Converse request fails locally |
+| `version_unreadable` | no | a pre-release or vendor build (`1.43.0rc1`) is third-party DATA, and item 11a's line is that data is COUNTED and configuration RAISES. Reported once, loudly, by name; `bedrock_probe.py`'s ParamValidator run is the authority that settles it |
+| `absent` | no | `get_bedrock_anthropic_client()` already raises a named `RuntimeError` on the ImportError, and it is the function that needs the library. Refusing here would move that failure to a function that does not need it -- and would make the branch untestable on a machine without boto3, which `build_converse_request`'s own docstring names as a property it has and wants |
+
+**`version_unreadable` IS ITS OWN STATE RATHER THAN A FALL-THROUGH, AND THAT IS
+THE WHOLE REASON THE VOCABULARY EXISTS.** The natural way to write this check is
+`if version and version < floor: raise` -- and then an unreadable version takes
+the `else` and is **REPORTED AS COMPLIANT**, which is a claim about a number
+nobody read. **That defect shipped once, in the probe's own preflight.**
+
+**THE VERSION'S SOURCE IS REPORTED BECAUSE THE TWO CAN DISAGREE.**
+`BOTOCORE_VERSION_SOURCES` names three -- the imported module, the installed
+distribution metadata, and nothing to read -- and `_BOTOCORE_NOT_LOOKED_UP` is
+an OBJECT rather than a string, because a string sentinel is a value botocore
+could in principle report and `None` is already taken (it is the answer "looked,
+and there is no botocore"). Three states need three distinct values. Neither
+that cache nor the report-once flag is locked, and that is argued rather than
+overlooked: Stage 5 validates from `MAX_WORKERS` worker threads, both threads
+compute the same deterministic string from the same files, and the worst case of
+racing the flag is a warning printed twice -- unlike the client caches this file
+does lock, where a second build is a second connection pool.
+
+### An empty verdict is asked once more (the empty-verdict retry pass)
+
+**THE JUDGE CAN RETURN `{"evaluations": []}` AND NOTHING THIS FILE ALREADY
+HANDLES COVERS IT.** The reply is well-formed under `build_response_schema()`,
+which puts no `minItems` on the array; `stopReason` is `end_turn`; it is 20 to
+30 output tokens against a 32,000 ceiling. It is not a refusal, not a
+truncation, not malformed JSON and not a non-list body -- every one of those has
+its own branch in Stage 5 and its own budget, and **none of them fires**. The
+reconciliation at the end of the node then finds the trial has no entry and
+records it `omitted_from_model_response`. **`MAX_LLM_CLASSIFIER_RETRIES` does
+NOT cover it**: that budget fires on a parse failure, and this parses.
+
+**WHY IT IS WORTH A SECOND ASK, MEASURED RATHER THAN ASSUMED.** The 2026-09-03
+empty-verdict investigation resent the byte-identical call ten times and got ten
+clean verdicts -- **0/10** -- so the condition is a stochastic
+constrained-decoding degeneracy at the first array-element decision point and
+NOT a property of the input. Halving the trial's criteria changed nothing, and
+the same trial bytes under a different patient prefix answered cleanly. On the
+one hard pair it was seen on the rate is **2/12, 16.7%, Wilson 95% CI [4.7%,
+44.8%]**, so one retry recovers ~83% of occurrences. **Under the previous belief
+-- deterministic, input-driven -- a retry was pure waste; that belief is
+disproven.**
+
+**WHY EXACTLY ONE.** The marginal recovery of a second retry at p ~ 0.17 is ~3%,
+and two empty replies on one pair is evidence the pair is genuinely hard, at
+which point `not_evaluable` is the honest record.
+`config.MATCHING_PER_TRIAL_EMPTY_RETRIES` accepts **0 or 1 and nothing else**;
+0 leaves the behaviour that shipped, verbatim.
+
+**IT IS NOT THE PARSE-RETRY BUDGET AND MUST NOT BECOME IT.**
+`MAX_LLM_CLASSIFIER_RETRIES` re-enters the WHOLE NODE -- every trial of the
+patient, at N billed calls a time. This is one call for one trial. Sharing the
+budget would either fail a patient for a defect in one trial's decoding or
+re-bill fourteen trials to recover one, and `retry_count` is deliberately left
+unincremented for the reason the refusal branch already states.
+
+**THE SELECTION BIAS IS REAL AND IS WHAT THE RECORD IS FOR.** Retrying only the
+calls that returned nothing resamples a non-random subset -- the pairs the judge
+found hardest -- and nothing re-examines the calls that answered badly. **Not
+retrying is also a selection rule and a worse-founded one**: it drops those
+pairs from the denominator entirely, and on the pair measured the model, when it
+speaks, states a true and quotable disqualifier 12 times out of 12. So the
+no-retry policy discards `not_eligible` verdicts and keeps `eligible` ones,
+which biases a campaign toward **over-reporting eligibility**. The two biases
+are not symmetric in AUDITABILITY, and that asymmetry is the whole argument: a
+recovered verdict can be EXCLUDED from any first-pass-only statistic, and a
+dropped verdict cannot be recovered after the campaign.
+
+**WHICH IS WHY A RECOVERED VERDICT IS IDENTIFIABLE WITH NO NEW COLUMN.** The
+retry's own row in `inferences.llm_classifier_call_details` carries
+`empty_retry_of`, whose value is the **1-based `call_index` of the empty first
+attempt**, so the two rows join to each other inside one ledger. It is present
+on the retry's row and on no other -- the absent-rather-than-empty convention
+`warmup` and `unconsumed` already follow in that ledger -- and **the first
+attempt's row is UNCHANGED and stays there carrying `entries_emitted: 0`**,
+because it was issued and billed and deleting or amending it would understate
+what the patient cost. Every verdict the retry produced carries the RETRY's
+`call_index`, so `trial_matches.call_index` joined against that list identifies
+every recovered verdict.
+
+**THREE COUNTERS, AND THE SPLIT IS THE POINT RATHER THAN BOOKKEEPING.**
+
+| counter | keyed by | what its total is |
+|---|---|---|
+| `PER_TRIAL_EMPTY_FIRST_ATTEMPTS` | `EMPTY_RETRY_DECISIONS` -- `retry_queued` / `retry_disabled` | **the phenomenon's rate**, which is the number nobody has: the investigation measured 2/12 on ONE pair and could not give a population rate at n = 20. A campaign's own total, read against its `candidates_evaluated`, IS that measurement |
+| `PER_TRIAL_EMPTY_AFTER_RETRY` | the answering model | **what the mechanism did not recover.** Every one of these is recorded `omitted_from_model_response` exactly as it would have been with no retry at all -- the retry buys the chance, not the outcome |
+| `PER_TRIAL_EMPTY_RETRY_RECOVERIES` | the answering model | **a verdict the campaign would have lost and did not** |
+
+**THE FIRST IS KEYED BY THE DECISION AND NOT BY THE OUTCOME**, and that keeps
+its total honest: the decision is known at the moment the empty reply is read,
+so keying on it holds the counter to exactly one increment per event -- which is
+what makes the total, the one figure `run_metrics` persists, a count of the
+phenomenon rather than a number of nothing. **A retry's own empty reply does not
+land there**; without that separation the total would double-count the pairs
+this mechanism failed to recover.
+
+**RECOVERIES ARE COUNTED RATHER THAN SUBTRACTED, and that is why the third
+counter exists at all.** Recoveries are NOT `queued - after_retry`: a queued
+retry can be declined by the shutdown gate or the spend gate, or raise in
+transport, so the subtraction is wrong by exactly the number of those, silently.
+Those three states already have vocabularies -- `STAGE5_SHUTDOWN_SKIPS`,
+`spend.SPEND_GATE_SKIPS` and `PER_TRIAL_CALL_FAILURES` -- and no new one was
+invented for them. **The three do not sum, and the run-end report is where all
+three are printed together**, which is the campaign's own estimate of p.
+
+**THE RECOVERIES COUNTER IS IN `oncotriage/degradation.py`'s CENSUS AND THE
+OTHER TWO ARE IN ITS REGISTRY** -- `TEMPORAL_CONFLICT_RESOLVED_MARKERS`'
+argument, applied here. A recovery is the mechanism WORKING; an empty first
+attempt is a verdict the campaign paid for and did not get, whether or not the
+retry recovered it. Only the two degradation counters reach `run_metrics`.
+**Both degradation counters are keyed by the ANSWERING MODEL rather than by the
+nct_id**: a counter's key space reaches the run-end console block, and one key
+per trial would be up to `MAX_TRIALS_FOR_EVALUATION` keys per patient over a
+campaign, while the model is bounded and WHICH trial is already in the log line
+and in the record.
+
+**IT IS GATED, AND THE RARITY IS THE ARGUMENT FOR RATHER THAN AGAINST.**
+`FINGERPRINT_VERSION` is **5 -> 6**, gaining `matching_per_trial_empty_retries`,
+and `SCHEMA_USER_VERSION` is **10 -> 11** with `runs.matching_per_trial_empty_retries` (additive INTEGER, NULL on every existing row and on every run whose
+caller stamped no fingerprint, never backfilled). The field meets every clause
+of the test the call-mode field was gated under: it changes how many billed
+calls a patient costs, it changes WHICH TRIALS CAN BE OMITTED FROM A RESPONSE AT
+ALL, and therefore it changes the verdicts -- while nothing else in the stamp
+moves with it, because it is a bool no other gated field is a function of. **So
+a checkpoint written with the retry on and resumed with it off would have
+answered FP_MATCH**, and the resulting `inferences` table would carry two
+verdict-production policies with nothing in it saying which patients got which;
+every `not_evaluable` rate over that artifact would then be a number about two
+policies presented as one. The population rate is not known -- n = 20, on one
+pair -- so nobody can say in advance how much of a mixed artifact is affected,
+**which is exactly the state in which a stamp is worth more than a judgement.**
+Every artifact stamped at 5 answers FP_VERSION until an operator clears it once.
+
+**`MATCHING_OUTPUT_TOKENS_PER_TRIAL` IS 2500 AND IS LABELLED INTERIM.** The
+same investigation resent the pair that answered empty and got verdicts whose
+output reached **2,234** tokens -- so the 1,450 the 6b probe pass derived was
+the max of a set that did NOT include this pair answering. **n = 12, on ONE
+(patient prefix, trial) pair, and that pair is the hardest one the project has
+seen**: the largest rendered block of its patient's fifteen and the most
+complex, 31 criteria against 16 / 19 / 13 / 2 for the others. 2,234 is therefore
+a maximum drawn from the TAIL of the input distribution rather than from the
+middle of it -- the right direction for an upper bound, and not a distribution.
+The re-derivation owed is from a real cohort sample rather than one pair, and it
+should replace this figure with a percentile of a population rather than a
+maximum of a sample of 12.
+
+**AND IT ARMS THE PRE-SPLITTER IN THE RETAINED GROUPED ARM, WHICH IS STATED
+RATHER THAN GLOSSED.** At 2,500 output tokens fifteen trials is 33,510, above
+`MATCHING_MAX_TOKENS = 32,000` -- a 15-trial grouped request genuinely cannot be
+answered in one response. A grouped full-cap patient becomes two requests
+instead of one (the pre-split halves 15 into 8 and 7), so
+`llm_classifier_truncation_splits` reads 1 where it read 0 and **the shared
+system prefix is SENT TWICE**, which is the real cost; output is unchanged and
+input roughly doubles for that arm. Grouped is the dormant comparison arm, so no
+shipped campaign pays it -- but a comparison run against it should be read
+knowing its request count moved. **PER-TRIAL, THE SHIPPED ARM, IS UNAFFECTED AND
+CANNOT BE AFFECTED BY ANY VALUE IN THIS RANGE**: one trial estimates at
+1.25 x 2,500 = 3,125 against the same 28,800 threshold, and the reactive
+splitter's floor refuses to halve a singleton anyway.
+
+**ONE CLAIM DID NOT SURVIVE THE MEASUREMENT, and it is the one
+`_estimate_output_tokens`'s own docstring rested on.** "Output is flat in
+criteria length" was drawn from at most eight points, none of which was a
+31-criterion trial that ANSWERED; this pair emits a row per criterion, so its
+output scales with criterion COUNT. The count term remains the driver of the
+estimate and the criteria-CHARACTER term remains a capped tie-breaker, but "a
+trial with 4,000 characters of criteria costs about the same to answer as one
+with 800" is now known to be false for a trial carrying four times the criteria.
 
 
 Data and keys live outside this folder. Never write an
