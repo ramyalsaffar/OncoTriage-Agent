@@ -841,9 +841,23 @@ try:
     # pipeline while it was the single largest lever on what a patient costs.
     # Its own SHAPE is pinned by tests/test_api_call_mode_and_db_health.py,
     # which is where the block's meaning is tested; here it is one key.
-    check("2g  ...and its config sub-block is the old nine plus call_mode",
+    # `matching_provider` IS THE SECOND ADDITION, on the same footing as
+    # call_mode above: WHICH judge serves Stage 5 was absent from the endpoint
+    # that describes the pipeline, while the two fields naming a model both read
+    # the OPENAI arm's constant -- so a Converse deployment answered
+    # "gpt-5.6-terra" to the question "what is your judge". Added to the
+    # expectation rather than loosening the pin.
+    #
+    # `matching_model_note` IS DELIBERATELY NOT HERE, and its absence is the
+    # assertion. It is spread in only when the wire model could not be resolved
+    # -- `trials_indexed_note`'s convention -- so on the ordinary path this pin
+    # stays exact, and a note appearing here would mean the provider stopped
+    # being recognised. 4c drives the other arm.
+    check("2g  ...and its config sub-block is the old ten plus "
+          "matching_provider",
           sorted(_INFO_JSON["config"]),
           ["call_mode", "collection_name", "embedding_model", "matching_model",
+           "matching_provider",
            "max_llm_classifier_retries", "max_trials_for_evaluation",
            "medcpt_score_floor", "qdrant_endpoint",
            "quality_threshold_percentile", "top_k_candidates"])

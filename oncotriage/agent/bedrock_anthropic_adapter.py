@@ -4,21 +4,43 @@
 
 """Translate the Stage 5 request onto Amazon Bedrock's Converse API.
 
-THE FLAG IS OFF AND NOTHING HERE RUNS. ``config.MATCHING_PROVIDER`` is
-``"openai"``; ``oncotriage/agent/evaluation.py:call_matching_model`` dispatches
-on it and every statement in this module is unreachable under the default. No
-Bedrock client is constructed, no credential is resolved, boto3 is not
-imported, and the request the OpenAI client is handed is byte-for-byte the one
-it was handed before this file existed. The twelve characterization fixtures
-replay clean without recapture, which is the behavioural half of that claim;
-``tests/test_agent_bedrock_anthropic_adapter.py`` section 1 is the structural
-half.
+THIS IS THE SHIPPED ARM. ``config.MATCHING_PROVIDER`` is
+``"bedrock_anthropic"``; ``oncotriage/agent/evaluation.py:call_matching_model``
+dispatches on it, so every statement in this module is on the default path and
+a campaign's Stage 5 spend goes through the request built here. A Bedrock
+client IS constructed, a credential IS resolved, and boto3 IS imported -- inside
+the two functions that need it, so importing this module still costs neither.
+``tests/test_agent_bedrock_anthropic_adapter.py`` and
+``tests/test_agent_bedrock_anthropic_per_trial.py`` are its cover, and they are
+the whole of it: the twelve characterization fixtures were captured on the
+OpenAI arm, ``fixtures/capture.py`` admits that provider alone, and the harness
+therefore REFUSES rather than replaying at this default. So this branch has no
+characterization gate and the two files above are all there is.
+
+(This block used to open "THE FLAG IS OFF AND NOTHING HERE RUNS", which was
+true when the module was written and stopped being true at the provider flip.
+It is rewritten rather than annotated because a module's first paragraph is
+what a reader trusts about whether their money goes through it. Everything
+below it is unchanged: the API choice, the field mapping, the error taxonomy
+and the A-list were all argued against the documentation rather than against
+the flag, and none of those arguments turns on which provider ships.)
+
+TWO PREMISES OF THIS ARM HAVE NEVER BEEN OBSERVED AGAINST THE LIVE PROVIDER,
+and both fail in the expensive direction rather than the loud one. A11 (does
+the per-trial warmup's ``maxTokens = 1`` shape come back 200 or 400) and A12
+(does the ``cachePoint`` prefix actually warm) are settled by three billed
+calls -- ``bedrock_probe.py --provider bedrock_anthropic --probe-per-trial``,
+read out of the USAGE BLOCK and never the wall clock. Until that has run, this
+module is a configuration nobody has seen serve a request. See the A1..A10 list
+below, and A11/A12 in ``bedrock_probe.py``.
 
 THIS IS THE SECOND BEDROCK BRANCH, NOT A REPLACEMENT FOR THE FIRST.
 ``oncotriage/agent/bedrock_adapter.py`` translates onto the OpenAI-compatible
 **Responses** API and serves ``MATCHING_PROVIDER = "bedrock"`` (GPT-5.6 Terra).
-That branch is intact, reachable, and is the documented comparison arm. This
-one serves ``MATCHING_PROVIDER = "bedrock_anthropic"`` (Claude Sonnet 4.6).
+That branch is intact, selectable, and is a documented comparison arm; it is
+DORMANT at the shipped default, which is the state this module was in when it
+was written. This one serves ``MATCHING_PROVIDER = "bedrock_anthropic"``
+(Claude Sonnet 4.6) and is the one that ships.
 They share no code, and that is measured rather than stylistic: different
 client library (boto3 vs the OpenAI SDK), different credential chain, different
 request shape, different response shape, different error classes, different

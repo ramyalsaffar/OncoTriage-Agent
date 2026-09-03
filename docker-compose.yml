@@ -165,9 +165,12 @@ x-app-environment: &app-environment
   #     os.environ QDRANT_URL after  load_env_keys -> https://bd717e5f-....qdrant.io
   #
   # `paths.load_env_keys()` POPS OPENAI_API_KEY, QDRANT_URL and QDRANT_API_KEY
-  # out of os.environ and reloads them from /app/.env with `override=True`. That
-  # pop is deliberate — it stops a stale exported credential shadowing the
-  # credentials file — so no environment variable could redirect Qdrant, and the
+  # out of os.environ and rewrites them from /app/.env. (It used to do that with
+  # `load_dotenv(override=True)`, which loaded EVERY name in the file; it is an
+  # ALLOWLIST now -- `paths.ALLOWLISTED_ENV_KEYS` -- and QDRANT_URL is in it, so
+  # nothing this paragraph argues has moved.) That pop is deliberate — it stops
+  # a stale exported credential shadowing the credentials file — so no
+  # environment variable could redirect Qdrant, and the
   # `qdrant` service started, went healthy, held zero collections and was
   # queried by nothing while /pipeline/info reported 12,067 trials from the
   # cloud.
@@ -608,7 +611,49 @@ services:
     ports:
       - "8000:8000"
     volumes: *app-volumes
-    environment: *app-environment
+    # THE ONLY SERVICE THAT CALLS STAGE 5, AND THEREFORE THE ONLY ONE HANDED A
+    # BEDROCK CREDENTIAL.
+    #
+    # `config.MATCHING_PROVIDER` ships "bedrock_anthropic", so this container
+    # builds a boto3 `bedrock-runtime` client and signs Converse requests --
+    # and nothing here gave boto3 anything to sign with. `.dockerignore`
+    # excludes nothing relevant, but there is no `~/.aws` in the image, no
+    # instance role on a laptop, and `/app/.env` is read by
+    # `paths.load_env_keys()` INTO THIS PROCESS -- which is enough for the
+    # project's own resolver and, on the SigV4 path, for boto3 too. What was
+    # missing is the host's variable reaching the container at all.
+    #
+    # EXACTLY THE TWO NAMES `paths.OPTIONAL_ENV_KEYS` DECLARES, and no more.
+    # AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY are deliberately ABSENT: no
+    # module in `oncotriage/` reads either (measured -- every `os.environ` and
+    # `os.getenv` in the package was enumerated for the allowlist pass), so
+    # forwarding them would widen what this container can authenticate as for
+    # a capability nothing here uses. An operator who genuinely wants the SigV4
+    # chain mounts `~/.aws` or runs with a task role, which needs no edit here.
+    #
+    # THE NULL FORM (`NAME:`), NOT `${NAME:-}`, AND THAT IS MEASURED RATHER
+    # THAN STYLISTIC. Compose v5.4.0, `docker compose config`:
+    #
+    #     AWS_BEARER_TOKEN_BEDROCK: ${AWS_BEARER_TOKEN_BEDROCK:-}   host unset
+    #         -> renders ""      -- the variable IS SET, to the empty string
+    #     AWS_BEARER_TOKEN_BEDROCK:                                 host unset
+    #         -> renders null    -- the variable is NOT SET
+    #     AWS_BEARER_TOKEN_BEDROCK:                                 host set
+    #         -> renders the host's value
+    #
+    # and an empty string here is not harmless. botocore 1.40.76,
+    # `handlers.py:1424`, selects bearer auth on
+    # `get_token_from_environment(...) is not None` -- NOT on truthiness. So an
+    # empty AWS_BEARER_TOKEN_BEDROCK makes botocore sign with an EMPTY BEARER
+    # TOKEN (a 401 that names nothing) *instead of* falling through to the
+    # SigV4 chain -- so on any host that has a working instance role, SSO
+    # profile or container role, the `:-` form would DISABLE the credential it
+    # was added to enable. Verified by driving that function directly across
+    # absent / empty / present.
+    environment:
+      <<: *app-environment
+      ONCOTRIAGE_BEDROCK_API_KEY:
+      AWS_BEARER_TOKEN_BEDROCK:
     working_dir: /app
     # NO SHELL AND NO QUOTING PROBLEM. The old command wrapped everything in
     # `bash -c '...'` to survive the space in the filename; an argument vector

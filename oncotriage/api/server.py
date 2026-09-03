@@ -127,7 +127,6 @@ from oncotriage.config import (
     ENABLE_RATE_LIMITING,
     MATCHING_CALL_MODE_GROUPED,
     MATCHING_CALL_MODE_PER_TRIAL,
-    MATCHING_MODEL,
     MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
     MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,
     MAX_LLM_CLASSIFIER_RETRIES,
@@ -140,6 +139,7 @@ from oncotriage.config import (
     TOP_K_CANDIDATES,
     matching_call_mode,
     matching_call_mode_pin,
+    matching_wire_model,
     qdrant_endpoint_sources,
 )
 from oncotriage.fhir.parser import parse_fhir_bundle
@@ -1131,6 +1131,63 @@ def create_app():
                 "returned a falsy object, so the index could not be asked. This "
                 "is not an empty index.")
 
+        # ===================================================================
+        # WHICH JUDGE THIS DEPLOYMENT WILL ACTUALLY CALL (the provider flip)
+        # ===================================================================
+        #
+        # `MATCHING_PROVIDER` ships "bedrock_anthropic", and until this pass
+        # NOTHING IN THIS RESPONSE SAID SO. Worse, the two fields that name a
+        # model both read `MATCHING_MODEL` -- which is the OPENAI arm's model
+        # and its priced identity, and which does not move when the provider
+        # flips. So a Converse deployment answered "gpt-5.6-terra" to an
+        # operator asking what its judge is, from a stage line that had already
+        # been fixed once for exactly this: pass 20g's block above records
+        # finding "5. GPT-4o Criterion-Level Evaluation" three lines from
+        # `"matching_model": "gpt-5.6-terra"` and calls it "the same response
+        # disagreeing with itself about which model Stage 5 calls". It was
+        # disagreeing with itself again, one provider later, and for the same
+        # reason: a value connected to nothing that would move it.
+        #
+        # THE FIX IS DERIVATION, per that block. `matching_wire_model()` is the
+        # ONE function that answers "what id does Stage 5 send", it is what
+        # `run_fingerprint` stamps, and on the OpenAI arm it returns
+        # `MATCHING_MODEL` byte-identically -- so this field is unchanged for
+        # anyone on that arm and correct for the first time on the other two.
+        # `MATCHING_MODEL` is no longer imported here; nothing else in this
+        # module read it, and an import left behind is what check 2h(i) reports.
+        #
+        # `matching_provider` IS READ OFF `_config`, NOT FROM A from-import, and
+        # that is load-bearing rather than stylistic: `from oncotriage.config
+        # import MATCHING_PROVIDER` BINDS THE VALUE AT IMPORT, so a process that
+        # changed the provider afterwards -- a test pinning an arm, a harness --
+        # would be described by this endpoint as running whatever it started
+        # with. That is the defect the Bedrock pass found in the storage layer's
+        # provenance column and fixed the same way. `_config` is already
+        # imported and already used live at the call-mode block below.
+        #
+        # THE WIRE MODEL IS GUARDED AND THE PROVIDER IS NOT, deliberately.
+        # `matching_wire_model()` RAISES on an unrecognised provider -- by
+        # design, because a silent default there is a wrong-provider run. But
+        # this endpoint is the one an operator asks FIRST, and it must survive
+        # the failure they are asking about: that is the argument `trials_indexed`
+        # above already makes for routing through the probe. An unguarded call
+        # here would 500 the whole response over a mistyped provider and hide
+        # the one field that names it. So the provider is reported from a plain
+        # attribute read that cannot raise, and the model reports `null` beside
+        # a note -- never a fabricated id, on `trials_indexed`'s "this is not an
+        # empty index" precedent.
+        try:
+            matching_model = matching_wire_model()
+            matching_model_note = None
+        except Exception as exc:                                  # noqa: BLE001
+            matching_model = None
+            matching_model_note = (
+                f"the configured provider is not one this build can send to, "
+                f"so there is no wire model to report: "
+                f"{type(exc).__name__}. See `matching_provider` in this same "
+                f"block for the value that needs correcting. This is not a "
+                f"model-less pipeline.")
+
         return {
             "version": __version__,
             "architecture": "LangGraph StateGraph over the oncotriage package",
@@ -1144,7 +1201,10 @@ def create_app():
                 # nothing that would move it when the checkpoint changed.
                 f"3. Cross-Encoder Rerank ({CROSS_ENCODER_MODEL})",
                 "4. Rule-Based Filtering",
-                f"5. Criterion-Level Evaluation ({MATCHING_MODEL})",
+                (f"5. Criterion-Level Evaluation ({matching_model})"
+                 if matching_model is not None
+                 else "5. Criterion-Level Evaluation (provider not recognised; "
+                      "see config.matching_provider)"),
                 "6. Final Ranking"
             ],
             "config": {
@@ -1172,7 +1232,20 @@ def create_app():
                 # one fact twice. Adding a key is also a response-shape change,
                 # and this pass's job in this file was to stop it carrying three
                 # version numbers, not to widen what it answers.
-                "matching_model": MATCHING_MODEL,
+                # WHICH PROVIDER SERVES STAGE 5, and it is FIRST in this pair
+                # because it is the field that diagnoses the other one: a null
+                # `matching_model` is only readable beside the provider that
+                # produced it.
+                "matching_provider": _config.MATCHING_PROVIDER,
+                # THE ID THAT GOES ON THE WIRE, not the OpenAI arm's priced
+                # identity. Equal to `MATCHING_MODEL` on the OpenAI arm, so this
+                # key's value is unchanged for anyone still on it.
+                "matching_model": matching_model,
+                # ABSENT ON THE ORDINARY PATH rather than null, on
+                # `trials_indexed_note`'s convention: a note that is always
+                # present is a note nobody reads.
+                **({"matching_model_note": matching_model_note}
+                   if matching_model_note is not None else {}),
                 "top_k_candidates": TOP_K_CANDIDATES,
                 # RENAMED, not retyped. This key was "rerank_threshold" and
                 # carried RERANK_SCORE_THRESHOLD = -10, a floor on the FUSED

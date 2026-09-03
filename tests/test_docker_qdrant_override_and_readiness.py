@@ -6,8 +6,10 @@
 THE FOUR THINGS UNDER TEST, and the defect each one closes:
 
     1. **The Qdrant endpoint override.** ``paths.load_env_keys()`` POPS
-       ``QDRANT_URL`` out of ``os.environ`` and reloads it from the .env with
-       ``override=True``, so no environment variable could redirect Qdrant --
+       ``QDRANT_URL`` out of ``os.environ`` and rewrites it from the .env (with
+       ``override=True`` when this was measured; an ALLOWLIST write now, and
+       ``QDRANT_URL`` is in the allowlist, so the guarantee is unchanged), so
+       no environment variable could redirect Qdrant --
        measured inside the running container, where
        ``QDRANT_URL: http://qdrant:6333`` was set, popped, and the client still
        opened Qdrant Cloud. The pop is DELIBERATE (a stale exported credential

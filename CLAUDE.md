@@ -565,6 +565,20 @@ python tests/test_storage_query_layer.py                           # 434 (was 42
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
 python tests/test_paths_glob_determinism.py                        #  25
+
+# The .env allowlist pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus, no database, no git history,
+# no live server. Every .env is FABRICATED under a tempfile.mkdtemp it removes
+# and asserts gone, and THE REAL 05- Keys/.env IS NEVER READ -- every call
+# passes an explicit keys_dir, so keys_path is never resolved and no glob
+# fires. Every fabricated value is assembled from one `_FAKE` prefix and
+# section 8 asserts that by AST, so this project's own secret scanner cannot
+# read one as a finding. It EXECS NOTHING and writes nothing in the
+# repository, so it is NOT in the collision matrix; oncotriage/paths.py is
+# sha256-compared at the end. It DOES mutate os.environ -- that is the subject
+# -- and check 8e requires every watched name to be restored to what it read
+# at import. Bucket A, ~0.6 s.
+python tests/test_env_key_allowlist.py                             #  48
 python tests/test_storage_wipe_all_tables.py                       #  22
 python tests/test_fhir_parser_dict_input.py                        #  31 (was 28 passed / 1 FAILED on a developer tree -- bucket E, so CI never ran it. The API-shutdown-gate pass re-added `import os` to oncotriage/api/server.py for its async-signal-safe os.write(2, ...) and left this file asserting the server imports neither os nor tempfile. The import ban was a PROXY for 'no temp-file round trip'; the pre-diagnosis ECOG pass replaced it with the property itself -- no filesystem call is reached anywhere in the module -- which is strictly stronger and survives)
 python tests/test_ablation_db_isolation.py                         #  72 (was 43; pass 20f-3 added section 5b for the --db parent guard and the checkpoint)
@@ -660,13 +674,13 @@ python tests/test_docker_qdrant_override_and_readiness.py           # 127 (was 1
 # collision matrix. It DOES exec -- one in-memory copy of
 # oncotriage/fixtures/capture.py with the --resume gate reverted to "the file
 # exists, skip it", argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_resume_capture_and_ragas.py                       # 210 (was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
+python tests/test_resume_capture_and_ragas.py                       # 211 (was 210; the allowlist pass PINS this file to the OpenAI arm through tests/_provider_pin.py -- it drives the REAL capture.main(), which REFUSES at the shipped provider and returns 1 before reading a bundle, so without the pin the whole file measures the refusal instead of the resume plan -- and counts the pin's release. Before that 210, was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
 
 # The MCP pass. Same shape, same directory. No keys and NO SPEND -- the judging
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
 # and 6 make real Qdrant round trips, because the readiness gate and the trial
 # lookup are what it exists to prove. Not in the collision matrix. ~2 min.
-python tests/test_mcp_server_stdio_contract.py                      # 145 (was 135; the logging pass's section 8c raised it, and said so 500 lines below while this line stayed at 135)
+python tests/test_mcp_server_stdio_contract.py                      # 146 with a live Qdrant (DERIVED as 145 + 1, not measured: this pass ran it OFFLINE, where sections 4/5/6 fail for want of the index and it reports 125/5). The +1 is the allowlist pass's spend TRIPWIRE -- a boto3.client counter asserted at teardown to have recorded ZERO, which is the half the flip pass's provider pin did not have: the pin PREVENTS and nothing MEASURED it, so a later edit that moved or deleted the pin put the file straight back to building real Bedrock clients with every check still green. Before that 145, was 135; the logging pass's section 8c raised it, and said so 500 lines below while this line stayed at 135)
 
 # The structured-logging pass. Same shape, same directory. No keys and NO SPEND
 # -- section 8 drives all six stages of the real graph with the Qdrant client,
@@ -2283,7 +2297,9 @@ nothing.
 **1. `ONCOTRIAGE_QDRANT_URL` IS THE DELIBERATE OVERRIDE, AND THE POP THAT MADE
 IT NECESSARY IS KEPT.** `paths.load_env_keys()` POPS `OPENAI_API_KEY`,
 `QDRANT_URL` and `QDRANT_API_KEY` out of `os.environ` and reloads all three from
-the .env with `override=True`, so `QDRANT_URL: http://qdrant:6333` in
+the .env (with `override=True` when this was measured; it is an ALLOWLIST write
+now and `QDRANT_URL` is in the allowlist, so nothing this paragraph argues has
+moved), so `QDRANT_URL: http://qdrant:6333` in
 docker-compose.yml was set, popped, and reached nothing. That pop exists so a
 stale exported credential cannot shadow the credentials file, and it is
 untouched. What is added is a second tier that beats it, on the
@@ -13435,6 +13451,23 @@ key in that file into `os.environ` -- not only the three it validates.** So any
 process that had called `load_env_keys()` first, and any EC2 or IAM-bearing
 runner, would have issued live billed Converse requests out of a suite that
 reports it makes none.
+
+> **CURRENT STATE -- THE SECOND HALF OF THAT SENTENCE IS CLOSED AND THE
+> PARAGRAPH IS KEPT AS WRITTEN.** `load_env_keys` no longer loads every key: it
+> parses with `dotenv_values` and writes only `paths.ALLOWLISTED_ENV_KEYS` =
+> `REQUIRED_ENV_KEYS + OPTIONAL_ENV_KEYS`, the second tuple built by
+> measurement over every `os.environ` / `os.getenv` read in the package. What
+> that does and does not buy is stated at `OPTIONAL_ENV_KEYS`: the two Bedrock
+> names are IN, because the shipped arm's judge does not authenticate without
+> one of them, so the credential still reaches `os.environ` and this paragraph's
+> hazard is NOT removed for that name. What is removed is the UNBOUNDED set --
+> the file's other entries (`ANTHROPIC_API_KEY` today, measured; whatever an
+> operator adds tomorrow) never reach the process, so the next credential put
+> in that file is inert until somebody names it. `tests/test_env_key_allowlist.py`
+> is the cover; the deeper fix -- `resolve_bedrock_api_key` reading the file
+> directly, the way `evaluation/rater.py` already does, so the secret
+> materialises only when the Bedrock resolver asks -- is a change to that
+> resolver's contract and is a recorded follow-up.
 
 **THE REMEDY IS A PIN AND IT HAS ONE OWNER: `tests/_provider_pin.py`.** No
 `test_` prefix, on `tests/_control_harness.py`'s argument. Twenty-three files

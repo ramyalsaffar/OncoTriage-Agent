@@ -33,8 +33,10 @@ and ``converse`` instead, and the consequences are the two this pin removes:
     credential here for the chain to find -- but the same suite on a host that
     HAS one (an EC2 runner, a developer who has exported
     ``AWS_BEARER_TOKEN_BEDROCK``, or any process that called
-    ``paths.load_env_keys()`` first, since this project's ``05- Keys/.env``
-    carries that name and ``load_dotenv`` loads every key in the file) would
+    ``paths.load_env_keys()`` first -- which at the time loaded EVERY key in
+    this project's ``05- Keys/.env``, and that file carries that name; the
+    loader is an ALLOWLIST now, and the two Bedrock names are ON it, so
+    this route is narrower and NOT closed) would
     have issued live, billed Converse requests from a test suite that reports
     it makes none.
 

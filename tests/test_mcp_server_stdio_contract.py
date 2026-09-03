@@ -184,6 +184,74 @@ import _provider_pin                                             # noqa: E402
 
 _PROVIDER_BEFORE_PIN = _provider_pin.pin_openai_arm(os.path.basename(__file__))
 
+# ===========================================================================
+# AND A TRIPWIRE THAT MEASURES WHAT THE PIN PREVENTS
+# ===========================================================================
+#
+# The pin above stops the dispatch reaching the Converse seam. NOTHING
+# MEASURED THAT. This file was the one the provider flip's bucket-A sweep could
+# not see -- it is bucket C, so it was outside the 97 files that sweep ran --
+# and before it was pinned it BUILT THREE REAL BEDROCK CLIENTS and still
+# reported `Passed: 145, Failed: 0, exit 0`, because `match_patient_tool`
+# catches the error and returns it as a refusal payload. A test that reports
+# success while making live billed calls is exactly what
+# `capture.assert_provider_is_hookable` exists to prevent, reached through a
+# surface that guard does not cover.
+#
+# So the guarantee has two halves and only one of them was here: the pin
+# PREVENTS, and this COUNTS. Without the counter, a future edit that deletes,
+# moves or mis-scopes the pin puts this file straight back into that state and
+# every check still passes.
+#
+# WHY A COUNTER AND NOT A STAND-IN AT `deps.BEDROCK_ANTHROPIC_CLIENT`, which is
+# the seam this file uses for OpenAI, Qdrant and MedCPT and is the obvious
+# symmetry. A stand-in there would ABSORB the failure: with the pin gone, the
+# dispatch would reach the Bedrock seam, find the stand-in, and the file would
+# go green while measuring the wrong arm -- which is the silent-wrong-provider
+# outcome the pin is a HARD guard (rather than a `check()`) precisely to avoid.
+# A counter cannot mask anything: it is not on any resolution path, it only
+# records, and it turns "the pin was removed" into a named failure. Prevention
+# and measurement must not be the same object.
+#
+# IT PATCHES `boto3.client` AND NOT `config.get_bedrock_anthropic_client`,
+# because the question is "did this process construct a client", not "did one
+# named function run" -- `oncotriage/staging/` and any future caller reach
+# boto3 by their own route, and all of them land here. `config` imports boto3
+# INSIDE the function that needs it, so the module object in `sys.modules` is
+# the one that gets looked up at call time and the patch reaches it.
+_BOTO3_CLIENTS_BUILT = []
+
+try:
+    import boto3 as _boto3                                       # noqa: E402
+except Exception as _boto3_exc:                                  # noqa: BLE001
+    # NOT A SKIP AND NOT A PASS. boto3 absent means a real client could not be
+    # built by any path, so the property this guards holds for a stronger
+    # reason -- and that reason is RECORDED, so a reader does not mistake an
+    # inert guard for a guard that ran. Named after the pattern
+    # tests/test_dockerignore_exclusions.py uses for its untracked-venv half.
+    _BOTO3_GUARD = f"inert: boto3 not importable ({type(_boto3_exc).__name__})"
+else:
+    _BOTO3_GUARD = "armed"
+    _real_boto3_client = _boto3.client
+
+    def _counting_boto3_client(*args, **kwargs):
+        """Record the attempt and REFUSE, rather than recording and building.
+
+        Building "just to see" is how a test that reports it spends nothing
+        spends something: botocore resolves credentials and can probe the
+        instance metadata service during construction. The refusal is a
+        RuntimeError so the MCP tool's own handler turns it into a refusal
+        payload rather than killing the run -- which is the behaviour this file
+        already depends on everywhere else.
+        """
+        _BOTO3_CLIENTS_BUILT.append(args[0] if args else kwargs.get("service_name"))
+        raise RuntimeError(
+            "tests/test_mcp_server_stdio_contract.py: boto3.client() was "
+            "called. This file pins Stage 5 to the OpenAI arm and must build "
+            "no AWS client at all; see the tripwire block at the top.")
+
+    _boto3.client = _counting_boto3_client
+
 
 # `oncotriage.mcp` and `mcp` are different modules, and the SDK is the one that
 # answers `import mcp`. Fired rather than argued: absolute-import resolution is
@@ -1176,6 +1244,17 @@ print("=" * 70)
 #
 # THE OUTCOME IS RECORDED BEFORE THE RESTORE, so "there was a pin to release"
 # cannot be satisfied by a process that never installed one.
+# --- the spend tripwire's verdict, recorded BEFORE the pin is released ------
+# Before, because releasing restores the shipped provider and anything that ran
+# afterwards could legitimately reach the Bedrock seam -- so a count taken after
+# the release would be answering a different question.
+check("[spend guard] this file built ZERO AWS clients: the OpenAI pin held for "
+      "every section, so no Converse request was reachable and nothing here "
+      "could be billed"
+      + (f" (guard {_BOTO3_GUARD})" if _BOTO3_GUARD != "armed" else ""),
+      (_BOTO3_GUARD == "armed", list(_BOTO3_CLIENTS_BUILT)),
+      (True, []))
+
 _PIN_WHO, _PIN_PREVIOUS, _PIN_RESTORED = _provider_pin.release_openai_arm()
 check("[provider pin] the OpenAI pin this file installed was released, and "
       "config.MATCHING_PROVIDER is back to the shipped provider",

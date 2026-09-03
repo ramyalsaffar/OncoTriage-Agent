@@ -1056,6 +1056,22 @@ BUCKETS = {
         "added to that one"),
     "test_observability_logging.py": (
         _A, None, "ran green in 9.2s; all six stages driven with deps stand-ins"),
+    "test_env_key_allowlist.py": (
+        _A, None,
+        "ran green in ~0.6s, 48 checks, against ONLY the directory skeleton. "
+        "No network, no keys, NO SPEND, no live Qdrant, no model load, no "
+        "corpus, no database, no git history and no live server. Every .env is "
+        "FABRICATED under a tempfile.mkdtemp it removes and asserts gone, and "
+        "the REAL 05- Keys/.env is never read -- every call passes an explicit "
+        "keys_dir, so keys_path is never resolved and no glob fires. Every "
+        "fabricated value carries a 'fake' marker and section 8 asserts that, "
+        "so this project's own secret scanner cannot read one as a finding. It "
+        "EXECS NOTHING and writes nothing in the repository, so it is not in "
+        "the collision matrix; oncotriage/paths.py is written by neither of "
+        "the suite's two writers and is sha256-compared at the end. It DOES "
+        "mutate os.environ -- that is the subject -- and restores every "
+        "watched name, which check 8e measures against a snapshot taken at "
+        "import."),
     "test_paths_glob_determinism.py": (
         _A, None, "ran green in 0.1s against the skeleton; asserts 18 resolvers"),
     "test_paths_portability_roots.py": (

@@ -989,6 +989,72 @@ def assert_hooks_reach_the_agent(expected: dict, what: str) -> None:
         )
 
 
+MATCHING_SEAMS = {
+    config.MATCHING_PROVIDER_OPENAI:
+        "chat.completions.create on deps.OPENAI_CLIENT",
+    config.MATCHING_PROVIDER_BEDROCK:
+        "responses.create on deps.BEDROCK_CLIENT",
+    config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        "converse on deps.BEDROCK_ANTHROPIC_CLIENT",
+}
+"""Which client seam and method Stage 5 reaches, per provider.
+
+WHY THIS EXISTS: THE REFUSAL NAMED THE WRONG SEAM FOR THE ARM THAT SHIPS.
+``UnsupportedMatchingProviderError`` was written when there were two providers
+and it hard-coded the second one's seam, so it told EVERY non-OpenAI provider
+that Stage 5 "would reach responses.create on deps.BEDROCK_CLIENT". At the
+shipped ``"bedrock_anthropic"`` that is false in both halves -- the seam is
+``deps.BEDROCK_ANTHROPIC_CLIENT`` and the method is ``converse`` -- so the one
+message a reader gets when this harness refuses sent them to the wrong adapter,
+which is a longer wrong turn than no detail at all. Measured at the provider
+flip and recorded there as the top follow-up.
+
+KEYED ON THE PROVIDER CONSTANTS, NEVER ON THEIR STRING VALUES, so a renamed
+member is an import-time ``AttributeError`` here rather than a key that silently
+stops matching. The three keys must be exactly ``config.MATCHING_PROVIDERS``;
+``describe_matching_seam`` is where that is enforced rather than assumed."""
+
+
+def describe_matching_seam(provider: str) -> str:
+    """One phrase naming the seam and method Stage 5 reaches for ``provider``.
+
+    Returns a description for an UNRECOGNISED provider too, rather than raising
+    or returning None. This is called from inside an exception's ``__init__``:
+    a lookup that raised there would replace the refusal an operator needs with
+    a ``KeyError`` about the refusal, which is the abort-instead-of-report shape
+    this project keeps removing. An unrecognised provider is also exactly the
+    state ``validate_matching_provider_config`` exists to report, so the phrase
+    says so.
+    """
+    return MATCHING_SEAMS.get(
+        provider,
+        f"a seam this build does not know ({provider!r} is not one of "
+        f"{list(config.MATCHING_PROVIDERS)})")
+
+
+def _assert_matching_seams_total() -> None:
+    """Every provider in the closed vocabulary has a seam phrase.
+
+    A ``RuntimeError`` at IMPORT and not an ``assert``: ``python -O`` deletes
+    those, and the failure this guards against -- a fourth provider added to
+    ``config.MATCHING_PROVIDERS`` and not to the table -- would then reach an
+    operator as the generic "a seam this build does not know" phrase on a
+    provider that IS known, which reads like a typo in their config rather than
+    a gap in this module.
+    """
+    missing = [p for p in config.MATCHING_PROVIDERS if p not in MATCHING_SEAMS]
+    extra = [p for p in MATCHING_SEAMS if p not in config.MATCHING_PROVIDERS]
+    if missing or extra:
+        raise RuntimeError(
+            f"MATCHING_SEAMS and config.MATCHING_PROVIDERS disagree: "
+            f"missing={missing}, extra={extra}. Every provider Stage 5 can "
+            f"dispatch to needs a seam phrase here, because this table is what "
+            f"a refusal tells an operator to go and look at.")
+
+
+_assert_matching_seams_total()
+
+
 class UnsupportedMatchingProviderError(RuntimeError):
     """The fixture harness was asked to run against a provider it cannot hook.
 
@@ -1024,12 +1090,13 @@ class UnsupportedMatchingProviderError(RuntimeError):
             f"{what}: config.MATCHING_PROVIDER is "
             f"{config.MATCHING_PROVIDER!r}, and this harness can only hook the "
             f"{config.MATCHING_PROVIDER_OPENAI!r} provider -- it wraps "
-            f"chat.completions.create on deps.OPENAI_CLIENT, and Stage 5 would "
-            f"reach responses.create on deps.BEDROCK_CLIENT instead. Every "
+            f"chat.completions.create on deps.OPENAI_CLIENT. At the configured "
+            f"provider Stage 5 would reach "
+            f"{describe_matching_seam(config.MATCHING_PROVIDER)} instead. Every "
             f"Stage 5 call would be REAL and BILLED while the run reported it "
             f"had made none. Set MATCHING_PROVIDER back to "
             f"{config.MATCHING_PROVIDER_OPENAI!r} in oncotriage/config.py, or "
-            f"teach the proxies the Bedrock seam first."
+            f"teach the proxies that seam first."
         )
 
 
@@ -3984,6 +4051,48 @@ def main() -> int:
     # pin_call_mode_for_fixture_process for why this is a pin rather than the
     # refusal it replaces, and why it prints even when it changed nothing.
     pin_call_mode_for_fixture_process("fixture_capture.py")
+
+    # ======================================================================
+    # THE PROVIDER, WHICH IS A REFUSAL RATHER THAN A PIN -- AND NOT FOR
+    # --scan-only, WHICH BILLS NOTHING AND HOOKS NOTHING
+    # ======================================================================
+    #
+    # `assert_provider_is_hookable` already refuses at the first statement of
+    # `install_recording_hooks`, 470 lines above any `graph.invoke`, so no money
+    # was ever at risk here. What it did NOT do is refuse READABLY: that call
+    # site sits on the line ABOVE its `try`, so the error propagates out of
+    # `main()` as a traceback -- the same shape `fixture_replay.py` had, closed
+    # in the same pass so the two harnesses do not diverge on how they say no.
+    #
+    # GATED ON --scan-only DELIBERATELY. That mode captures nothing, installs no
+    # hook and reaches no provider; it is the free command an operator runs to
+    # see which patients WOULD be captured, and blocking it on the configured
+    # provider would take a free, correct tool away for a reason that does not
+    # apply to it. The refusal covers exactly the path that would otherwise
+    # spend.
+    if not args.scan_only and \
+            config.MATCHING_PROVIDER != config.MATCHING_PROVIDER_OPENAI:
+        console.out("\n[REFUSED] CAPTURE CANNOT RUN AT THE CONFIGURED PROVIDER.")
+        console.out(f"          configured provider : "
+                    f"{config.MATCHING_PROVIDER!r}  (config.MATCHING_PROVIDER)")
+        console.out(f"          hookable provider   : "
+                    f"{config.MATCHING_PROVIDER_OPENAI!r}")
+        console.out(f"          Stage 5 would reach : "
+                    f"{describe_matching_seam(config.MATCHING_PROVIDER)}, "
+                    f"which neither proxy wraps -- so every Stage 5 call would "
+                    f"be REAL and BILLED and the fixture would be written with "
+                    f"an empty Stage 5 exchange, looking exactly like a "
+                    f"successful capture.")
+        console.out(f"          remedy              : set "
+                    f"config.MATCHING_PROVIDER to "
+                    f"{config.MATCHING_PROVIDER_OPENAI!r}, or teach OpenAIProxy "
+                    f"the seam above first -- a fixture-FORMAT change (the "
+                    f"recorded request block is chat-shaped) with a "
+                    f"SCHEMA_VERSION bump.")
+        console.out("          --scan-only still works and costs nothing.")
+        console.out("          NOTHING WAS READ, NOTHING WAS HOOKED AND "
+                    "NOTHING WAS BILLED.")
+        return 1
 
     root = args.fixture_dir or fixture_root()
     os.makedirs(root, exist_ok=True)

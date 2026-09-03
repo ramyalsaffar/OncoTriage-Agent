@@ -142,10 +142,19 @@ ENV_ALLOW_DEGRADED_REGISTRIES; fourth victim.
 
 WHY THIS EXISTS, AND WHY IT IS NOT SIMPLY ``QDRANT_URL``. ``paths.load_env_keys()``
 POPS ``OPENAI_API_KEY``, ``QDRANT_URL`` and ``QDRANT_API_KEY`` out of
-``os.environ`` and reloads all three from the .env with ``override=True``. That
-pop is deliberate and is KEPT: it exists so a stale exported credential cannot
-shadow the credentials file, which is the direction that silently sends a
-production key to the wrong endpoint or a dead key to the right one. The
+``os.environ`` and rewrites all three from the .env. That pop is deliberate and
+is KEPT: it exists so a stale exported credential cannot shadow the credentials
+file, which is the direction that silently sends a production key to the wrong
+endpoint or a dead key to the right one.
+
+(The mechanism under that sentence changed after the provider flip and the
+guarantee did not. It used to be ``load_dotenv(..., override=True)``, which
+loaded EVERY name in the file; it is now an ALLOWLIST -- the file is parsed with
+``dotenv_values`` and only ``paths.ALLOWLISTED_ENV_KEYS`` is written into
+``os.environ``. ``QDRANT_URL`` is in that allowlist, so everything this block
+argues is unchanged. What changed is that a name NOT in it -- whatever an
+operator adds to the credentials file next -- no longer reaches the process
+environment as a side effect of resolving these three.) The
 consequence, measured inside the running container on 2026-08-06, was that
 ``QDRANT_URL: http://qdrant:6333`` in docker-compose.yml set the variable, was
 popped, and the client still opened Qdrant Cloud -- so the compose `qdrant`

@@ -905,6 +905,61 @@ def main() -> int:
     # own guard, and Stage 5's partition on every fixture below.
     _capture.pin_call_mode_for_fixture_process("fixture_replay.py")
 
+    # ======================================================================
+    # AND THE PROVIDER, WHICH IS A REFUSAL AND NOT A PIN
+    # ======================================================================
+    #
+    # `config.MATCHING_PROVIDER` ships "bedrock_anthropic". The proxies hook
+    # `deps.OPENAI_CLIENT` and wrap `chat.completions.create`, so at the shipped
+    # default `assert_provider_is_hookable` refuses -- correctly, and that is
+    # the seam working. What it did NOT do is refuse READABLY: the guard fires
+    # inside `install_replay_hooks`, which `replay_fixture` calls on the line
+    # ABOVE its `try`, so nothing catches it and this program died with a
+    # traceback out of module scope. Exit 1 either way and nothing billed, so
+    # the money was never at risk -- but the call-mode-pin pass had already
+    # recorded that shape as "worse than a clean refusal", one guard over, and
+    # this is that finding closed.
+    #
+    # WHY A REFUSAL AND NOT A PIN, which is the obvious symmetry with the call
+    # mode two lines up and is the wrong move here. That pin exists because
+    # refusing would have taken a LIVE gate out of service: the fixtures
+    # characterize the grouped arm and pinning it lets them keep doing so. A
+    # provider pin would instead make this program QUIETLY REPLAY THE DORMANT
+    # ARM and report "12/12 clean" for a pipeline nobody is running -- the gate
+    # would look alive and be measuring the wrong branch, which is worse than a
+    # gate that says it cannot run. The refusal is loud and one command from
+    # fixed; the pin would be silent and wrong.
+    #
+    # THE REMEDY IS STATED HONESTLY, INCLUDING THE PART THAT DOES NOT EXIST.
+    # "Re-capture on the shipped arm" is not available: `capture.py` refuses
+    # the same providers this does, so there is no way to produce a Converse
+    # fixture until the proxies learn that seam. What IS available is running
+    # this gate against the arm the fixtures describe.
+    if config.MATCHING_PROVIDER != config.MATCHING_PROVIDER_OPENAI:
+        console.out("\n[REFUSED] THIS GATE CANNOT RUN AT THE CONFIGURED PROVIDER.")
+        console.out(f"          configured provider : "
+                    f"{config.MATCHING_PROVIDER!r}  (config.MATCHING_PROVIDER)")
+        console.out(f"          fixtures' provider  : "
+                    f"{config.MATCHING_PROVIDER_OPENAI!r}  (the only provider "
+                    f"this harness can hook, so every fixture on disk was "
+                    f"captured on it by construction)")
+        console.out("          why                 : the proxies wrap "
+                    "chat.completions.create on deps.OPENAI_CLIENT. At any "
+                    "other provider Stage 5 reaches a seam they do not cover, "
+                    "so every Stage 5 call would be REAL and BILLED while this "
+                    "run reported it had made none.")
+        console.out("          remedy              : set "
+                    "config.MATCHING_PROVIDER to "
+                    f"{config.MATCHING_PROVIDER_OPENAI!r} to replay the "
+                    "fixtures against the arm they describe. RE-CAPTURING ON "
+                    "THE SHIPPED ARM IS NOT AVAILABLE: fixture_capture.py "
+                    "refuses the same providers, so a Converse fixture cannot "
+                    "be produced until OpenAIProxy learns that seam -- a "
+                    "fixture-FORMAT change with a SCHEMA_VERSION bump.")
+        console.out("          NOTHING WAS READ, NOTHING WAS HOOKED AND "
+                    "NOTHING WAS BILLED.")
+        return 1
+
     # And before a single fixture is read: the deferral
     # this module's import block installs has to have actually reached
     # oncotriage.agent.deps. If it did not, MedCPT and FastEmbed load for real

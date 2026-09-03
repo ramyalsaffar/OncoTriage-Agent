@@ -8,6 +8,21 @@ Imports ``oncotriage.settings`` and nothing else from the project. ``settings``
 must never import this module in either direction — at module scope OR inside a
 function body — because ``paths`` reads it while resolving the root.
 
+THE .env LOAD IS AN ALLOWLIST, and that is a correction rather than a polish
+-----------------------------------------------------------------------------
+``load_env_keys`` used to end in ``load_dotenv(dotenv_path=..., override=True)``,
+which writes EVERY name the file defines into ``os.environ``. A credentials file
+is an unbounded set by nature, so resolving three names had the side effect of
+publishing all of them to the process -- where any library's own credential
+chain finds them. That was measured at the provider flip: this project's
+``05- Keys/.env`` carries five names, and a suite reporting that it makes no
+billed call would have handed botocore a live Bedrock credential on any host
+that had called this function first.
+
+The file is parsed with ``dotenv_values`` now and only ``ALLOWLISTED_ENV_KEYS``
+is written. See ``OPTIONAL_ENV_KEYS`` for how that set was measured, which
+credential is deliberately NOT in it, and what the change does and does not buy.
+
 ``load_env_keys`` LIVES HERE as of pass 20c-2a. Pass 20c-1 put it in
 ``settings`` and reached ``keys_path`` through an import deferred into the
 function body; that worked, but a deferred import is a dependency no static scan
@@ -50,9 +65,11 @@ What is NOT lazy, and must not be:
     20c; pass 20f-1 added a SECOND message, for a pattern that matches more
     than one directory, and the block above the function argues why that raises
     rather than picking a winner;
-  * ``REQUIRED_ENV_KEYS`` / ``load_env_keys`` — data and a function. Importing
-    ``load_env_keys`` triggers no resolution at all; CALLING it with no argument
-    resolves ``keys_path`` and nothing else.
+  * ``REQUIRED_ENV_KEYS`` / ``OPTIONAL_ENV_KEYS`` / ``ALLOWLISTED_ENV_KEYS`` /
+    ``ENV_KEYS_NOT_LOADED`` / ``load_env_keys`` / ``env_keys_not_loaded`` — data
+    and two functions. Importing any of them triggers no resolution at all;
+    CALLING ``load_env_keys`` with no argument resolves ``keys_path`` and
+    nothing else.
 
 WHAT ``__getattr__`` DOES TO ``hasattr``, and it is not the usual thing
 -----------------------------------------------------------------------
@@ -93,7 +110,7 @@ import glob
 import os
 import threading
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values
 
 from oncotriage import settings as path_settings
 from oncotriage.observability import console
@@ -802,6 +819,145 @@ REQUIRED_ENV_KEYS = ("OPENAI_API_KEY", "QDRANT_URL", "QDRANT_API_KEY")
 the two loops below, which is how one of them once came to be cleared but not
 validated."""
 
+OPTIONAL_ENV_KEYS = (
+    path_settings.ENV_BEDROCK_API_KEY,
+    path_settings.ENV_AWS_BEARER_TOKEN_BEDROCK,
+)
+"""Credential names this project reads FROM THE ENVIRONMENT BY DESIGN, loaded
+from the .env when the file defines them and simply absent when it does not.
+
+Unlike ``REQUIRED_ENV_KEYS`` these are NOT validated: a machine running the
+OpenAI arm has no Bedrock credential and must still start, which is the exact
+argument ``settings.ENV_BEDROCK_API_KEY`` already makes for why the Bedrock key
+is not a fourth REQUIRED line in the file.
+
+THE NAMES ARE IMPORTED FROM ``settings``, NEVER RETYPED. They are declared
+there, one of them is not project-prefixed, and a second spelling here is the
+``CROSS_ENCODER_MODEL`` shape: two copies of one fact, no error when they
+disagree, and the only symptom a Bedrock campaign that cannot find a credential
+the file plainly contains.
+
+WHY THIS TUPLE EXISTS AT ALL -- THE MEASUREMENT, AND THE HAZARD IT CLOSES
+------------------------------------------------------------------------
+``load_env_keys`` used to call ``load_dotenv(dotenv_path=..., override=True)``,
+which loads EVERY name in the file into ``os.environ``. The file is a
+credentials file, so that is an unbounded set: whatever an operator adds to it
+next -- a Slack token, a database password, ``AWS_SECRET_ACCESS_KEY`` -- reaches
+the process environment as a side effect of resolving three names, where any
+library's own credential chain can find it. Measured at the provider flip: this
+project's ``05- Keys/.env`` carries FIVE names, three of them required, and a
+test suite that reports it makes no billed call would have handed botocore a
+live Bedrock credential on any host that had called this function first.
+
+The set is therefore DECLARED rather than inherited from the file. It was built
+by measurement -- every ``os.environ`` / ``os.getenv`` read in ``oncotriage/``,
+classified by whether the name is a credential this pipeline reads from the
+environment:
+
+  * ``ONCOTRIAGE_BEDROCK_API_KEY`` and ``AWS_BEARER_TOKEN_BEDROCK`` --
+    ``settings.resolve_bedrock_api_key()`` reads both, in that order, and
+    ``config`` raises naming both when neither is set. IN, and they are why
+    this tuple exists: ``MATCHING_PROVIDER`` ships ``"bedrock_anthropic"``, so
+    the shipped arm's judge does not authenticate without one of them.
+  * ``ANTHROPIC_API_KEY`` -- read by ``evaluation/rater.py``, and DELIBERATELY
+    OUT. That module resolves it in two tiers and its SECOND tier parses this
+    same .env itself, setting ``os.environ`` when it finds the name; its
+    docstring records that routing it through this function "would couple this
+    harness to the pipeline's credential handling for no gain". Loading it here
+    would not add a capability -- the rater already finds it -- it would only
+    change which tier answers, so a run that had called this function would
+    report the source as ``"environment"`` and one that had not would report
+    ``"keys_file"`` for the same file. Out, and the rater is unchanged.
+  * every other environment read in the package is a project-prefixed SETTING
+    (``ONCOTRIAGE_MAIN_PATH``, ``ONCOTRIAGE_LOG_LEVEL``,
+    ``ONCOTRIAGE_INFERENCES_DB``, ``ONCOTRIAGE_QDRANT_URL``,
+    ``ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES``, the two Region names, the two
+    image names, ``ONCOTRIAGE_AIRFLOW_PASSWORD``, ``ONCOTRIAGE_DEFER_LOCAL_MODELS``),
+    a variable this project WRITES rather than reads (``AIRFLOW_HOME``,
+    ``MLFLOW_ALLOW_FILE_STORE``, ``RAGAS_DO_NOT_TRACK``), or ``DOCKER_CONTAINER``.
+    A setting is not a credential and does not belong in a credentials file, so
+    none of them is here.
+
+``ONCOTRIAGE_AIRFLOW_PASSWORD`` is the one borderline case and it is OUT with an
+argument: it IS a credential and it IS read from the environment, but it is tier
+3 of a four-tier route whose tier 4 reads Airflow's own generated password file,
+this project's .env has never carried it, and adding it would put a web-UI
+password into the same file as the model credentials for a service that has its
+own. A later pass that decides the .env should carry it adds one line here.
+
+WHAT THIS TUPLE DOES NOT DO, stated rather than implied. It does not remove the
+Bedrock credential from ``os.environ`` -- the shipped arm needs it there, since
+botocore reads its own environment. What it removes is the UNBOUNDED set: a name
+not written down here can never reach the process from this file, so the next
+credential added to it is inert until somebody names it. Narrowing further --
+having ``resolve_bedrock_api_key`` read the file directly, the way the rater
+does, so the secret materialises only when the Bedrock resolver asks -- is a
+change to that resolver's contract and to a third .env parser, and is recorded
+as a follow-up rather than taken here."""
+
+ALLOWLISTED_ENV_KEYS = REQUIRED_ENV_KEYS + OPTIONAL_ENV_KEYS
+"""The complete set of names this function will write into ``os.environ``.
+
+Derived, never retyped: a hand-written union is a third list to forget, and the
+one thing that must be true of this set is that it is exactly the two tuples
+above. Nothing outside it is loaded, whatever the file contains."""
+
+ENV_KEYS_NOT_LOADED = set()
+"""NAMES ONLY of .env entries this loader declined to put in ``os.environ``.
+
+A ``set`` OF NAMES and deliberately NOT a ``Counter`` OF EVENTS, for two
+reasons. The question an operator asks is "which of my keys did this drop", and
+the answer is a name; how many times ``load_env_keys`` ran is a fact about
+caching, not about the file. And ``oncotriage/degradation.py`` binds counter
+OBJECTS, so registering one here would put a module the whole package imports
+into that registry's import graph -- ``degradation`` imports twenty modules and
+this is the one every one of them sits above.
+
+NEVER A VALUE. A dropped key is by construction a credential this project did
+not ask for, so its value must not survive the frame that parsed it, must not
+enter a module-level container that lives for the process, and must not be
+printed. ``env_keys_not_loaded()`` is the reader and it returns names.
+
+SILENCE WOULD BE THE DEFECT. An operator who adds a key to the credentials file
+and finds it has no effect is owed the reason at the moment it is dropped, not a
+grep of this module -- so ``load_env_keys`` announces each newly-seen name once,
+on the console channel (stderr; stdout is the MCP server's protocol stream)."""
+
+
+def _optional_value(parsed, key):
+    """An OPTIONAL key's value from the parsed .env, or None for "not set".
+
+    AN EMPTY OR WHITESPACE-ONLY VALUE IS "NOT SET", and for the Bedrock names
+    that is a correctness requirement rather than tidiness. MEASURED against
+    the installed botocore 1.40.76 rather than reasoned about:
+
+        botocore/handlers.py:1424   has_token = get_token_from_environment(...)
+                                                is not None
+
+    -- ``is not None``, NOT truthiness. So ``AWS_BEARER_TOKEN_BEDROCK=""`` in
+    ``os.environ`` makes botocore select **bearer auth with an empty token**:
+    it sends ``Authorization: Bearer `` and gets a 401 that names nothing, AND
+    it does so INSTEAD of the SigV4 chain -- so an instance role, an SSO
+    profile or a container role that would have worked is bypassed. An empty
+    line in a credentials file is how somebody says "I have not filled this in
+    yet", and it must not be the thing that disables a working credential.
+
+    This mirrors ``settings.resolve_bedrock_api_key``, which already treats a
+    whitespace-only value as unset for the same class of reason (``export
+    VAR=$(cat file)`` carries the file's trailing newline). The two now agree.
+
+    REQUIRED KEYS ARE DELIBERATELY NOT ROUTED THROUGH THIS. An empty
+    ``OPENAI_API_KEY=`` in the file is loaded as ``""`` today and passes the
+    validation below, because that checks ``is None``; making it raise would be
+    a better function and a DIFFERENT one, and this pass's contract is that the
+    three-key path is byte-compatible with what every caller has today. It is
+    recorded as a follow-up rather than smuggled in beside a security fix.
+    """
+    value = parsed.get(key)
+    if value is None or value.strip() == "":
+        return None
+    return value
+
 
 def load_env_keys(keys_dir=None):
     """Load API keys from the .env file in `keys_dir`.
@@ -820,6 +976,27 @@ def load_env_keys(keys_dir=None):
     Raises:
         FileNotFoundError: no .env at that location.
         ValueError: the file loaded but did not define all three keys.
+
+    THE LOAD IS AN ALLOWLIST, NOT A FILE DUMP (see ``OPTIONAL_ENV_KEYS``). Only
+    a name in ``ALLOWLISTED_ENV_KEYS`` is written into ``os.environ``; anything
+    else the file happens to define is READ INTO A LOCAL AND DROPPED. The names
+    of the dropped keys are counted into ``ENV_KEYS_NOT_LOADED`` and their VALUES
+    are never held beyond this frame, never logged and never returned.
+
+    THE POP-THEN-SET SEMANTICS ARE PRESERVED FOR EVERY ALLOWLISTED NAME, which
+    is what keeps ``ONCOTRIAGE_QDRANT_URL``'s whole argument true: an exported
+    ``QDRANT_URL`` is an ACCIDENT and must still lose to the file. The three
+    REQUIRED names are popped unconditionally, exactly as before -- a required
+    name absent from the file then reaches the validation below as ``None`` and
+    raises, which is the behaviour every caller has today.
+
+    AN OPTIONAL NAME IS POPPED ONLY WHEN THE FILE DEFINES IT, and that asymmetry
+    is the point rather than an oversight. ``AWS_BEARER_TOKEN_BEDROCK`` exported
+    by an operator following AWS's own getting-started page, with a .env that
+    does not mention it, is a DOCUMENTED configuration -- ``settings`` says so in
+    as many words. Popping it would delete a credential this function was never
+    given and break that operator; leaving it means the file wins where the file
+    speaks and the environment survives where it does not.
     """
     if keys_dir is None:
         keys_dir = _resolve("keys_path")
@@ -830,12 +1007,56 @@ def load_env_keys(keys_dir=None):
     if not os.path.exists(env_path):
         raise FileNotFoundError(f".env file not found at: {env_path}")
 
-    # Clear previous env vars to avoid stale values
+    # PARSE, DO NOT LOAD. `dotenv_values` returns the file's mapping and
+    # touches os.environ not at all, which is what makes the allowlist below
+    # the only writer. A value whose name is not allowlisted exists only inside
+    # `parsed` and dies with this frame.
+    parsed = dotenv_values(dotenv_path=env_path)
+
+    # Clear previous env vars to avoid stale values. The three REQUIRED names
+    # unconditionally (unchanged since item 20c); an OPTIONAL name only when the
+    # file is about to answer for it -- see the docstring.
     for key in REQUIRED_ENV_KEYS:
         os.environ.pop(key, None)
+    for key in OPTIONAL_ENV_KEYS:
+        if _optional_value(parsed, key) is not None:
+            os.environ.pop(key, None)
 
-    # Load from file
-    load_dotenv(dotenv_path=env_path, override=True)
+    # Write the allowlist, and only the allowlist. `dotenv_values` yields None
+    # for a bare `NAME` line with no `=`; os.environ refuses a non-str, so that
+    # case is skipped rather than crashing on a malformed file.
+    #
+    # THE TWO HALVES TREAT AN EMPTY VALUE DIFFERENTLY, ON PURPOSE, and the
+    # asymmetry is measured rather than aesthetic -- see `_optional_value`.
+    for key in REQUIRED_ENV_KEYS:
+        value = parsed.get(key)
+        if value is not None:
+            os.environ[key] = value
+    for key in OPTIONAL_ENV_KEYS:
+        value = _optional_value(parsed, key)
+        if value is not None:
+            os.environ[key] = value
+
+    # NAMES ONLY, NEVER VALUES. The count is what an operator acts on and the
+    # names are what tells them which line to move; a value here would put a
+    # credential into a module-level container for the life of the process.
+    #
+    # ANNOUNCED ONCE PER NAME, under the lock the rest of this module already
+    # uses: the read-decide-write sequence below is not atomic, and two threads
+    # calling this concurrently would otherwise both find a name unseen and both
+    # print it. `console.out` writes to stderr.
+    not_loaded = sorted(k for k in parsed if k not in ALLOWLISTED_ENV_KEYS)
+    if not_loaded:
+        with _RESOLVE_LOCK:
+            fresh = [k for k in not_loaded if k not in ENV_KEYS_NOT_LOADED]
+            ENV_KEYS_NOT_LOADED.update(not_loaded)
+        if fresh:
+            console.out(
+                f"[Keys] {len(fresh)} entr{'y' if len(fresh) == 1 else 'ies'} "
+                f"in {os.path.basename(env_path)} not loaded into the "
+                f"environment (not in ALLOWLISTED_ENV_KEYS): "
+                f"{', '.join(fresh)}. Names only; no value is read out of this "
+                f"file for an entry this loader does not own.")
 
     # Validate all keys loaded
     keys = {
@@ -849,6 +1070,20 @@ def load_env_keys(keys_dir=None):
         raise ValueError(f"Missing keys in .env file: {missing}")
 
     return keys
+
+
+def env_keys_not_loaded():
+    """Names of .env entries this loader has declined, sorted. Never values.
+
+    The production reader for ``ENV_KEYS_NOT_LOADED`` -- a live declaration with
+    no audience is the shape the counter-reader pass exists to remove -- and the
+    supported way for a diagnostic to ask the question without reaching into a
+    module-level container it might then mutate. ``deps.peek``'s rule: a READ,
+    never a build and never a mutation, so it returns a tuple rather than the
+    set itself.
+    """
+    with _RESOLVE_LOCK:
+        return tuple(sorted(ENV_KEYS_NOT_LOADED))
 
 
 #------------------------------------------------------------------------------

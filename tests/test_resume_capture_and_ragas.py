@@ -86,6 +86,28 @@ from oncotriage import config, paths
 from oncotriage.fixtures import capture as cap
 from oncotriage.evaluation import ragas_harness as rh
 
+# ===========================================================================
+# THIS FILE DRIVES capture.main(), WHICH IS AN OpenAI-ARM PROGRAM -- SO IT PINS
+# ===========================================================================
+#
+# `config.MATCHING_PROVIDER` ships "bedrock_anthropic", and the fixture harness
+# can hook ONE provider: the proxies wrap `chat.completions.create` on
+# `deps.OPENAI_CLIENT`, so `capture.main()` REFUSES at any other and returns 1
+# before it reads a bundle. That refusal is correct and is the point of the
+# guard -- but this file's subject is `--resume` PLANNING (which fixture ids a
+# run skips and why), which is provider-independent, and it drives the real
+# `main()` with every paid and networked seam replaced. Without the pin the
+# whole file measures the refusal instead of the plan.
+#
+# THE PIN IS THE PROJECT'S OWN, not a local assignment, for the reason
+# tests/_provider_pin.py argues: twenty-three other files needed exactly this
+# and a hand-written block per file is a release placement to get wrong. It is
+# a HARD guard -- a pin that did not take would leave every check below
+# silently measuring a refusal.
+import _provider_pin                                             # noqa: E402
+
+_PROVIDER_BEFORE_PIN = _provider_pin.pin_openai_arm(os.path.basename(__file__))
+
 
 #------------------------------------------------------------------------------
 # Harness
@@ -1777,6 +1799,19 @@ for _tmp in (ROOT1, ROOT_FRESH, ROOT_ALL, ROOT_PART, ROOT_REDERIVE, ROOT_ONLY,
 
 
 #------------------------------------------------------------------------------
+
+# --- the provider pin is released ABOVE the summary -------------------------
+# Below it, the outcome would still decide the exit code while being absent
+# from the number the summary printed -- a run that reports "0 failed" and
+# exits non-zero, which the default-flip pass shipped in three of seven files.
+# The outcome is recorded BEFORE the restore, so "there was a pin to release"
+# cannot be satisfied by a process that never installed one.
+_PIN_WHO, _PIN_PREVIOUS, _PIN_RESTORED = _provider_pin.release_openai_arm()
+check("[provider pin] the OpenAI pin this file installed was released, and "
+      "config.MATCHING_PROVIDER is back to the shipped provider",
+      (_PIN_WHO == os.path.basename(__file__), _PIN_PREVIOUS, _PIN_RESTORED,
+       _provider_pin.pin_state()),
+      (True, _PROVIDER_BEFORE_PIN, True, (None, None)))
 
 print()
 print("=" * 70)
