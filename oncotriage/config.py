@@ -77,6 +77,8 @@ deferred import, and it is stated here rather than discovered from a stray
 "[Paths] Project root" line in a log.
 """
 
+import sys
+
 import httpx
 from openai import OpenAI
 from qdrant_client import QdrantClient
@@ -1863,6 +1865,350 @@ def bedrock_anthropic_max_attempts():
 
 
 
+# ===========================================================================
+# THE CONVERSE SDK FLOOR — WHAT THE INSTALLED botocore MUST BE ABLE TO EXPRESS
+# ===========================================================================
+#
+# WHY THIS IS HERE AT ALL, AND IT IS THE MOST EXPENSIVE LESSON THE PROBE HAS
+# LEARNED. Run on 2026-09-03, `bedrock_probe.py --provider bedrock_anthropic`
+# built the adapter's real request, waited out its pacer and called `converse`,
+# and got
+#
+#     ParamValidationError: Unknown parameter in input: "outputConfig"
+#     Unknown parameter in system[1].cachePoint: "ttl"
+#
+# -- botocore's OWN validator, refusing locally. Nothing was signed, nothing was
+# sent, nothing was billed. THAT IS THE WHOLE FAILURE MODE: it costs $0 in
+# provider spend and it fails EVERY Stage 5 call, so a campaign started against
+# a too-old SDK opens a `runs` row, fails every patient, and the operator's
+# first hypothesis is Amazon Bedrock or their AWS account -- neither of which
+# the request ever reached. A ValidationException FROM THE SERVICE and a
+# ParamValidationError FROM botocore are opposite findings with opposite
+# remedies, and only one of them is about this project's code.
+#
+# THE FLOOR IS MEASURED, NOT READ OFF A CHANGELOG AND NOT INFERRED FROM A
+# RELEASE DATE. Bisected by installing released wheels and reading each one's
+# `bedrock-runtime/2023-09-30/service-2.json` through botocore's own shape map:
+#
+#     botocore              outputConfig   cachePoint.ttl   usage.cacheDetails
+#     <= 1.42.20                 no              no                no
+#     1.42.21 .. 1.42.41         no             yes               yes
+#     1.42.42 and later         YES             YES               YES
+#
+# So structured output on Converse -- A1, the item the adapter ranks first
+# because its failure makes the branch useless rather than degraded -- is
+# expressible from 1.42.42 and from no earlier release. The three boundary rows
+# were RE-DERIVED on 2026-09-03 against 1.42.20, 1.42.41 and 1.42.42 rather
+# than inherited from the bisect that first reported them.
+MIN_BOTOCORE_FOR_CONVERSE_REQUEST = (1, 42, 42)
+"""Lowest botocore whose bedrock-runtime model carries all three fields."""
+
+MIN_BOTO3_FOR_CONVERSE_REQUEST = (1, 42, 42)
+"""Lowest boto3 to pin BESIDE that botocore, and the number is not cosmetic.
+
+A boto3 pin does not merely fail to carry a botocore floor -- it can FORBID
+one. Read from the installed distribution metadata rather than assumed:
+
+    boto3 1.40.14   botocore >=1.40.14,<1.41.0    <- the pin that shipped;
+                                                     it EXCLUDES 1.42.42
+    boto3 1.42.0    botocore >=1.41.6, <1.42.0    <- still excludes it
+    boto3 1.42.1    botocore >=1.42.0, <1.43.0    <- admits it
+    boto3 1.42.42   botocore >=1.42.42,<1.43.0    <- its floor IS the floor
+    boto3 1.42.43   botocore >=1.42.43,<1.43.0    <- demands one ABOVE it
+
+Note the offset at the minor boundary: boto3 X.Y.Z does NOT in general require
+botocore X.Y.Z, so the pair cannot be derived from either number alone. 1.42.42
+is the unique release whose declared botocore floor EQUALS the measured one,
+and it is the release AWS published alongside that botocore -- which is the
+pair they ship and test together. A lower boto3 that merely ADMITS a botocore
+forty patches ahead of it would satisfy the resolver and pair two releases
+nobody released together.
+"""
+
+MIN_BOTOCORE_MEASURED_ON = "2026-09-03"
+"""The date both floors above were measured. Printed in every refusal."""
+
+BOTOCORE_SDK_OK = "ok"
+"""The installed botocore is at or above the measured floor."""
+
+BOTOCORE_SDK_TOO_OLD = "too_old"
+"""It is BELOW the floor. Every Converse request fails locally. REFUSED."""
+
+BOTOCORE_SDK_VERSION_UNREADABLE = "version_unreadable"
+"""botocore is installed and its version string does not parse.
+
+ITS OWN STATE RATHER THAN A FALL-THROUGH, and that is the whole of this
+vocabulary's reason for existing. The natural way to write this check is
+``if version and version < floor: raise`` -- and then an unreadable version
+takes the `else` and is REPORTED AS COMPLIANT, which is a claim about a number
+nobody read. That defect shipped once in the probe's own preflight.
+"""
+
+BOTOCORE_SDK_ABSENT = "absent"
+"""No botocore was found at all. See the policy below: NOT a refusal."""
+
+BOTOCORE_SDK_STATES = (BOTOCORE_SDK_OK, BOTOCORE_SDK_TOO_OLD,
+                       BOTOCORE_SDK_VERSION_UNREADABLE, BOTOCORE_SDK_ABSENT)
+"""The closed vocabulary. A caller may branch on it exhaustively."""
+
+BOTOCORE_SDK_REFUSING_STATES = (BOTOCORE_SDK_TOO_OLD,)
+"""Which states `validate_matching_provider_config()` RAISES on.
+
+DECLARED AS A SET RATHER THAN AS AN `if`, so "which states refuse" is one
+readable fact instead of a condition spread across a branch -- and so the two
+non-refusing states are visibly a DECISION rather than an omission.
+
+WHY `absent` DOES NOT REFUSE. `get_bedrock_anthropic_client()` already raises a
+named RuntimeError on the ImportError, pointing at pyproject.toml and
+`pip install -e .`, and it is the function that actually needs the library.
+Refusing here would move that failure to a function that does not need it --
+and would make the branch untestable on a machine without boto3, which
+`bedrock_anthropic_adapter.build_converse_request`'s own docstring names as a
+property it has and wants ("it imports no boto3, so it is testable on a machine
+where boto3 is not installed").
+
+WHY `version_unreadable` DOES NOT REFUSE. A pre-release or a vendor build --
+`1.43.0rc1`, `1.42.42.dev0` -- is a version string this project did not choose,
+which is third-party DATA rather than this project's configuration; item 11a's
+line is that data is COUNTED and configuration RAISES. Refusing would block a
+botocore that very likely works, and the thing at stake is a run that costs $0
+to fail. It is reported instead -- once, loudly, by name -- and
+`bedrock_probe.py`'s ParamValidator run is the authority that settles it.
+"""
+
+BOTOCORE_VERSION_SOURCE_MODULE = "the imported botocore module"
+BOTOCORE_VERSION_SOURCE_DISTRIBUTION = "installed distribution metadata"
+BOTOCORE_VERSION_SOURCE_NONE = "nothing to read"
+BOTOCORE_VERSION_SOURCES = (BOTOCORE_VERSION_SOURCE_MODULE,
+                            BOTOCORE_VERSION_SOURCE_DISTRIBUTION,
+                            BOTOCORE_VERSION_SOURCE_NONE)
+"""Where the version came from. Reported, because the two can disagree."""
+
+_BOTOCORE_NOT_LOOKED_UP = object()
+"""Sentinel: the metadata lookup has not been attempted in this process.
+
+AN OBJECT AND NOT A STRING. A string sentinel is a value botocore could in
+principle report, and `None` is already taken -- it is the answer "looked, and
+there is no botocore". Three states need three distinct values.
+"""
+
+_BOTOCORE_DIST_VERSION = _BOTOCORE_NOT_LOOKED_UP
+"""Cache for the metadata lookup only. See `installed_botocore_version()`.
+
+NOT LOCKED, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT. Stage 5 validates
+from `MAX_WORKERS` worker threads, so two of them can race this. Both compute
+the SAME deterministic string from the same files, and a duplicated computation
+here allocates nothing and opens nothing -- unlike the client caches this file
+locks, where a second build is a second connection pool. `_BOTOCORE_SDK_
+REPORTED` races the same way and its worst case is the warning printed twice.
+"""
+
+_BOTOCORE_SDK_REPORTED = False
+"""Whether the non-refusing SDK state has already been said out loud."""
+
+
+def _botocore_release_tuple(text):
+    """The leading all-numeric components of a version string, or None. PURE.
+
+    THE RULE, and it errs in the safe direction by construction: take dotted
+    components while they are ENTIRELY digits, stop at the first that is not,
+    keep at most three. Nothing here can raise -- `str.split` and `str.isdigit`
+    are total -- so this function has no `except` and therefore no silent
+    recovery to argue about.
+
+        "1.42.42"       -> (1, 42, 42)   at the floor
+        "1.42.97"       -> (1, 42, 97)   above it
+        "1.42.42.dev0"  -> (1, 42, 42)   a dev build OF the floor, admitted
+        "1.43.0rc1"     -> (1, 43)       and (1, 43) > (1, 42, 42), admitted
+        "1.42.42rc1"    -> (1, 42)       and (1, 42) < (1, 42, 42), REFUSED
+        "unknown"       -> None          unreadable
+        ""              -> None          unreadable
+
+    The fifth row is the deliberate over-strictness: a pre-release OF the floor
+    itself is refused, because a truncated tuple compares below the floor. That
+    is a false refusal in the one direction that costs an operator one pin edit
+    rather than a campaign of locally-failing calls.
+
+    Args:
+        text: whatever the SDK or its metadata reported. Any object; it is
+            stringified first, so None and a non-string cannot raise here.
+
+    Returns:
+        tuple[int, ...] | None: None when not even the first component is
+        numeric, which is exactly `BOTOCORE_SDK_VERSION_UNREADABLE`.
+    """
+    parts = []
+    for chunk in str(text).split("."):
+        if not chunk.isdigit():
+            break
+        parts.append(int(chunk))
+        if len(parts) == 3:
+            break
+    return tuple(parts) or None
+
+
+def installed_botocore_version():
+    """What botocore this process would use, WITHOUT importing it.
+
+    NOT `import botocore`, AND THAT IS A HARD CONSTRAINT RATHER THAN A
+    PREFERENCE. `tests/test_agent_bedrock_anthropic_adapter.py` (section 1c and
+    again in section 5) and `tests/test_agent_bedrock_anthropic_per_trial.py`
+    all assert that `botocore` is absent from `sys.modules` after importing the
+    package and DRIVING the Converse request builder -- which calls
+    `validate_matching_provider_config()` at its first statement. An import
+    here would turn those three measurements red, and they are the checks that
+    say the request builder reaches no AWS library.
+
+    TWO SOURCES, IN THIS ORDER, AND THE ORDER IS THE ARGUMENT:
+
+      1. an ALREADY-IMPORTED botocore's own `__version__`. If the module is in
+         `sys.modules` it is the thing that will actually run, so its own
+         answer is authoritative and free.
+      2. otherwise the installed DISTRIBUTION metadata, which is the best
+         answer available without causing an import.
+
+    They can disagree -- a vendored copy earlier on `sys.path` with no
+    dist-info, or dist-info for a module something else shadows -- so the
+    source is RETURNED rather than folded away, and every message prints it.
+
+    ONLY THE METADATA LOOKUP IS CACHED. `sys.modules` is checked on every call
+    because it is a dict lookup and because caching it would freeze an answer
+    that legitimately changes the moment the client factory imports boto3.
+
+    Returns:
+        tuple[str | None, str]: the version string as reported, and one member
+        of `BOTOCORE_VERSION_SOURCES`.
+    """
+    global _BOTOCORE_DIST_VERSION
+
+    module = sys.modules.get("botocore")
+    if module is not None:
+        reported = getattr(module, "__version__", None)
+        if reported:
+            return str(reported), BOTOCORE_VERSION_SOURCE_MODULE
+
+    if _BOTOCORE_DIST_VERSION is _BOTOCORE_NOT_LOOKED_UP:
+        # DEFERRED, on the `import icd10` / `import torch` footing: importing
+        # this module must stay free, and a stdlib package whose import walks
+        # `email` and `zipfile` is not free enough to pay for on every process
+        # that touches config.
+        import importlib.metadata
+        try:
+            _BOTOCORE_DIST_VERSION = importlib.metadata.version("botocore")
+        except Exception:                                      # noqa: BLE001
+            # NOT A SWALLOWED EXCEPTION. The absence IS the answer, it is
+            # returned to the caller as a named state, and every consumer
+            # reports it; there is no path on which this reads as compliant.
+            _BOTOCORE_DIST_VERSION = None
+
+    if _BOTOCORE_DIST_VERSION:
+        return _BOTOCORE_DIST_VERSION, BOTOCORE_VERSION_SOURCE_DISTRIBUTION
+
+    # BOTOCORE IS IMPORTABLE AND SAID NOTHING USABLE, which is NOT `absent`.
+    # The two states carry different remedies: `absent` says the client build
+    # is where this refuses, and that is FALSE of a botocore already sitting in
+    # `sys.modules` -- the client will build and every Converse call will then
+    # fail on a version nobody could read. An empty string is what
+    # `classify_botocore_version` reads as `version_unreadable`, which is the
+    # honest answer.
+    if module is not None:
+        return "", BOTOCORE_VERSION_SOURCE_MODULE
+    return None, BOTOCORE_VERSION_SOURCE_NONE
+
+
+def classify_botocore_version(reported):
+    """One of `BOTOCORE_SDK_STATES` for a version string. PURE and total.
+
+    Args:
+        reported: the version string, or None when nothing was found.
+
+    Returns:
+        str: a member of `BOTOCORE_SDK_STATES`.
+    """
+    if reported is None:
+        return BOTOCORE_SDK_ABSENT
+    release = _botocore_release_tuple(reported)
+    if release is None:
+        return BOTOCORE_SDK_VERSION_UNREADABLE
+    if release < MIN_BOTOCORE_FOR_CONVERSE_REQUEST:
+        return BOTOCORE_SDK_TOO_OLD
+    return BOTOCORE_SDK_OK
+
+
+def botocore_sdk_state():
+    """Can the installed botocore express a Converse request? ONE OWNER.
+
+    The pipeline reaches this through `validate_matching_provider_config()` and
+    `bedrock_probe.py` reaches it directly for its own report; both read the
+    same floor, the same parser and the same vocabulary, so the probe cannot
+    tell an operator something the pipeline will not act on.
+
+    Returns:
+        tuple[str, str | None, str]: the state, the version as reported, and
+        where it was read from.
+    """
+    reported, source = installed_botocore_version()
+    return classify_botocore_version(reported), reported, source
+
+
+def botocore_floor_text():
+    """The measured botocore floor as a dotted string. One formatter."""
+    return ".".join(str(n) for n in MIN_BOTOCORE_FOR_CONVERSE_REQUEST)
+
+
+def boto3_floor_text():
+    """The boto3 release to pin beside it, as a dotted string."""
+    return ".".join(str(n) for n in MIN_BOTO3_FOR_CONVERSE_REQUEST)
+
+
+def botocore_upgrade_command():
+    """The one command that fixes a too-old SDK. DERIVED from both floors.
+
+    BOTH DISTRIBUTIONS, NEVER botocore ALONE, and that is the finding rather
+    than belt-and-braces: the shipped `boto3==1.40.14` pin declares
+    `botocore<1.41.0`, so `pip install botocore==1.42.42` on its own leaves
+    pip's resolver reporting a broken environment and leaves the operator
+    reading a conflict message about a package they did not name.
+    """
+    return (f"pip install 'boto3=={boto3_floor_text()}' "
+            f"'botocore=={botocore_floor_text()}'")
+
+
+def _report_botocore_sdk_state_once(state, reported, source):
+    """Say a non-refusing, non-ok SDK state out loud. Once per process.
+
+    ONCE, because `validate_matching_provider_config()` runs at the top of
+    every Converse request and a per-request line would be one line per trial
+    call per patient. NOT SILENT, because `absent` and `version_unreadable`
+    both mean the floor went unverified, and an unverified floor that says
+    nothing is indistinguishable from a verified one.
+
+    A COUNTER WOULD BE THE STRONGER RECORD and is a named follow-up rather than
+    an omission: `oncotriage/degradation.py` binds counter OBJECTS by module,
+    so a counter here needs an entry in its `_REGISTRY_SPEC` -- an edit outside
+    the file this belongs in. Until then the console is the record, and
+    `botocore_sdk_state()` is public so that reader can be written without
+    changing the mechanism.
+    """
+    global _BOTOCORE_SDK_REPORTED
+    if _BOTOCORE_SDK_REPORTED:
+        return
+    _BOTOCORE_SDK_REPORTED = True
+    if state == BOTOCORE_SDK_ABSENT:
+        console.out(
+            f"⚠️  botocore was not found ({source}), so the Converse SDK "
+            f"floor {botocore_floor_text()} is UNVERIFIED. The client build "
+            f"is where this refuses; see get_bedrock_anthropic_client().")
+        return
+    console.out(
+        f"⚠️  botocore reports version {reported!r} ({source}), which this "
+        f"project cannot parse -- so whether it meets the Converse floor "
+        f"{botocore_floor_text()} is NOT established. It is not being read as "
+        f"compliant. Run `python bedrock_probe.py --provider "
+        f"bedrock_anthropic` for the authoritative answer: it validates the "
+        f"real request against the installed service model.")
+
+
 def _validate_bedrock_region(interpolated_into):
     """Refuse a Region that cannot produce a working endpoint. One owner.
 
@@ -2027,6 +2373,43 @@ def _validate_bedrock_anthropic_config():
             f"bool. It decides whether the per-trial cache warmup carries the "
             f"structured-output block, and a truthy non-bool would make that "
             f"decision by accident. Edit it in oncotriage/config.py.")
+
+    # THE INSTALLED SDK IS PART OF THE CONFIGURATION, and this is the last
+    # check rather than the first for one reason: every check above names a
+    # constant an operator chose, and this one names a version they may not
+    # know they have. A run whose model id is wrong AND whose botocore is old
+    # should hear about the model id, which is the edit they meant to make.
+    #
+    # IT REFUSES HERE RATHER THAN AT THE CLIENT because the client is not what
+    # fails. `boto3.client("bedrock-runtime", ...)` constructs perfectly
+    # against a 2024 botocore; what fails is the REQUEST, inside
+    # `client.converse(**kwargs)`, on botocore's own ParamValidator -- so a
+    # guard on the client build would pass and every Stage 5 call would still
+    # fail. This is the earliest point at which the fact is knowable.
+    _sdk_state, _sdk_version, _sdk_source = botocore_sdk_state()
+    if _sdk_state in BOTOCORE_SDK_REFUSING_STATES:
+        raise RuntimeError(
+            f"The installed botocore is {_sdk_version} ({_sdk_source}) and "
+            f"MATCHING_PROVIDER is "
+            f"{MATCHING_PROVIDER_BEDROCK_ANTHROPIC!r}, which reaches Stage 5 "
+            f"through the Converse API.\n"
+            f"  That release's bedrock-runtime service model has no "
+            f"`outputConfig`, so botocore REFUSES this project's request "
+            f"locally, before it is signed -- every Stage 5 call, for the "
+            f"whole run, at $0 of provider spend and with nothing in the "
+            f"failure naming the SDK.\n"
+            f"  REQUIRED: botocore >= {botocore_floor_text()} (measured "
+            f"{MIN_BOTOCORE_MEASURED_ON} by bisecting released wheels; see "
+            f"MIN_BOTOCORE_FOR_CONVERSE_REQUEST in oncotriage/config.py).\n"
+            f"  FIX:      {botocore_upgrade_command()}\n"
+            f"            -- or `pip install -e .` from 03- Code/, which "
+            f"installs the pins pyproject.toml declares. BOTH distributions "
+            f"are named on purpose: a boto3 pin below "
+            f"{boto3_floor_text()} declares an UPPER bound on botocore that "
+            f"EXCLUDES the floor, so upgrading botocore alone leaves pip "
+            f"reporting a broken environment.")
+    if _sdk_state != BOTOCORE_SDK_OK:
+        _report_botocore_sdk_state_once(_sdk_state, _sdk_version, _sdk_source)
 
 
 def validate_matching_provider_config():
@@ -2308,6 +2691,15 @@ def get_bedrock_anthropic_client():
         _assert_bedrock_anthropic_credential_is_visible()
 
         console.out(f"🔐 Bedrock Converse region: {BEDROCK_REGION}")
+        # THE SDK IS PROVENANCE, so it is printed on the provenance path and
+        # printed on EVERY state -- including `ok`. Silence and "verified"
+        # would otherwise look identical, which is the reading the shutdown
+        # gate's banner already refuses to allow. Once per process by
+        # construction: this factory caches.
+        _sdk_state, _sdk_version, _ = botocore_sdk_state()
+        console.out(f"🔐 Bedrock Converse SDK: botocore {_sdk_version} "
+                    f"[{_sdk_state}]; floor {botocore_floor_text()} measured "
+                    f"{MIN_BOTOCORE_MEASURED_ON}")
         _BEDROCK_ANTHROPIC_CLIENT_CACHE = boto3.client(
             "bedrock-runtime",
             region_name=BEDROCK_REGION,

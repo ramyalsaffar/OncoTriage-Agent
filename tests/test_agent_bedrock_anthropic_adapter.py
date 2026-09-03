@@ -49,11 +49,12 @@ sha256'd before the first plant and compared at the end.
 
 NOT in ``tests/run_serial_tests.py``'s collision matrix, derived rather than
 assumed: it writes nothing anywhere -- not even a temp directory -- and the
-three repository files it READS are ``oncotriage/agent/bedrock_anthropic_
-adapter.py``, ``oncotriage/agent/evaluation.py`` and ``oncotriage/config.py``.
-The last IS rewritten in place by
-``tests/test_config_snapshot_date_rot.py``, so all three are sha256-compared at
-the end and an interleaved serial run is visible rather than silent.
+FOUR repository files it READS are ``oncotriage/agent/bedrock_anthropic_
+adapter.py``, ``oncotriage/agent/evaluation.py``, ``oncotriage/config.py`` and
+``pyproject.toml`` (section 7d, the dependency pins). The third IS rewritten in
+place by ``tests/test_config_snapshot_date_rot.py`` and neither of the suite's
+two writers touches the others, so all four are sha256-compared at the end and
+an interleaved serial run is visible rather than silent.
 
 EVERY CONFIG MUTATION IS INSIDE try/finally AND THE RESTORE IS ASSERTED.
 Section 9 re-reads every knob this file touches, and derives the list from
@@ -235,8 +236,13 @@ _CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(config.__file__)))
 _ADAPTER_PATH = os.path.abspath(bac.__file__)
 _EVALUATION_PATH = os.path.abspath(_evaluation.__file__)
 _CONFIG_PATH = os.path.abspath(config.__file__)
+# THE FOURTH FILE, added with section 7d: the dependency pins. Hashed HERE
+# rather than where it is read, so the window it covers is the whole run --
+# a hash taken at the point of use cannot see a write that preceded it.
+_PYPROJECT_PATH = os.path.join(_CODE_DIR, "pyproject.toml")
 _SHA_BEFORE = {p: hashlib.sha256(open(p, "rb").read()).hexdigest()
-               for p in (_ADAPTER_PATH, _EVALUATION_PATH, _CONFIG_PATH)}
+               for p in (_ADAPTER_PATH, _EVALUATION_PATH, _CONFIG_PATH,
+                         _PYPROJECT_PATH)}
 
 
 def exec_copy(mutate):
@@ -504,7 +510,8 @@ check("...and no Converse field leaked into it",
 #
 # IT MATTERS MORE SINCE THE PROVIDER FLIP, NOT LESS, and the note that used to
 # sit here ("on this machine boto3 is not installed at all") is no longer true
-# -- boto3 1.40.14 IS installed, and `config.get_bedrock_anthropic_client()`'s
+# -- boto3 IS installed (1.40.14 when this was written; pyproject pins 1.42.42
+# since the Converse SDK floor), and `config.get_bedrock_anthropic_client()`'s
 # flag guard is now SATISFIED by the shipped default. So an unpinned drive
 # anywhere above this line builds a real botocore client, imports boto3, and
 # sends botocore off down its credential chain. MEASURED at the moment of the
@@ -1278,6 +1285,459 @@ check("the shipped default's price is the INFERRED geo rate, and the global "
 
 
 # ===========================================================================
+# SECTION 7c — THE INSTALLED SDK IS PART OF THE CONFIGURATION
+# ===========================================================================
+
+section("7c. A botocore that cannot express the request is refused at "
+        "validation")
+
+# WHY THIS SECTION EXISTS. On 2026-09-03 `bedrock_probe.py` built the adapter's
+# real request, called `converse`, and was refused by botocore's OWN validator:
+# `Unknown parameter in input: "outputConfig"`. Nothing was signed and nothing
+# was billed -- and that is the whole hazard rather than a consolation. A
+# too-old SDK fails EVERY Stage 5 call at $0 of provider spend, so a campaign
+# opens a `runs` row, fails every patient, and the operator's first hypothesis
+# is Amazon Bedrock or their AWS account, neither of which the request reached.
+#
+# THE FLOOR HAS ONE OWNER AND IT IS `config`, NOT THIS FILE AND NOT THE PROBE.
+# Everything below reads `config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST` and
+# `config.classify_botocore_version` rather than a literal, so a floor
+# re-measurement moves these checks with it instead of leaving them asserting
+# the old number.
+
+check("the state vocabulary is closed and has four members",
+      config.BOTOCORE_SDK_STATES,
+      (config.BOTOCORE_SDK_OK, config.BOTOCORE_SDK_TOO_OLD,
+       config.BOTOCORE_SDK_VERSION_UNREADABLE, config.BOTOCORE_SDK_ABSENT))
+check("the refusing states are a PROPER, NON-EMPTY subset of it -- which is "
+      "what makes the two non-refusing states a decision rather than an "
+      "omission",
+      (set(config.BOTOCORE_SDK_REFUSING_STATES) < set(config.BOTOCORE_SDK_STATES)
+       and len(config.BOTOCORE_SDK_REFUSING_STATES) > 0), True)
+check("absent does not refuse -- get_bedrock_anthropic_client() already "
+      "raises on the ImportError, and refusing here would make the request "
+      "builder untestable without boto3",
+      config.BOTOCORE_SDK_ABSENT in config.BOTOCORE_SDK_REFUSING_STATES, False)
+check("an unreadable version does not refuse either; it is reported",
+      config.BOTOCORE_SDK_VERSION_UNREADABLE
+      in config.BOTOCORE_SDK_REFUSING_STATES, False)
+
+# --- 7c-i. The classifier, over literals, with every state reached ---------
+#
+# The natural control for a pure function is a different INPUT, so the table is
+# the test. The BOUNDARY rows are DERIVED from the constant rather than typed,
+# because a floor re-measurement must move them.
+_FLOOR = config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST
+_AT_FLOOR = ".".join(str(n) for n in _FLOOR)
+_BELOW_FLOOR = ".".join(str(n) for n in _FLOOR[:-1] + (_FLOOR[-1] - 1,))
+_ABOVE_FLOOR = ".".join(str(n) for n in _FLOOR[:-1] + (_FLOOR[-1] + 1,))
+
+_VERSIONS = [
+    (_AT_FLOOR, config.BOTOCORE_SDK_OK),
+    (_ABOVE_FLOOR, config.BOTOCORE_SDK_OK),
+    (_BELOW_FLOOR, config.BOTOCORE_SDK_TOO_OLD),
+    ("1.40.76", config.BOTOCORE_SDK_TOO_OLD),      # what shipped before this
+    ("2.0.0", config.BOTOCORE_SDK_OK),
+    (f"{_AT_FLOOR}.dev0", config.BOTOCORE_SDK_OK),  # a dev build OF the floor
+    ("unknown", config.BOTOCORE_SDK_VERSION_UNREADABLE),
+    ("", config.BOTOCORE_SDK_VERSION_UNREADABLE),
+    ("v1.42.42", config.BOTOCORE_SDK_VERSION_UNREADABLE),   # a leading 'v'
+    (None, config.BOTOCORE_SDK_ABSENT),
+]
+for _text, _want in _VERSIONS:
+    check(f"classify_botocore_version({_text!r}) is {_want}",
+          drive(config.classify_botocore_version, _text), _want)
+
+check("the boundary rows are not the same string, so 'at the floor' and "
+      "'below the floor' are two different measurements",
+      len({_AT_FLOOR, _BELOW_FLOOR, _ABOVE_FLOOR}), 3)
+check("every state in the vocabulary is REACHED by the table, so no member "
+      "is asserted about without being driven",
+      sorted({config.classify_botocore_version(t) for t, _ in _VERSIONS}),
+      sorted(config.BOTOCORE_SDK_STATES))
+
+# --- 7c-ii. THE BUG THE UNREADABLE STATE EXISTS TO PREVENT -----------------
+#
+# The natural way to write this check is `if ver and ver < floor: raise`, and
+# an unreadable version then takes the `else` and is REPORTED AS COMPLIANT --
+# a claim about a number nobody read. That defect shipped once in the probe's
+# own preflight. The control is a reader's own implementation of the buggy
+# form, shown to DISAGREE with the shipped classifier on exactly that input
+# and to AGREE on every other row -- so the difference is attributable to the
+# unreadable case and not to two unrelated functions.
+
+
+def _bug9_reads_as_compliant(text):
+    """The shape 6b shipped: a falsy release falls through to 'fine'."""
+    release = config._botocore_release_tuple(text) if text is not None else None
+    if release and release < config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST:
+        return config.BOTOCORE_SDK_TOO_OLD
+    return config.BOTOCORE_SDK_OK          # <- 'unknown' lands HERE
+
+
+check("the buggy form reads an unparseable version as COMPLIANT, which is the "
+      "defect", _bug9_reads_as_compliant("unknown"), config.BOTOCORE_SDK_OK)
+check("...and the shipped classifier does not",
+      config.classify_botocore_version("unknown"),
+      config.BOTOCORE_SDK_VERSION_UNREADABLE)
+check("the two forms disagree ONLY on the states the shipped one added, so "
+      "the difference is attributable",
+      sorted({t for t, _ in _VERSIONS
+              if _bug9_reads_as_compliant(t)
+              != config.classify_botocore_version(t)},
+             key=lambda s: (s is None, s)),
+      sorted({t for t, w in _VERSIONS
+              if w in (config.BOTOCORE_SDK_VERSION_UNREADABLE,
+                       config.BOTOCORE_SDK_ABSENT)},
+             key=lambda s: (s is None, s)))
+
+# --- 7c-iii. The refusal, driven through the real validator ----------------
+#
+# The version is injected through config's own metadata cache rather than by
+# installing an old botocore, so this costs nothing and cannot leave a broken
+# environment behind. `sys.modules['botocore']` is popped for the block because
+# an imported module WINS over the metadata by design -- see
+# installed_botocore_version() -- and leaving it in would make the injection
+# reach nothing.
+
+
+@contextlib.contextmanager
+def botocore_reporting(version):
+    """Make config see `version` as the installed botocore, for one block."""
+    saved_cache = config._BOTOCORE_DIST_VERSION
+    saved_flag = config._BOTOCORE_SDK_REPORTED
+    saved_mod = sys.modules.pop("botocore", None)
+    config._BOTOCORE_DIST_VERSION = version
+    config._BOTOCORE_SDK_REPORTED = False
+    try:
+        yield
+    finally:
+        config._BOTOCORE_DIST_VERSION = saved_cache
+        config._BOTOCORE_SDK_REPORTED = saved_flag
+        if saved_mod is not None:
+            sys.modules["botocore"] = saved_mod
+
+
+with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC):
+    with botocore_reporting("1.40.76"):
+        check("a botocore below the floor is REFUSED at validation",
+              raises(config.validate_matching_provider_config), "RuntimeError")
+        _sdk_msg = message_of(config.validate_matching_provider_config)
+
+for _needle, _why in (
+        ("1.40.76", "the INSTALLED version, so the operator can see what "
+                    "they have"),
+        (_AT_FLOOR, "the REQUIRED version"),
+        # THE WHOLE RENDERED COMMAND, not the words in it. The first version
+        # of this row asked for "pip install", "boto3" and "botocore"
+        # separately -- and the revert that replaced the command outright with
+        # "upgrade it." was MISSED, because the surrounding prose still
+        # contains all three. A substring that appears in several places
+        # cannot be evidence about one of them.
+        (config.botocore_upgrade_command(),
+         "the WHOLE upgrade command, verbatim -- naming BOTH distributions, "
+         "because a boto3 pin below the floor CAPS botocore below it and "
+         "upgrading botocore alone leaves pip reporting a broken environment"),
+        ("MIN_BOTOCORE_FOR_CONVERSE_REQUEST", "the constant that owns the "
+                                              "number"),
+        ("outputConfig", "the field that is missing, so the refusal is "
+                         "checkable against the service model"),
+        ("pip install -e .", "the route that installs what pyproject declares"),
+):
+    check_true(f"the refusal names {_needle!r} -- {_why}", _needle in _sdk_msg)
+check_true("...and it says the failure is LOCAL rather than a finding about "
+           "Amazon Bedrock, which is the misdiagnosis it exists to prevent",
+           "locally" in _sdk_msg)
+
+# --- 7c-iv. It is Converse-only, and the other two branches are untouched --
+for _other in (config.MATCHING_PROVIDER_OPENAI, config.MATCHING_PROVIDER_BEDROCK):
+    with provider(_other):
+        with botocore_reporting("1.40.76"):
+            check(f"a too-old botocore does NOT refuse on {_other!r}, which "
+                  f"reaches no Converse API",
+                  drive(config.validate_matching_provider_config), None)
+
+# --- 7c-v. The two non-refusing states are not silent ----------------------
+with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC):
+    for _version, _label in ((None, "absent"), ("unknown", "unreadable")):
+        with botocore_reporting(_version):
+            # NOT THROUGH `drive`. That helper installs its OWN redirect, so
+            # an outer one captures nothing -- which reported this section as
+            # silent when it was not, and would have made the "said once"
+            # comparison a comparison of two empty strings.
+            _buf = io.StringIO()
+            _first = Raised(AssertionError("never ran"))
+            with contextlib.redirect_stderr(_buf), contextlib.redirect_stdout(_buf):
+                try:
+                    _first = config.validate_matching_provider_config()
+                except Exception as _exc:              # noqa: BLE001
+                    _first = Raised(_exc)
+                _said_once = _buf.getvalue()
+                try:
+                    config.validate_matching_provider_config()
+                except Exception:                      # noqa: BLE001
+                    pass
+                _said_twice = _buf.getvalue()
+            check(f"a {_label} botocore does not refuse", _first, None)
+            check_true(f"...and the {_label} arm really did emit something, so "
+                       f"the once-per-process comparison below is not two "
+                       f"empty strings", len(_said_once) > 0)
+            check_true(f"...but it is SAID, naming the floor -- silence and "
+                       f"'verified' must not look identical",
+                       _AT_FLOOR in _said_once and len(_said_once) > 0)
+            check(f"...and said ONCE per process, because validation runs at "
+                  f"the top of every Converse request",
+                  _said_twice, _said_once)
+
+# --- 7c-vi. The reader never imports botocore, which two other sections
+#            assert about sys.modules and would report as red -------------
+_saved_botocore = sys.modules.pop("botocore", None)
+try:
+    _v, _src = config.installed_botocore_version()
+    check("installed_botocore_version() leaves botocore out of sys.modules -- "
+          "sections 1c and 5 assert exactly that after driving the request "
+          "builder, which calls the validator at its first statement",
+          "botocore" in sys.modules, False)
+    check("...and it still answers, from the distribution metadata",
+          _src, config.BOTOCORE_VERSION_SOURCE_DISTRIBUTION)
+    check("the source vocabulary is closed and the live source is a member of "
+          "it -- the two sources can disagree, so which one answered is "
+          "reported rather than folded away",
+          (config.BOTOCORE_VERSION_SOURCES
+           == (config.BOTOCORE_VERSION_SOURCE_MODULE,
+               config.BOTOCORE_VERSION_SOURCE_DISTRIBUTION,
+               config.BOTOCORE_VERSION_SOURCE_NONE)
+           and _src in config.BOTOCORE_VERSION_SOURCES), True)
+    check("...with a version that parses",
+          config.classify_botocore_version(_v)
+          in config.BOTOCORE_SDK_STATES, True)
+
+    # AN IMPORTED botocore WINS, and the source says which answered. The two
+    # can disagree -- a vendored copy with no dist-info, or dist-info for a
+    # module something else shadows -- so the source is reported rather than
+    # folded away.
+    _fake = types.ModuleType("botocore")
+    _fake.__version__ = "9.9.9"
+    sys.modules["botocore"] = _fake
+    check("an already-imported botocore answers instead of the metadata, "
+          "because it is the thing that would actually run",
+          config.installed_botocore_version(),
+          ("9.9.9", config.BOTOCORE_VERSION_SOURCE_MODULE))
+
+    # AN IMPORTABLE botocore THAT REPORTS NO VERSION IS NOT `absent`, AND THE
+    # DIFFERENCE IS THE REMEDY. `absent` tells an operator the client build is
+    # where this refuses -- which is FALSE of a botocore already in
+    # sys.modules: that client WILL build, and every Converse call will then
+    # fail on a version nobody could read. The first version of this reader
+    # conflated the two.
+    _versionless = types.ModuleType("botocore")            # no __version__
+    sys.modules["botocore"] = _versionless
+    _saved_dist = config._BOTOCORE_DIST_VERSION
+    config._BOTOCORE_DIST_VERSION = None                   # and no metadata
+    try:
+        check("an importable botocore with no readable version is "
+              "version_unreadable, NOT absent",
+              config.botocore_sdk_state()[0],
+              config.BOTOCORE_SDK_VERSION_UNREADABLE)
+        check("...and it names the module as the source, which is why it is "
+              "not absent", config.botocore_sdk_state()[2],
+              config.BOTOCORE_VERSION_SOURCE_MODULE)
+        del sys.modules["botocore"]
+        check("...while the same state with NO module IS absent, so the two "
+              "are distinguished by the module and not by the version",
+              config.botocore_sdk_state()[0], config.BOTOCORE_SDK_ABSENT)
+    finally:
+        config._BOTOCORE_DIST_VERSION = _saved_dist
+finally:
+    sys.modules.pop("botocore", None)
+    if _saved_botocore is not None:
+        sys.modules["botocore"] = _saved_botocore
+check("the fake was removed again", "botocore" in sys.modules, False)
+
+# THE CACHE SENTINEL IS AN OBJECT, NOT A STRING, AND THIS IS WHAT SEES THE
+# DIFFERENCE. A string sentinel is a value botocore could in principle report,
+# and the cache would then read a REAL reported version as "not looked up",
+# silently re-resolve, and answer about the environment instead of about what
+# it was told. Driven with exactly that string: the cached value must be
+# HONOURED (and therefore classified `version_unreadable`), not re-resolved.
+with botocore_reporting("<not looked up>"):
+    check("a version string that happens to equal the old string sentinel is "
+          "still treated as a REPORTED version rather than as an empty cache",
+          config.installed_botocore_version(),
+          ("<not looked up>", config.BOTOCORE_VERSION_SOURCE_DISTRIBUTION))
+    check("...so it classifies as unreadable rather than silently answering "
+          "about the real environment",
+          config.botocore_sdk_state()[0],
+          config.BOTOCORE_SDK_VERSION_UNREADABLE)
+
+# --- 7c-vii. THIS ENVIRONMENT can run the shipped provider -----------------
+#
+# NOT an assertion that the state is `ok`: this file's own docstring says it
+# runs on a machine where boto3 is not installed, and `absent` is the right
+# answer there. What it refuses is the one state that means Stage 5 cannot
+# work at all.
+_LIVE_STATE, _LIVE_VERSION, _LIVE_SOURCE = config.botocore_sdk_state()
+print(f"  [environment] botocore {_LIVE_VERSION} ({_LIVE_SOURCE}) -> "
+      f"{_LIVE_STATE}; floor {_AT_FLOOR}")
+check(f"the installed botocore is not below the Converse floor "
+      f"(if this fails: {config.botocore_upgrade_command()})",
+      _LIVE_STATE == config.BOTOCORE_SDK_TOO_OLD, False)
+
+
+# ===========================================================================
+# SECTION 7d — THE PINS AND THE FLOOR CANNOT DRIFT APART
+# ===========================================================================
+
+section("7d. pyproject.toml declares a pair that satisfies the measured floor")
+
+# WHY A TEST AND NOT A COMMENT. The floor lives in config and the pins live in
+# pyproject.toml, and nothing connected them: the pin that shipped
+# (`boto3==1.40.14`, botocore undeclared) not only carried no floor, it
+# declared `botocore<1.41.0` and therefore FORBADE the one the Converse branch
+# needs. A floor whose pin can drift below it is a floor that fires as a
+# refusal on every run instead of at `pip install`.
+
+_PYPROJECT = _PYPROJECT_PATH          # hashed at import, with the other three
+
+
+def _declared_pin(name):
+    """The exact `==` pin pyproject declares for `name`, or None.
+
+    Returns None rather than raising on an unreadable file, so a broken
+    pyproject.toml is a RECORDED failure in the checks below rather than a
+    traceback at module level that takes the rest of this file with it.
+    """
+    import tomllib
+    try:
+        with open(_PYPROJECT, "rb") as fh:
+            data = tomllib.load(fh)
+    except Exception:                                          # noqa: BLE001
+        return None
+    prefix = f"{name}=="
+    for spec in data["project"]["dependencies"]:
+        if spec.replace(" ", "").startswith(prefix):
+            return spec.replace(" ", "")[len(prefix):]
+    return None
+
+
+_PIN_BOTO3 = _declared_pin("boto3")
+_PIN_BOTOCORE = _declared_pin("botocore")
+
+check("pyproject declares an EXACT boto3 pin", _PIN_BOTO3 is not None, True)
+check("pyproject declares an EXACT botocore pin -- boto3's own requirement is "
+      "a RANGE, so a boto3 pin alone leaves the resolver free to pick anywhere "
+      "inside it",
+      _PIN_BOTOCORE is not None, True)
+
+_REL_BOTO3 = config._botocore_release_tuple(_PIN_BOTO3)
+_REL_BOTOCORE = config._botocore_release_tuple(_PIN_BOTOCORE)
+
+
+def _at_or_above(release, floor):
+    """Comparison that cannot raise. A MISSING pin is NOT at or above.
+
+    A bare `release >= floor` raises TypeError when the pin is absent -- which
+    is EXACTLY the revert this section exists to catch -- and a raise inside a
+    `check(...)` argument list aborts the file with no summary. Measured: the
+    first version of this section reported one traceback where it owed nine
+    failures.
+    """
+    return isinstance(release, tuple) and release >= floor
+
+
+def _same_minor(left, right):
+    """Whether two parsed pins share major.minor. Never raises."""
+    return (isinstance(left, tuple) and isinstance(right, tuple)
+            and len(left) >= 2 and len(right) >= 2 and left[:2] == right[:2])
+
+
+check("the declared botocore pin parses", _REL_BOTOCORE is not None, True)
+check("the declared boto3 pin parses", _REL_BOTO3 is not None, True)
+check(f"the declared botocore pin {_PIN_BOTOCORE} is AT OR ABOVE the measured "
+      f"Converse floor {_AT_FLOOR} -- this is the check that keeps the pin and "
+      f"config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST from drifting apart",
+      _at_or_above(_REL_BOTOCORE, config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST),
+      True)
+check(f"the declared boto3 pin {_PIN_BOTO3} is at or above "
+      f"config.MIN_BOTO3_FOR_CONVERSE_REQUEST",
+      _at_or_above(_REL_BOTO3, config.MIN_BOTO3_FOR_CONVERSE_REQUEST), True)
+check("the two pins share a major.minor -- boto3's requirement on botocore is "
+      "capped at the next minor, so a pair from two different minors cannot "
+      "resolve at all",
+      _same_minor(_REL_BOTO3, _REL_BOTOCORE), True)
+
+# --- 7d-i. VERIFIED AGAINST boto3's OWN METADATA, where it can be ----------
+#
+# The three checks above rest on a pattern observed in boto3's published
+# metadata. This reads that metadata rather than trusting the pattern -- and it
+# is the check that would have caught the shipped defect, because
+# `boto3==1.40.14` declares `botocore<1.41.0` and 1.42.42 is outside it.
+#
+# It can only run when the INSTALLED boto3 IS the declared pin, because that is
+# the only metadata on disk. When it cannot, it says so by name rather than
+# passing quietly.
+
+
+def _botocore_bounds_of_installed_boto3():
+    """(lower, upper) release tuples boto3's metadata allows for botocore."""
+    import importlib.metadata
+    import re
+    lower = upper = None
+    for spec in importlib.metadata.requires("boto3") or []:
+        if ";" in spec or not spec.replace(" ", "").startswith("botocore"):
+            continue
+        for op, value in re.findall(r"(>=|<=|<|>|==)\s*([0-9][0-9.]*)", spec):
+            release = config._botocore_release_tuple(value)
+            if op in (">=", ">", "=="):
+                lower = release
+            elif op in ("<", "<="):
+                upper = release
+    return lower, upper
+
+
+try:
+    import importlib.metadata as _md
+    _INSTALLED_BOTO3 = _md.version("boto3")
+except Exception:                                              # noqa: BLE001
+    _INSTALLED_BOTO3 = None
+
+if _INSTALLED_BOTO3 == _PIN_BOTO3:
+    _lower, _upper = _botocore_bounds_of_installed_boto3()
+    check("boto3's own metadata declares a botocore range at all, so the "
+          "comparison below is not vacuous",
+          _lower is not None and _upper is not None, True)
+    check(f"the declared boto3 pin's metadata ADMITS the declared botocore "
+          f"pin ({_lower} <= {_REL_BOTOCORE} < {_upper}) -- the shipped "
+          f"boto3==1.40.14 declared botocore<1.41.0 and did NOT",
+          (_at_or_above(_REL_BOTOCORE, _lower)
+           and isinstance(_upper, tuple) and isinstance(_REL_BOTOCORE, tuple)
+           and _REL_BOTOCORE < _upper), True)
+else:
+    print(f"  NOTE  boto3's metadata was not read: installed "
+          f"{_INSTALLED_BOTO3!r} != declared {_PIN_BOTO3!r}, so the only "
+          f"metadata on disk describes a different release. Run "
+          f"`pip install -e .` to verify this check.")
+    check("the pins are still checkable against the floors without it",
+          _REL_BOTOCORE >= config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST, True)
+
+# --- 7d-ii. The floors are read by something other than this file ---------
+check("config.MIN_BOTO3_FOR_CONVERSE_REQUEST is a 3-tuple of ints, so the "
+      "upgrade command it renders is a real version",
+      (isinstance(config.MIN_BOTO3_FOR_CONVERSE_REQUEST, tuple)
+       and len(config.MIN_BOTO3_FOR_CONVERSE_REQUEST) == 3
+       and all(isinstance(n, int)
+               for n in config.MIN_BOTO3_FOR_CONVERSE_REQUEST)), True)
+check("the upgrade command names BOTH distributions and both floors",
+      (f"boto3=={config.boto3_floor_text()}" in config.botocore_upgrade_command()
+       and f"botocore=={config.botocore_floor_text()}"
+       in config.botocore_upgrade_command()), True)
+check("MIN_BOTOCORE_MEASURED_ON is a date, printed in the refusal so the "
+      "number is not an anonymous constant",
+      bool(config.MIN_BOTOCORE_MEASURED_ON
+           and config.MIN_BOTOCORE_MEASURED_ON in _sdk_msg), True)
+
+
+# ===========================================================================
 # SECTION 7b — THE CREDENTIAL GUARD, ALL SIXTEEN STATES
 # ===========================================================================
 
@@ -1289,7 +1749,10 @@ section("7b. A credential boto3 must not use is refused before the client")
 # other layer: an empty `AWS_BEARER_TOKEN_BEDROCK` is not "no credential", it
 # is an EMPTY BEARER TOKEN, and botocore selects bearer auth on the variable's
 # PRESENCE -- `botocore/handlers.py` asks `get_token_from_environment(...) is
-# not None`, verified against the installed botocore 1.40.76. So the SigV4
+# not None`, verified against botocore 1.40.76 when this was written and
+# RE-VERIFIED against the pinned 1.42.42 on 2026-09-03 (the predicate was
+# renamed `_should_use_bearer_auth` -> `_should_prefer_bearer_auth`; the rule
+# is the same, and an empty string is still `is not None`). So the SigV4
 # chain is bypassed, an instance role that would have worked is never
 # consulted, and the only symptom is a 401 that names nothing.
 #

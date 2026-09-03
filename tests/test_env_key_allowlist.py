@@ -501,7 +501,10 @@ print("=" * 74)
 
 # THE MEASUREMENT THIS SECTION DEFENDS. botocore selects bearer auth on
 # `get_token_from_environment(...) is not None` -- NOT on truthiness
-# (botocore/handlers.py, `_should_use_bearer_auth`). So an empty
+# (botocore/handlers.py, `_should_prefer_bearer_auth` at the pinned
+# botocore 1.42.42; it was `_should_use_bearer_auth` when this was
+# first measured against 1.40.76, and the RULE is unchanged across the
+# rename -- re-read 2026-09-03). So an empty
 # AWS_BEARER_TOKEN_BEDROCK makes it sign with an EMPTY BEARER TOKEN -- a 401
 # that names nothing -- and it does so INSTEAD of the SigV4 chain, so an
 # instance role, an SSO profile or a container role that would have worked is

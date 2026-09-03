@@ -1223,22 +1223,21 @@ def _probe_bedrock_anthropic(args):
 # THE SDK SHAPE PREFLIGHT — FREE, AND IT RUNS ABOVE EVERY PAID CALL
 # ===========================================================================
 
-# THE MINIMUM botocore THAT CAN EXPRESS THIS REQUEST AT ALL. MEASURED
-# 2026-09-03 by bisecting the released wheels and reading each one's
-# `bedrock-runtime/2023-09-30/service-2.json` -- not read off a changelog and
-# not inferred from a release date:
+# THE FLOOR, THE VERSION READER AND THE STATE VOCABULARY ALL LIVE IN
+# `oncotriage/config.py` AND ARE NOT RESTATED HERE. They were declared in this
+# file when only this file consulted them; the pipeline consults them now --
+# `config.validate_matching_provider_config()` REFUSES a Converse run whose
+# botocore predates the floor -- and a probe carrying its own copy of the
+# number would be able to tell an operator something the pipeline will not act
+# on. `config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST` carries the measured bisect
+# table and `config.botocore_sdk_state()` is the reader.
 #
-#     botocore              outputConfig   cachePoint.ttl   usage.cacheDetails
-#     <= 1.42.20                 no              no                no
-#     1.42.21 .. 1.42.41         no             yes               yes
-#     1.42.42 and later         YES             YES               YES
-#
-# So structured output on Converse -- A1, the item the adapter ranks first
-# because its failure makes the branch useless rather than degraded -- is
-# expressible from 1.42.42 and from no earlier release.
-MIN_BOTOCORE_FOR_CONVERSE_REQUEST = (1, 42, 42)
-MIN_BOTOCORE_MEASURED_ON = "2026-09-03"
-
+# WHAT THIS FILE STILL OWNS, and it is the half config cannot do: the request
+# built by the adapter, validated by botocore's OWN ParamValidator against the
+# service model of THIS client. A version number is a proxy for that; the
+# validator is the fact. So the two are not redundant -- config refuses a
+# version it knows is too old, and this refuses a request the SDK will not
+# accept whatever the version says.
 # Response members the adapter READS. These raise nothing when absent -- the
 # field simply never arrives, `.get` returns None, and the shipped code records
 # 'not_reported' and fails the patient. That is cache-or-nothing working, and
@@ -1248,15 +1247,6 @@ MIN_BOTOCORE_MEASURED_ON = "2026-09-03"
 _RESPONSE_MEMBERS_READ = (("TokenUsage", "cacheReadInputTokens"),
                           ("TokenUsage", "cacheWriteInputTokens"),
                           ("TokenUsage", "cacheDetails"))
-
-
-def _botocore_version_tuple():
-    """The installed botocore's version as a tuple, or None if unreadable."""
-    try:
-        import botocore
-        return tuple(int(x) for x in str(botocore.__version__).split(".")[:3])
-    except Exception:                                  # noqa: BLE001
-        return None
 
 
 def _preflight_sdk_shape(client, kwargs, config):
@@ -1289,15 +1279,14 @@ def _preflight_sdk_shape(client, kwargs, config):
     IT IS bedrock_anthropic ONLY. The Responses branch reaches Bedrock through
     the OpenAI SDK and has no botocore service model to validate against.
     """
-    import botocore
-
     section("SDK PREFLIGHT — can the installed botocore express this request")
-    ver = _botocore_version_tuple()
-    floor = ".".join(str(n) for n in MIN_BOTOCORE_FOR_CONVERSE_REQUEST)
-    print(f"  botocore installed : {botocore.__version__}")
+    state, reported, source = config.botocore_sdk_state()
+    floor = config.botocore_floor_text()
+    print(f"  botocore installed : {reported} ({source})")
     print(f"  minimum that can   : {floor}  (measured "
-          f"{MIN_BOTOCORE_MEASURED_ON} by bisecting released wheels; see "
-          f"MIN_BOTOCORE_FOR_CONVERSE_REQUEST)")
+          f"{config.MIN_BOTOCORE_MEASURED_ON} by bisecting released wheels; "
+          f"see config.MIN_BOTOCORE_FOR_CONVERSE_REQUEST)")
+    print(f"  version verdict    : {state}")
 
     try:
         from botocore.validate import ParamValidator
@@ -1359,22 +1348,33 @@ def _preflight_sdk_shape(client, kwargs, config):
           "Stage 5 call on")
     print(f"  provider {config.MATCHING_PROVIDER!r} fails here, locally, "
           f"before the wire.")
-    if ver is None:
-        # THE VERSION COULD NOT BE PARSED, so neither remedy can be asserted.
-        # Saying "at or above the floor" here would be a claim about a number
-        # nobody read.
+    # FOUR STATES, FOUR REMEDIES, AND THE THIRD IS THE ONE THAT MUST NOT BE
+    # FOLDED INTO THE OTHERS. `config.classify_botocore_version` is the owner;
+    # this branches on its closed vocabulary exhaustively, so a state added
+    # there and not handled here reaches the `else` by name rather than being
+    # absorbed into "at or above the floor" -- which would be a claim about a
+    # number nobody read.
+    if state == config.BOTOCORE_SDK_TOO_OLD:
+        print(f"\n  REMEDY: botocore >= {floor}. The installed {reported} "
+              f"predates it.")
+        print(f"          {config.botocore_upgrade_command()}")
+        print("          NOTE: reaching this line at all means the pipeline's "
+              "own refusal was")
+        print("          bypassed -- config.validate_matching_provider_config()"
+              " refuses this")
+        print("          state before any request is built.")
+    elif state == config.BOTOCORE_SDK_VERSION_UNREADABLE:
         print(f"\n  REMEDY: botocore >= {floor}. The installed version string "
-              f"({botocore.__version__!r}) could not be")
+              f"({reported!r}) could not be")
         print("          parsed, so whether it is below that floor is NOT "
               "established here --")
         print("          the refusal above is, and it is the authority.")
-    elif ver < MIN_BOTOCORE_FOR_CONVERSE_REQUEST:
-        print(f"\n  REMEDY: botocore >= {floor}. The installed "
-              f"{botocore.__version__} predates it.")
-        print("          boto3 is pinned in pyproject.toml and botocore is "
-              "NOT, so the floor")
-        print("          has to be stated for botocore itself: a boto3 pin "
-              "alone carries none.")
+    elif state == config.BOTOCORE_SDK_ABSENT:
+        print(f"\n  REMEDY: botocore >= {floor}. No botocore version could be "
+              f"read at all, so the")
+        print("          floor is unverified; the refusal above is the "
+              "authority.")
+        print(f"          {config.botocore_upgrade_command()}")
     else:
         print("\n  REMEDY: the installed botocore is at or above the "
               "measured floor, so this is")

@@ -11325,7 +11325,8 @@ claim is corrected in place and (A5) is the item that settles where the field
 really lives.
 
 **FOUR NEW GO-LIVE ITEMS, A11..A14, RANKED.** (A11) is the warmup's request
-shape -- `maxTokens = 1` with the structured-output block dropped -- ranked
+shape -- `maxTokens = 1`, WITH the structured-output block since
+`BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG` shipped True -- ranked
 first because a warmup that cannot be issued makes the mode unavailable.
 (A12) is the write-and-read pair, ranked second because it is the failure that
 costs money silently, and it is now the one the shipped code REFUSES rather
@@ -11334,16 +11335,25 @@ cache hit makes every stored `estimated_cost_usd` on this branch an
 OVER-estimate -- deliberate, in the safe direction, and a pricing-schema
 decision rather than a go-live blocker. (A14) is the throttling response.
 
-**THE WARMUP DROPS `outputConfig` AND THAT IS ARGUED FROM THE CACHED CHAIN
-RATHER THAN FROM TASTE.** Converse processes checkpoints `tools -> system ->
-messages` and `outputConfig` is in none of them, so dropping it cannot change
-the prefix -- a stronger statement than the OpenAI warmup can make about
-`response_format`, which carries a VERIFY-AT-GO-LIVE for exactly that reason.
-What it costs is stated: `structured-output.html` warns a first-time schema
-"compiles the grammar, which may take up to a few minutes", and with the warmup
-not carrying the schema the WAVE pays that compile, N requests at once.
-`BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG` turns it back on in one edit once
-(A1)'s timing says whether it is real.
+**THE WARMUP CARRIES `outputConfig`, AND THE ARGUMENT FOR DROPPING IT WAS
+REFUTED BY A LIVE PROBE.** This paragraph used to say the opposite, from the
+cached chain: Converse processes checkpoints `tools -> system -> messages`,
+`outputConfig` is in none of them, so dropping it cannot change the prefix the
+warmup writes. **The citation is accurate and the inference from it is false.**
+Measured 2026-09-01 against `us.anthropic.claude-sonnet-4-6` with the warmup
+and the trial calls carrying a system block asserted byte-identical, the
+structured-output block DOES take part in the cached prefix -- so the two
+shapes cache separately, and under the old default the warmup warmed a prefix
+no trial call ever used. **What it cost was money, not correctness**: nothing
+raised and no verdict changed, and the only trace was a counter nobody had
+read. `BEDROCK_ANTHROPIC_WARMUP_SEND_OUTPUT_CONFIG` ships **True**, and its own
+block in `oncotriage/config.py` is the source for all of it -- the two arms'
+cache readings, the per-campaign cost of the old default, and the two arguments
+that SURVIVED: that a full Stage 5 schema at `maxTokens = 1` was ACCEPTED
+(which settles A11 for both warmup shapes), and that carrying the schema in the
+warmup makes the WARMUP pay the grammar compile `structured-output.html` warns
+about, once and awaited, instead of N wave requests meeting it at once. It
+remains a knob; set it False to reproduce the old behaviour.
 
 **THE PROBE IS EXTENDED AND WAS NOT RUN.** `--probe-per-trial` issues three
 extra billed calls -- one warmup-shaped, two trial-shaped over the same

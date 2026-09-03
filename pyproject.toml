@@ -530,7 +530,54 @@ dependencies = [
     # the import into the functions that need it, so the dry run -- the half
     # that runs today -- works with boto3 absent. That is the same third-party
     # in-a-function-body exemption `import icd10` and `import torch` carry.
-    "boto3==1.40.14",
+    # --- 1.42.42, NOT 1.40.14, AND THE STAGE 5 JUDGE IS WHY -----------------
+    # This stopped being only the S3 tool's dependency when
+    # MATCHING_PROVIDER flipped to "bedrock_anthropic": Stage 5 now reaches
+    # Claude Sonnet 4.6 through Converse, and botocore VALIDATES that request
+    # locally before signing it. On 2026-09-03 `bedrock_probe.py` was refused
+    # by the installed SDK rather than by Amazon:
+    #
+    #     ParamValidationError: Unknown parameter in input: "outputConfig"
+    #     Unknown parameter in system[1].cachePoint: "ttl"
+    #
+    # THE FLOOR IS MEASURED, by installing released wheels and reading each
+    # one's `bedrock-runtime/2023-09-30/service-2.json` through botocore's own
+    # shape map -- not off a changelog and not from a release date:
+    #
+    #     botocore              outputConfig   cachePoint.ttl   usage.cacheDetails
+    #     <= 1.42.20                 no              no                no
+    #     1.42.21 .. 1.42.41         no             yes               yes
+    #     1.42.42 and later         YES             YES               YES
+    #
+    # `oncotriage/config.py:MIN_BOTOCORE_FOR_CONVERSE_REQUEST` is the one
+    # owner of that number, the pipeline refuses at validation below it, and
+    # tests/test_agent_bedrock_anthropic_adapter.py section 7c fails if this
+    # pin and that constant ever disagree.
+    #
+    # BOTH DISTRIBUTIONS ARE PINNED, AND THE SECOND IS NOT REDUNDANT. boto3's
+    # requirement on botocore is a RANGE, so a boto3 pin alone leaves the
+    # resolver free to choose anywhere inside it -- measured: resolving
+    # `boto3==1.42.42` alone picks botocore 1.42.97. Worse, a boto3 pin can
+    # FORBID the floor: `boto3==1.40.14` declares `botocore<1.41.0`, so the
+    # shipped pin made 1.42.42 uninstallable and `pip install botocore==...`
+    # on its own would leave the environment broken.
+    #
+    # 1.42.42 FOR BOTH, and boto3's number is measured rather than mirrored:
+    # boto3 X.Y.Z does not in general require botocore X.Y.Z (1.42.0 requires
+    # >=1.41.6,<1.42.0). Read from the distributions' own metadata, 1.42.42 is
+    # the unique boto3 whose declared botocore floor EQUALS the measured one,
+    # and it is the release AWS published alongside that botocore -- the pair
+    # they ship and test together. 1.42.1 would merely ADMIT it, pairing two
+    # releases nobody released together; 1.42.43 would demand one ABOVE the
+    # floor.
+    #
+    # WHAT IT MOVES, measured with `pip install`: s3transfer 0.13.1 -> 0.16.1
+    # (boto3 1.42.x declares `s3transfer>=0.16.0,<0.17.0`), and nothing else.
+    # jmespath 1.0.1, urllib3 2.3.0 and python-dateutil 2.9.0.post0 all
+    # already satisfy the new botocore's ranges, so no other pin in this file
+    # moves.
+    "boto3==1.42.42",
+    "botocore==1.42.42",
 
     "tqdm==4.67.1",
 ]
