@@ -746,12 +746,20 @@ nowhere while the server's 401 says nothing about a trailing separator. Fifth
 victim of that helper after ENV_AIRFLOW_PASSWORD, ENV_INFERENCES_DB,
 ENV_ALLOW_DEGRADED_REGISTRIES and ENV_LOG_LEVEL.
 
-WHY IT IS NOT A FOURTH LINE IN ``05- Keys/.env``. ``paths.load_env_keys()``
-reads exactly three names and validates that all three are present; a fourth
-would make every process that has no Bedrock key fail to start, including every
-process running the default OpenAI provider. The credential is therefore an
-environment variable, which is also what AWS's own documentation assumes -- see
+WHY IT IS NOT A FOURTH *REQUIRED* LINE IN ``05- Keys/.env``.
+``paths.load_env_keys()`` VALIDATES exactly three names -- ``REQUIRED_ENV_KEYS``
+-- and raises when any of them is absent; a fourth required name would make
+every process that has no Bedrock key fail to start, including every process
+running the OpenAI provider. The credential is therefore resolved from the
+environment, which is also what AWS's own documentation assumes -- see
 ENV_AWS_BEARER_TOKEN_BEDROCK below.
+
+THE FILE *MAY* CARRY IT, AND SINCE THE .env ALLOWLIST PASS IT IS LOADED WHEN IT
+DOES. This name is a member of ``paths.OPTIONAL_ENV_KEYS``, so a line for it in
+the .env is parsed and written into ``os.environ`` and is NEVER validated: a
+machine with no Bedrock credential still starts. That is a widening of what the
+sentence above used to describe and not a contradiction of it -- what remains
+true, and is the whole argument, is that no process is required to supply it.
 
 A SHORT-TERM BEDROCK API KEY EXPIRES IN AT MOST 12 HOURS (AWS, "API keys",
 docs.aws.amazon.com/bedrock/latest/userguide/api-keys.html, read 2026-08-21),

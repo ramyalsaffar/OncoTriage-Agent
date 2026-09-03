@@ -73,6 +73,7 @@ import hashlib
 import io
 import json
 import os
+import subprocess
 import sys
 import types
 
@@ -222,6 +223,15 @@ def sub(text, old, new, expect):
 
 
 _PLANT_SEQ = [0]
+# DERIVED FROM THE MODULE THIS PROCESS IMPORTED, never from this file's own
+# location: the child in section 7b must import the same tree the parent did.
+#
+# OFF `config.__file__` AND NOT `oncotriage.__file__`. The bootstrap above binds
+# the name `oncotriage` only on its SUCCESS path -- its ImportError branch
+# inserts a directory into sys.path and never re-imports -- so on a checkout
+# without `pip install -e .` that name is UNBOUND and reading it here would
+# abort the whole file at module scope. `config` is bound on every path.
+_CODE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(config.__file__)))
 _ADAPTER_PATH = os.path.abspath(bac.__file__)
 _EVALUATION_PATH = os.path.abspath(_evaluation.__file__)
 _CONFIG_PATH = os.path.abspath(config.__file__)
@@ -1265,6 +1275,362 @@ check("the shipped default's price is the INFERRED geo rate, and the global "
       get_model_cost("us.anthropic.claude-sonnet-4-6", 1_000_000, 0)
       == get_model_cost("global.anthropic.claude-sonnet-4-6", 1_000_000, 0),
       False)
+
+
+# ===========================================================================
+# SECTION 7b — THE CREDENTIAL GUARD, ALL SIXTEEN STATES
+# ===========================================================================
+
+section("7b. A credential boto3 must not use is refused before the client")
+
+# WHY THIS SECTION IS DRIVEN AND NOT READ. `config._assert_bedrock_anthropic_
+# credential_is_visible()` is the last thing between this process and
+# `boto3.client(...)`, and the state it exists to refuse is invisible to every
+# other layer: an empty `AWS_BEARER_TOKEN_BEDROCK` is not "no credential", it
+# is an EMPTY BEARER TOKEN, and botocore selects bearer auth on the variable's
+# PRESENCE -- `botocore/handlers.py` asks `get_token_from_environment(...) is
+# not None`, verified against the installed botocore 1.40.76. So the SigV4
+# chain is bypassed, an instance role that would have worked is never
+# consulted, and the only symptom is a 401 that names nothing.
+#
+# THE SIXTEEN STATES ARE DRIVEN RATHER THAN SAMPLED because the two variables
+# interact: one refusal is about AWS's variable alone and the other is about
+# this project's variable in the ABSENCE of AWS's, and the interesting cells
+# are the ones where both have an opinion.
+#
+# NO CLIENT IS BUILT HERE AND boto3 IS NOT IMPORTED. The guard is a standalone
+# function that imports nothing, so it is called directly; the "the guard runs
+# BEFORE boto3.client" claim is settled twice below -- structurally by an AST
+# pin, and behaviourally in a SUBPROCESS, so this process's `boto3 is not in
+# sys.modules` claim (section 1c, section 9) survives verbatim.
+
+_CRED_VARS = (config.settings.ENV_BEDROCK_API_KEY,
+              config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK)
+_CRED_SAVED = {_v: os.environ.get(_v) for _v in _CRED_VARS}
+
+# Assembled rather than written out, so this file carries no literal a secret
+# scanner has to be taught to ignore. `test_secret_scan_gate.py`'s own rule.
+_FAKE_TOKEN = "_FAKE" + "-bedrock-token-" + str(len("placeholder"))
+
+# (label, value) -- None means "not in os.environ at all".
+_CRED_STATES = (("unset", None), ("empty", ""), ("blank", " \t\n "),
+                ("real", _FAKE_TOKEN))
+
+_REFUSE_BLANK = "blank-bearer"
+_REFUSE_INVISIBLE = "project-key-invisible"
+_ALLOWED = "allowed"
+
+
+def _set_cred(name, value):
+    if value is None:
+        os.environ.pop(name, None)
+    else:
+        os.environ[name] = value
+
+
+def _guard_verdict():
+    """One of the three outcomes above, or a Raised for anything unexpected."""
+    out = drive(config._assert_bedrock_anthropic_credential_is_visible)
+    if not isinstance(out, Raised):
+        return _ALLOWED
+    if out.kind != "RuntimeError":
+        return out
+    if "empty or whitespace-only value" in out.message:
+        return _REFUSE_BLANK
+    if "is set but" in out.message:
+        return _REFUSE_INVISIBLE
+    return out
+
+
+# EXPECTED IS DERIVED FROM THE RULE, NOT TRANSCRIBED FROM A RUN. Transcribing
+# the observed matrix would make whatever the code does correct by definition,
+# which is this project's standing objection to a golden file refreshed to
+# accommodate a change.
+def _expected(onc_label, aws_label):
+    if aws_label in ("empty", "blank"):
+        return _REFUSE_BLANK                     # botocore would see a token
+    if aws_label == "unset" and onc_label == "real":
+        return _REFUSE_INVISIBLE                 # boto3 cannot read the other
+    return _ALLOWED                              # boto3's own chain decides
+
+
+try:
+    _matrix = {}
+    for _onc_label, _onc in _CRED_STATES:
+        for _aws_label, _aws in _CRED_STATES:
+            _set_cred(_CRED_VARS[0], _onc)
+            _set_cred(_CRED_VARS[1], _aws)
+            _matrix[(_onc_label, _aws_label)] = _guard_verdict()
+
+    for _cell, _got in sorted(_matrix.items()):
+        check(f"ONCOTRIAGE={_cell[0]:<5} AWS={_cell[1]:<5} -> "
+              f"{_expected(*_cell)}", _got, _expected(*_cell))
+
+    # NEITHER LINE MAY PUT A VERDICT IN A SET. `Raised` defines __eq__ and no
+    # __hash__, so it is unhashable -- and `set(_matrix.values())` therefore
+    # raises TypeError EXACTLY when a defect makes a cell answer with an
+    # unexpected exception, which is when this file owes failures rather than a
+    # traceback. MEASURED: revert R5 below aborted here before this was
+    # written. The known outcomes are strings; anything else is repr'd.
+    _known = [_v for _v in _matrix.values() if isinstance(_v, str)]
+    _unknown = sorted(repr(_v) for _v in _matrix.values()
+                      if not isinstance(_v, str))
+    check_true("NON-DEGENERACY: the matrix exercises all three outcomes, so "
+               "the expectations above are not one answer repeated",
+               len(set(_known)) == 3)
+    check("...and every cell resolved to a known outcome rather than an "
+          "unexpected exception", _unknown, [])
+
+    # --- 7b-ii. THE TWO STATES THAT USED TO ESCAPE ------------------------
+    #
+    # MEASURED AGAINST THE PRE-FIX GUARD, which tested
+    # `not os.environ.get(AWS_BEARER_TOKEN_BEDROCK)` -- truthiness. A
+    # WHITESPACE-ONLY value is TRUTHY, so it read as "set" there while
+    # `settings.resolve_bedrock_api_key()` had already decided the same value
+    # said nothing: two questions, two answers, one variable. Both cells are
+    # pinned by name so a revert to either question fails here.
+    check("a whitespace-only AWS token is REFUSED even when this project's "
+          "variable carries a real one -- the pre-fix guard let this through",
+          _matrix[("real", "blank")], _REFUSE_BLANK)
+    check("...and an EMPTY one is refused for the same reason rather than "
+          "being reported as 'AWS_BEARER_TOKEN_BEDROCK is not set', which is "
+          "false of a variable that is set to ''",
+          _matrix[("real", "empty")], _REFUSE_BLANK)
+
+    # --- 7b-iii. THE MESSAGE CARRIES WHAT AN OPERATOR ACTS ON -------------
+    _set_cred(_CRED_VARS[0], None)
+    _set_cred(_CRED_VARS[1], "")
+    _blank_msg = message_of(config._assert_bedrock_anthropic_credential_is_visible)
+    for _needle, _why in (
+            (config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK, "names the variable"),
+            ("is not None", "names botocore's PRESENCE test verbatim"),
+            ("bypass the SigV4 chain", "names what is lost, not just what fails"),
+            ("unset", "gives the first fix"),
+            ("set it to a real Bedrock API key", "gives the second fix")):
+        check_true(f"the blank-token refusal {_why}", _needle in _blank_msg)
+    check("...and it does NOT name this project's variable when that variable "
+          "is not set, so the remedy is not padded with an irrelevant one",
+          config.settings.ENV_BEDROCK_API_KEY in _blank_msg, False)
+
+    _set_cred(_CRED_VARS[0], _FAKE_TOKEN)
+    _both_msg = message_of(config._assert_bedrock_anthropic_credential_is_visible)
+    check_true("...and it DOES when that variable carries a real value, so the "
+               "operator is not sent round the loop twice",
+               config.settings.ENV_BEDROCK_API_KEY in _both_msg
+               and "the same value" in _both_msg)
+
+    # NEVER THE VALUE. The one thing every refusal in this area must not do.
+    for _label, _msg in (("blank-only", _blank_msg), ("both-set", _both_msg)):
+        check(f"the {_label} refusal prints no credential VALUE",
+              _FAKE_TOKEN in _msg, False)
+
+    # --- 7b-iv. AN EMPTY ONCOTRIAGE_BEDROCK_API_KEY IS NOT REFUSED --------
+    #
+    # ASSERTED AS A DECISION, not left as an accident. boto3 never reads that
+    # name, so an empty value cannot change which credential is selected -- its
+    # outcome is identical to the variable being absent, and refusing it would
+    # stop a machine whose instance role works.
+    for _blank in ("", "   "):
+        _set_cred(_CRED_VARS[0], _blank)
+        _set_cred(_CRED_VARS[1], None)
+        check(f"an ONCOTRIAGE_BEDROCK_API_KEY of {_blank!r} is treated exactly "
+              f"as absent, because boto3 does not read it",
+              _guard_verdict(), _ALLOWED)
+    check("...which is the same verdict the genuinely-absent state gets, so "
+          "the claim is a comparison and not one reading",
+          _matrix[("unset", "unset")], _ALLOWED)
+
+    # --- 7b-v. ONE DERIVATION, THREE CLOSED STATES ------------------------
+    check("the bearer-state vocabulary is closed and has exactly three members",
+          sorted(config.BEDROCK_BEARER_STATES),
+          sorted({config.BEDROCK_BEARER_ABSENT, config.BEDROCK_BEARER_BLANK,
+                  config.BEDROCK_BEARER_SET}))
+    check_true("...and its members are distinct, which is what the import-time "
+               "guard beside it protects",
+               len(set(config.BEDROCK_BEARER_STATES)) == 3)
+    for _value, _state in ((None, config.BEDROCK_BEARER_ABSENT),
+                           ("", config.BEDROCK_BEARER_BLANK),
+                           (" \t\n ", config.BEDROCK_BEARER_BLANK),
+                           (_FAKE_TOKEN, config.BEDROCK_BEARER_SET)):
+        _set_cred(_CRED_VARS[1], _value)
+        check(f"_bedrock_bearer_env_state() answers {_state!r} for "
+              f"{'absent' if _value is None else repr(_value)}",
+              config._bedrock_bearer_env_state(), _state)
+    _seen_states = []
+    for _v in (None, "", " ", "\t", _FAKE_TOKEN, " x "):
+        _set_cred(_CRED_VARS[1], _v)
+        _seen_states.append(config._bedrock_bearer_env_state())
+    check("every answer it gives is a member of the vocabulary",
+          sorted({_s for _s in _seen_states
+                  if _s not in config.BEDROCK_BEARER_STATES}), [])
+    check("...and it reaches all three, so the sweep is not one answer six "
+          "times", sorted(set(_seen_states)),
+          sorted(set(config.BEDROCK_BEARER_STATES)))
+finally:
+    for _v, _old in _CRED_SAVED.items():
+        _set_cred(_v, _old)
+
+check("both credential variables are back where this section found them",
+      {_v: os.environ.get(_v) for _v in _CRED_VARS}, _CRED_SAVED)
+
+# --- 7b-vi. BOTH REFUSALS READ ONE DERIVATION -------------------------------
+#
+# STRUCTURAL, because the behavioural matrix above cannot see WHICH question
+# each refusal asked -- only that today they agree. The pre-fix defect was
+# exactly two questions agreeing on three states out of four.
+_GUARD_SRC = ast.parse(open(_CONFIG_PATH, encoding="utf-8").read())
+_GUARD_FN = next((n for n in ast.walk(_GUARD_SRC)
+                  if isinstance(n, ast.FunctionDef)
+                  and n.name == "_assert_bedrock_anthropic_credential_is_visible"),
+                 None)
+check_true("the guard was found in the shipped source, so the walk below is "
+           "not vacuous", _GUARD_FN is not None)
+_GUARD_CALLS = [n.func.id for n in ast.walk(_GUARD_FN)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)] \
+    if _GUARD_FN else []
+check("the guard asks for the bearer state exactly ONCE -- two calls is two "
+      "readings of a variable another thread could have changed between them",
+      _GUARD_CALLS.count("_bedrock_bearer_env_state"), 1)
+# WALKED AS NAMES, NOT GREPPED. `ast.unparse` keeps the docstring, and this
+# guard's docstring ARGUES about os.environ -- so a substring test would report
+# the argument as the defect. This project has shipped that shape before.
+_GUARD_ENVIRON_READS = [n for n in ast.walk(_GUARD_FN)
+                        if isinstance(n, ast.Attribute) and n.attr == "environ"
+                        and isinstance(n.value, ast.Name)] if _GUARD_FN else []
+check("the guard reaches os.environ NOWHERE itself, so the truthiness test "
+      "that disagreed with the resolver cannot come back",
+      len(_GUARD_ENVIRON_READS), 0)
+check_true("NON-DEGENERACY: the same walk DOES find the one read, in the "
+           "derivation that owns it",
+           any(isinstance(n, ast.Attribute) and n.attr == "environ"
+               for f in ast.walk(_GUARD_SRC)
+               if isinstance(f, ast.FunctionDef)
+               and f.name == "_bedrock_bearer_env_state"
+               for n in ast.walk(f)))
+
+# --- 7b-vii. THE GUARD RUNS BEFORE boto3.client -----------------------------
+_FACTORY = next((n for n in ast.walk(_GUARD_SRC)
+                 if isinstance(n, ast.FunctionDef)
+                 and n.name == "get_bedrock_anthropic_client"), None)
+check_true("the factory was found, so the ordering pin below is not vacuous",
+           _FACTORY is not None)
+_guard_lines = [n.lineno for n in ast.walk(_FACTORY)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                and n.func.id == "_assert_bedrock_anthropic_credential_is_visible"] \
+    if _FACTORY else []
+_client_lines = [n.lineno for n in ast.walk(_FACTORY)
+                 if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                 and n.func.attr == "client"
+                 and isinstance(n.func.value, ast.Name)
+                 and n.func.value.id == "boto3"] if _FACTORY else []
+check("the factory calls the guard exactly once", len(_guard_lines), 1)
+check("...and constructs exactly one boto3 client", len(_client_lines), 1)
+check_true("...and the guard is ABOVE the construction, so no credential this "
+           "project refuses can reach botocore",
+           bool(_guard_lines) and bool(_client_lines)
+           and _guard_lines[0] < _client_lines[0])
+
+# --- 7b-viii. AND NOT ONE CLIENT IS BUILT, MEASURED IN A SUBPROCESS ---------
+#
+# THE AST PIN ABOVE PROVES AN ORDERING; THIS PROVES AN OUTCOME, and neither
+# replaces the other. A pin cannot see a client built by something the factory
+# calls, and a counter cannot see a second construction site added tomorrow.
+#
+# WHY A SUBPROCESS. `get_bedrock_anthropic_client()` imports boto3 BEFORE it
+# reaches the guard -- deliberately, so a machine without boto3 is told to
+# install it rather than told its credentials are wrong -- so driving the real
+# factory in THIS process would put boto3 in `sys.modules` and break the claim
+# section 1c and section 9 make verbatim. The child counts; the parent stays
+# boto3-free.
+#
+# THE CHILD'S PROJECT ROOT IS A DIRECTORY THAT DOES NOT EXIST. Nothing on this
+# path should resolve a path or read a .env, and if a future edit makes it do
+# so the child reports an unexpected exception instead of quietly reading the
+# operator's real credentials file. `paths` resolves lazily, so pointing the
+# root at nothing costs nothing until something reads.
+
+_CHILD = r'''
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+_net = []
+import socket
+def _boom(*a, **k):
+    _net.append("connect"); raise AssertionError("network attempt")
+socket.socket.connect = _boom
+socket.socket.connect_ex = _boom
+socket.create_connection = _boom
+socket.getaddrinfo = _boom
+built = []
+guard = "armed"
+try:
+    import boto3
+except Exception as exc:
+    guard = "inert: boto3 not importable (%s)" % type(exc).__name__
+else:
+    def _counting(*a, **k):
+        built.append(a[0] if a else k.get("service_name"))
+        raise AssertionError("boto3.client was reached")
+    boto3.client = _counting
+from oncotriage import config
+try:
+    config.get_bedrock_anthropic_client()
+    outcome = "<did not raise>"
+    message = ""
+except Exception as exc:
+    outcome = type(exc).__name__
+    message = str(exc)
+print("__RESULT__" + json.dumps({
+    "guard": guard, "outcome": outcome, "clients": len(built),
+    "net": len(_net), "blank": "empty or whitespace-only value" in message,
+    "reached_counter": "boto3.client was reached" in message}))
+'''
+
+
+def _child(aws_value):
+    """Drive the REAL factory in a child; return its JSON report or a Raised."""
+    env = dict(os.environ)
+    env["PYTHONPATH"] = _CODE_DIR
+    env["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
+    env["ONCOTRIAGE_MAIN_PATH"] = os.path.join(
+        _CODE_DIR, "__no_such_root_for_the_credential_guard__")
+    env.pop(config.settings.ENV_BEDROCK_API_KEY, None)
+    if aws_value is None:
+        env.pop(config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK, None)
+    else:
+        env[config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK] = aws_value
+    proc = subprocess.run([sys.executable, "-c", _CHILD, _CODE_DIR],
+                          capture_output=True, text=True, env=env, timeout=180)
+    for line in proc.stdout.splitlines():
+        if line.startswith("__RESULT__"):
+            return json.loads(line[len("__RESULT__"):])
+    return {"guard": "<no result>", "outcome": proc.stderr.strip()[-300:],
+            "clients": -1, "net": -1, "blank": False, "reached_counter": False}
+
+
+_blank_child = _child("")
+_real_child = _child(_FAKE_TOKEN)
+
+check("the child's boto3 tripwire was ARMED rather than inert -- an inert "
+      "counter counts nothing and passes",
+      _blank_child.get("guard"), "armed")
+
+check("a BLANK AWS token: the factory raises RuntimeError", 
+      _blank_child.get("outcome"), "RuntimeError")
+check("...it is the blank-token refusal and not some other RuntimeError",
+      _blank_child.get("blank"), True)
+check("...and ZERO boto3 clients were constructed, which is the whole claim",
+      _blank_child.get("clients"), 0)
+check("...and the child made no network attempt", _blank_child.get("net"), 0)
+
+# NON-DEGENERACY. Without this the zero above is equally satisfied by a counter
+# that was never installed, by a factory that returns early for an unrelated
+# reason, and by a child that died before it got there.
+check("NON-DEGENERACY: with a REAL-looking token the same child reaches "
+      "boto3.client, so the counter is wired and the guard is what stopped "
+      "the other one", _real_child.get("clients"), 1)
+check("...and it got there through the counting stand-in rather than building "
+      "anything", _real_child.get("reached_counter"), True)
+check("...and still made no network attempt", _real_child.get("net"), 0)
 
 
 # ===========================================================================

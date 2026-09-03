@@ -741,17 +741,29 @@ def get_openai_api_key() -> str:
 #     config.get_qdrant_url()                    -> https://bd717e5f-....qdrant.io
 #     os.environ QDRANT_URL after  load_env_keys -> https://bd717e5f-....qdrant.io
 #
-# `paths.load_env_keys()` POPS all three key names out of os.environ and reloads
-# them from the .env with `override=True`, so NO environment variable and no
-# compose setting could redirect Qdrant. docker-compose.yml had carried
+# `paths.load_env_keys()` POPS all three key names out of os.environ and
+# rewrites them from the .env, so NO environment variable and no compose
+# setting could redirect Qdrant. docker-compose.yml had carried
 # `QDRANT_URL: http://qdrant:6333` for exactly that purpose, and the `qdrant`
 # service it named started, went healthy, held zero collections and was queried
 # by nothing while /pipeline/info reported 12,067 trials from the cloud.
 #
 # THE POP IS NOT THE BUG AND IS NOT TOUCHED. It exists so a stale exported
 # credential cannot shadow the credentials file -- the direction that quietly
-# sends a live key to the wrong endpoint. `load_env_keys` is unchanged, and
-# `get_keys()` still returns exactly what the .env says.
+# sends a live key to the wrong endpoint.
+#
+# THE MECHANISM UNDER THAT POP MOVED AND THE GUARANTEE DID NOT, which is worth
+# stating because this paragraph used to describe the old one. `load_env_keys`
+# once ended in `load_dotenv(dotenv_path=..., override=True)`, which loaded
+# EVERY name the credentials file defined; since the .env allowlist pass it
+# parses with `dotenv_values` and writes only `paths.ALLOWLISTED_ENV_KEYS` into
+# os.environ. All three names this block is about are `REQUIRED_ENV_KEYS`, and
+# those are popped unconditionally and rewritten exactly as before -- so the
+# pop-then-rewrite semantics everything here rests on are unchanged, and
+# `get_keys()` still returns exactly what the .env says. What DID change is
+# that a name outside the allowlist no longer reaches the process environment
+# as a side effect of resolving these three; see `paths.OPTIONAL_ENV_KEYS` for
+# how that set was measured and what it deliberately leaves out.
 #
 # What is added is a SECOND, deliberately-named tier that beats it. See
 # settings.ENV_QDRANT_URL for why the accidental route stays closed while this
@@ -2166,7 +2178,10 @@ def get_bedrock_anthropic_client():
 
     Raises:
         RuntimeError: when the provider flag is not this branch; when boto3 is
-            absent; or when a credential is set that boto3 cannot see.
+            absent; when a credential is set that boto3 cannot see; or when
+            AWS's own variable is set to a blank value, which boto3 CAN see and
+            must not use -- see
+            ``_assert_bedrock_anthropic_credential_is_visible``.
     """
     global _BEDROCK_ANTHROPIC_CLIENT_CACHE
     if _BEDROCK_ANTHROPIC_CLIENT_CACHE is None:
@@ -2225,6 +2240,79 @@ def get_bedrock_anthropic_client():
     return _BEDROCK_ANTHROPIC_CLIENT_CACHE
 
 
+BEDROCK_BEARER_ABSENT = "absent"
+"""``AWS_BEARER_TOKEN_BEDROCK`` is not in ``os.environ`` at all."""
+
+BEDROCK_BEARER_BLANK = "blank"
+"""It IS in ``os.environ`` and its value is empty or whitespace-only.
+
+THE ONE STATE ``settings.resolve_bedrock_api_key()`` CANNOT REPORT. That
+function answers ``(None, None)`` for unset, for empty and for whitespace-only
+alike -- deliberately, because for a value it is going to HAND to a client
+those three mean one thing. For a value botocore reads out of the environment
+BY ITSELF they do not, which is why this vocabulary exists here rather than
+there."""
+
+BEDROCK_BEARER_SET = "set"
+"""It is present and carries at least one non-whitespace character."""
+
+BEDROCK_BEARER_STATES = (BEDROCK_BEARER_ABSENT, BEDROCK_BEARER_BLANK,
+                         BEDROCK_BEARER_SET)
+"""The closed set a caller may branch on exhaustively.
+
+Declared for ``oncotriage.agent.deps.RESOLUTION_STATES``' reason: a caller that
+cannot see the whole vocabulary writes an ``else`` and an ``else`` is where a
+fourth state goes unnoticed. Read by the distinctness guard below, so a member
+renamed to collide with another fails at import rather than at the one call
+site that could no longer tell them apart."""
+
+if len(set(BEDROCK_BEARER_STATES)) != len(BEDROCK_BEARER_STATES):
+    # A `RuntimeError` and not an `assert`: `python -O` deletes those, and this
+    # decides whether a credential refusal can distinguish its own cases.
+    raise RuntimeError(
+        f"BEDROCK_BEARER_STATES has duplicate members: "
+        f"{BEDROCK_BEARER_STATES!r}. Two states that compare equal make the "
+        f"refusals in _assert_bedrock_anthropic_credential_is_visible() "
+        f"indistinguishable.")
+
+
+def _bedrock_bearer_env_state():
+    """Which of ``BEDROCK_BEARER_STATES`` describes AWS's own variable. Pure.
+
+    ONE DERIVATION FOR TWO REFUSALS, which is the point rather than tidiness.
+    The two checks below used to ask this question two different ways -- one
+    through ``settings.resolve_bedrock_api_key()`` (which strips, so
+    whitespace-only reads as unset) and one through
+    ``os.environ.get(...)`` TRUTHINESS (where whitespace-only reads as SET) --
+    and they therefore disagreed about ``AWS_BEARER_TOKEN_BEDROCK="   "``:
+    MEASURED, that state passed the guard entirely while the project's own
+    resolver had already decided the variable said nothing. Both read this now,
+    so the disagreement is not a thing that can be reintroduced by ordering.
+
+    ``os`` is imported here rather than at module scope to leave this module's
+    import block exactly as it was; it is stdlib, so it falls under the
+    function-body import exemption `tests/test_package_invariants.py` check 1b
+    already grants third-party imports, and it is the idiom the guard below
+    used before this derivation replaced it.
+
+    WHAT IT DELIBERATELY DOES NOT ANSWER: whether a NON-blank value is
+    well-formed. A token carrying leading or trailing whitespace reads as
+    ``BEDROCK_BEARER_SET`` and is sent to Bedrock verbatim -- botocore reads
+    this variable itself and nothing here can strip it, unlike
+    ``settings.resolve_bedrock_api_key()``, which hands its value to a client
+    by hand and does strip. That failure is a 401 at the provider rather than a
+    silently bypassed credential chain, so it is named here as a known gap
+    rather than folded into a refusal whose subject is the other thing.
+    """
+    import os as _os
+    raw = _os.environ.get(settings.ENV_AWS_BEARER_TOKEN_BEDROCK)
+    if raw is None:
+        return BEDROCK_BEARER_ABSENT
+    if raw.strip() == "":
+        return BEDROCK_BEARER_BLANK
+    return BEDROCK_BEARER_SET
+
+
 def _assert_bedrock_anthropic_credential_is_visible():
     """Refuse a credential boto3 cannot see, rather than ignoring it.
 
@@ -2246,26 +2334,78 @@ def _assert_bedrock_anthropic_credential_is_visible():
     IT DOES NOT VERIFY THAT ANY CREDENTIAL EXISTS. boto3's chain has half a
     dozen sources -- a profile, an instance role, SSO, a container role -- and
     a check that demanded an environment variable would refuse a perfectly
-    ordinary IAM deployment. What it refuses is the ONE state that is
-    unambiguously a mistake: this project's variable set, AWS's not.
+    ordinary IAM deployment. What it refuses are the TWO states that are
+    unambiguously a mistake:
+
+      1. AWS's own variable PRESENT AND BLANK. botocore selects bearer auth on
+         PRESENCE and not on content, so a blank value is not "no token" -- it
+         is an empty token, sent INSTEAD of the SigV4 chain. See the refusal.
+      2. this project's variable set and AWS's ABSENT. boto3 never reads the
+         first, so continuing would silently use some other credential.
+
+    AN EMPTY ``ONCOTRIAGE_BEDROCK_API_KEY`` IS DELIBERATELY NOT REFUSED, and
+    the asymmetry is a decision rather than an omission. boto3 does not read
+    that name at all, so an empty value has NO effect on which credential is
+    selected -- its outcome is byte-identical to the variable being absent, and
+    refusing it would turn a harmless leftover export into a run that will not
+    start on a machine whose instance role works perfectly. It is not silent
+    either: on the Responses branch ``get_bedrock_api_key()`` already raises
+    naming BOTH variables when neither resolves. MEASURED across all sixteen
+    (unset, empty, whitespace, real) x (unset, empty, whitespace, real) states;
+    the matrix is driven in
+    ``tests/test_agent_bedrock_anthropic_adapter.py``.
 
     Raises:
-        RuntimeError: naming both variables and the one-line fix.
+        RuntimeError: naming the offending variable and every fix for it.
     """
+    bearer = _bedrock_bearer_env_state()
     key, source = settings.resolve_bedrock_api_key()
-    if key is not None and source == settings.ENV_BEDROCK_API_KEY:
-        import os as _os
-        if not _os.environ.get(settings.ENV_AWS_BEARER_TOKEN_BEDROCK):
-            raise RuntimeError(
-                f"{settings.ENV_BEDROCK_API_KEY} is set but "
-                f"{settings.ENV_AWS_BEARER_TOKEN_BEDROCK} is not, and this "
-                f"provider reaches Bedrock through boto3, which reads only the "
-                f"second. Continuing would ignore the key you set and fall "
-                f"through to whatever else is in the AWS credential chain -- "
-                f"possibly a different account.\n"
-                f"  Fix: export {settings.ENV_AWS_BEARER_TOKEN_BEDROCK} with "
-                f"the same value, or unset {settings.ENV_BEDROCK_API_KEY} if "
-                f"you meant to use the ordinary AWS credential chain.")
+
+    # ORDERED, AND THE ORDER IS LOAD-BEARING. A blank AWS variable satisfies
+    # the second refusal's own condition too -- and that refusal's sentence is
+    # "AWS_BEARER_TOKEN_BEDROCK is not set", which is FALSE of a variable that
+    # is set to "". An operator told a variable is unset does not go and unset
+    # it. The dangerous state is also the more specific one, so it answers
+    # first and the message below carries the other refusal's remedy when it
+    # applies, rather than making the operator meet two refusals in a row.
+    if bearer == BEDROCK_BEARER_BLANK:
+        message = (
+            f"{settings.ENV_AWS_BEARER_TOKEN_BEDROCK} is set to an empty or "
+            f"whitespace-only value, and MATCHING_PROVIDER is "
+            f"{MATCHING_PROVIDER_BEDROCK_ANTHROPIC!r}, which reaches Bedrock "
+            f"through boto3.\n"
+            f"  botocore SELECTS BEARER AUTHENTICATION ON THE VARIABLE'S "
+            f"PRESENCE, NOT ON ITS CONTENT: it asks "
+            f"`get_token_from_environment(...) is not None`, and an empty "
+            f"string is not None. So this client would send an empty bearer "
+            f"token AND would bypass the SigV4 chain entirely -- an instance "
+            f"role, an SSO profile or a container role that would have worked "
+            f"is never consulted -- and the 401 that comes back names none of "
+            f"this.\n"
+            f"  Fix, whichever you meant:\n"
+            f"    * unset {settings.ENV_AWS_BEARER_TOKEN_BEDROCK} entirely, to "
+            f"use the ordinary AWS credential chain; or\n"
+            f"    * set it to a real Bedrock API key.")
+        if key is not None and source == settings.ENV_BEDROCK_API_KEY:
+            message += (
+                f"\n  {settings.ENV_BEDROCK_API_KEY} IS set to a non-empty "
+                f"value and boto3 does not read it, so the second fix is "
+                f"almost certainly the one you meant: export "
+                f"{settings.ENV_AWS_BEARER_TOKEN_BEDROCK} with the same value.")
+        raise RuntimeError(message)
+
+    if (key is not None and source == settings.ENV_BEDROCK_API_KEY
+            and bearer == BEDROCK_BEARER_ABSENT):
+        raise RuntimeError(
+            f"{settings.ENV_BEDROCK_API_KEY} is set but "
+            f"{settings.ENV_AWS_BEARER_TOKEN_BEDROCK} is not, and this "
+            f"provider reaches Bedrock through boto3, which reads only the "
+            f"second. Continuing would ignore the key you set and fall "
+            f"through to whatever else is in the AWS credential chain -- "
+            f"possibly a different account.\n"
+            f"  Fix: export {settings.ENV_AWS_BEARER_TOKEN_BEDROCK} with "
+            f"the same value, or unset {settings.ENV_BEDROCK_API_KEY} if "
+            f"you meant to use the ordinary AWS credential chain.")
 
 
 # Wall-clock ceiling on ONE Stage 5 request, in seconds.
