@@ -1428,10 +1428,13 @@ BILLED_SITES = {
         "it issues exactly one call per `--per-trial-user-file` and refuses "
         "before any of them when either input is missing, and what it MEASURES "
         "is `MATCHING_OUTPUT_TOKENS_PER_TRIAL` -- the constant Stage 5's "
-        "pre-split guard is built from, derived on gpt-5.6-terra and never "
-        "measured on the shipped judge. A cap able to refuse it would be a cap "
-        "refusing the measurement that tells an operator how big one verdict "
-        "is."),
+        "pre-split guard is built from. It was derived on gpt-5.6-terra and "
+        "was re-derived on the shipped judge by THIS phase on 2026-09-03; the "
+        "exemption stands because the constant's own block requires the same "
+        "re-derivation on every model, provider or effort change, so this is a "
+        "recurring measurement rather than a settled one. A cap able to refuse "
+        "it would be a cap refusing the measurement that tells an operator how "
+        "big one verdict is."),
 }
 """Every site in this repository that touches a billed provider endpoint, with
 its disposition and the argument for it. CLOSED, and derived-against.

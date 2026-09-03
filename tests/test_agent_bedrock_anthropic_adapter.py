@@ -74,8 +74,10 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import types
 
 # ABOVE THE PACKAGE IMPORTS ON PURPOSE. See the module docstring.
@@ -101,6 +103,7 @@ except ImportError:
 
 from oncotriage import config
 from oncotriage import degradation as _degradation
+from oncotriage import paths
 from oncotriage.agent import bedrock_anthropic_adapter as bac
 from oncotriage.agent import deps
 from oncotriage.agent import evaluation as _evaluation
@@ -2094,6 +2097,230 @@ check("NON-DEGENERACY: with a REAL-looking token the same child reaches "
 check("...and it got there through the counting stand-in rather than building "
       "anything", _real_child.get("reached_counter"), True)
 check("...and still made no network attempt", _real_child.get("net"), 0)
+
+
+# ===========================================================================
+# SECTION 7e — THE CREDENTIAL IS PUBLISHED BY THE FACTORY, NOT BY LUCK
+# ===========================================================================
+
+section("7e. This project's .env is consulted on the Converse path itself")
+
+# WHY THIS SECTION EXISTS -- MEASURED ON 2026-09-03, AND IT COST A BLOCKED
+# PROBE. `bedrock_probe.py` built the Converse client, passed section 7b's
+# guard, and died on `NoCredentialsError: Unable to locate credentials` with
+# the credential PLAINLY PRESENT in 05- Keys/.env as
+# AWS_BEARER_TOKEN_BEDROCK. Driven, both arms:
+#
+#     'AWS_BEARER_TOKEN_BEDROCK' in os.environ           -> False
+#     config.get_bedrock_anthropic_client(); converse()   -> NoCredentialsError
+#
+#     config.get_qdrant_url()                             # <- the only change
+#     'AWS_BEARER_TOKEN_BEDROCK' in os.environ           -> True
+#
+# So the credential reached the process ONLY as a side effect of some OTHER
+# client having been built first: `get_qdrant_url()` and `get_openai_api_key()`
+# both call `get_keys()`, which calls `paths.load_env_keys()`, whose allowlist
+# NAMES this variable for exactly this reason. Nothing on the Converse path
+# called it. On an ordinary batch run Stage 2 builds those clients before
+# Stage 5, so the credential arrived by ACCIDENT OF ORDERING -- and that
+# accident is one ablation flag, one installed stand-in or one
+# ONCOTRIAGE_QDRANT_URL override away from not happening.
+#
+# SECTION 7b CANNOT SEE IT, BY ITS OWN DESIGN. With neither name in
+# os.environ the state is `absent + absent`, which that guard deliberately
+# tolerates so it does not refuse an ordinary IAM deployment. A .env this
+# project owns and has not read is indistinguishable there from a host that
+# legitimately has none. THE TWO CHECKS ARE THEREFORE NOT REDUNDANT: 7b
+# refuses a credential boto3 must not use, and this one makes sure the one it
+# SHOULD use is in front of it.
+
+# --- 7e-i. THE VOCABULARY IS CLOSED AND DISTINCT ---------------------------
+check("the keys-file state vocabulary has exactly the three members a caller "
+      "may branch on", tuple(config.KEYS_FILE_STATES),
+      (config.KEYS_FILE_LOADED, config.KEYS_FILE_ALREADY_LOADED,
+       config.KEYS_FILE_UNAVAILABLE))
+check("...and no two of them compare equal, which is what would make one "
+      "answer unreachable",
+      len(set(config.KEYS_FILE_STATES)), len(config.KEYS_FILE_STATES))
+
+# --- 7e-ii. THE FACTORY CALLS IT, ABOVE THE GUARD AND ABOVE THE CLIENT ------
+#
+# STRUCTURAL, and it is the half a behavioural check cannot supply: a child
+# process that finds the credential present cannot tell whether the FACTORY
+# published it or something else in that child did.
+_PUB_LINES = [n.lineno for n in ast.walk(_FACTORY)
+              if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+              and n.func.id == "_publish_project_bedrock_credential"] \
+    if _FACTORY else []
+check("the factory publishes this project's credential exactly once",
+      len(_PUB_LINES), 1)
+check_true("...ABOVE the credential guard, so the guard reads an environment "
+           "the .env has already reached rather than one it has not",
+           bool(_PUB_LINES) and bool(_guard_lines)
+           and _PUB_LINES[0] < _guard_lines[0])
+check_true("...and ABOVE the client, so botocore's chain is never asked "
+           "before this project's own file has been",
+           bool(_PUB_LINES) and bool(_client_lines)
+           and _PUB_LINES[0] < _client_lines[0])
+
+_PUB_FN = next((n for n in ast.walk(_GUARD_SRC)
+                if isinstance(n, ast.FunctionDef)
+                and n.name == "_publish_project_bedrock_credential"), None)
+check_true("the publisher was found in the shipped source, so the walks above "
+           "and below are not vacuous", _PUB_FN is not None)
+# WALKED AS NAMES rather than grepped: this function's own docstring argues
+# about os.environ at length, and a substring test would report the argument as
+# the defect. Section 7b-vi records this project having shipped that shape.
+_PUB_ENVIRON = [n for n in ast.walk(_PUB_FN)
+                if isinstance(n, ast.Attribute) and n.attr == "environ"] \
+    if _PUB_FN else []
+check("the publisher writes os.environ NOWHERE itself -- it delegates to the "
+      "loader that owns the allowlist, which is the whole reason section 7b "
+      "was allowed to refuse doing this by hand",
+      len(_PUB_ENVIRON), 0)
+
+# --- 7e-iii. THE THREE STATES, DRIVEN ---------------------------------------
+#
+# `get_keys()` caches on success, so the two loaded states are distinguished by
+# whether that cache was already warm. Driven by moving the cache, never by
+# reading a private attribute and asserting about it.
+_SAVED_KEYS_CACHE = config._KEYS_CACHE
+try:
+    config._KEYS_CACHE = {"openai": "x", "qdrant_url": "y", "qdrant_key": "z"}
+    check("a warm keys cache answers 'already-loaded' and re-reads nothing",
+          config._publish_project_bedrock_credential(),
+          config.KEYS_FILE_ALREADY_LOADED)
+finally:
+    config._KEYS_CACHE = _SAVED_KEYS_CACHE
+check("the cache was put back exactly as this section found it",
+      config._KEYS_CACHE, _SAVED_KEYS_CACHE)
+
+# THE UNAVAILABLE ARM, and it must NOT raise. A host running an instance role,
+# an SSO profile or a container role has no .env at all and must still start --
+# which is the same sentence section 7b uses to justify tolerating
+# `absent + absent`, applied one function earlier.
+_SAVED_RESOLVED = dict(paths._RESOLVED)
+_saved_cache2 = config._KEYS_CACHE
+try:
+    config._KEYS_CACHE = None
+    paths._RESOLVED["keys_path"] = os.path.join(
+        _CODE_DIR, "__no_such_keys_dir_for_7e__")
+    _unavailable = drive(config._publish_project_bedrock_credential)
+    check("an unreadable .env answers 'unavailable' and does NOT raise, so a "
+          "working IAM deployment is not refused for having no keys file",
+          _unavailable, config.KEYS_FILE_UNAVAILABLE)
+finally:
+    paths._RESOLVED.clear()
+    paths._RESOLVED.update(_SAVED_RESOLVED)
+    config._KEYS_CACHE = _saved_cache2
+check("paths._RESOLVED was put back exactly as this section found it",
+      dict(paths._RESOLVED), _SAVED_RESOLVED)
+
+# --- 7e-iv. THE DEFECT ITSELF, DRIVEN THROUGH THE REAL FACTORY --------------
+#
+# IN A SUBPROCESS, for section 7b-viii's reason verbatim: the factory imports
+# boto3 before it reaches any of this, and this file's sections 1c and 9 assert
+# that boto3 never entered THIS process. The child gets a FABRICATED project
+# root with a FABRICATED .env, so the operator's real credentials file is never
+# opened and no real secret can reach this file's output.
+#
+# THE CONTROL NEUTRALISES THE PUBLISHER RATHER THAN EDITING THE SOURCE. The
+# defect was "the factory does not call it", which from the factory's own
+# position is indistinguishable from "it calls something that does nothing" --
+# and 7e-ii above is what proves the call is really there, so the two halves
+# together cover both readings without writing to any file in the repository.
+
+_ENV_CHILD = r"""
+import json, os, sys
+sys.path.insert(0, sys.argv[1])
+_neutralise = sys.argv[2] == "neutralise"
+import boto3
+built = []
+def _counting(*a, **k):
+    built.append(a[0] if a else k.get("service_name"))
+    raise AssertionError("boto3.client was reached")
+boto3.client = _counting
+from oncotriage import config
+NAME = config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK
+before = NAME in os.environ
+if _neutralise:
+    config._publish_project_bedrock_credential = (
+        lambda: config.KEYS_FILE_ALREADY_LOADED)
+try:
+    config.get_bedrock_anthropic_client()
+    outcome = "<did not raise>"
+except Exception as exc:
+    outcome = type(exc).__name__ + ": " + str(exc)[:120]
+print("__RESULT__" + json.dumps({
+    "before": before, "after": NAME in os.environ,
+    "value": os.environ.get(NAME), "clients": len(built),
+    "reached_client": "boto3.client was reached" in outcome,
+    "outcome": outcome[:160]}))
+"""
+
+# Assembled, never written out: this file's own secret-scan rule.
+_FAKE_BEARER = "_FAKE" + "-published-bearer-" + str(len("seven-e"))
+_FAKE_OPENAI = "_FAKE" + "-openai-key"
+_FAKE_QURL = "https://" + "_FAKE" + "-qdrant.example.invalid"
+_FAKE_QKEY = "_FAKE" + "-qdrant-key"
+
+
+def _env_child(neutralise):
+    """Drive the REAL factory against a FABRICATED .env in a child process."""
+    root = tempfile.mkdtemp(prefix="oncotriage-7e-")
+    try:
+        keys = os.path.join(root, "05- Keys")
+        os.makedirs(keys)
+        with open(os.path.join(keys, ".env"), "w", encoding="utf-8") as fh:
+            fh.write(f"OPENAI_API_KEY={_FAKE_OPENAI}\n"
+                     f"QDRANT_URL={_FAKE_QURL}\n"
+                     f"QDRANT_API_KEY={_FAKE_QKEY}\n"
+                     f"{config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK}"
+                     f"={_FAKE_BEARER}\n")
+        env = dict(os.environ)
+        env["PYTHONPATH"] = _CODE_DIR
+        env["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
+        env["ONCOTRIAGE_MAIN_PATH"] = root
+        env.pop(config.settings.ENV_BEDROCK_API_KEY, None)
+        env.pop(config.settings.ENV_AWS_BEARER_TOKEN_BEDROCK, None)
+        proc = subprocess.run(
+            [sys.executable, "-c", _ENV_CHILD, _CODE_DIR,
+             "neutralise" if neutralise else "live"],
+            capture_output=True, text=True, env=env, timeout=180)
+        for line in proc.stdout.splitlines():
+            if line.startswith("__RESULT__"):
+                return json.loads(line[len("__RESULT__"):])
+        return {"before": None, "after": None, "value": None, "clients": -1,
+                "reached_client": False,
+                "outcome": proc.stderr.strip()[-300:]}
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
+_live = _env_child(neutralise=False)
+_pre = _env_child(neutralise=True)
+
+check("the child starts with the bearer name ABSENT, so 'present afterwards' "
+      "is a statement about the factory rather than about the environment it "
+      "inherited", _live.get("before"), False)
+check("THE FIX: after the shipped factory runs, this project's .env has been "
+      "read and the bearer name IS in os.environ where botocore looks",
+      _live.get("after"), True)
+check("...carrying the value the fabricated .env defined, so it came from the "
+      "keys file rather than from anywhere else",
+      _live.get("value"), _FAKE_BEARER)
+check("...and the factory got as far as constructing a client, so nothing "
+      "refused before the credential mattered",
+      _live.get("reached_client"), True)
+
+check("CONTROL: with the publisher neutralised the same child starts from the "
+      "same absent state", _pre.get("before"), False)
+check("CONTROL: ...and the bearer name is STILL ABSENT after the factory runs "
+      "-- which is the pre-fix behaviour, and the NoCredentialsError this "
+      "section is named for", _pre.get("after"), False)
+check("CONTROL: ...while the factory still reached the client, so the two arms "
+      "differ in the credential and in nothing else",
+      _pre.get("reached_client"), True)
 
 
 # ===========================================================================

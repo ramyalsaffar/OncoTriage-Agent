@@ -1392,12 +1392,19 @@ def _preflight_sdk_shape(client, kwargs, config):
 def _probe_output_tokens(args, config, adapter, client):
     """One real trial-shaped call per rendered user message. THE MEASUREMENT.
 
-    WHAT IT ANSWERS. `MATCHING_OUTPUT_TOKENS_PER_TRIAL` is 1,100, derived on
-    gpt-5.6-terra over 27 runs at reasoning_effort='none', and it is the input
-    to Stage 5's pre-split guard. Claude Sonnet 4.6 has never been measured
-    against it, so on the shipped provider that constant is a GUARD CALIBRATED
-    ON ANOTHER MODEL. This issues one call per supplied trial message over one
-    shared prefix and reports `usage.outputTokens` for each.
+    WHAT IT ANSWERS. `MATCHING_OUTPUT_TOKENS_PER_TRIAL` is the input to Stage
+    5's pre-split guard. It was 1,100, derived on gpt-5.6-terra over 27 runs at
+    reasoning_effort='none' -- a guard calibrated on a model the shipped
+    provider does not call. THIS PHASE IS WHAT RE-DERIVED IT: run on
+    2026-09-03 over eight real trial blocks of one real patient, it measured a
+    maximum of 1,356 output tokens per verdict and the constant is now 1,450.
+    The table, the window the value was chosen from and what the run did NOT
+    settle are all at the constant in `oncotriage/config.py`.
+
+    IT IS NOT A ONE-OFF. The constant's own block says to re-derive it whenever
+    the model, the provider or the thinking/effort configuration changes, and
+    this is the command that does so: one call per supplied trial message over
+    one shared prefix, reporting `usage.outputTokens` for each.
 
     WHY THE REQUESTS ARE THE ADAPTER'S AND NOT THIS FILE'S. Every one is built
     by `adapter.build_converse_request(prefix, user)` -- the same builder the
@@ -1542,6 +1549,18 @@ def _probe_output_tokens(args, config, adapter, client):
         check(f"({label}) the response is well-formed under the shipped "
               f"schema{' (fenced; fence stripped first)' if fenced else ''}",
               problems, [])
+        # THE NON-DEGENERACY TWIN, AND IT IS NOT DECORATION. `{"evaluations":
+        # []}` is WELL-FORMED under the shipped schema -- the array carries no
+        # `minItems` -- and it evaluates nothing. So the check above passes for
+        # a response that answered no question, and on the first run of this
+        # phase it did exactly that: message 1, the LARGEST trial block of the
+        # five, came back at 30 output tokens and was reported PASS. A verdict
+        # count is what separates "the model answered and the answer conforms"
+        # from "the model declined and the decline conforms", and only the
+        # first is a measurement of what a verdict costs.
+        check_true(f"({label}) ...and carries at least ONE evaluation, so the "
+                   f"conformance above is not a well-formed non-answer",
+                   isinstance(n_evals, int) and n_evals >= 1)
         rows.append({
             "path": path,
             "user_chars": len(user),
@@ -1564,10 +1583,16 @@ def _probe_output_tokens(args, config, adapter, client):
         return
 
     section("OUTPUT TOKENS — the finding")
+    # `evals` AND `chars` ARE PRINTED BECAUSE THEY WERE ALREADY CAPTURED AND
+    # DROPPED. Without them a 30-output-token row is uninterpretable -- it
+    # could be a terse verdict or an empty array -- and the reader's only route
+    # to the answer is another billed call. They were in `rows` from the start;
+    # only the table was short.
     print(f"  {'#':>2} {'user chars':>10} {'outputTokens':>13} "
-          f"{'cacheRead':>10} {'stopReason':>12} {'parsed':>7} {'USD':>9}")
+          f"{'cacheRead':>10} {'stopReason':>12} {'parsed':>7} "
+          f"{'evals':>6} {'chars':>7} {'USD':>9}")
     print(f"  {'-' * 2} {'-' * 10} {'-' * 13} {'-' * 10} {'-' * 12} "
-          f"{'-' * 7} {'-' * 9}")
+          f"{'-' * 7} {'-' * 6} {'-' * 7} {'-' * 9}")
     model = config.matching_wire_model()
     phase_cost = 0.0
     for i, r in enumerate(rows, start=1):
@@ -1579,7 +1604,8 @@ def _probe_output_tokens(args, config, adapter, client):
         phase_cost += 0.0 if cost != cost else cost
         print(f"  {i:>2} {r['user_chars']:>10,} {(r['output_tokens'] or 0):>13,} "
               f"{(r['cache_read'] or 0):>10,} {str(r['stop_reason']):>12} "
-              f"{str(r['parsed_ok']):>7} {cost:>9.4f}")
+              f"{str(r['parsed_ok']):>7} {str(r['evaluations']):>6} "
+              f"{r['text_chars']:>7,} {cost:>9.4f}")
 
     observed = [r["output_tokens"] for r in rows
                 if isinstance(r["output_tokens"], int)]
@@ -1588,6 +1614,45 @@ def _probe_output_tokens(args, config, adapter, client):
         mean = sum(observed) / len(observed)
         print(f"\n  n={len(observed)}  min {lo:,}  mean {mean:,.0f}  "
               f"max {hi:,}  spread {hi - lo:,}")
+        # THE ANSWERING SUBSET IS REPORTED SEPARATELY, AND WHICH STATISTIC IT
+        # MOVES IS THE POINT. A well-formed non-answer (`evaluations: []`) can
+        # only pull the MIN and the MEAN down; it can never raise the MAX. So a
+        # ceiling adopted from the max is unaffected by one, and a mean quoted
+        # as "what a verdict costs" is not -- which is why both are here rather
+        # than only the one this file's own adoption rule reads.
+        answered = [r["output_tokens"] for r in rows
+                    if isinstance(r["output_tokens"], int)
+                    and isinstance(r["evaluations"], int)
+                    and r["evaluations"] >= 1]
+        blank = len(observed) - len(answered)
+        if blank:
+            # `answered` CAN BE EMPTY AND THE FIRST VERSION OF THIS BLOCK
+            # RAISED ON IT. A run in which EVERY response is a non-answer is
+            # not hypothetical -- it is what a single-message confirmation of
+            # the empty-array finding IS -- and `min([])` ended the phase with
+            # a traceback where it owed a summary, one line below a check that
+            # had correctly just failed. The abort shape this project has
+            # shipped more often than any other, reproduced inside the guard
+            # written to catch a degenerate value. Measured, not reasoned
+            # about: it happened on the first run of this code.
+            print(f"  {blank} of {len(observed)} response(s) carried ZERO "
+                  f"evaluations -- well-formed, and not a verdict.")
+            if answered:
+                print(f"  over the {len(answered)} that ANSWERED: "
+                      f"min {min(answered):,}  "
+                      f"mean {sum(answered) / len(answered):,.0f}  "
+                      f"max {max(answered):,}")
+                print("  THE MAX IS UNAFFECTED BY THEM BY CONSTRUCTION (an "
+                      "empty answer is short), so a ceiling adopted from the "
+                      "max stands; the MEAN above is the one a reader must "
+                      "not quote as the cost of a verdict.")
+            else:
+                print("  NOTHING ANSWERED, so there is no verdict-cost "
+                      "figure in this run at all and the max above is the "
+                      "size of a REFUSAL. Do not adopt a ceiling from it.")
+        else:
+            print(f"  every response carried at least one evaluation, so the "
+                  f"figures above are all verdicts.")
         print(f"  MATCHING_OUTPUT_TOKENS_PER_TRIAL is "
               f"{config.MATCHING_OUTPUT_TOKENS_PER_TRIAL:,}; the measured max "
               f"is {hi:,} "

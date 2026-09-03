@@ -1233,6 +1233,52 @@ MATCHING_REASONING_EFFORT = "none"
 # measured runs, so this ceiling currently covers visible output alone -- but
 # it stops being true the moment MATCHING_REASONING_EFFORT changes, and at
 # 'medium' the reasoning share was already 12.9% of output.
+#
+# ===========================================================================
+# RIGHT-SIZED FOR PER-TRIAL MODE ON 2026-09-03, AND THE ANSWER IS THAT IT
+# ALREADY IS. THE NUMBER DOES NOT MOVE, AND THAT IS A MEASUREMENT.
+# ===========================================================================
+#
+# The per-trial requirement on this constant is that the ceiling covers ONE
+# WHOLE RESPONSE, so no split fires for a chunk of one -- which the reactive
+# splitter could not honour anyway, since `len(chunk) == 1` is its floor and a
+# truncated single trial is a LOST verdict recorded `truncation_floor`.
+# Measured on the shipped judge over eight real trial-shaped calls (the table
+# at MATCHING_OUTPUT_TOKENS_PER_TRIAL): the largest response was 1,356 output
+# tokens, 4.2% of this ceiling, and every one of the eight reported stopReason
+# 'end_turn'. 32,000 covers the worst observed single response 23.6x over.
+#
+# LOWERING IT WAS CONSIDERED AND IS REFUSED, on two measured grounds rather
+# than on caution.
+#
+#   1. IT WOULD ARM A SPLITTER IN THE ARM THE MIGRATION MEASURES AGAINST. The
+#      grouped proactive splitter stays dead only while
+#      1.25 x MATCHING_OUTPUT_TOKENS_PER_TRIAL x MAX_TRIALS_FOR_EVALUATION
+#      <= MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS. At the adopted
+#      1,450 the left side is 27,187.5, so any ceiling below 30,209 arms it.
+#      That is a silent behaviour change to the retained comparison arm, made
+#      while it is the thing being compared against.
+#   2. A HIGH CEILING IS FREE UNLESS IT IS REACHED. Bedrock bills tokens
+#      GENERATED, not the ceiling requested -- confirmed on every call of that
+#      run, which asked for 32,000 and was billed 269 to 1,356. So the only
+#      thing a lower ceiling buys is a smaller blast radius on a runaway, and
+#      the only thing it costs is a lost verdict whenever a real response
+#      exceeds it. Nothing in eight calls came within 23x of the ceiling, so
+#      the expected saving is ~zero against a cost that lands on the tail this
+#      measurement cannot see.
+#
+# WHAT THE BLAST-RADIUS BOUND IS ON THIS PROVIDER, since the figure above is
+# the OpenAI arm's: 32,000 x $16.50/1M = $0.53 for one runaway call on
+# us.anthropic.claude-sonnet-4-6, against $0.38 at gpt-5.6-terra's rate.
+#
+# THE TWO ARMS GENUINELY WANT DIFFERENT CEILINGS AND THIS IS ONE CONSTANT.
+# Per-trial would be well served by ~8,000 (5.9x the worst observed response);
+# grouped needs >= 30,209 to keep its splitter dead. Making the ceiling
+# arm-dependent is the fix that would let both have what they want, and it is
+# NOT taken here: it changes the per-trial wire request, and the case for it
+# rests on a runaway nobody has observed. It is recorded as a follow-up rather
+# than built, because a constant split into two on the strength of an
+# unobserved failure is two constants to calibrate instead of one.
 MATCHING_MAX_TOKENS = 32000
 
 # Best-effort determinism. gpt-5.6-terra ACCEPTS seed (probed live 2026-08-04:
@@ -2688,9 +2734,26 @@ def get_bedrock_anthropic_client():
                 f"It is declared in pyproject.toml and is not importable here: "
                 f"{exc}. Run `pip install -e .` from 03- Code/.") from exc
 
+        # THIS PROJECT'S OWN CREDENTIALS FILE IS CONSULTED HERE, ABOVE THE
+        # VISIBILITY GUARD AND ABOVE THE CLIENT. Without it the guard below
+        # reads an environment the .env has not reached yet, answers
+        # "absent + absent" -- the one state it deliberately tolerates, because
+        # demanding a variable would refuse an ordinary IAM deployment -- and
+        # boto3 then fails with `NoCredentialsError` naming nothing. See
+        # `_publish_project_bedrock_credential` for what that cost to learn.
+        _keys_state = _publish_project_bedrock_credential()
+
         _assert_bedrock_anthropic_credential_is_visible()
 
         console.out(f"🔐 Bedrock Converse region: {BEDROCK_REGION}")
+        # THE CREDENTIAL FILE'S OUTCOME IS PROVENANCE TOO, and is printed on
+        # EVERY state for the reason the SDK line below is: an operator meeting
+        # a credential failure needs to know whether the .env was read, and
+        # silence cannot say so. Which of the two loaded states answered is
+        # itself the finding -- `already-loaded` means something else in this
+        # process published it first, which is the ordering accident this call
+        # replaces with a property of the function.
+        console.out(f"🔐 Bedrock Converse credentials file: {_keys_state}")
         # THE SDK IS PROVENANCE, so it is printed on the provenance path and
         # printed on EVERY state -- including `ok`. Silence and "verified"
         # would otherwise look identical, which is the reading the shutdown
@@ -2794,6 +2857,122 @@ def _bedrock_bearer_env_state():
     if raw.strip() == "":
         return BEDROCK_BEARER_BLANK
     return BEDROCK_BEARER_SET
+
+
+KEYS_FILE_LOADED = "loaded-here"
+"""``get_keys()`` had not run in this process and this call is what read the
+.env, so this function is what published the Bedrock credential."""
+
+KEYS_FILE_ALREADY_LOADED = "already-loaded"
+"""``get_keys()`` had already run, so the names were in ``os.environ`` before
+this function was reached. THE STATE THAT WAS MASKING THE DEFECT: on the
+ordinary batch path Stage 2 builds the Qdrant or the OpenAI client first and
+both reach ``get_keys()``, so the credential arrived by accident of ordering."""
+
+KEYS_FILE_UNAVAILABLE = "unavailable"
+"""The .env could not be read -- absent, incomplete, or its directory did not
+resolve. NOT AN ERROR HERE, and that is the whole reason this returns a state
+instead of raising: boto3's chain has a profile, an instance role, SSO and a
+container role, and a machine running any of them has no .env and must still
+start. The refusals below still fire on the two states that are unambiguously a
+mistake, and boto3 still fails loudly if the chain is genuinely empty."""
+
+KEYS_FILE_STATES = (KEYS_FILE_LOADED, KEYS_FILE_ALREADY_LOADED,
+                    KEYS_FILE_UNAVAILABLE)
+"""The closed set a caller may branch on exhaustively.
+
+``BEDROCK_BEARER_STATES``' reason, and its distinctness guard is below for the
+same one: a member renamed to collide with another fails at import rather than
+at the one call site that could no longer tell them apart."""
+
+if len(set(KEYS_FILE_STATES)) != len(KEYS_FILE_STATES):
+    raise RuntimeError(
+        f"KEYS_FILE_STATES has a duplicate member: {KEYS_FILE_STATES!r}. Each "
+        f"names a different answer to 'was this project's .env read', and two "
+        f"that compare equal make one of those answers unreachable.")
+
+
+def _publish_project_bedrock_credential():
+    """Read this project's .env so boto3 can see the Bedrock credential.
+
+    **THE DEFECT THIS CLOSES, MEASURED RATHER THAN REASONED ABOUT.** Driven on
+    2026-09-03, on the shipped provider, with the credential plainly present in
+    ``05- Keys/.env`` as ``AWS_BEARER_TOKEN_BEDROCK``:
+
+        import os; from oncotriage import config
+        'AWS_BEARER_TOKEN_BEDROCK' in os.environ        -> False
+        config.get_bedrock_anthropic_client()            -> builds, no refusal
+        client.converse(...)  -> NoCredentialsError: Unable to locate credentials
+
+    and the same two lines with ``config.get_qdrant_url()`` inserted between
+    them answer ``True``. So the credential reached the process ONLY as a side
+    effect of some other client having been built first, and
+    ``bedrock_probe.py`` -- which builds no Qdrant and no OpenAI client -- was
+    the first caller to arrive without one.
+
+    **THE GUARD BELOW CANNOT SEE IT, AND THAT IS BY ITS OWN DESIGN RATHER THAN
+    AN OVERSIGHT IN IT.** With neither name in ``os.environ`` the state is
+    ``absent + absent``, which
+    ``_assert_bedrock_anthropic_credential_is_visible`` deliberately tolerates:
+    "a check that demanded an environment variable would refuse a perfectly
+    ordinary IAM deployment". Correct, and it means a .env this project owns and
+    has not read is indistinguishable to that guard from a host that legitimately
+    has none.
+
+    **WHY THIS IS NOT THE `os.environ` MUTATION THAT GUARD REFUSED TO MAKE.**
+    Its docstring rejected "mutate ``os.environ`` so boto3 finds it" as "a
+    process-wide side effect this file has no business having". That argument is
+    about ``config`` reaching in and writing a name itself. This calls
+    ``get_keys()`` -- the loader whose declared job is exactly this, whose
+    allowlist NAMES ``AWS_BEARER_TOKEN_BEDROCK``, and whose own
+    ``OPTIONAL_ENV_KEYS`` docstring says why: "``MATCHING_PROVIDER`` ships
+    ``bedrock_anthropic``, so the shipped arm's judge does not authenticate
+    without one of them". The intent was already declared; nothing on this path
+    called it.
+
+    **IT CHANGES NOTHING ON THE ORDINARY PATH, AND THAT IS ASSERTED RATHER THAN
+    HOPED FOR.** ``get_keys()`` caches on success, so on a run that has already
+    built a Qdrant or an OpenAI client this is a cache hit: no file is re-read,
+    no name is re-written, and the loader's own announcement is not repeated.
+    The return value says which happened.
+
+    **WHY HERE AND NOT SOMEWHERE TIDIER.** Not at module scope -- importing
+    ``oncotriage.config`` must open no file, which
+    ``tests/test_package_invariants.py`` section 2 proves with twelve traps. Not
+    in ``oncotriage/agent/deps.py`` -- that seam hands back whatever is
+    overridden, so a property placed there is absent exactly when a stand-in is
+    installed. Not in each entry point -- that is the call-graph property this
+    replaces, and the flag refusal ten lines above already argues the case:
+    "here it is a property of the function, so no future caller can break it
+    silently".
+
+    Returns:
+        One of ``KEYS_FILE_STATES``. It is RETURNED and not only printed
+        because a printed string is not a fact a test can assert on, and the
+        distinction between the two loaded states is the evidence that this
+        call rather than an ordering accident published the credential.
+    """
+    if _KEYS_CACHE is not None:
+        return KEYS_FILE_ALREADY_LOADED
+    try:
+        get_keys()
+    except Exception as exc:                           # noqa: BLE001
+        # EVERY failure mode of the loader is tolerated here and NONE is
+        # silent. `load_env_keys` raises FileNotFoundError for an absent file,
+        # ValueError for one missing a required name, and `_glob_one` raises a
+        # plain RuntimeError when the keys directory matches nothing or matches
+        # several -- so the handler is broad on purpose rather than by
+        # omission, and it prints what it caught.
+        console.out(f"🔐 Bedrock Converse: this project's .env could not be "
+                    f"read ({type(exc).__name__}: {exc}). Falling through to "
+                    f"boto3's own credential chain -- a profile, an instance "
+                    f"role, SSO or a container role. If none of those is "
+                    f"configured the call below fails with "
+                    f"NoCredentialsError, and the fix is to set "
+                    f"{settings.ENV_AWS_BEARER_TOKEN_BEDROCK} or repair the "
+                    f".env.")
+        return KEYS_FILE_UNAVAILABLE
+    return KEYS_FILE_LOADED
 
 
 def _assert_bedrock_anthropic_credential_is_visible():
@@ -3091,54 +3270,163 @@ def _assert_bedrock_anthropic_credential_is_visible():
 # Expected output tokens per trial evaluated, used to decide whether a batch
 # should be split BEFORE it is sent.
 #
-# RE-DERIVED 2026-08-04 for gpt-5.6-terra at reasoning_effort='none'. The
-# previous value of 900 was calibrated on 1,094 GPT-4o rows (median 712, p95
-# 861 per trial) and no longer describes this model, which is ~35% more verbose
-# per verdict.
+# ===========================================================================
+# RE-DERIVED 2026-09-03 ON THE SHIPPED JUDGE, us.anthropic.claude-sonnet-4-6.
+# ===========================================================================
 #
-# The new figure comes from the step 7 runs: 27 of the 30 cases issued exactly
-# ONE call, so output_tokens / trials_evaluated is the per-trial cost exactly,
-# with no split double-counting. Over those 27 runs:
+# THE VALUE IT REPLACES WAS 1,100 AND WAS CALIBRATED ON A DIFFERENT MODEL.
+# That figure came from 27 gpt-5.6-terra runs at reasoning_effort='none' (the
+# history is kept below, because that arm is retained and this constant is
+# shared with it). MATCHING_PROVIDER has shipped 'bedrock_anthropic' since the
+# provider flip, so from that day until this measurement the pre-split guard on
+# the arm that actually runs was calibrated on a judge it never called.
+#
+# WHAT WAS MEASURED. `bedrock_probe.py --probe-output-tokens`, eight real Stage
+# 5 trial-shaped calls over ONE real rendered system prefix (32,495 chars;
+# 9,281 tokens as the model counted them, cached and read back on every call
+# after the first). The prefix and the trial blocks are one real cohort
+# patient's, rendered by `render_per_trial_probe_inputs.py` through the real
+# de-identified path, so every byte is what Stage 5 would have sent:
+#
+#     nct_id         user chars   outputTokens   evaluations
+#     NCT06107920         3,504       30 / 20              0   <- see below
+#     NCT06567782         2,904        1,038               1
+#     NCT07143487         2,627          649               1
+#     NCT05855200         2,304        1,076               1
+#     NCT03026140         1,939        1,356               1   <- the max
+#     NCT05789433         1,571          986               1
+#     NCT04185272         1,175          888               1
+#     NCT06270017           255          269               1
+#
+#     n = 7 verdicts:  min 269   median 986   mean 895   max 1,356
+#
+# All eight responses were well-formed under the shipped schema, and all eight
+# reported stopReason 'end_turn' -- nothing truncated at the 32,000 ceiling; the
+# largest reached 4.2% of it.
+#
+# THE ADMISSIBLE WINDOW IS [1,356, 1,536] AND BOTH BOUNDS ARE REAL.
+#
+#   lower  1,356 -- the measured max. Below it this constant is not an upper
+#          bound and a guard built on it is not a guard. The shipped 1,100 was
+#          BELOW it, by 23%.
+#   upper  1,536 -- the largest value for which the PROACTIVE splitter stays
+#          dead in the retained grouped arm. That arm's largest possible
+#          estimate at MAX_TRIALS_FOR_EVALUATION = 15 is the count term plus the
+#          capped criteria term, 1.25 x K x 15 = 18.75 K, against a threshold of
+#          MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS = 0.90 x 32,000
+#          = 28,800. 18.75 K <= 28,800 gives K <= 1,536.
+#
+# 1,450 IS THE MIDPOINT OF THAT WINDOW (1,446), ROUNDED UP TO THE NEAREST 50.
+# The midpoint rather than a fixed percentage, because the window is only 13%
+# wide and a conventional margin does not fit inside it: +25% over the measured
+# max is 1,695 and leaves the window entirely, arming a splitter that is
+# currently dead. Stated as the two things it buys:
+#
+#   +6.9% over the measured max. A margin is REQUIRED and is not decoration:
+#       n = 7, on ONE patient, is a weak estimate of the maximum over the
+#       ~4,500 trial-verdicts a 300-patient campaign produces.
+#   -5.6% under the constraint ceiling. Refusing to press that bound either,
+#       because what lies past it is a silent behaviour change to the arm the
+#       migration measures AGAINST.
+#
+# WHY THE MIDPOINT AND NOT THE TOP OF THE WINDOW -- THE TWO ERRORS ARE NOT
+# SYMMETRIC. Too LOW: the proactive guard under-fires, a batch is sent that
+# should have been split, and the REACTIVE splitter catches the truncation --
+# which is confirmed live on this model, not assumed: the same probe run
+# reported stopReason 'max_tokens' on a deliberate truncation (A7), which is the
+# single string that arms it. Bounded, handled, and it costs one extra call.
+# Too HIGH: past 1,536 the proactive splitter arms in grouped mode, silently,
+# and nothing in a grouped run would say so.
+#
+# NEITHER ARM'S BEHAVIOUR MOVES AT 1,450, and that is arithmetic rather than
+# hope. 18.75 x 1,450 = 27,187.5 <= 28,800, so the proactive splitter stays dead
+# in grouped mode -- and 1,450 is also above the gpt-5.6-terra measured max of
+# 1,138, so it remains a valid upper bound for the dormant arm this constant is
+# shared with. In PER-TRIAL mode the estimate for one trial is 1.25 x 1,450 =
+# 1,812 against the same 28,800, so the proactive splitter cannot fire there at
+# any value in this window at all.
+#
+# THE FLAT-IN-CRITERIA-LENGTH CLAIM WAS RE-CONFIRMED ON THIS MODEL, and it is
+# the claim `_estimate_output_tokens`'s own docstring rests on. The three
+# LARGEST inputs (2,904 / 2,627 / 2,304 chars) produced 1,038 / 649 / 1,076 --
+# every one of them BELOW the 1,356 that a 1,939-char trial produced. Output is
+# driven by the verdict's SHAPE, not by how much criteria text it was handed, so
+# the count term remains the driver and the criteria term remains a tie-breaker.
+# This was measured rather than assumed: a linear extrapolation from the first
+# five points predicted ~2,365 tokens for the largest trial and was wrong.
+#
+# THE ONE NON-ANSWER, RECORDED BECAUSE IT BOUNDS WHAT THIS MEASUREMENT IS.
+# NCT06107920 -- the LARGEST trial block of the eight -- returned
+# `{"evaluations": []}` on two separate calls (30 and 20 output tokens, 18
+# characters of body). That is WELL-FORMED under the shipped schema, which has
+# no `minItems` on the array, and it is not a verdict. It is excluded from the
+# seven above; excluding it cannot raise the max, because an empty answer is
+# short. Stage 5 absorbs it and it costs a verdict rather than money: driven
+# through the real node in the shipped arm, it produces one `not_evaluable`
+# verdict carrying reason `omitted_from_model_response`, zero retries and no
+# extra billed call. What it means for THIS constant is that one point of the
+# input range -- the top of it -- has no verdict measurement at all.
+#
+# WHAT WAS NOT RE-DERIVED, stated rather than left to be discovered. The
+# residual standard deviation quoted at MATCHING_OUTPUT_SPLIT_FRACTION below
+# (~1,398 tokens, 1 sd) is a per-BATCH figure from the 27-run gpt-5.6-terra set.
+# This measurement is per-TRIAL, taken in per-trial mode, and produced no batch
+# estimates at all, so that sd is NOT a figure about this model. Re-deriving it
+# needs grouped-arm runs on this judge.
+#
+# RE-DERIVE THIS WHENEVER MATCHING_MODEL, MATCHING_PROVIDER,
+# BEDROCK_ANTHROPIC_THINKING OR BEDROCK_ANTHROPIC_EFFORT CHANGES. It is a
+# measurement of one judge in one configuration, and the same sentence stood
+# above the gpt-5.6-terra numbers it replaced -- which is exactly how a constant
+# comes to be calibrated on a model nobody calls any more.
+#
+# ---------------------------------------------------------------------------
+# THE SUPERSEDED gpt-5.6-terra CALIBRATION, kept because the OpenAI arm is
+# RETAINED and this constant is shared with it.
+# ---------------------------------------------------------------------------
+#
+# DERIVED 2026-08-04 for gpt-5.6-terra at reasoning_effort='none'. The value
+# before that was 900, calibrated on 1,094 GPT-4o rows (median 712, p95 861 per
+# trial), and no longer described that model, which is ~35% more verbose per
+# verdict.
+#
+# That figure came from the step 7 runs: 27 of the 30 cases issued exactly ONE
+# call, so output_tokens / trials_evaluated is the per-trial cost exactly, with
+# no split double-counting. Over those 27 runs:
 #
 #     mean 959   median 974   p75 1,032   p90 1,048   p95 1,073   max 1,138
 #     sd 92      (15 of the 27 were at the full 15-trial cap)
 #
-# Reasoning tokens are INCLUDED in these figures by construction --
+# Reasoning tokens are INCLUDED in those figures by construction --
 # usage.completion_tokens already contains them -- and at 'none' they are 0 on
 # every run, so the count is visible output. At a higher effort this constant
 # must be re-derived, not scaled.
 #
-# 1,100 sits between p95 and the max, deliberately:
-#   - above the median, because a guard that uses the average case is not a
-#     guard;
-#   - not at the max, because calibrating to the single worst run makes the
-#     estimate a description of one patient.
-#   As a predictor of the whole response it errs high, which is what a guard
-#   should do: over the 27 runs the count term alone is >= the actual output in
-#   26 of them, the one under-estimate is 577 tokens, and the residual sd is
-#   1,398 tokens.
-#
-# WHERE THE THRESHOLD BITES — AND IT NO LONGER DOES. The pre-split threshold is
-# 0.90 x 32,000 = 28,800. The largest estimate this function can produce at
-# MAX_TRIALS_FOR_EVALUATION = 15 is the count term plus the capped criteria
-# term, 1.25 x 1,100 x 15 = 20,625, which is under it by 8,175. So the PROACTIVE
-# splitter cannot fire at the current batch cap: it is dead code until either
-# MAX_TRIALS_FOR_EVALUATION rises above 20 or the ceiling comes down. That is a
-# consequence of moving from a model whose 16,000-token ceiling the batch nearly
-# filled to one with 128,000, and it is stated here rather than discovered later
-# from a splitter whose counter never moves.
-#
-# The REACTIVE path and the single-trial floor stay, and are still the only
-# thing standing between a runaway response and a lost patient. Neither fired in
-# the 30-run measurement either: the worst single call reached 17,077 of 32,000.
-# Both are exercised by the truncation_split fixture, which injects a truncation
-# rather than waiting for one (see File 45).
-MATCHING_OUTPUT_TOKENS_PER_TRIAL = 1100
+# 1,100 sat between that set's p95 and its max, deliberately: above the median,
+# because a guard that uses the average case is not a guard; not at the max,
+# because calibrating to the single worst run makes the estimate a description
+# of one patient. THAT RULE IS NOT THE ONE THIS PASS APPLIED, and the difference
+# is n: 27 runs support a p95, 7 do not, so the shipped rule is now "the
+# measured max plus a margin" rather than "between p95 and the max".
+MATCHING_OUTPUT_TOKENS_PER_TRIAL = 1450
 
 # Fraction of MATCHING_MAX_TOKENS the estimate may reach before a batch is
-# split pre-emptively. 0.90 leaves 3,200 tokens of headroom for the estimate's
-# own error, which is ~1,398 tokens (1 sd) over the 27-run calibration set —
-# 2.3 sd of margin, against 0.8 sd under the previous model and ceiling.
+# split pre-emptively. 0.90 leaves 3,200 tokens between the threshold (28,800)
+# and the ceiling (32,000) for the estimate's own error.
+#
+# THE FRACTION DID NOT MOVE WHEN MATCHING_OUTPUT_TOKENS_PER_TRIAL WAS
+# RE-DERIVED ON 2026-09-03, AND WHAT THAT COSTS IS STATED. The headroom
+# BETWEEN the largest possible grouped estimate and the threshold DID move:
+# 1.25 x 1,450 x 15 = 27,187.5 against 28,800 leaves 1,612 tokens, where at the
+# previous 1,100 it left 8,175.
+#
+# THE '2.3 sd OF MARGIN' CLAIM THAT STOOD HERE IS DELETED RATHER THAN RESCALED.
+# The ~1,398-token residual sd it rested on is a per-BATCH figure from the
+# 27-run gpt-5.6-terra calibration; the 2026-09-03 measurement is per-TRIAL on
+# a different judge and produced no batch estimates at all, so there is no sd
+# for this model to restate the claim against. Re-deriving one needs grouped-arm
+# runs on the shipped judge, and until then this fraction is inherited rather
+# than measured -- which is worth knowing before anyone tightens it.
 MATCHING_OUTPUT_SPLIT_FRACTION = 0.90
 
 # How many times a batch may be HALVED because of truncation. This is depth,
@@ -3349,12 +3637,48 @@ HARNESS_GET_TIMEOUT = (HARNESS_CONNECT_TIMEOUT_SECONDS,
 # cannot disagree.)
 #
 # IT IS ALSO THE INPUT-PACKING DIVISOR (see MATCHING_INPUT_TOKEN_BUDGET below),
-# and there it is deliberately CONSERVATIVE rather than accurate. Measured on
-# this project's own Stage 5 prompts the true ratio is 4.2-4.4 characters per
-# token, so dividing by 4 over-states the token count by 5-10% and the packer
-# closes a chunk slightly early. That is the direction a budget guard must err
-# in: an under-estimate ships a chunk over the threshold the packing exists to
-# stay under, and the threshold is where the measured degradation begins.
+# and there it was chosen to be CONSERVATIVE rather than accurate. On
+# gpt-5.6-terra, measured on this project's own Stage 5 prompts, the true ratio
+# is 4.2-4.4 characters per token, so dividing by 4 OVER-states the token count
+# by 5-10% and the packer closes a chunk slightly early. That is the direction a
+# budget guard must err in: an under-estimate ships a chunk over the threshold
+# the packing exists to stay under, and the threshold is where the measured
+# degradation begins.
+#
+# ===========================================================================
+# THAT IS A FACT ABOUT ONE TOKENIZER AND IT DOES NOT HOLD ON THE SHIPPED ONE.
+# MEASURED 2026-09-03 ON us.anthropic.claude-sonnet-4-6.
+# ===========================================================================
+#
+# Read out of the usage blocks of the per-trial probe run -- so these are the
+# model's OWN token counts for this project's OWN rendered Stage 5 text, not an
+# estimate of them:
+#
+#     the rendered system prefix   32,495 chars /  9,281 tokens = 3.50
+#     a rendered trial user block   3,504 chars /    985 tokens = 3.56
+#                                   1,939 chars /    538 tokens = 3.60
+#                                   1,175 chars /    304 tokens = 3.87
+#
+# So on this judge the ratio is ~3.5, not 4.2-4.4, and dividing by 4
+# UNDER-states the token count by ~12.5% on the largest and cleanest sample
+# (the prefix estimates at 8,123 against a measured 9,281). THAT IS THE
+# DIRECTION THE PARAGRAPH ABOVE NAMES AS THE UNSAFE ONE.
+#
+# THE CONSTANT IS NOT CHANGED HERE, and the reason is the blast radius rather
+# than doubt about the measurement. This value has TWO owners' worth of
+# consumers -- the Stage 5 input packer and the indexer's embedding batch sizer
+# -- and the indexer talks to an OpenAI tokenizer for which 4 is still the
+# conservative direction. Lowering it globally would make the embedding sizer
+# batch smaller for no reason, and raising the packer's conservatism on one arm
+# is a change to what Stage 5 SENDS, which is a fixture-invalidating edit. The
+# honest fix is a per-provider ratio with its own measurement on each, and it is
+# recorded as a follow-up.
+#
+# WHAT IT MEANS IN THE MEANTIME, stated so nobody has to re-derive it: on the
+# shipped provider the input packer's chunks are ~12% larger in real tokens than
+# it believes, so MATCHING_INPUT_TOKEN_BUDGET is effectively ~12% looser than
+# its own comment claims. The per-trial arm is unaffected -- it bypasses the
+# packer entirely -- so this binds only on the retained grouped comparison arm.
 CHARS_PER_TOKEN = 4
 
 

@@ -1031,7 +1031,7 @@ python tests/test_agent_bedrock_adapter.py                          # 284 (was 2
 # visible rather than silent. It DOES exec: ten in-memory copies of
 # oncotriage/agent/bedrock_anthropic_adapter.py, one plant each, argued at
 # _EXEC_ALLOWLIST. Bucket A, ~0.8 s.
-python tests/test_agent_bedrock_anthropic_adapter.py                # 274
+python tests/test_agent_bedrock_anthropic_adapter.py                # 411 (was 393; the 6b probe pass added section 7e over the credential publisher, with four reverts all caught. This line said 274 and was stale by 119 -- the botocore-pin commit moved it and did not say so; MEASURED 2026-09-03)
 
 # The Bedrock go-live probe. NOT a test, NOT in tests/, NOT in any bucket, and
 # it REFUSES to do anything without its flag (exit 2, nothing called, nothing
@@ -1042,8 +1042,11 @@ python bedrock_probe.py --i-understand-this-bills --probe-seed   # + 1 more
 # The SECOND Bedrock branch (Claude Sonnet 4.6 over Converse). A DIFFERENT
 # lettered list -- A1..A10 at the top of
 # oncotriage/agent/bedrock_anthropic_adapter.py -- because both lists have an
-# item about structured output and they are about different APIs. NOT RUN YET:
-# every A-item is documentation until it is.
+# item about structured output and they are about different APIs.
+# RUN 2026-09-03: A1, A2, A3, A7, A11 and A12 are SETTLED and every one came
+# back positive. See "A11, A12 and A7 are settled" below for the numbers. The
+# remaining items (A5 effort, A6 against a console bill, A13, A14 throttling)
+# are still documentation.
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
     --probe-truncation                                   # + 1 more, settles A7
@@ -1057,16 +1060,38 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
     --probe-per-trial                                    # + 3 more
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
     --probe-per-trial --per-trial-prefix-file <a real rendered system prompt>
+# THE PREFIX AND THE TRIAL MESSAGES ARE RENDERED, FREE, BY THIS. It writes them
+# OUTSIDE the repository (a rendered prefix is a patient record) and refuses
+# boto3 for its whole run, so nothing it does can reach the judge.
+python render_per_trial_probe_inputs.py --trials 5
+# AND THE OUTPUT-TOKEN MEASUREMENT -- one billed call per --per-trial-user-file
+# over that shared prefix. THIS IS WHAT RE-DERIVES
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL, and the constant's own block says to re-run
+# it on every model, provider or thinking/effort change. Run it directly after
+# --probe-per-trial so the prefix is still inside BEDROCK_ANTHROPIC_CACHE_TTL;
+# a cold cache costs money and costs the measurement nothing.
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --calls 1 --per-trial-prefix-file <prefix> --probe-output-tokens \
+    --per-trial-user-file <trial 1> --per-trial-user-file <trial 2>   # 1 + N calls
 
 # ═══════════════════════════════════════════════════════════════════════════
-#  GO-LIVE, PER-TRIAL: NO PAID RUN BEFORE THE THREE-CALL PROBE.
-#  MATCHING_PER_TRIAL_CALLS_ENABLED SHIPS **True** AND TWO OF ITS PREMISES
-#  HAVE NEVER BEEN OBSERVED AGAINST THE LIVE PROVIDER.
+#  GO-LIVE, PER-TRIAL: THE THREE-CALL PROBE HAS BEEN RUN AND BOTH PREMISES
+#  HOLD. MEASURED 2026-09-03 against us.anthropic.claude-sonnet-4-6, on a REAL
+#  rendered Stage 5 prefix (32,495 chars / 9,281 tokens as the model counts
+#  them) rather than the probe's built-in one, which is below the cache floor.
 # ═══════════════════════════════════════════════════════════════════════════
-#  The probe is THREE CALLS and answers both, out of the USAGE BLOCK and never
-#  the wall clock. It is the migration window's FIRST command, on
-#  bedrock_probe.py's footing -- a deliberate, flagged, tiny spend that settles
-#  a configuration question before a campaign's worth of money rests on it:
+#    1. WARMUP ACCEPTANCE -- ACCEPTED. maxTokens = 1 WITH the structured-output
+#       block came back 200: stopReason 'max_tokens', outputTokens 1. The
+#       one-then-rest fallback is not needed on this provider.
+#    2. PREFIX WARMING -- IT WARMS. The warmup reported
+#       cacheWriteInputTokens 9,281 at TTL '5m', and BOTH trial calls behind it
+#       reported cacheReadInputTokens 9,281. Measured saving 48.7% on that
+#       three-call sequence; 4.2x per patient extrapolated to 15 trials.
+#
+#  SO THIS BANNER IS NO LONGER A BLOCK ON A PAID RUN. What follows is kept as
+#  the two questions it answered and WHY each mattered, because the constant's
+#  own block requires the probe to be re-run on every model, provider or
+#  thinking/effort change -- at which point both are open again:
 #
 #    1. WARMUP ACCEPTANCE -- does MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS
 #       = 1 come back 200 or 400? A reasoning model bills reasoning against
@@ -1081,6 +1106,13 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 #       NOTHING RAISES: every request succeeds, every verdict is produced, and
 #       the only trace is cached_tokens reading 0 in
 #       inferences.llm_classifier_call_details.
+#
+#  WHAT IS STILL UNMEASURED ON A PAID RUN, so this is not a clean bill: the
+#  cached READ is not priced (PRICING_CONFIG has no cached term, so every
+#  stored estimated_cost_usd on this branch is an OVER-estimate -- A13); the
+#  geo rows of that table are INFERRED at +10% and have never been reconciled
+#  against a console bill (A6); and A14, what the account does under sustained
+#  throttling, has not been run at all.
 #
 #  AND THE FIXTURE GATE DOES NOT COVER THE SHIPPED ARM. fixture_capture.py and
 #  fixture_replay.py PIN themselves to grouped and print that they did, so the
@@ -10854,6 +10886,164 @@ read, so check 2h is satisfied); CI bucket A **79 files, 0 failed, 0 not run**;
 `python s3_stage.py` exits 1 as above. Exactly two files changed. Across the
 whole repository **exactly one capture changed status**, and it is the offender.
 
+### A11, A12 and A7 are settled, and the per-trial output constant is measured (the 6b probe pass)
+
+**THE MIGRATION WINDOW'S FIRST COMMAND HAS BEEN RUN.** Every A-item this branch
+rested on was documentation; three of them are measurements now, and the
+constant Stage 5's pre-split guard is built from was re-derived on the judge
+that actually serves it. **17 billed calls, $0.513 at PRICING_CONFIG's uncached
+rates** (an over-estimate: the cache was working for most of them), against a
+$5.00 cap.
+
+**THE PROBE WAS BLOCKED AT $0 BY A PRODUCTION DEFECT, AND FINDING IT IS THE
+LARGEST THING IN THIS PASS.** `get_bedrock_anthropic_client()` built a client
+and `converse()` died `NoCredentialsError: Unable to locate credentials` --
+with the credential plainly present in `05- Keys/.env` as
+`AWS_BEARER_TOKEN_BEDROCK`. Driven, both arms:
+
+    'AWS_BEARER_TOKEN_BEDROCK' in os.environ           -> False
+    config.get_bedrock_anthropic_client(); converse()   -> NoCredentialsError
+
+    config.get_qdrant_url()                             # <- the only change
+    'AWS_BEARER_TOKEN_BEDROCK' in os.environ           -> True
+
+**THE CREDENTIAL REACHED THE PROCESS ONLY AS A SIDE EFFECT OF SOME OTHER CLIENT
+HAVING BEEN BUILT FIRST.** `get_qdrant_url()` and `get_openai_api_key()` both
+call `get_keys()` -> `paths.load_env_keys()`, whose allowlist NAMES this
+variable and whose `OPTIONAL_ENV_KEYS` docstring says why: "the shipped arm's
+judge does not authenticate without one of them". The intent was declared and
+**nothing on the Converse path called it**. On an ordinary batch run Stage 2
+builds those clients before Stage 5, so it worked by ACCIDENT OF ORDERING --
+one ablation flag, one installed stand-in or one `ONCOTRIAGE_QDRANT_URL`
+override away from not working, and the symptom is a CONFIGURATION fault
+arriving in the `credentials` category that Stage 5 retries like a transport
+one.
+
+**`_assert_bedrock_anthropic_credential_is_visible` CANNOT SEE IT, BY ITS OWN
+DESIGN RATHER THAN BY AN OVERSIGHT IN IT.** With neither name in `os.environ`
+the state is `absent + absent`, which that guard deliberately tolerates so it
+does not refuse an ordinary IAM deployment. A .env this project owns and has
+not read is indistinguishable there from a host that legitimately has none.
+
+`config._publish_project_bedrock_credential()` is the fix: called from the
+factory **above the guard and above the client**, returning a closed
+three-member vocabulary (`KEYS_FILE_STATES`) printed on the provenance path on
+every state. It is **not** the `os.environ` mutation that guard's docstring
+refused to make -- it calls `get_keys()`, the loader whose declared job this is.
+**It changes nothing on the ordinary path**: `get_keys()` caches on success, so
+a run that already built a Qdrant or OpenAI client gets a cache hit and
+`already-loaded`, which is the state that was masking the defect and is now
+reported. An unreadable .env answers `unavailable` and **does not raise**, so an
+IAM deployment still starts.
+
+**WHAT THE PROBE SETTLED, out of the usage block and never the wall clock:**
+
+| item | verdict |
+|---|---|
+| **A11** warmup shape | **ACCEPTED.** `maxTokens = 1` WITH the structured-output block: `stopReason 'max_tokens'`, `outputTokens 1`. The fallback schedule is not needed |
+| **A12** prefix warming | **THE CACHE WARMS.** The warmup wrote **9,281** tokens at TTL `5m` (matching `BEDROCK_ANTHROPIC_CACHE_TTL`), and both trial calls behind it read **9,281**. `classify_cache_write()` lets the wave out |
+| **A12** disjointness | AWS's own formula holds on all three: `prompt_tokens == inputTokens + cacheRead + cacheWrite` |
+| **A7** truncation | **`stopReason 'max_tokens'`** on a deliberate truncation -- the single string that arms the reactive split |
+| **A1** structured output | accepted AND enforced; the response conforms to the real Stage 5 schema |
+| **A3** model echo | **ARRIVES** -- see the correction above |
+| cache economics | 3 calls $0.0500 with the cache against $0.0976 without: **48.7% saving**, and **4.2x** cheaper per patient extrapolated to 15 trials |
+
+**`MATCHING_OUTPUT_TOKENS_PER_TRIAL` IS 1,450, RE-DERIVED FROM EIGHT REAL
+TRIAL-SHAPED CALLS.** It was 1,100, calibrated on gpt-5.6-terra over 27 runs --
+so from the provider flip until this measurement the guard on the arm that runs
+was calibrated on a judge it never called. Seven verdicts: min 269, median 986,
+mean 895, **max 1,356**. The full table, the window and what was NOT re-derived
+are at the constant.
+
+**THE VALUE IS THE MIDPOINT OF AN ADMISSIBLE WINDOW WHOSE BOTH BOUNDS ARE
+REAL** -- `[1,356, 1,536]`, only 13% wide. The lower bound is the measured max
+(below it the constant is not an upper bound); the upper is the largest K for
+which `18.75 K <= 0.90 x 32,000`, past which the **proactive splitter arms in
+the retained grouped comparison arm**. A conventional +25% is 1,695 and leaves
+the window entirely. The midpoint refuses to press either bound, and the two
+errors are not symmetric: too low is caught by the reactive splitter (A7,
+confirmed live), too high is a silent behaviour change to the arm the migration
+measures against.
+
+**`MATCHING_MAX_TOKENS` DOES NOT MOVE, AND THAT IS A MEASUREMENT.** The
+per-trial requirement is that the ceiling covers one whole response; 32,000
+covers the worst observed (1,356) **23.6x** over, and every one of the eight
+calls reported `end_turn`. Lowering it was refused on two measured grounds: any
+ceiling below **30,209** arms the grouped splitter, and Bedrock bills tokens
+GENERATED rather than the ceiling requested (confirmed on every call), so a high
+ceiling is free unless reached. The two arms genuinely want different ceilings
+-- per-trial ~8,000, grouped >= 30,209 -- and an arm-dependent ceiling is
+recorded as a follow-up rather than built on an unobserved runaway.
+
+**OUTPUT IS FLAT IN CRITERIA LENGTH ON THIS MODEL TOO, RE-CONFIRMED**, which is
+the claim `_estimate_output_tokens`'s docstring rests on. The three LARGEST
+inputs (2,904 / 2,627 / 2,304 chars) produced 1,038 / 649 / 1,076 -- all below
+the 1,356 a 1,939-char trial produced. **Measured rather than extrapolated: a
+linear fit to the first five points predicted ~2,365 for the largest trial and
+was wrong.**
+
+**ONE WELL-FORMED NON-ANSWER, AND IT EXPOSED A DEGENERATE-VALUE GAP IN THE
+PROBE.** The LARGEST trial block returned `{"evaluations": []}` on two separate
+calls (30 and 20 output tokens, 18 characters) -- schema-valid, because the
+array has no `minItems`, and not a verdict. **The probe reported PASS.** It now
+carries a non-degeneracy twin requiring at least one evaluation, prints the
+`evals` and `chars` columns it was already capturing, and reports the answering
+subset separately. Stage 5 absorbs the response itself: driven through the real
+node in the shipped arm it produces one `not_evaluable` verdict with reason
+`omitted_from_model_response`, **zero retries and no extra billed call** -- so
+it costs a verdict, not money.
+
+**`CHARS_PER_TOKEN = 4` UNDER-STATES ON THE SHIPPED TOKENIZER, WHICH IS THE
+DIRECTION ITS OWN COMMENT NAMES AS UNSAFE.** That comment records 4.2-4.4
+chars/token measured on gpt-5.6-terra. Read out of this run's usage blocks on
+Claude Sonnet 4.6: the rendered system prefix is **32,495 chars / 9,281 tokens
+= 3.50**, so dividing by 4 estimates 8,123 against a measured 9,281 -- **12.5%
+UNDER**. The constant is NOT changed (two subsystems share it and the indexer's
+tokenizer is the other one), the measurement is recorded at it, and the
+consequence is stated: on the shipped provider the input packer's chunks are
+~12% larger in real tokens than it believes. **It binds only on the grouped arm
+-- per-trial bypasses the packer.**
+
+**VERIFIED BY RUNNING.** `tests/test_agent_bedrock_anthropic_adapter.py`
+**411/0** (was 393; +18 from the new section 7e), with **four reverts, four
+caught** -- the publisher call deleted (11 failures), moved below the guard (1),
+made to raise instead of degrade (4), and a duplicated vocabulary member (an
+import-time `RuntimeError` naming both, so the module is unimportable, which is
+that guard working). The unplanted control copy is green at 411/0, so the
+harness imports the copy. `tests/test_package_invariants.py` **261/0/0**
+(unchanged -- MEASURED against HEAD in a worktree, so CLAUDE.md's "260" was
+already stale before this pass). CI bucket A **99 ran, 2 failed** and **both
+failures reproduce identically at HEAD** (`test_cancer_grouping_single_owner`
+7c, `test_paths_portability_roots` 8j) -- pre-existing, not this pass's.
+`static_checks.py` compiles 275; `ci_test_buckets --check` consistent at 118
+files. Every other suite at its documented count.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **n IS 7, ON ONE PATIENT.** It bounds what one verdict costs on this model;
+   it is not a distribution. The largest input in the sample has no verdict
+   measurement at all, because it is the one that answered empty.
+2. **THE EMPTY-ARRAY RATE IS UNKNOWN.** One of eight trials, reproduced twice,
+   on a patient whose cancer is RESOLVED and who has no ECOG and no stage. It
+   is handled at $0, but nothing measures how often it happens across a cohort
+   -- and in per-trial mode every such trial is a dedicated billed call that
+   produces no verdict.
+3. **A per-provider `CHARS_PER_TOKEN`** (above).
+4. **AN ARM-DEPENDENT `MATCHING_MAX_TOKENS`** (above).
+5. **`MATCHING_OUTPUT_SPLIT_FRACTION`'s residual sd IS INHERITED, NOT
+   MEASURED.** The ~1,398-token figure is per-BATCH from the gpt-5.6-terra set;
+   this measurement is per-TRIAL and produced no batch estimates. Re-deriving it
+   needs grouped-arm runs on the shipped judge.
+6. **THE TWELVE FIXTURES ARE STILL STALE** and this pass did not recapture. The
+   constant it moved is not a fixture-compared field, so it adds nothing to
+   what was already owed.
+7. **A14 (throttling) WAS NOT RUN.** `--probe-throttle` provokes 429s on purpose
+   and was out of this pass's scope.
+8. **THE `credentials` ERROR CATEGORY IS STILL RETRIED LIKE A TRANSPORT ONE.**
+   With the publisher in place the only way to reach it is a genuinely absent
+   credential, whose remedies the guard names -- but Stage 5 will still spend
+   its retry budget on it before saying so.
+
 ## Conventions
 
 - **All tunables live in `oncotriage/config.py`, and every one of them has a reader.** (`03- Config.py` used to re-export them for the exec chain; pass 20e deleted it.) Retrieval sizes, thresholds, rate limiting, drift windows, batch runner settings. Don't scatter magic numbers into node bodies. **The second half of that sentence is new in pass 20f-2 and it is enforced**, by `tests/test_package_invariants.py` check 2h: a constant here that nothing anywhere reads fails, and the exemption list is closed. That is what this promise is worth — an operator who sets a value in this file is entitled to an effect, and `BATCH_SIZE` and `EXPANSION_TEMPERATURE` were two that had none. Note the parenthesis that used to say "temperatures (both 0 for determinism)": `MATCHING_TEMPERATURE` is `None` because gpt-5.6-terra rejects the parameter, and `EXPANSION_TEMPERATURE` is deleted — so the phrase described neither of the two things it named.
@@ -11060,19 +11250,30 @@ substitution are in the log line. **THIS IS A DIFFERENT JUDGE.** The 69.1%
 agreement measurement behind the `'none'` choice was taken on another model and
 nothing carries it across.
 
-**CONVERSE RETURNS NO MODEL ECHO, SO `MatchingModelMismatchError` CANNOT FIRE
-ON THIS BRANCH.** The response shape declares `additionalModelResponseFields`,
-`metrics`, `output`, `performanceConfig`, `serviceTier`, `stopReason`, `trace`
-and `usage`, and no `model`. Three things are done: the echo is **asked for**
+**CONVERSE DECLARES NO MODEL ECHO IN ITS RESPONSE SHAPE, SO THE ADAPTER WAS
+BUILT ASSUMING `MatchingModelMismatchError` COULD NOT FIRE ON THIS BRANCH.**
+The response shape declares `additionalModelResponseFields`, `metrics`,
+`output`, `performanceConfig`, `serviceTier`, `stopReason`, `trace` and
+`usage`, and no `model`. Three things were done: the echo is **asked for**
 (`additionalModelResponseFieldPaths=["/model"]`, which the API reference says is
 ignored when the field is absent, so it is free if unsupported and a real
 attestation if it works -- A3); when it does not arrive the REQUESTED id is used
 **and the substitution is counted** under `model_echo_unavailable`, reaching the
 run-end report; and pricing is unaffected, because Bedrock bills for the id the
-request named. **`inferences.matching_model` on a `bedrock_anthropic` row is
-therefore what was requested rather than what answered, unless that counter is
-zero.** The alternative -- passing the requested id through silently -- would
-make the mismatch check compare a value with itself.
+request named. The alternative -- passing the requested id through silently --
+would make the mismatch check compare a value with itself.
+
+> **A3 IS SETTLED AND THE ANSWER IS THE OTHER ONE. MEASURED 2026-09-03 against
+> `us.anthropic.claude-sonnet-4-6`: THE ECHO ARRIVES.** The response carried
+> `additionalModelResponseFields: {"model": "claude-sonnet-4-6"}` -- the bare
+> id rather than the cross-Region profile -- which the adapter normalised to
+> `us.anthropic.claude-sonnet-4-6` and recorded as
+> `model_echo_normalised_from_alias: 1`. `model_echo_unavailable` did **not**
+> fire. So the "asked for it in case it works" branch is the live one:
+> **`MatchingModelMismatchError` IS live on this branch**, and
+> `inferences.matching_model` on a `bedrock_anthropic` row is what ANSWERED
+> rather than what was requested. The paragraph above is kept as the design's
+> own reasoning, which was right to ask and right not to assume.
 
 **A DEFECT STAGE 5 HAD ALREADY REMOVED WAS ABOUT TO BE REINTRODUCED, AND IT WAS
 FOUND BY READING WHAT THE CONSUMER DOES WITH THE FIELD.** Converse has no
@@ -11164,6 +11365,9 @@ migration was run.**
    does the disjointness formula hold against a real response) are ranked first
    and second because the first makes the branch useless and the second costs
    money silently.
+
+> **DISCHARGED 2026-09-03 -- the sentence above is kept as this pass's own conclusion rather than rewritten, per the rule that a past-tense account keeps its wording.** The probe HAS been run. A1, A2, A3, A7, A11 and A12 are settled and every one came back positive; A5, A6, A13 and A14 are still documentation. See "A11, A12 and A7 are settled" below for the numbers.
+
 2. ~~**PER-TRIAL MODE IS REFUSED ON THIS PROVIDER**~~ -- **CLOSED. See "Per-trial
    mode reaches the Converse branch" below.** The gap this named was real and
    the reason it gave was right: `cachePoint` with a 1,024-token minimum is
@@ -11355,7 +11559,13 @@ warmup makes the WARMUP pay the grammar compile `structured-output.html` warns
 about, once and awaited, instead of N wave requests meeting it at once. It
 remains a knob; set it False to reproduce the old behaviour.
 
-**THE PROBE IS EXTENDED AND WAS NOT RUN.** `--probe-per-trial` issues three
+**THE PROBE IS EXTENDED AND WAS NOT RUN.**
+
+> **RUN 2026-09-03. The paragraph below is kept as written; what it describes
+> as unrun is settled, and the `--probe-output-tokens` phase it added is what
+> re-derived `MATCHING_OUTPUT_TOKENS_PER_TRIAL` from 1,100 to 1,450.**
+
+`--probe-per-trial` issues three
 extra billed calls -- one warmup-shaped, two trial-shaped over the same
 prefix -- and reads the answer out of the USAGE BLOCK, never the wall clock. It
 also checks for free, before spending anything, that the two requests carry a
@@ -11419,6 +11629,9 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 1. **THE PROBE HAS NOT BEEN RUN.** Every A-item on this branch, old and new, is
    documentation until it is. (A11) and (A12) are the two that decide whether
    per-trial mode is usable here at all.
+
+> **DISCHARGED 2026-09-03 -- the sentence above is kept as this pass's own conclusion rather than rewritten, per the rule that a past-tense account keeps its wording.** The probe HAS been run. A1, A2, A3, A7, A11 and A12 are settled and every one came back positive; A5, A6, A13 and A14 are still documentation. See "A11, A12 and A7 are settled" below for the numbers.
+
 2. **THE CACHED READ IS NOT PRICED.** `get_model_cost()` takes an
    {input, output} pair; a cache hit therefore makes `estimated_cost_usd` on
    this branch an over-estimate by the gap between $3.00 and $0.30 per 1M on
