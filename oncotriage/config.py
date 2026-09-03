@@ -547,83 +547,174 @@ QUALITY_THRESHOLD_PERCENTILE = 25
 # score (the skip_cross_encoder ablation, or a trial no query scored) is not a
 # low score.
 #
-# PROVISIONAL, MEASURED, NOT TUNED.
+# MEASURED, NOT TUNED. RE-MEASURED 2026-09-03 (UTC) AND THIS SUPERSEDES THE
+# THREE-GROUP CALIBRATION THE PREVIOUS VALUE CAME FROM.
 #
 # It is the 5th percentile of the observed medcpt_score_max distribution over
-# 1,200 reranked trials from 30 patients -- 10 breast + 10 colon + 10 lung,
-# classified by oncotriage/evaluation/sampling.py:classify_cancer over the
-# primary condition registries/primary_cancer.py resolves, drawn with
-# random.Random(42).sample from each filename-sorted group of the 1,000-bundle
-# FHIR corpus. Run through Stages 1-3 only -- no rule filter, no billed Stage 5
-# call -- against the live 14,324-trial index on 2026-08-07.
+# 1,200 reranked trials from 30 patients, drawn PROPORTIONALLY across every
+# cancer group the corpus holds -- minimum one per non-empty group, by
+# oncotriage/evaluation/cohort.allocate_proportional -- with each patient's
+# group decided by the one grouper in
+# oncotriage/registries/primary_cancer.py:cancer_group_key. Seed 42
+# (sampling.SEED), each group's pool sorted by bundle filename so the draw is
+# order-independent. Run through Stages 1-3 only -- no rule filter, no billed
+# Stage 5 call -- against the live index trial_criteria_20260810_145902,
+# 14,324 points, on 2026-09-03 (UTC). Cost: 30 text-embedding-3-small calls,
+# $0.000074, read back out of spend.SPEND_LEDGER rather than estimated.
+#
+# THE POOL, AS DRAWN. Corpus group populations were breast 290, colorectal
+# 405, prostate 237, hematologic 52, lung 16 -- and those five sum to 1,000,
+# so on this corpus five of the vocabulary's fifteen anatomical groups are
+# non-empty and NEITHER `other` NOR `unknown` occurs at all: every patient
+# resolves to a named cancer. The allocator drew:
+#
+#     colorectal   12        hematologic   1
+#     breast        9        lung          1
+#     prostate      7
+#
+# LUNG IS ONE PATIENT AND THAT IS THE PRICE OF PROPORTIONALITY, stated rather
+# than glossed. The retired rule took ten per group by construction, whatever
+# a group held; this one takes the share each group actually has, and lung
+# holds 16 of 1,000 under the shipped grouper. The floor is a property of the
+# score distribution the pipeline meets, and the pipeline meets this corpus,
+# so a draw that over-weighted a 1.6% group to make the pool look balanced
+# would be calibrating against a cohort nobody runs. WHAT THAT COSTS: this
+# floor is a statement about breast, colorectal and prostate disease with one
+# observation each of hematologic and lung, and a corpus whose mix moves is
+# the FIRST of the four staleness conditions below.
 #
 # OBSERVED, and the whole shape is recorded so a reader can disagree with the
 # choice of percentile from the same numbers rather than from this sentence:
 #
 #              per patient   per distinct pool
-#     p0        -12.1689         -12.1689
-#     p1        -10.6643         -10.3281
-#     p5         -8.4173          -8.4035     <- the floor
-#     p10        -7.4909          -7.4909
-#     p25        -4.6214          -4.4771
-#     p50        -2.1574          -2.1574
-#     p75        +2.1062          +2.1062
-#     p95        +4.6252          +4.9323
+#     p0        -15.6467         -15.6467
+#     p1        -12.2018         -13.1827
+#     p5        -10.4508         -11.6265     <- the floor
+#     p10        -8.4035          -9.1290
+#     p25        -5.3177          -5.5338
+#     p50        -3.0963          -3.0804
+#     p75        +0.0807          +0.0807
+#     p90        +3.7354          +3.9499
+#     p95        +6.7569          +7.9567
+#     p99        +9.6746         +10.4493
 #     p100      +13.9987         +13.9987
-#     mean       -1.6813   std 4.3548
+#     mean       -2.5566   std 4.8543
 #
 #     1,200 of 1,200 reranked trials carried a score; 0 came back None.
-#     800 were scored by 3 rerank queries and 400 by 4.
+#     840 were scored by 3 rerank queries and 360 by 4.
 #
-# THE SECOND COLUMN IS NOT DECORATION. The 30 patients produce only 19 DISTINCT
-# reranked pools -- 760 distinct trials counted 1,200 times -- because Synthea
-# patients within one cancer type carry near-identical condition lists, so
-# Stage 1 builds the same expanded query and Stage 2 retrieves the same trials.
-# "1,200 trials" is a sample size this measurement does not have, and the
-# per-patient column is weighted by how often each pool RECURS. Both are
-# reported so neither can be mistaken for the other.
+# THE SECOND COLUMN IS NOT DECORATION. The 30 patients produce only 21
+# DISTINCT reranked pools -- 840 distinct trials counted 1,200 times --
+# because Synthea patients within one cancer type carry near-identical
+# condition lists, so Stage 1 builds the same expanded query and Stage 2
+# retrieves the same trials. "1,200 trials" is a sample size this measurement
+# does not have, and the per-patient column is weighted by how often each pool
+# RECURS. Both are reported so neither can be mistaken for the other.
 #
 # WHICH ONE WINS IS A RULE, NOT A JUDGEMENT: the LOWER of the two, always. A
 # floor set too low drops nothing, which is the state it replaced, so the cost
 # is zero and the error is visible as floor_only == 0. Set too high it silently
 # removes trials that would have been evaluated, and that loss appears in no
-# counter and no stored row. Here the per-patient figure is lower, so it wins.
+# counter and no stored row. Here the DISTINCT-POOL figure is lower, so it wins
+# -- the other way round from the previous calibration, where the two were
+# within 0.02 of each other and the per-patient one won.
 #
-# IT WAS NOT ADJUSTED AFTERWARDS TO HIT A DROP COUNT. Measured impact on those
-# same 30 pools, by RUNNING the gate rather than by arguing from the value:
-# the relative percentile dropped 300 trials, the floor dropped 60, and the
-# floor dropped 10 THAT THE PERCENTILE DID NOT -- 6 once duplicate pools are
-# removed, across 10 of the 30 patients. Six distinct trials out of 760 is the
-# honest size of this knob's effect on this sample, and it is recorded whether
-# or not it flatters the change.
+# THE PREVIOUS VALUE WAS OVER-FILTERING, AND THAT IS THE FINDING RATHER THAN
+# THE RECALIBRATION ITSELF. Both floors were run through the real
+# apply_quality_gate over the same reranked pools, so this is measured and not
+# argued from the values. THE MEASUREMENT WAS REPEATED THREE TIMES IN THREE
+# PROCESSES and both columns are given, because one of them is stable and the
+# other is not:
+#
+#                     by percentile   by floor   floor ONLY   patients hit
+#     -8.4173 (was)        300          113          21          16/30   <- all 3 runs
+#    -11.6265 (now)        300           44           4           1/30   <- runs 1 and 2
+#    -11.6265 (now)        300           50          10           7/30   <- run 3
+#
+# The old number was calibrated to drop 60 trials with 10 floor-only; on the
+# corpus this project runs today it drops 113 with 21 floor-only and reaches
+# 16 patients of 30, IDENTICALLY IN EVERY RUN. The distribution moved DOWN
+# under it -- p50 -2.1574 -> -3.0963, mean -1.6813 -> -2.5566 -- so a fixed
+# floor bites harder every time the corpus shifts, in the direction whose cost
+# appears nowhere. The adoption rests on that row, which is the reproducible
+# one.
+#
+# THE MEASUREMENT IS NOT EXACTLY REPRODUCIBLE, AND THE PREVIOUS NOTE DID NOT
+# SAY SO BECAUSE NOBODY HAD RUN IT TWICE. Three runs against the same corpus,
+# the same seed and the same collection:
+#
+#     run   distinct pools   per-patient p5   distinct-pool p5   recommended
+#      1          21            -10.4508          -11.6265        -11.6265
+#      2          21            -10.4508          -11.6265        -11.6265
+#      3          20            -10.4508          -11.6609        -11.6609
+#
+# THE PER-PATIENT COLUMN IS IDENTICAL TO FOUR DECIMALS AT ALL ELEVEN REPORTED
+# PERCENTILES IN ALL THREE RUNS. What varies is the DEDUPLICATION: on run 3 one
+# patient's Stage 2 returned a candidate set equal to another patient's, so 30
+# patients collapsed to 20 distinct pools instead of 21 and the distinct-pool
+# percentile -- which the LOWER-of-two rule selects -- moved by 0.034.
+#
+# THE CAUSE IS ANN RETRIEVAL, NOT THE CROSS-ENCODER, and that was measured
+# rather than assumed: across run 3's thirty pools the number of distinct trial
+# id SETS equals the number of distinct digests exactly, and no two pools share
+# an id set while differing in digest. MedCPT is therefore bit-reproducible
+# given the same trials, and the variation is Qdrant's HNSW search returning a
+# slightly different candidate set for one patient of thirty.
+#
+# WHY -11.6265 AND NOT THE MORE PERMISSIVE -11.6609. The LOWER-of-two rule is
+# pre-registered for the two ESTIMATORS WITHIN ONE RUN. Extending it to "the
+# lowest across however many runs were done" would make the number a function
+# of how many times it was measured, which is the post-hoc selection that rule
+# exists to prevent, pointing the other way. So the value is the one the
+# SHIPPED entry point recommended on the run of record -- independently
+# reproduced by a second process, and the majority of three -- and the spread
+# is recorded here so the next reader decides from the same numbers rather
+# than from this sentence.
+#
+# IT WAS NOT ADJUSTED AFTERWARDS TO HIT A DROP COUNT, and the sweep that says
+# so is recorded because it does not flatter the number. Running the gate at
+# every percentile from p0 to p25 over run 2's pools gives floor-only counts of
+# 0, 4, 4, 4, 4, 11, 11, 11, 11, 21, 58, 151 at p0/p1/p2/p3/p4/p5/p6/p7/p8/
+# p10/p15/p25 of the per-patient distribution. THERE IS A STEP AT p4 -> p5,
+# where floor-only goes 4 -> 11: the adopted value is exactly the per-patient
+# p4 (the two percentiles select the same observation), so it sits at the FOOT
+# of that step, on the flat and permissive side. One percentile stricter would
+# nearly triple the knob's effect. That is stated here rather than left for the
+# next reader to find, and it is the reason the LOWER-of-two rule is a rule.
 #
 # STALE AS SOON AS ANY OF FOUR THINGS MOVES: the indexed corpus, the rerank
-# queries, the cross-encoder checkpoint, or THE GROUPING THE CALIBRATION POOL IS
-# DRAWN THROUGH. Re-measure with `python measure_medcpt_scores.py`.
+# queries, the cross-encoder checkpoint, or the grouping the calibration pool
+# is drawn through. Re-measure with `python measure_medcpt_scores.py`.
 #
-# THE FOURTH CONDITION IS NEW AND IT HAS ALREADY FIRED. The pool above was
-# "10 breast + 10 colon + 10 lung, classified by
-# oncotriage/evaluation/sampling.py:classify_cancer" -- a THREE-GROUP
-# vocabulary fitted to a retired corpus, in which everything else was "other"
-# and unsampled. On the corpus this project runs today that "other" is 289 of
-# 1,000 patients, all of them prostate, myeloma or leukaemia, and the
-# cohort-stratification pass replaced that vocabulary with the fifteen-group
-# one now owned by oncotriage/registries/primary_cancer.py. So the pool
-# `python measure_medcpt_scores.py` draws today is NOT the pool this number was
-# measured over: it is proportional across every group the corpus holds rather
-# than ten each from three of them.
+# WHETHER A SECOND CONDITION HAD ALSO FIRED CANNOT BE ESTABLISHED, and that is
+# itself the finding. The grouping had changed, which the previous note
+# recorded. Whether the INDEXED CORPUS had is UNANSWERABLE from the artifacts:
+# the previous note recorded a point count and no collection NAME, the alias
+# has been repointed at least once since (it resolves to
+# trial_criteria_20260810_145902 today), and the count is 14,324 both then and
+# now -- so the one number that was written down is the one number that cannot
+# distinguish two collections. A COUNT IS NOT AN IDENTITY;
+# `oncotriage/run_fingerprint.py:COLLECTION_IDENTITY` records the same limit
+# for the resume gate, in as many words. The collection name is recorded above
+# for the first time so this question has an answer next time it is asked.
 #
-# THE NUMBER WAS DELIBERATELY NOT RE-MEASURED IN THAT PASS, which spent nothing
-# and made no billed call -- a recalibration is a real measurement against a
-# live index and belongs to a pass that can run one. WHAT THAT COSTS, STATED:
-# the floor in force is a 5th percentile of a distribution over breast, colon
-# and lung pools, applied to a pipeline that now also evaluates prostate,
-# hematologic and every other group. It is a FLOOR, so the direction of the
-# error is that it drops too little rather than too much -- the state it
-# replaced -- and `quality_dropped_floor_only` is the counter that would show
-# it doing nothing. It is recorded here so the recalibration item knows there
-# are four conditions and that one of them is already true.
-MEDCPT_SCORE_FLOOR = -8.4173
+# THE TWELVE CHARACTERIZATION FIXTURES RECORD THIS TUNABLE, so a replay of a
+# capture taken before this change reports it as a CONFIG MOVED line, which is
+# correct and is what that report is for. IT IS NOT ONLY A TUNABLE DIFF, and
+# the difference matters: the floor is one of Stage 4's two quality knobs, so
+# moving it can move the KEPT SET and therefore the deterministic prefix. That
+# was measured against the twelve fixtures on disk rather than assumed, by
+# re-gating each one's recorded stage3 scores against its own recorded
+# quality_threshold -- 0 currently-kept trials are dropped by the new floor
+# (it is more permissive, so none can be), and at most 23 trials across the
+# twelve could be RESTORED to a kept set, concentrated in
+# mesh_fallback_siteless_code (<= 13) and normal_2 (<= 5). Five fixtures are
+# provably unchanged in both directions. 23 is an exact upper bound rather
+# than a count because a fixture records how many trials the rule filter
+# passed but not WHICH, so the rule-dropped trials cannot be excluded from the
+# band. Every change is in the permissive direction: more trials evaluated,
+# never fewer.
+MEDCPT_SCORE_FLOOR = -11.6265
 
 
 # Limiting the number of trials sent to GPT

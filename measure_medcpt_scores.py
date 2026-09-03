@@ -4,7 +4,7 @@
 """Measure the ``medcpt_score_max`` distribution and propose MEDCPT_SCORE_FLOOR.
 
     python measure_medcpt_scores.py
-    python measure_medcpt_scores.py --patients-per-cancer 10 --seed 42
+    python measure_medcpt_scores.py --sample-total 60 --seed 42
     python measure_medcpt_scores.py --floor -9.14 --json /tmp/medcpt.json
 
 THIN ENTRY POINT. Every definition lives in
@@ -12,15 +12,18 @@ THIN ENTRY POINT. Every definition lives in
 what it costs and how the sample is drawn.
 
 IT IS NOT FREE, AND IT IS NOT EXPENSIVE. Stages 1-3 only, stopping before the
-rule filter and before the billed eligibility call: one
-``text-embedding-3-small`` call per rerank query per patient, thirty patients.
-Fractions of a cent. MedCPT is local and Qdrant is a read.
+rule filter and before the billed eligibility call: ONE
+``text-embedding-3-small`` call PER PATIENT -- not one per rerank query, which
+is what this said until it was measured -- over ``SAMPLE_TOTAL`` patients.
+$0.000074 for the whole run on the shipped corpus, 2026-09-03. MedCPT is local
+and Qdrant is a read.
 
 WHY THIS FILE IS NOT NUMBERED. Same reason as ``fixture_capture.py``,
 ``fixture_replay.py`` and ``mcp_server.py``: the numbered sequence says what you
 can run in pipeline order, and this is a calibration tool run by hand after an
-index rebuild, a rerank-query change or a cross-encoder checkpoint change --
-the three things that make the floor in ``oncotriage/config.py`` stale.
+index rebuild, a rerank-query change, a cross-encoder checkpoint change or a
+change to the GROUPING its pool is drawn through -- the four things that make
+the floor in ``oncotriage/config.py`` stale.
 
 Exit codes:
     0 -- the measurement completed

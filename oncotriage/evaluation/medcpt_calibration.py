@@ -14,21 +14,46 @@ by judgement would be the same defect one layer along, so it is measured here.
 WHAT IT RUNS, AND WHAT IT COSTS. Stages 1, 2 and 3 only:
 
     node_query_expansion   deterministic, no LLM, free
-    node_hybrid_retrieval  Qdrant + one text-embedding-3-small call per query
+    node_hybrid_retrieval  Qdrant + ONE text-embedding-3-small call per
+                           PATIENT, over ``state["expanded_query"]``
     node_cross_encoder_rerank   MedCPT, local, free
 
-IT STOPS BEFORE STAGE 4 AND STAGE 5. No eligibility call is made, so the run
-costs the embedding calls and nothing else -- fractions of a cent at
-$0.02/1M tokens for thirty short queries. It is not free, and saying "free"
-about a script that calls an API is the kind of claim this project does not
-make.
+ONE CALL PER PATIENT, NOT ONE PER RERANK QUERY, and this file claimed the
+latter until it was measured. Stage 2's three BM25 channels are FastEmbed
+sparse vectors computed locally, and Stage 3's rerank queries are scored by
+MedCPT, which is also local -- so the only priced endpoint either stage
+reaches is the dense channel's single embedding of the fused query
+(``oncotriage/agent/retrieval.py``: ``query = state["expanded_query"]``, then
+``models.get_embedding(query)`` once).
 
-HOW THE PATIENTS ARE DRAWN. The same rule
-``oncotriage/evaluation/sampling.py`` uses for the evaluation sample: classify
-each patient's primary condition into breast / colon / lung with
-``classify_cancer``, sort each group by bundle filename so the pool is
-order-independent, and take ``random.Random(seed).sample`` of ten from each.
-Seed 42 by default, which is ``sampling.SEED``.
+IT STOPS BEFORE STAGE 4 AND STAGE 5. No eligibility call is made, so the run
+costs ``SAMPLE_TOTAL`` embedding calls and nothing else. MEASURED on the
+shipped corpus, 2026-09-03: $0.000074 for the whole run, read back out of
+``oncotriage.spend.SPEND_LEDGER`` rather than estimated. It is not free, and
+saying "free" about a script that calls an API is the kind of claim this
+project does not make.
+
+HOW THE PATIENTS ARE DRAWN. ``SAMPLE_TOTAL`` patients in total, allocated
+PROPORTIONALLY across every cancer group the corpus holds -- minimum one per
+non-empty group -- by ``oncotriage/evaluation/cohort.allocate_proportional``,
+the same allocator the campaign cohort and the evaluation extract use, so the
+three samplers in this package cannot come to disagree about what
+"proportional" means. Each patient's group comes from the ONE grouper,
+``oncotriage/registries/primary_cancer.py:cancer_group_key``, reached here as
+``sampling.classify_cancer`` -- an alias of it rather than a forwarder, so
+this pool cannot be drawn through a vocabulary of its own. Each group's pool
+is sorted by bundle filename so the draw is order-independent, and its members
+are taken with ``random.Random(seed).sample``. Seed 42 by default, which is
+``sampling.SEED``.
+
+THIS PARAGRAPH DESCRIBED THE RETIRED RULE -- "ten each from breast, colon and
+lung" -- for the whole of the pass that replaced it, and that is recorded
+rather than quietly corrected. The code moved at the cohort-stratification
+pass and the prose did not, so a reader of this file was told the pool was
+three fixed groups of ten while the function beneath drew a proportional
+sample over fifteen. A docstring that contradicts its own function is the same
+defect class as the stale comment ``RERANK_SCORE_THRESHOLD`` died of, one
+directory over.
 
 IT DRAWS FROM THE FHIR CORPUS, NOT FROM ``inferences.db``, and that is
 deliberate: the floor must be measured against the patients the pipeline can be
@@ -36,14 +61,18 @@ asked about, not against the subset that happens to have been run already --
 which is a record of past batch runs and would make the floor a function of
 what was measured last time.
 
-THE FLOOR IS STALE THE MOMENT ANY OF THREE THINGS MOVES: the indexed corpus
+THE FLOOR IS STALE THE MOMENT ANY OF FOUR THINGS MOVES: the indexed corpus
 (different documents to score), the rerank queries (different queries to score
-them with), or the cross-encoder checkpoint (a different scale entirely).
-Re-run this after any of them.
+them with), the cross-encoder checkpoint (a different scale entirely), or THE
+GROUPING THIS POOL IS DRAWN THROUGH (a different population to score them
+over). Re-run this after any of them. ``config.MEDCPT_SCORE_FLOOR`` carries
+the same four conditions and is where each is argued; the count is stated in
+both places because a reader who meets one of them will be at whichever of the
+two files they opened first.
 
 Run from terminal (or F5 in Spyder):
     python measure_medcpt_scores.py
-    python measure_medcpt_scores.py --patients-per-cancer 10 --seed 42
+    python measure_medcpt_scores.py --sample-total 60 --seed 42
     python measure_medcpt_scores.py --json /tmp/medcpt.json
 
 Exit codes:
@@ -206,8 +235,21 @@ def select_patients(sample_total: int = SAMPLE_TOTAL,
         for path in random.Random(seed).sample(pool, share):
             selected.append((kind, path, parsed[path]))
 
-    console.out(f"Pool sizes: "
+    # TWO DIFFERENT NUMBERS, AND UNDER THE PROPORTIONAL DRAW THEY ARE EASY TO
+    # CONFUSE. The first line is the CORPUS -- how many patients each group
+    # holds -- and the second is what was DRAWN from it. Only the first was
+    # printed, under the label "Pool sizes", which reads as the drawn pool: a
+    # reader seeing `breast=290` would reasonably take it for 290 breast
+    # patients measured. That was harmless while the draw was a fixed ten per
+    # group and the two could not be confused, and became misleading the
+    # moment the allocation started varying with the corpus -- which is the
+    # change `config.MEDCPT_SCORE_FLOOR`'s fourth staleness condition records.
+    console.out("Corpus group populations: "
                 + ", ".join(f"{k}={len(groups[k])}" for k in sorted(groups)))
+    console.out(f"Drawn ({len(selected)} of {sample_total} requested, "
+                f"proportional, minimum one per non-empty group): "
+                + ", ".join(f"{k}={allocation[k]}" for k in sorted(groups)
+                            if allocation[k]))
     return selected
 
 
@@ -240,9 +282,27 @@ def pool_digest(reranked: list) -> str:
     Synthea patients within one cancer type carry near-identical condition
     lists, so Stage 1 builds the same expanded query, Stage 2 retrieves the
     same trials and Stage 3 hands back the same pool. Measured on the shipped
-    corpus, 2026-08-07: 30 patients produce 19 DISTINCT pools -- 760 distinct
-    trials counted 1,200 times. Without this, "1,200 trials from 30 patients"
-    is a sample size the measurement does not have.
+    corpus under the PROPORTIONAL draw, 2026-09-03: 30 patients produce 21
+    DISTINCT pools -- 840 distinct trials counted 1,200 times. Without this,
+    "1,200 trials from 30 patients" is a sample size the measurement does not
+    have. (It was 19 pools and 760 trials under the retired three-group draw,
+    measured 2026-08-07; the figure is a property of the pool, so it moves
+    with the draw and with the corpus.)
+
+    THIS DIGEST IS THE ONE PART OF THE MEASUREMENT THAT IS NOT REPRODUCIBLE
+    RUN TO RUN, and the recommendation is taken from the column it produces,
+    so the sensitivity is worth knowing before trusting a fourth decimal.
+    Three runs against one corpus, one seed and one collection gave 21, 21 and
+    20 distinct pools: on the third, one patient's Stage 2 returned a
+    candidate set equal to another patient's, and the distinct-pool p5 moved
+    by 0.034. THE CAUSE IS THE ANN SEARCH AND NOT THIS FUNCTION, measured --
+    across those thirty pools the count of distinct trial id SETS equals the
+    count of distinct digests, and no two pools share an id set while
+    differing in digest, so MedCPT is bit-reproducible given the same trials
+    and Qdrant's HNSW is what varied. The per-patient distribution is
+    unaffected: identical to four decimals at all eleven reported percentiles
+    in all three runs. ``config.MEDCPT_SCORE_FLOOR`` records the spread and
+    which run the shipped value came from.
 
     A CHEAPER SIGNATURE WAS TRIED FIRST AND WAS WRONG. Grouping patients by
     (min, max) of their pool's scores reported all ten breast patients as one
@@ -345,6 +405,17 @@ def measure(pools: list, seed: int, sample_total: int) -> dict:
         "trials_unscored": unscored,
         "queries_scored_histogram": {str(k): v for k, v in sorted(
             query_counts.items(), key=lambda kv: (kv[0] is None, kv[0]))},
+        # WHAT WAS ACTUALLY DRAWN, PER GROUP. Derived from per_patient rather
+        # than passed in, so it describes the pools this report is computed
+        # over and cannot disagree with them. It is a field of its own because
+        # under the proportional draw the composition is a function of the
+        # CORPUS -- it was a constant 10/10/10 before -- so it is the first
+        # thing a reader needs in order to judge how far the floor below
+        # generalises, and re-deriving it from per_patient is work every
+        # consumer of the artefact would otherwise repeat.
+        "drawn_composition": {
+            k: sum(1 for p in per_patient if p["cancer_type"] == k)
+            for k in sorted({p["cancer_type"] for p in per_patient})},
         "per_patient": per_patient,
     }
 
@@ -361,13 +432,15 @@ def measure(pools: list, seed: int, sample_total: int) -> dict:
     # --- THE SAME DISTRIBUTION OVER DISTINCT POOLS --------------------------
     #
     # WITHOUT THIS THE HEADLINE NUMBER IS A COHORT ARTEFACT WEARING A SAMPLE
-    # SIZE. All ten breast patients in the shipped corpus produce a byte-
-    # identical reranked pool, so "1,200 trials from 30 patients" is really
-    # ~320 distinct trials with one pool carrying a third of the weight. The
-    # per-patient figure is still the one the floor is set from -- production
-    # gates per patient, so a pool that recurs ten times really is gated ten
-    # times -- but a reader who is not shown the deduplicated figure beside it
-    # cannot tell a broad measurement from a narrow one repeated.
+    # SIZE. Patients within one cancer group routinely share a byte-identical
+    # reranked pool: measured 2026-09-03 on the proportional draw, 30 patients
+    # collapse to 21 distinct pools with the largest cluster holding five, so
+    # "1,200 trials from 30 patients" is really 840 distinct trials unevenly
+    # weighted. The per-patient figure is still the one the floor is set from
+    # -- production gates per patient, so a pool that recurs five times really
+    # is gated five times -- but a reader who is not shown the deduplicated
+    # figure beside it cannot tell a broad measurement from a narrow one
+    # repeated.
     unique = distinct_pools(pools)
     unique_scores = [
         float(t["medcpt_score_max"])
@@ -488,6 +561,10 @@ def print_report(report: dict) -> None:
                 f"(of {report['sample_total_requested']} requested, "
                 f"proportional across cancer groups, "
                 f"seed {report['seed']})")
+    console.out("  by cancer group   : "
+                + (", ".join(f"{k}={v}" for k, v in
+                             sorted(report.get("drawn_composition", {}).items()))
+                   or "(none)"))
     console.out(f"patients measured   : {report['patients_measured']}")
     console.out(f"trials scored       : {report['trials_scored']}")
     console.out(f"trials with NO score: {report['trials_unscored']}")
