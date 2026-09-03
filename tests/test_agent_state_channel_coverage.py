@@ -117,6 +117,29 @@ from oncotriage.agent.state import TrialMatchState
 from oncotriage.agent.terminal import node_finalize
 from oncotriage import config                            # noqa: E402
 
+# ===========================================================================
+# THIS FILE'S SUBJECT IS THE DORMANT OpenAI STAGE 5 REQUEST -- SO IT PINS IT
+# ===========================================================================
+#
+# `config.MATCHING_PROVIDER` ships "bedrock_anthropic". Every Stage 5 stand-in
+# below is installed at `deps.OPENAI_CLIENT` and wraps `chat.completions
+# .create`, so at the shipped default the dispatch would reach
+# `deps.BEDROCK_ANTHROPIC_CLIENT` and `converse` instead: the stand-in would
+# never be called, every assertion here would compare against an empty
+# recorder, and `config.get_bedrock_anthropic_client()` would BUILD -- boto3
+# probing the instance metadata service from a suite that reports it makes no
+# network call, and issuing live billed Converse requests on any host whose
+# credential chain finds something.
+#
+# The pin, its cost and why it has one owner rather than a block per file are
+# argued in tests/_provider_pin.py. THE SHIPPED ARM IS NOT COVERED BY THIS
+# FILE; on Converse these subjects are covered by
+# tests/test_agent_bedrock_anthropic_adapter.py and
+# tests/test_agent_bedrock_anthropic_per_trial.py alone.
+import _provider_pin                                             # noqa: E402
+
+_PROVIDER_BEFORE_PIN = _provider_pin.pin_openai_arm(os.path.basename(__file__))
+
 
 # ===========================================================================
 # THIS FILE'S SUBJECT IS THE RETAINED GROUPED ARM, AND IT PINS IT
@@ -1096,6 +1119,24 @@ else:
 
 print()
 print("=" * 70)
+
+# --- RELEASE THE PROVIDER PIN, ABOVE THE SUMMARY ---------------------------
+#
+# ABOVE, NOT BELOW: a release under the results line still decides the exit
+# code while being absent from the number the summary printed -- a run that
+# reports "0 failed" and exits non-zero. The default-flip pass shipped exactly
+# that in three of seven files, which is why the release is one function with
+# one caller-visible answer rather than four hand-written lines here.
+#
+# THE OUTCOME IS RECORDED BEFORE THE RESTORE, so "there was a pin to release"
+# cannot be satisfied by a process that never installed one.
+_PIN_WHO, _PIN_PREVIOUS, _PIN_RESTORED = _provider_pin.release_openai_arm()
+check("[provider pin] the OpenAI pin this file installed was released, and "
+      "config.MATCHING_PROVIDER is back to the shipped provider",
+      (_PIN_WHO == os.path.basename(__file__), _PIN_PREVIOUS, _PIN_RESTORED,
+       _provider_pin.pin_state()),
+      (True, _PROVIDER_BEFORE_PIN, True, (None, None)))
+
 print("SUMMARY")
 print("=" * 70)
 print(f"Passed: {_RESULTS['passed']}")

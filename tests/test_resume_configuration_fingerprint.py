@@ -119,6 +119,20 @@ import tempfile
 from pathlib import Path
 
 from oncotriage import config as _config
+
+# CAPTURED AT IMPORT, BEFORE ANY SECTION HAS REBOUND ANYTHING, so the leakage
+# checks at the end of this file compare against what was in force when it
+# started rather than against a local left behind by whichever scenario
+# happened to run last. The end-of-file check used to read `_model_was` -- a
+# scenario-scoped name -- which meant deleting or reshaping that scenario
+# turned a leakage check into a NameError at module scope, i.e. a traceback
+# where the file owed a summary. Measured: that is exactly what happened when
+# the model scenario stopped rebinding MATCHING_MODEL.
+_SHIPPED_AT_IMPORT = {
+    "MATCHING_MODEL": _config.MATCHING_MODEL,
+    "MATCHING_PROVIDER": _config.MATCHING_PROVIDER,
+    "DATA_SNAPSHOT_DATE": _config.DATA_SNAPSHOT_DATE,
+}
 from oncotriage import paths as _paths
 from oncotriage import run_fingerprint as _fp
 from oncotriage import utils as _utils
@@ -289,8 +303,19 @@ check_true("...which is NOT config.COLLECTION_NAME (non-degeneracy: a gate on "
            _one["qdrant_collection"] != _config.COLLECTION_NAME)
 check("...and the point count came from the probe of THAT name",
       _one["collection_points"], _COLLECTION["points"])
-check("...and the model is the configured one",
-      _one["matching_model_configured"], _config.MATCHING_MODEL)
+# READ THROUGH `matching_wire_model()`, WHICH IS THE FUNCTION THE FIELD
+# ACTUALLY CALLS. This compared against `MATCHING_MODEL` and was right only
+# while the shipped provider was "openai", where the two are the same string --
+# so it asserted a CONFLATION the field's own owner exists to remove
+# (`MATCHING_MODEL` is the PRICED identity of the judge; the gated field is the
+# id that goes ON THE WIRE, and they part company on either Bedrock branch).
+# It went red the day the provider flipped, naming a mechanism that works.
+check("...and the model is the WIRE id for the configured provider",
+      _one["matching_model_configured"], _config.matching_wire_model())
+check_true("...which is a non-empty string (non-degeneracy: an equality "
+           "between two calls of the same resolver would hold for None)",
+           isinstance(_one["matching_model_configured"], str)
+           and bool(_one["matching_model_configured"]))
 check("...and the snapshot date is the configured one",
       _one["data_snapshot_date"], _config.DATA_SNAPSHOT_DATE)
 
@@ -1944,14 +1969,35 @@ try:
     check("...having spent nothing", _CALLS["n"], 0)
     check("...and written nothing", digest(_MAN_PATH), _MAN_BEFORE)
 
-    _model_was = _config.MATCHING_MODEL
-    _config.MATCHING_MODEL = "gpt-4o-2024-08-06"
+    # THE GATED FIELD IS THE WIRE MODEL, SO THE SCENARIO HAS TO MOVE THE WIRE
+    # MODEL. This used to assign `MATCHING_MODEL` directly, which moved it
+    # while the shipped provider was "openai" and moves NOTHING on either
+    # Bedrock branch -- so at the flipped default the run did not refuse, the
+    # manifest was rewritten, and the four `written nothing` checks BELOW this
+    # one failed as well, for a reason that had nothing to do with what they
+    # assert. The provider is stepped through `MATCHING_PROVIDERS` until
+    # `matching_wire_model()` -- the one owner of the provider -> constant
+    # mapping -- reports a different id, so no second copy of that mapping is
+    # written here and the driver is correct at any default.
+    _prov_was = _config.MATCHING_PROVIDER
+    _wire_was = _config.matching_wire_model()
+    for _cand in _config.MATCHING_PROVIDERS:
+        _config.MATCHING_PROVIDER = _cand
+        if _config.matching_wire_model() != _wire_was:
+            break
+    else:                                   # pragma: no cover - three distinct
+        _config.MATCHING_PROVIDER = _prov_was
+    check_true("[scenario] the wire model really moved, without which the "
+               "refusal below would be about nothing",
+               _config.matching_wire_model() != _wire_was)
     _COLLECTION["name"] = "trial_criteria_20260807_111807"
     _code = run_main(["--select", "3", "--output-dir", _OUT])
-    check("a run under a different MODEL refuses", _code,
+    check("a run under a different WIRE MODEL refuses", _code,
           _rh.EXIT_PRECONDITION)
     check("...and written nothing", digest(_MAN_PATH), _MAN_BEFORE)
-    _config.MATCHING_MODEL = _model_was
+    _config.MATCHING_PROVIDER = _prov_was
+    check("[restore] the provider is back", _config.MATCHING_PROVIDER,
+          _prov_was)
 
     _snap_was = _config.DATA_SNAPSHOT_DATE
     _config.DATA_SNAPSHOT_DATE = "2020-06-30"
@@ -2156,9 +2202,15 @@ _fp.FINGERPRINT_DEGRADATIONS.clear()
 _runner.CHECKPOINT_FAULTS.clear()
 _study.CHECKPOINT_FAULTS.clear()
 
-check("config.MATCHING_MODEL was restored", _config.MATCHING_MODEL, _model_was)
-check("config.DATA_SNAPSHOT_DATE was restored", _config.DATA_SNAPSHOT_DATE,
-      _snap_was)
+# COMPARED AGAINST THE IMPORT-TIME CAPTURE, not against scenario locals, and
+# the provider joins the two that were already here -- this file rebinds it now
+# and a rebind nothing checks is how one leaks into the next file of a shared
+# process.
+check("every config attribute this file rebinds was restored",
+      {n: getattr(_config, n) for n in _SHIPPED_AT_IMPORT}, _SHIPPED_AT_IMPORT)
+check_true("...and the capture it is compared against is non-degenerate",
+           len(_SHIPPED_AT_IMPORT) == 3
+           and all(v for v in _SHIPPED_AT_IMPORT.values()))
 
 shutil.rmtree(_SCRATCH, ignore_errors=True)
 check("every file this test wrote is gone", os.path.exists(_SCRATCH), False)

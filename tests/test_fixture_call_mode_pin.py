@@ -753,6 +753,64 @@ check("4c  ...non-degeneracy: the same walk finds the PROVIDER guard in both",
       (["install_recording_hooks"], ["install_replay_hooks"]))
 
 
+# --- 4d. THE PROVIDER GUARD FIRES AT THE SHIPPED DEFAULT --------------------
+#
+# THIS IS THE HALF THE STRUCTURAL PIN ABOVE CANNOT SEE, and the provider flip
+# is what made it worth asserting: 4c says the guard is CALLED, and a guard
+# that is called and answers "fine" for every provider is a guard that has
+# stopped guarding. `config.MATCHING_PROVIDER` now ships "bedrock_anthropic",
+# which the proxies do NOT cover -- they wrap `chat.completions.create` on
+# `deps.OPENAI_CLIENT`, and Stage 5 reaches `converse` on
+# `deps.BEDROCK_ANTHROPIC_CLIENT` -- so the guard must REFUSE with nothing
+# pinned. Driven rather than read.
+#
+# AND THE REFUSAL IS THE CORRECT BEHAVIOUR RATHER THAN A GAP TO CLOSE, which
+# is worth writing down beside the check that measures it: the twelve
+# characterization fixtures ARE OpenAI-arm recordings. A harness that replayed
+# them against a different configured provider would send twelve real Stage 5
+# prompts to a live endpoint, be billed for all of them, and print that they
+# replayed clean -- verbatim the regression pass 20c-2c wrote the seam to make
+# impossible. What the refusal COSTS is that the free twelve-fixture replay
+# gate does not cover the shipped arm; that is recorded at
+# `config.MATCHING_PROVIDER` and is a standing migration item, not something
+# this file can fix.
+#
+# NOT PINNED TO A MESSAGE. The refusal's text names the RESPONSES seam
+# (`responses.create` on `deps.BEDROCK_CLIENT`) whatever the non-OpenAI
+# provider is, which is a real defect in that message for this branch --
+# reported rather than pinned here, because pinning a wrong string is how a
+# wrong string becomes a contract.
+_prov_outcome = drive(_capture.assert_provider_is_hookable, "probe")
+check("4d  at the SHIPPED provider the fixture guard REFUSES, so a capture or "
+      "a replay cannot silently run against a seam the proxies do not wrap",
+      isinstance(_prov_outcome, _capture.UnsupportedMatchingProviderError),
+      True)
+check("4d  ...and it is a RuntimeError and not a ValueError, so a stray "
+      "`except ValueError` in a harness cannot eat it",
+      (issubclass(_capture.UnsupportedMatchingProviderError, RuntimeError),
+       issubclass(_capture.UnsupportedMatchingProviderError, ValueError)),
+      (True, False))
+
+_prov_saved = config.MATCHING_PROVIDER
+try:
+    _prov_admitted = []
+    for _name in config.MATCHING_PROVIDERS:
+        config.MATCHING_PROVIDER = _name
+        if drive(_capture.assert_provider_is_hookable, "probe") is None:
+            _prov_admitted.append(_name)
+finally:
+    config.MATCHING_PROVIDER = _prov_saved
+check("4d  ...and the ONE provider it admits is OpenAI -- derived by driving "
+      "every member of the closed vocabulary rather than by asserting the "
+      "one, so a provider added tomorrow is admitted only on purpose",
+      _prov_admitted, [config.MATCHING_PROVIDER_OPENAI])
+check("4d  ...non-degeneracy: the vocabulary really has more than one member, "
+      "without which 'exactly one is admitted' would hold for free",
+      len(config.MATCHING_PROVIDERS) > 1, True)
+check("4d  ...and the provider this file found was restored",
+      config.MATCHING_PROVIDER, _prov_saved)
+
+
 # ===========================================================================
 # SECTION 5 -- THE WHOLE GESTURE, IN SCRATCH PROCESSES, BOTH DEFAULTS
 # ===========================================================================

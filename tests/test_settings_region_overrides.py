@@ -608,8 +608,17 @@ check("4g  the three attributes this section rebinds are restored",
       {name: getattr(config, name) for name in _SAVED}, _SAVED)
 check("4h  ...and the captured baseline is non-degenerate, without which 4g "
       "would hold for a section that rebound nothing",
-      _SAVED["MATCHING_PROVIDER"] == config.MATCHING_PROVIDER_OPENAI
+      _SAVED["MATCHING_PROVIDER"] != config.MATCHING_PROVIDER_BEDROCK
       and bool(_SAVED["BEDROCK_REGION"]), True)
+# THIS PROBE USED TO PIN THE LITERAL `MATCHING_PROVIDER_OPENAI` AND WAS RIGHT BY
+# ACCIDENT. The property 4g needs is that the baseline DIFFERS from what
+# `validator_message` sets -- which is `MATCHING_PROVIDER_BEDROCK`, and nothing
+# else -- so pinning the incumbent made this a statement about the shipped
+# default rather than about the rebind. It went red the day the default flipped
+# to "bedrock_anthropic", naming a mechanism that works perfectly. Written
+# against the value the section actually assigns, it holds at any default except
+# `bedrock` itself -- where the rebind genuinely IS degenerate and a failure
+# here is the correct answer.
 
 
 #------------------------------------------------------------------------------

@@ -382,16 +382,31 @@ def counters_zeroed():
 
 
 # ===========================================================================
-# SECTION 1 — THE FLAG IS OFF AND NOTHING CHANGED
+# SECTION 1 — THE FLAG IS ON, AND THE ARM IT DISPLACED IS STILL EXACT
 # ===========================================================================
+#
+# THIS SECTION USED TO BE "THE FLAG IS OFF AND NOTHING CHANGED" and its two
+# opening checks pinned `config.MATCHING_PROVIDER == "openai"`. The provider
+# flip made both false, and re-scoping them rather than deleting them is the
+# point: what they were really worth was the DORMANT-ARM property -- "the arm
+# this file is not about is unreachable and unchanged" -- and that property is
+# still worth stating, now about the other arm. So the default assertion is
+# inverted (this file's subject is the LIVE arm) and every check below that
+# measures the OpenAI request PINS the provider explicitly, which is stronger
+# than what it replaced: those checks used to hold only because the default
+# happened to agree with them.
 
-section("1. Flag OFF: the Converse branch is unreachable and the OpenAI "
-        "request is unchanged")
+section("1. Flag ON: Converse is the shipped arm, and the OpenAI request it "
+        "displaced is still byte-exact when pinned")
 
-check("the shipped provider is still OpenAI",
-      config.MATCHING_PROVIDER, config.MATCHING_PROVIDER_OPENAI)
+check("the shipped provider is the Converse branch -- which is what makes "
+      "this file's subject the LIVE arm rather than a dormant one",
+      config.MATCHING_PROVIDER, config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC)
 check("...spelt exactly, which is what the whole file's claim rests on",
-      config.MATCHING_PROVIDER, "openai")
+      config.MATCHING_PROVIDER, "bedrock_anthropic")
+check("...and the OpenAI provider is still a member of the vocabulary, so the "
+      "pins below name something real (non-degeneracy)",
+      config.MATCHING_PROVIDER_OPENAI in config.MATCHING_PROVIDERS, True)
 
 # --- 1a. The dispatch, pinned by AST ---------------------------------------
 #
@@ -435,16 +450,25 @@ _openai = _OpenAIStub(reply="OPENAI-REPLY")
 _responses = _ResponsesStub(reply="RESPONSES-REPLY")
 _converse = _ConverseStub(reply=CONVERSE_REPLY)
 
-with overrides(openai_client=_openai, bedrock_client=_responses,
-               bedrock_anthropic_client=_converse):
+# PINNED EXPLICITLY. Before the provider flip this block ran on the shipped
+# default and the OpenAI client answered because that WAS the default; the
+# assertion was therefore about two things at once and could not distinguish
+# "the OpenAI request shape is unchanged" from "somebody moved the default".
+# Pinned, it measures the shape alone -- and it is the only thing in this suite
+# that still measures it, since the arm is dormant.
+with provider(config.MATCHING_PROVIDER_OPENAI), \
+        overrides(openai_client=_openai, bedrock_client=_responses,
+                  bedrock_anthropic_client=_converse):
     _got = drive(_evaluation.call_matching_model, "SYS", "USR")
 
-check("with the flag off the OpenAI client answered", _got, "OPENAI-REPLY")
+check("with the provider pinned to OpenAI the OpenAI client answered", _got,
+      "OPENAI-REPLY")
 check("...the OpenAI client was called exactly once",
       len(_openai.recorder.calls), 1)
 check("...the RESPONSES Bedrock client was NOT touched",
       len(_responses.recorder.calls), 0)
-check("...and the CONVERSE Bedrock client was NOT touched",
+check("...and the CONVERSE Bedrock client was NOT touched -- which is the "
+      "dormant-arm property this section keeps, pointed the other way",
       len(_converse.calls), 0)
 
 _sent = _openai.recorder.calls[0] if _openai.recorder.calls else {}
@@ -466,22 +490,37 @@ check("...and no Converse field leaked into it",
 #
 # THE STRONGEST FORM OF "no client was built", and it is free: importing the
 # adapter, importing the package and driving the OpenAI path must all leave
-# boto3 out of sys.modules. If boto3 is INSTALLED and something else imported
-# it this check would be a false alarm, so it reports what it found rather than
-# asserting blind -- and on this machine boto3 is not installed at all, which
-# is itself the point that the request builder needs none.
+# boto3 out of sys.modules.
+#
+# IT MATTERS MORE SINCE THE PROVIDER FLIP, NOT LESS, and the note that used to
+# sit here ("on this machine boto3 is not installed at all") is no longer true
+# -- boto3 1.40.14 IS installed, and `config.get_bedrock_anthropic_client()`'s
+# flag guard is now SATISFIED by the shipped default. So an unpinned drive
+# anywhere above this line builds a real botocore client, imports boto3, and
+# sends botocore off down its credential chain. MEASURED at the moment of the
+# flip: the drives in 1b and 1d were unpinned, this check went red, and the
+# probe it reported was an outbound request to the instance metadata service.
 check("boto3 is not in sys.modules after importing and driving the package",
       "boto3" in sys.modules, False)
 check("...nor botocore", "botocore" in sys.modules, False)
 
-# --- 1d. The Converse client factory refuses while the flag is off ---------
-check("config.get_bedrock_anthropic_client() REFUSES while the provider is "
-      "openai, so the guarantee is a property of the function rather than of "
-      "the call graph",
-      raises(config.get_bedrock_anthropic_client), "RuntimeError")
-check_true("...and the refusal names the override seam a test should use",
-           "BEDROCK_ANTHROPIC_CLIENT"
-           in message_of(config.get_bedrock_anthropic_client))
+# --- 1d. The Converse client factory refuses on any OTHER provider ---------
+#
+# PINNED, AND THE PIN IS LOAD-BEARING RATHER THAN TIDY. This drove the factory
+# on the shipped default, which WAS "openai"; at the flipped default the guard
+# is satisfied and the call BUILDS -- so the check reported an HTTPClientError
+# out of botocore's credential chain instead of the RuntimeError it asserts,
+# having made a real outbound attempt to do it. That is the whole failure this
+# guard exists to prevent, produced by the check written to prove it does not
+# happen.
+with provider(config.MATCHING_PROVIDER_OPENAI):
+    check("config.get_bedrock_anthropic_client() REFUSES while the provider "
+          "is openai, so the guarantee is a property of the function rather "
+          "than of the call graph",
+          raises(config.get_bedrock_anthropic_client), "RuntimeError")
+    check_true("...and the refusal names the override seam a test should use",
+               "BEDROCK_ANTHROPIC_CLIENT"
+               in message_of(config.get_bedrock_anthropic_client))
 
 # --- 1e. An unrecognised provider raises rather than defaulting ------------
 with provider("bedrock_anthropi"):        # one character short, on purpose

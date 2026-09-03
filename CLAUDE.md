@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-**OncoTriage Agent** — matches oncology patients (Synthea FHIR bundles) to recruiting ClinicalTrials.gov trials using a 6-stage LangGraph pipeline over hybrid BM25 + vector RAG on Qdrant, with an LLM classifier (`config.MATCHING_MODEL`, `gpt-5.6-terra` since 2026-08-04) for criterion-level eligibility evaluation.
+**OncoTriage Agent** — matches oncology patients (Synthea FHIR bundles) to recruiting ClinicalTrials.gov trials using a 6-stage LangGraph pipeline over hybrid BM25 + vector RAG on Qdrant, with an LLM classifier for criterion-level eligibility evaluation. **The judge is selected by `config.MATCHING_PROVIDER`, which ships `"bedrock_anthropic"` — Claude Sonnet 4.6 over Amazon Bedrock's Converse API — and `config.matching_wire_model()` is the one function that answers what is actually sent.** `config.MATCHING_MODEL` (`gpt-5.6-terra` since 2026-08-04) is the OpenAI arm's model and stays its priced identity; that arm is dormant. See "The Stage 5 provider default is Converse" below.
 
 ## THE EXEC CHAIN IS DEAD (pass 20e) — read this before touching any file
 
@@ -160,8 +160,8 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/agent/retrieval.py` | Stages 1–3 + `build_bm25_index_from_qdrant` | `agent.{deps,models,mesh_expansion,patient,state,text}`, `config`, `registries.mesh`, `utils` |
 | `oncotriage/agent/filtering.py` | Stage 4 | `agent.{deps,retrieval,state}`, `config`, `extraction.*` |
 | `oncotriage/agent/evaluation.py` | Stage 5 | `agent.{bedrock_adapter,deps,patient,state}`, `config`, `utils` |
-| `oncotriage/agent/bedrock_adapter.py` | Stage 5's Amazon Bedrock translation for **GPT-5.6 Terra**, behind `config.MATCHING_PROVIDER == "bedrock"` (OFF) — the Responses-API request, the ChatCompletion-shaped reply, the error taxonomy, the numbered VERIFY-AT-GO-LIVE list | `config`, `agent.{deps,response_schema}`, `observability` |
-| `oncotriage/agent/bedrock_anthropic_adapter.py` | Stage 5's Amazon Bedrock translation for **Claude Sonnet 4.6**, behind `config.MATCHING_PROVIDER == "bedrock_anthropic"` (OFF) — the **Converse** request (a `cachePoint`, a schema serialized to a STRING), the ChatCompletion-shaped reply (the disjoint usage counts summed back), the botocore error taxonomy, the lettered A1..A10 list. **Shares no code with the module above**: different client library, credential chain, request shape, response shape and error classes. boto3 is imported inside the two functions that need it | `config`, `agent.{deps,response_schema}`, `observability` |
+| `oncotriage/agent/bedrock_adapter.py` | Stage 5's Amazon Bedrock translation for **GPT-5.6 Terra**, behind `config.MATCHING_PROVIDER == "bedrock"` (**OFF** — this arm is dormant at the shipped default) — the Responses-API request, the ChatCompletion-shaped reply, the error taxonomy, the numbered VERIFY-AT-GO-LIVE list | `config`, `agent.{deps,response_schema}`, `observability` |
+| `oncotriage/agent/bedrock_anthropic_adapter.py` | Stage 5's Amazon Bedrock translation for **Claude Sonnet 4.6**, behind `config.MATCHING_PROVIDER == "bedrock_anthropic"` (**ON — this is the shipped default**) — the **Converse** request (a `cachePoint`, a schema serialized to a STRING), the ChatCompletion-shaped reply (the disjoint usage counts summed back), the botocore error taxonomy, the lettered A1..A10 list. **Shares no code with the module above**: different client library, credential chain, request shape, response shape and error classes. boto3 is imported inside the two functions that need it | `config`, `agent.{deps,response_schema}`, `observability` |
 | `oncotriage/agent/terminal.py` | the three terminal nodes + `_pipeline_provenance` | `agent.state`, `registries.primary_cancer`, `utils` |
 | `oncotriage/agent/graph.py` | `build_matching_graph`, `match_patient_to_trials` | every stage module |
 | `oncotriage/agent/display.py` | console rendering | `config` |
@@ -548,7 +548,7 @@ python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
 python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
 python tests/test_agent_ablation_flag_passthrough.py               #  39
 python tests/test_storage_inference_logging_contract.py            # 101 (was 79 when this line was written, then 98; the token-persistence pass added Test 2's three scoping/spread checks)
-python tests/test_agent_retrieval_observability.py                 # 103
+python tests/test_agent_retrieval_observability.py                 # 104
 python tests/test_fhir_birth_date_and_demographics.py              # 172
 python tests/test_fhir_ecog_surfacing.py                           # 113 (was 108; the pre-diagnosis ECOG pass made section 7's present-but-unusable assertion name the FAMILY rather than one member -- the scratch corpus's only unusable path is now all_before_primary_diagnosis and all_after_reference_date occurs zero times there, so the old one-member check was about to fail for a reason unrelated to what it tests. This line said 105, and the file has not reported that since the ECOG-surfacing checks were extended; MEASURED 2026-08-20); needs 04-'s scratch corpus
 python tests/test_storage_ecog_logging.py                          # 155 (this line said 104 and was stale by 51; MEASURED 2026-08-20). Needs 04-'s scratch corpus too
@@ -558,7 +558,7 @@ python tests/test_monitoring_ecog_availability_drift.py            # 111 (was 11
 python tests/test_registries_cancer_code_claims_audit.py           # 197
 python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 planted, 14 caught
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
-python tests/test_package_invariants.py                            # 260/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
+python tests/test_package_invariants.py                            # 261/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
 python tests/test_storage_query_layer.py                           # 434 (was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
 
@@ -666,7 +666,7 @@ python tests/test_resume_capture_and_ragas.py                       # 210 (was 2
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
 # and 6 make real Qdrant round trips, because the readiness gate and the trial
 # lookup are what it exists to prove. Not in the collision matrix. ~2 min.
-python tests/test_mcp_server_stdio_contract.py                      # 142 (was 135; the logging pass's section 8c raised it, and said so 500 lines below while this line stayed at 135)
+python tests/test_mcp_server_stdio_contract.py                      # 145 (was 135; the logging pass's section 8c raised it, and said so 500 lines below while this line stayed at 135)
 
 # The structured-logging pass. Same shape, same directory. No keys and NO SPEND
 # -- section 8 drives all six stages of the real graph with the Qdrant client,
@@ -703,7 +703,7 @@ python tests/test_extraction_stage_non_oncology_guard.py            #  80
 # spend -- every model response is a literal served by a stub installed through
 # oncotriage/agent/deps.py -- no git history, no corpus, and NOT in the
 # collision matrix. ~25 s.
-python tests/test_agent_trial_verdict_normalization.py              # 166 (was 165; the default-flip pass PINS this file to the retained GROUPED arm -- every scenario counts what ONE response did, and a per-trial stub serving N calls produces N of everything -- and counts the pin's release. Before that 165; this line said 161 and was stale by 4; MEASURED 2026-08-21)
+python tests/test_agent_trial_verdict_normalization.py              # 167 (was 165; the default-flip pass PINS this file to the retained GROUPED arm -- every scenario counts what ONE response did, and a per-trial stub serving N calls produces N of everything -- and counts the pin's release. Before that 165; this line said 161 and was stale by 4; MEASURED 2026-08-21)
 
 # The emission-provenance pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, and NOT in the collision matrix -- every
@@ -712,7 +712,7 @@ python tests/test_agent_trial_verdict_normalization.py              # 166 (was 1
 # compared at the end, and every database write goes to a scratch file in a temp
 # directory that is asserted to differ from the production path, and removed at
 # the end. ~1 s.
-python tests/test_agent_emission_provenance.py                      # 185 (was 184; the default-flip pass PINS this file to the retained GROUPED arm -- its subject is the packer's per-CALL provenance, which per-trial mode bypasses -- and counts the pin's release. Before that 184; this line said 162 and was stale by 22; MEASURED 2026-08-21)
+python tests/test_agent_emission_provenance.py                      # 186 (was 184; the default-flip pass PINS this file to the retained GROUPED arm -- its subject is the packer's per-CALL provenance, which per-trial mode bypasses -- and counts the pin's release. Before that 184; this line said 162 and was stale by 22; MEASURED 2026-08-21)
 
 # The write-durability pass. Same shape, same directory. No network, no keys,
 # no spend, no git history, no corpus, NOT in the collision matrix, and it execs
@@ -746,7 +746,7 @@ python tests/test_tracking_mlflow_index.py                          # 104 (was 9
 # sha256-compared at the end). It DOES exec -- five controls plant into
 # in-memory copies of database_logger.py and evaluation.py, argued at
 # _EXEC_ALLOWLIST. Bucket A, <1 s against only the CI skeleton.
-python tests/test_storage_packing_and_cache_columns.py              # 125 (was 124; the default-flip pass PINS this file to the retained GROUPED arm -- llm_classifier_packed_chunks and llm_classifier_packing are NULL by design in per-trial mode -- and counts the pin's release)
+python tests/test_storage_packing_and_cache_columns.py              # 126 (was 124; the default-flip pass PINS this file to the retained GROUPED arm -- llm_classifier_packed_chunks and llm_classifier_packing are NULL by design in per-trial mode -- and counts the pin's release)
 
 # The provenance-persistence pass. Same shape, same directory. No network, no
 # keys, no spend, no live Qdrant, no model load, no corpus, no git history, and
@@ -757,7 +757,7 @@ python tests/test_storage_packing_and_cache_columns.py              # 125 (was 1
 # neither of the suite's two writers. It DOES exec: five controls plant into
 # in-memory copies of database_logger.py and evaluation.py, argued at
 # _EXEC_ALLOWLIST. Bucket A, ~2.5 s.
-python tests/test_storage_provenance_persistence.py                 # 126
+python tests/test_storage_provenance_persistence.py                 # 128
 
 # The health-persistence pass. Same shape, same directory. No network, no keys,
 # no spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
@@ -932,7 +932,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  42
 # agent/evaluation.py, one plant each, argued at _EXEC_ALLOWLIST. Bucket A,
 # ~1.6 s (MEASURED; the first version was 21.6 s because its own harness
 # deadlocked and a timeout hid it -- see the pass's own findings).
-python tests/test_spend_gate.py                                     # 152 (was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
+python tests/test_spend_gate.py                                     # 158 (was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
 
 # The spend-coverage pass. Same shape, same directory. No network, no keys, NO
 # SPEND -- every provider client is a stand-in, the ablation study's
@@ -952,7 +952,7 @@ python tests/test_spend_gate.py                                     # 152 (was 1
 # into the temp tree and PARSED, never imported. Bucket A, ~6 s.
 python tests/test_spend_coverage.py                                 # 161
 
-python tests/test_agent_stage5_per_trial_calls.py                   # 321 (this line said 320 and was stale by one; MEASURED 2026-09-01 against HEAD in a git worktree as well as against the working tree, so the correction is about the note rather than about any change. Was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
+python tests/test_agent_stage5_per_trial_calls.py                   # 322 (this line said 320 and was stale by one; MEASURED 2026-09-01 against HEAD in a git worktree as well as against the working tree, so the correction is about the note rather than about any change. Was 318; the default-flip pass inverted 1a, added 1a-ii over the unpinned owner, derived 10e's restore from a value captured at import rather than a literal, and added 10f's non-degeneracy probe on that capture. Before that 283; the duplicated-derivation pass added section 1c over the import-time parallelism guard and section 5c over the answering-model check on the UNCONSUMED fold path. Before that 276; the operator-control pass rewrote 8b-r from a pinned limit to the grouped gate's contract and added c36. Before that 255; the pre-migration pass added section 8B over the Stage 5 shutdown flag and controls c32-c35. ~10 s: section 3d parks two workers for a bounded grace on each of its two arms)
 
 # The harness-budget pass. Same shape, same directory. No network, no keys, no
 # spend, NO LIVE SERVER and no live Qdrant -- it starts nothing and issues no
@@ -989,7 +989,7 @@ python tests/test_evaluation_sample_naming.py                       #  72
 # collision matrix; it DOES read oncotriage/config.py, which
 # tests/test_config_snapshot_date_rot.py rewrites, so all three files it reads
 # are sha256-compared at the end. Bucket A, ~4.8 s.
-python tests/test_fixture_call_mode_pin.py                          #  82 (unchanged across the consolidation pass, which moved its closed-port literal to tests/_control_harness.py. Was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
+python tests/test_fixture_call_mode_pin.py                          #  87 (unchanged across the consolidation pass, which moved its closed-port literal to tests/_control_harness.py. Was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
 
 # The Bedrock-adapter pass. Same shape, same directory. NO AWS CALL AND NO
 # BILLED CALL OF ANY KIND -- every client is a stand-in installed through
@@ -1001,7 +1001,7 @@ python tests/test_fixture_call_mode_pin.py                          #  82 (uncha
 # copies of oncotriage/agent/bedrock_adapter.py, one mapping broken in each,
 # argued at _EXEC_ALLOWLIST (the module is new, so `git show` has no revision
 # carrying a version with one mapping missing). ~2 s.
-python tests/test_agent_bedrock_adapter.py                          # 281 (was 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
+python tests/test_agent_bedrock_adapter.py                          # 284 (was 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
 
 # The Converse pass: the SECOND Bedrock branch, Claude Sonnet 4.6. Same shape,
 # same directory. NO AWS CALL AND NO BILLED CALL OF ANY KIND -- every client is
@@ -1017,7 +1017,7 @@ python tests/test_agent_bedrock_adapter.py                          # 281 (was 2
 # visible rather than silent. It DOES exec: ten in-memory copies of
 # oncotriage/agent/bedrock_anthropic_adapter.py, one plant each, argued at
 # _EXEC_ALLOWLIST. Bucket A, ~0.8 s.
-python tests/test_agent_bedrock_anthropic_adapter.py                # 261
+python tests/test_agent_bedrock_anthropic_adapter.py                # 274
 
 # The Bedrock go-live probe. NOT a test, NOT in tests/, NOT in any bucket, and
 # it REFUSES to do anything without its flag (exit 2, nothing called, nothing
@@ -1283,15 +1283,17 @@ Nodes 1–3 are in `agent/retrieval.py`, node 4 in `agent/filtering.py`, node 5 
 
 **STAGE 5 HAS THREE PROVIDER ARMS AND ONLY ONE OF THEM RUNS.**
 `config.MATCHING_PROVIDER` is a closed three-member vocabulary and
-`evaluation.call_matching_model` dispatches on it: `"openai"` (the shipped
-default — Chat Completions, unchanged), `"bedrock"` (the Responses API, GPT-5.6
-Terra) and `"bedrock_anthropic"` (Converse, Claude Sonnet 4.6). The two Bedrock
-arms are separate providers rather than modes of one because they share no
-client library, credential chain, request shape, response shape or error class.
-**An unrecognised name RAISES rather than falling through to OpenAI**, which is
-the silent-wrong-provider failure that tuple exists to prevent. With the flag at
-its default the OpenAI request is byte-identical to the one that shipped before
-either adapter existed — proved against `git show HEAD:` rather than asserted.
+`evaluation.call_matching_model` dispatches on it: **`"bedrock_anthropic"` (the
+shipped default — Converse, Claude Sonnet 4.6, through boto3)**, `"openai"`
+(Chat Completions, dormant) and `"bedrock"` (the Responses API, GPT-5.6 Terra,
+dormant). The two Bedrock arms are separate providers rather than modes of one
+because they share no client library, credential chain, request shape, response
+shape or error class. **An unrecognised name RAISES rather than falling through
+to OpenAI**, which is the silent-wrong-provider failure that tuple exists to
+prevent. The OpenAI request is still byte-identical to the one that shipped
+before either adapter existed — proved against `git show HEAD:` rather than
+asserted, and now measured with the provider PINNED to that arm rather than
+inherited from the default.
 
 Conditional edges route to `node_no_candidates` when a stage empties the pool, and any exception lands in `node_error_handler`, which still emits a well-formed result. `match_patient_to_trials(patient_data, graph)` is the public entry point; it stamps `qdrant_collection` and `patient_data_hash` onto the result. **Pass 20e removed the shim's wrapper around it** — the legacy-rebinding guard could only ever see rebindings in the shim's own namespace, and there is no such namespace now; `oncotriage/agent/deps.py` records why it needs no replacement.
 
@@ -5164,7 +5166,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 473 (was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
+python tests/test_resume_configuration_fingerprint.py            # 482 (was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -8395,7 +8397,7 @@ python tests/test_compose_shutdown_grace.py          #  43, ~0.8s. NO DOCKER DAE
                                                     #  landmine with the GROUPED arm's
                                                     #  own worst case, a vocabulary pin
                                                     #  and two controls)
-python tests/test_api_shutdown_gate.py                #  77, ~2s. NO BILLED CALL,
+python tests/test_api_shutdown_gate.py                #  78, ~2s. NO BILLED CALL,
                                                      #  no network, no keys, no live
                                                      #  server, no live Qdrant, no
                                                      #  model load, no corpus, no git
@@ -10221,7 +10223,7 @@ renderer digest is the mechanical half that covers exactly that.
 # directory; the three repository files it reads are sha256-compared at the
 # end. Every identifier-shaped fixture value is ASSEMBLED at run time and
 # section 11 scans this file with the scanner it tests. Bucket A, ~6 s.
-python tests/test_deid_stage_and_guard.py                           # 137
+python tests/test_deid_stage_and_guard.py                           # 138
 ```
 
 **FIFTEEN PLANTED REVERTS, FOURTEEN CAUGHT, AND THE FIFTEENTH IS A FINDING
@@ -11375,7 +11377,7 @@ true as it was. Both the pin and the docstring it pins say so.
 # sentence). It DOES exec: nine in-memory copies
 # (evaluation.py, bedrock_anthropic_adapter.py and config.py), one plant each,
 # argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_agent_bedrock_anthropic_per_trial.py              # 196
+python tests/test_agent_bedrock_anthropic_per_trial.py              # 198
 
 # The per-trial go-live probe for the Converse branch. NOT RUN by this pass.
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
@@ -12726,7 +12728,7 @@ remap marker.
 # suite's two writers and are sha256-compared at the end, with a
 # non-degeneracy probe that the three hashes differ. It DOES exec: five
 # in-memory copies, argued at _EXEC_ALLOWLIST. Bucket A, ~2.5 s.
-python tests/test_agent_not_evaluable_reason_coverage.py            #  86
+python tests/test_agent_not_evaluable_reason_coverage.py            #  87
 ```
 
 **EIGHT TREE-LEVEL REVERTS, EIGHT CAUGHT**, each applied to a `copytree`'d copy
@@ -13394,6 +13396,203 @@ AND TWO OF THEM BY THE REVERT MATRIX.**
 6. **NOTHING EXPOSES THE COHORT OVER HTTP.** `GET /pipeline/info` does not report
    which cohort a deployment would run, and the API writes no `runs` row, so its
    eight cohort columns are NULL by construction.
+
+
+### The Stage 5 provider default is Converse (the provider-flip pass)
+
+**ONE BEHAVIOUR CHANGE: `config.MATCHING_PROVIDER` goes `"openai"` ->
+`"bedrock_anthropic"`.** The call mode is untouched (per-trial, unchanged), the
+three model constants are untouched, no adapter moved, and no request shape
+moved. **NO BILLED CALL AND NO AWS CALL OF ANY KIND WAS MADE**; the production
+`inferences.db` was never opened and no fixture was recaptured.
+
+**THE FLIP'S BLAST RADIUS IS 27 TEST FILES, NOT THE THREE THAT MENTION THE
+CONSTANT, AND IT WAS MEASURED RATHER THAN READ.** CI bucket A was run before
+and after the one-line change under a hard network tripwire (`socket.connect`,
+`connect_ex`, `create_connection` and `getaddrinfo` replaced by a recorder that
+RAISES and logs the calling frame, armed through a `sitecustomize` on
+`PYTHONPATH` so it precedes every project import, and fired against a real
+outbound call first so the readings are not vacuous):
+
+| | before the flip | after the one-line flip |
+|---|---|---|
+| bucket A failures | 3 (all three are the TRIPWIRE's own doing -- files that legitimately reach Qdrant, Hugging Face or MLflow telemetry) | **30** |
+| attributable to the flip | -- | **27** |
+| files that ABORTED rather than failing | 0 | **7**, on `KeyError` / `IndexError` / `TypeError` / `AttributeError` reading a result the node never produced |
+| outbound attempts to `169.254.169.254` (the EC2 instance metadata service) | **0** | **242** |
+
+**THE 242 PROBES ARE THE FINDING.** Two dozen test files install a Stage 5
+stand-in at `deps.OPENAI_CLIENT` and drive the node. At the new default the
+dispatch reaches `deps.BEDROCK_ANTHROPIC_CLIENT` and `converse`, so the
+stand-in is never called -- and `config.get_bedrock_anthropic_client()`'s flag
+guard is SATISFIED, so it runs `boto3.client("bedrock-runtime", ...)` for real
+and botocore goes off down its credential chain. Nothing was billed **on this
+machine**, and the reason is a property of this machine rather than of the
+suite: there is no `~/.aws`, no AWS variable is exported, and the chain found
+nothing. **`05- Keys/.env` carries `AWS_BEARER_TOKEN_BEDROCK`, and
+`paths.load_env_keys()` calls `load_dotenv(override=True)`, which loads EVERY
+key in that file into `os.environ` -- not only the three it validates.** So any
+process that had called `load_env_keys()` first, and any EC2 or IAM-bearing
+runner, would have issued live billed Converse requests out of a suite that
+reports it makes none.
+
+**THE REMEDY IS A PIN AND IT HAS ONE OWNER: `tests/_provider_pin.py`.** No
+`test_` prefix, on `tests/_control_harness.py`'s argument. Twenty-three files
+gained two lines and one check: `pin_openai_arm(...)` immediately after their
+bootstrap, and `release_openai_arm()` **above the summary** with an outcome a
+check fails on. **ONE IMPLEMENTATION RATHER THAN TWENTY-TWO COPIES, AND THE
+REASON IS MEASURED HISTORY**: the default-flip pass pinned the retained
+call-mode arm in seven files by hand and got the release placement wrong in
+three of them -- below the results line, so the outcome still decided the exit
+code while being absent from the number the summary printed, i.e. a run that
+reported "0 failed" and exited 1. Twenty-three hand-written copies of that block
+is twenty-three chances to repeat it.
+
+**THE TWENTY-THIRD IS THE ONE THE BUCKET-A SWEEP COULD NOT SEE, AND IT IS THE
+WORST OF THEM.** `tests/test_mcp_server_stdio_contract.py` is bucket C -- it
+needs a live Qdrant -- so it was outside the 97 files the flip was measured
+against. Its section 5 calls `match_patient_tool` with a stand-in installed at
+`deps.OPENAI_CLIENT` alone. Measured with a guard that blocks `boto3.client`
+and nothing else, so Qdrant and OpenAI stayed reachable and the question was
+exactly "does this build a Bedrock client": **it built three, and the file
+still reported `Passed: 145, Failed: 0, exit 0`** -- because the MCP tool
+catches the error and returns it as a refusal payload. A test that reports
+success while making live billed calls is the precise failure
+`fixtures.capture.assert_provider_is_hookable` exists to prevent, reached
+through a surface that guard does not cover. Pinned, the same run builds
+**zero**. Every other non-bucket-A file was put through the same guard and
+built zero before and after.
+
+**IT IS A HARD GUARD, NOT A `check()`.** A pin that did not take leaves every
+assertion below it silently measuring the other arm -- not one failure but
+every failure, each with a misleading message. `ProviderPinError` propagates out
+of module scope, so the file dies naming the arm it found; it is a
+`RuntimeError` subclass and not a `ValueError` (the `UnknownModelPricingError`
+precedent) and it is catchable by name so the guard itself can be driven.
+
+**IT IS NOT `config.pin_matching_call_mode`'s KIND OF PIN, AND THE ASYMMETRY IS
+ARGUED.** That one exists because the fixture harness is an OPERATOR-FACING
+PROGRAM whose own reports must not say the project is configured one way while
+the process runs another, so the constant and the pin are kept apart by an
+owner function. A test file is not such a program: nothing reads its process's
+configuration afterwards. So this assigns the attribute and restores it, which
+is exactly what the three provider-aware files in this suite already do inside
+their own `provider()` / `settings()` context managers -- and unlike them it
+holds for a whole file rather than for one block.
+
+**FIVE FILES NEEDED SOMETHING OTHER THAN A FILE-SCOPE PIN, and each is the
+distinction STEP 2 of the brief draws -- "asserts the DEFAULT" versus "asserts
+the ARM".**
+
+| file | what it was | what it is |
+|---|---|---|
+| `test_agent_bedrock_adapter.py` | `MATCHING_PROVIDER == "openai"`, twice, plus eight blocks that measured the OpenAI request on the shipped default | the DEFAULT check re-scoped to the property it was actually worth -- *the shipped value is NOT the Responses branch*, which is this file's dormancy claim and is true at any default but `bedrock`; every ARM block wrapped in `provider(OPENAI)`. **Its section-9 leakage loop SKIPPED `MATCHING_PROVIDER` in order to pin the literal `"openai"` above it, under a comment arguing that the capture is the right instrument. The special case is gone and the name is checked exactly like its nine siblings** |
+| `test_agent_bedrock_anthropic_adapter.py` | section 1 titled "THE FLAG IS OFF AND NOTHING CHANGED" | "THE FLAG IS ON, AND THE ARM IT DISPLACED IS STILL EXACT". The 1b drive and the 1d factory-refusal both pinned -- **1d was building a real client and reporting botocore's error where it asserts a `RuntimeError`**, which is the failure that guard exists to prevent, produced by the check written to prove it cannot happen |
+| `test_agent_bedrock_anthropic_per_trial.py` | section 1 titled "Flag OFF", four unpinned OpenAI-arm drives | inverted and pinned per block through the file's own `settings()` |
+| `test_resume_configuration_fingerprint.py` | `matching_model_configured == config.MATCHING_MODEL`, and a scenario that moved `MATCHING_MODEL` to force a refusal | **that equality was a CONFLATION** -- the gated field reads `matching_wire_model()`, and the two are the same string only on the OpenAI arm. The scenario now steps the provider through `MATCHING_PROVIDERS` until the wire model differs, using that function as its own oracle so no second copy of the provider->constant mapping is written |
+| `test_settings_region_overrides.py` 4h | `_SAVED["MATCHING_PROVIDER"] == MATCHING_PROVIDER_OPENAI` | `!= MATCHING_PROVIDER_BEDROCK` -- the property 4g needs is that the baseline differs from what the section ASSIGNS, and pinning the incumbent made it a statement about the default instead |
+
+**THE RESUME FINGERPRINT FIELD THAT MOVED IS `matching_model_configured`:
+`gpt-5.6-terra` -> `us.anthropic.claude-sonnet-4-6`.** `FINGERPRINT_VERSION`
+is **unchanged at 5** (MEASURED; earlier accounts in this file say 4 and were
+true when written) -- the stamp's SHAPE did not move -- so nothing refuses
+for a shape reason, and every artifact stamped before the flip answers
+**FP_CHANGED naming that field**, which is correct: a resume across a provider
+change would otherwise put two judges' rows into one artifact. That is the
+field `matching_wire_model()` was written to gate and it did its job with no
+consumer edit. Measured by driving `run_fingerprint.compare()` across the flip.
+
+**THE FIXTURE HARNESS REFUSES, AND THAT IS CORRECT.**
+`capture.assert_provider_is_hookable` admits `"openai"` alone, so
+`python fixture_replay.py` refuses before any hook is installed and before any
+call -- verified by running it. `install_recording_hooks` refuses at its first
+statement, 470 lines above the `graph.invoke`, so a capture cannot spend
+anything either. **THE REFUSAL IS NOW ASSERTED** in
+`tests/test_fixture_call_mode_pin.py` section 4d, which drives every member of
+`MATCHING_PROVIDERS` and requires the admitted set to be exactly `["openai"]` --
+derived, so a fourth provider is admitted only on purpose -- with a
+non-degeneracy check that the vocabulary has more than one member. **NO
+PROVIDER PIN WAS BUILT FOR THE HARNESS**, deliberately: the call-mode pin exists
+because a refusal there would have taken a LIVE gate out of service, and this
+gate is already out of service for an unrelated reason (the twelve fixtures have
+been stale since the de-identification pass and replay 0/12), so a pin would be
+new mechanism preserving nothing.
+
+**WHAT THE FLIP COSTS, STATED RATHER THAN DISCOVERED.** The shipped arm's Stage
+5 behaviour -- the input packer, emission provenance, the out-of-set detector,
+verdict normalization, the state channels, the persisted packing columns, the
+spend gate's Stage 5 half -- is now covered on the DORMANT OpenAI request path
+in twenty-three files, and on the Converse path by
+`tests/test_agent_bedrock_anthropic_adapter.py` and
+`tests/test_agent_bedrock_anthropic_per_trial.py` alone. That is the same trade
+the default-flip pass recorded for the retained grouped call-mode arm, and it is
+a real coverage gap rather than a formality.
+
+**AND TWO PREMISES OF THE SHIPPED ARM HAVE STILL NEVER BEEN OBSERVED AGAINST
+THE LIVE PROVIDER** -- A11 (is the per-trial warmup's `maxTokens = 1` request
+shape accepted) and A12 (does the `cachePoint` prefix actually warm). A12
+failing costs `MAX_TRIALS_FOR_EVALUATION` x the input price with **nothing
+raising**: every request succeeds, every verdict is produced, and the only trace
+is a zero in `usage.cacheWriteInputTokens`. Both are settled by three billed
+calls, and that is the migration window's FIRST command:
+
+```bash
+python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
+    --probe-per-trial --per-trial-prefix-file <a real rendered system prompt>
+```
+
+```bash
+# The shared Stage 5 provider pin. NOT a test and it has no `test_` prefix:
+# every runner selects on that prefix and a file of no checks would report
+# "0 passed" and be counted as a file that ran. It imports oncotriage.config
+# and nothing else, which is why it is NOT in tests/_control_harness.py --
+# that module's stated invariant is that it imports nothing from the project,
+# because a usercustomize hook loads it at interpreter startup.
+tests/_provider_pin.py
+```
+
+**TEST COUNTS.** Twenty-three files are **+1** each (the release check),
+`tests/test_mcp_server_stdio_contract.py` among them at 144 -> **145**. Five
+moved by more, each argued in place: `test_agent_bedrock_adapter.py` 281 ->
+**284**, `test_agent_bedrock_anthropic_adapter.py` 273 -> **274**,
+`test_agent_bedrock_anthropic_per_trial.py` 196 -> **198**,
+`test_resume_configuration_fingerprint.py` 479 -> **482**,
+`test_fixture_call_mode_pin.py` 82 -> **87**.
+`test_settings_region_overrides.py` is unchanged at **59**.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **`capture.UnsupportedMatchingProviderError`'s MESSAGE IS WRONG FOR THIS
+   PROVIDER.** It names `responses.create` on `deps.BEDROCK_CLIENT` -- the
+   RESPONSES seam -- whatever the non-OpenAI provider is, so at the shipped
+   default it sends a reader to the wrong adapter. Pre-existing (the message
+   predates the third provider) and made REACHABLE by the flip. Not fixed:
+   `oncotriage/fixtures/capture.py` is outside this pass's scope, and
+   `tests/test_fixture_call_mode_pin.py` 4d deliberately does NOT pin the
+   message, because pinning a wrong string is how a wrong string becomes a
+   contract. **Top follow-up.**
+2. **`docker-compose.yml` PASSES NO AWS CREDENTIAL INTO ANY CONTAINER.** That
+   was consistent while the flag shipped `"openai"` and is now a live gap: the
+   `fastapi` service will build a Converse client with nothing for boto3 to
+   find. The fix is one `environment:` line, and it is a Docker edit.
+3. **THE TWELVE FIXTURES ARE 0/12 AND THE HARNESS NOW REFUSES OUTRIGHT.** The
+   recapture that was already owed cannot be taken at this default at all
+   without either pinning the provider in the harness or teaching `OpenAIProxy`
+   the Converse seam -- and the latter is a fixture-FORMAT change with a
+   `SCHEMA_VERSION` bump.
+4. **`fixture_replay.py` DIES WITH A TRACEBACK RATHER THAN A NAMED REFUSAL.**
+   The guard raises inside `replay_fixture` -> `install_replay_hooks`, which
+   nothing catches. The exit code is still 1 and nothing is spent, but the
+   call-mode-pin pass already recorded this exact shape as "worse than a clean
+   refusal".
+5. **`GET /pipeline/info` DOES NOT REPORT THE PROVIDER**, so an operator asking
+   the API which judge it will call cannot see it over HTTP. `matching_model`
+   there interpolates `MATCHING_MODEL`, which is now the DORMANT arm's model.
+   A contract change to a served response, and the sharpest of these five.
+6. **`BEDROCK_ENDPOINT` AND `BEDROCK_REGION` ARE STILL NOT GATED** by the resume
+   fingerprint. Two runs against the same profile id in different Regions are
+   indistinguishable to a resume gate. Unchanged by this pass and now one
+   provider more reachable.
 
 
 Data and keys live outside this folder. Never write an

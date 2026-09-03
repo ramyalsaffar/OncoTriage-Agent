@@ -388,10 +388,19 @@ _provider_assigns = [
 
 check("MATCHING_PROVIDER is assigned exactly once at config's module scope",
       len(_provider_assigns), 1)
-check("...and the shipped value is the OpenAI provider",
-      config.MATCHING_PROVIDER, config.MATCHING_PROVIDER_OPENAI)
-check("...which is the default the whole file's claim rests on",
-      config.MATCHING_PROVIDER, "openai")
+# THE CLAIM THIS FILE RESTS ON IS "the RESPONSES branch is dormant", and it
+# always was -- the two checks here pinned the shipped value to "openai", which
+# was the INCUMBENT rather than the property. The provider flip made that false
+# while leaving the Responses branch exactly as dormant as it has ever been, so
+# what is pinned now is the property itself: whatever the default is, it is not
+# this file's branch. Written this way it holds at any default except `bedrock`
+# -- where a failure here is the correct answer, because the branch this file
+# calls unreachable would be the one in force.
+check("...and the shipped value is NOT the Responses branch, which is the "
+      "dormancy this whole file's claim rests on",
+      config.MATCHING_PROVIDER == config.MATCHING_PROVIDER_BEDROCK, False)
+check("...spelt exactly: the shipped default is the Converse branch",
+      config.MATCHING_PROVIDER, "bedrock_anthropic")
 
 # --- 1b. The shipped call, pinned by AST -----------------------------------
 #
@@ -483,10 +492,18 @@ check("...naming the OpenAI client, with no provider guard around it",
 _openai_stub = _OpenAIStub(reply="OPENAI-REPLY")
 _bedrock_stub = _BedrockStub(reply=BEDROCK_REPLY)
 
-with overrides(openai_client=_openai_stub, bedrock_client=_bedrock_stub):
+# PINNED EXPLICITLY TO THE OpenAI ARM. This block ran on the shipped default
+# and the OpenAI client answered because that WAS the default, so the assertion
+# was about two things at once. Since the provider flip the default is the
+# Converse branch: unpinned, the dispatch reaches deps.BEDROCK_ANTHROPIC_CLIENT,
+# the stand-in below is never called, and every kwarg check compares against an
+# empty recorder. Pinned, this measures the OpenAI request shape alone -- which
+# is dormant and therefore measured here and in one other file only.
+with provider(config.MATCHING_PROVIDER_OPENAI), \
+        overrides(openai_client=_openai_stub, bedrock_client=_bedrock_stub):
     _returned = drive(_evaluation.call_matching_model, "SYSTEM-P", "USER-P")
 
-check("with the flag off the OpenAI client was called exactly once",
+check("with the provider pinned to OpenAI its client was called exactly once",
       len(_openai_stub.recorder.calls), 1)
 check("...and the Bedrock stand-in was NOT touched",
       len(_bedrock_stub.recorder.calls), 0)
@@ -1019,16 +1036,18 @@ check("...and the word IS in the file as prose, which is what defeats a "
 with provider(config.MATCHING_PROVIDER_BEDROCK):
     check("Stage 5 compares the echo against the WIRE model when the flag is on",
           config.matching_wire_model(), config.BEDROCK_MATCHING_MODEL)
-check("...and against MATCHING_MODEL when it is off",
-      config.matching_wire_model(), config.MATCHING_MODEL)
+with provider(config.MATCHING_PROVIDER_OPENAI):
+    check("...and against MATCHING_MODEL on the OpenAI arm",
+          config.matching_wire_model(), config.MATCHING_MODEL)
 
 # AND THE MISMATCH MESSAGE NAMES THE RIGHT CONSTANT FOR THE PROVIDER. Under
 # Bedrock the string that was SENT comes from BEDROCK_MATCHING_MODEL; telling
 # an operator to edit MATCHING_MODEL there is a wrong instruction in an error
 # that stops a run -- it changes the priced identity, leaves the wire id
 # untouched, and the next run raises identically with the pricing key broken.
-_mm_openai = str(_evaluation.MatchingModelMismatchError("a", "b"))
-check("with the flag off the message names MATCHING_MODEL",
+with provider(config.MATCHING_PROVIDER_OPENAI):
+    _mm_openai = str(_evaluation.MatchingModelMismatchError("a", "b"))
+check("on the OpenAI arm the message names MATCHING_MODEL",
       "set MATCHING_MODEL in" in _mm_openai, True)
 check("...and not the Bedrock constant",
       "BEDROCK_MATCHING_MODEL" in _mm_openai, False)
@@ -1178,12 +1197,18 @@ check("the scratch database is NOT the production one",
       os.path.abspath(_db) == os.path.abspath(
           _dl.resolve_inference_db_path(None)), False)
 
+# THE ROW RECORDS WHAT `config.MATCHING_PROVIDER` SAYS AT INSERT TIME, so the
+# expectation is DERIVED from it rather than typed. The literal "openai" here
+# was the incumbent, not the contract; the second check below already stated
+# the contract and is now the only form of it.
 _written = silence(_dl.log_inference, result_dict("normal"), dict(PATIENT),
                    db_path=_db)
-check("a normal row records the configured provider",
-      read_provider(_db, "normal"), ["openai"])
-check("...which is exactly config.MATCHING_PROVIDER's value",
+check("a normal row records the configured provider, which is exactly "
+      "config.MATCHING_PROVIDER's value",
       read_provider(_db, "normal"), [config.MATCHING_PROVIDER])
+check("...and that value is a member of the closed vocabulary, so the check "
+      "above cannot be satisfied by a column carrying anything at all",
+      config.MATCHING_PROVIDER in config.MATCHING_PROVIDERS, True)
 check("...and the write reported success",
       getattr(_written, "ok", None), True)
 
@@ -1195,7 +1220,7 @@ _failure = result_dict("failed-run", matching_model=None,
 silence(_dl.log_inference, _failure, dict(PATIENT), db_path=_db)
 check("a Stage 5 FAILURE row records the provider too -- the column is read "
       "from config, not from the result dict",
-      read_provider(_db, "failed-run"), ["openai"])
+      read_provider(_db, "failed-run"), [config.MATCHING_PROVIDER])
 
 with provider(config.MATCHING_PROVIDER_BEDROCK):
     silence(_dl.log_inference, result_dict("on-bedrock"), dict(PATIENT),
@@ -1318,7 +1343,11 @@ check("...and that expression is the DEGRADING wrapper, not the raising "
 # stamp would abort the run the stamp exists to describe, and an unrecognised
 # provider is exactly the input that makes matching_wire_model() raise.
 check("_wire_model() answers the wire model on a good configuration",
-      run_fingerprint._wire_model(), config.MATCHING_MODEL)
+      run_fingerprint._wire_model(), config.matching_wire_model())
+with provider(config.MATCHING_PROVIDER_OPENAI):
+    check("...and on the OpenAI arm that is MATCHING_MODEL exactly, which is "
+          "what kept every v2 stamp written before the Bedrock branches valid",
+          run_fingerprint._wire_model(), config.MATCHING_MODEL)
 _before_fp = run_fingerprint.FINGERPRINT_DEGRADATIONS.copy()
 with provider("bedrok"):
     _degraded_wire = silence(run_fingerprint._wire_model)
@@ -1336,13 +1365,20 @@ check("...and an UNKNOWN in a gated field is what makes a stamp UNRESOLVED, "
           {**_stamp_probe(), "matching_model_configured": run_fingerprint.UNKNOWN}),
       False)
 
-check("with the flag off that function answers MATCHING_MODEL exactly, so "
-      "every v2 stamp on disk still matches",
-      config.matching_wire_model(), config.MATCHING_MODEL)
+with provider(config.MATCHING_PROVIDER_OPENAI):
+    check("on the OpenAI arm that function answers MATCHING_MODEL exactly, "
+          "which is what kept every stamp written before either Bedrock "
+          "branch existed valid across their arrival",
+          config.matching_wire_model(), config.MATCHING_MODEL)
 with provider(config.MATCHING_PROVIDER_BEDROCK):
     _wire_on = config.matching_wire_model()
-check("with the flag on it answers the WIRE model",
+check("on the Responses arm it answers the WIRE model",
       _wire_on, config.BEDROCK_MATCHING_MODEL)
+check("...and the three arms give three DIFFERENT wire ids, without which "
+      "every comparison in this section would hold for a function that "
+      "ignored the provider",
+      len({config.MATCHING_MODEL, config.BEDROCK_MATCHING_MODEL,
+           config.BEDROCK_ANTHROPIC_MATCHING_MODEL}), 3)
 
 def _stamp(model):
     """A complete stamp differing only in the gated model field.
@@ -1447,8 +1483,15 @@ section("7b. Capture and replay REFUSE the flag they cannot hook")
 from oncotriage.fixtures import capture as _capture      # noqa: E402
 from oncotriage.fixtures import replay as _replay        # noqa: E402
 
-check("with the flag off the guard is a no-op",
-      drive(_capture.assert_provider_is_hookable, "probe"), None)
+with provider(config.MATCHING_PROVIDER_OPENAI):
+    check("on the OpenAI arm the guard is a no-op -- which is the ONLY arm it "
+          "admits, and therefore the only arm the twelve fixtures cover",
+          drive(_capture.assert_provider_is_hookable, "probe"), None)
+check("at the SHIPPED default the same guard REFUSES, so a capture or a "
+      "replay cannot silently run against a provider whose seam the proxies "
+      "do not wrap",
+      raises(_capture.assert_provider_is_hookable, "probe"),
+      "UnsupportedMatchingProviderError")
 
 with provider(config.MATCHING_PROVIDER_BEDROCK):
     _guard = raises(_capture.assert_provider_is_hookable, "install_recording_hooks")
@@ -1596,15 +1639,18 @@ for _label, _mutate, _probe, _expected_clean in _plants:
 
 section("9. Nothing leaked: config restored, files untouched, no client built")
 
-check("MATCHING_PROVIDER is back to the shipped value",
-      config.MATCHING_PROVIDER, "openai")
 # COMPARED AGAINST THE IMPORT-TIME CAPTURE, NOT AGAINST LITERALS -- see
 # _SHIPPED_AT_IMPORT for why, and note that the capture is strictly the right
 # instrument for a LEAKAGE check even where the literal would still work: the
 # question is "is it back to what it was", and only the capture knows.
+#
+# MATCHING_PROVIDER IS NO LONGER THE EXCEPTION TO THAT LOOP. It carried a
+# literal "openai" above this block under a comment arguing, correctly, that
+# the capture is the right instrument -- and it was the one name the loop
+# skipped in order to keep the literal. The provider flip made the literal
+# false, which is what a comment cannot do to itself: the special case is gone
+# and the name is checked exactly like its nine siblings.
 for _name in sorted(_SHIPPED_AT_IMPORT):
-    if _name == "MATCHING_PROVIDER":
-        continue                       # asserted by name immediately above
     check(f"config.{_name} is back to its shipped value",
           getattr(config, _name), _SHIPPED_AT_IMPORT[_name])
 

@@ -62,7 +62,7 @@ in this project.
 | Component | Choice |
 |---|---|
 | Orchestration | LangGraph 1.0.10 — `StateGraph`, conditional edges, cyclic retry, error handler |
-| Eligibility model | `config.MATCHING_MODEL` (`gpt-5.6-terra`), via the OpenAI SDK |
+| Eligibility model | `config.BEDROCK_ANTHROPIC_MATCHING_MODEL` (`us.anthropic.claude-sonnet-4-6`), via Amazon Bedrock's Converse API. `config.matching_wire_model()` is the one function that answers what is actually sent |
 | Embeddings | OpenAI `text-embedding-3-small` |
 | Reranker | `ncbi/MedCPT-Cross-Encoder` via Transformers 5.10.4 / Torch 2.10.0, loaded at `config.CROSS_ENCODER_DTYPE` (float32) |
 | Sparse retrieval | `Qdrant/bm25` via FastEmbed 0.7.4 |
@@ -78,10 +78,34 @@ in this project.
 | Input format | FHIR R4 Bundle |
 | Deployment | Docker Compose (six services) or local; the runtime detects which |
 
-A second Stage 5 provider — Amazon Bedrock — is implemented in
-[`agent/bedrock_adapter.py`](oncotriage/agent/bedrock_adapter.py) and is
-**off**: `config.MATCHING_PROVIDER` ships `"openai"`. Its go-live checklist is
-in that module's docstring.
+Stage 5 has **three** provider arms and `config.MATCHING_PROVIDER` selects one
+of them; it ships `"bedrock_anthropic"`.
+
+| Arm | Module | Wire API | State |
+|---|---|---|---|
+| `bedrock_anthropic` | [`agent/bedrock_anthropic_adapter.py`](oncotriage/agent/bedrock_anthropic_adapter.py) | Bedrock **Converse**, via boto3 | **shipped** |
+| `openai` | none — the call is inline in [`agent/evaluation.py`](oncotriage/agent/evaluation.py) | OpenAI Chat Completions | dormant, and still asserted: the tests whose subject is that request shape pin the provider back to it through [`tests/_provider_pin.py`](tests/_provider_pin.py) |
+| `bedrock` | [`agent/bedrock_adapter.py`](oncotriage/agent/bedrock_adapter.py) | Bedrock Responses (GPT-5.6 Terra) | dormant; `config.get_bedrock_client()` refuses while it is not selected |
+
+Each Bedrock module's docstring carries its own numbered go-live checklist, and
+**none of those items has been settled against the live provider yet.** Two of
+them decide whether the shipped arm is economic at all — whether the per-trial
+warmup's one-token request shape is accepted (A11) and whether the `cachePoint`
+prefix actually warms (A12) — and both are answered by three billed calls:
+
+```bash
+python bedrock_probe.py --i-understand-this-bills \
+    --provider bedrock_anthropic --probe-per-trial
+```
+
+That is the migration window's first command. Embeddings are still OpenAI's on
+every arm, so an `OPENAI_API_KEY` is required whatever `MATCHING_PROVIDER` says.
+
+Two consequences of the shipped arm are worth knowing before a campaign:
+`fixture_capture.py` and `fixture_replay.py` **refuse** at this provider by
+design — the twelve characterization fixtures are OpenAI-arm recordings and the
+harness hooks that seam alone — and a resume across the flip refuses, because
+the gated fingerprint field `matching_model_configured` reads the wire model.
 
 ## Evaluation
 

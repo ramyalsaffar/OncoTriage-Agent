@@ -1143,22 +1143,62 @@ MATCHING_SEED = 42
 # WHICH PROVIDER SERVES STAGE 5
 # ---------------------------------------------------------------------------
 #
-# THE DEFAULT IS "openai" AND FLIPPING IT IS THE ONLY THING THAT CHANGES ANY
-# BEHAVIOUR IN THIS FILE. With MATCHING_PROVIDER == "openai" every accessor
-# below is unreachable, no Bedrock client is constructed, no Bedrock module is
-# imported for its side effects, and `call_matching_model` issues byte-for-byte
-# the request it issued before the adapter existed. That is asserted three ways
-# by tests/test_agent_bedrock_adapter.py -- structurally (the dispatch is one
-# `if` above the unchanged return), behaviourally (the kwargs the OpenAI client
-# is handed are compared field by field against a pinned expectation), and by
-# the twelve characterization fixtures replaying clean without recapture.
+# THE DEFAULT IS "bedrock_anthropic" AND THIS ONE NAME DECIDES WHICH OF THREE
+# WHOLE REQUEST PATHS STAGE 5 TAKES. It was "openai" until the provider flip;
+# nothing else about that flip changed, and the two dormant arms are dormant in
+# exactly the way the incumbent used to be.
 #
-# ONE FLAG, TWO NAMES, AND THE PROVENANCE COLUMN. `MATCHING_MODEL` above stays
-# the PRICED and CONFIGURED identity of the judge; `BEDROCK_MATCHING_MODEL`
-# below is the string that goes on the wire when the provider is Bedrock, and
-# `matching_wire_model()` is the one function that answers "what will actually
-# be sent". `inferences.matching_provider` records which of the two branches a
-# row was produced by, so no stored row has to be dated to be interpreted.
+# WHAT "DORMANT" MEANS HERE, STATED PER ARM RATHER THAN AS ONE SENTENCE,
+# because the three are not symmetric and a single claim would be false of one
+# of them:
+#
+#   * "bedrock" -- the Responses branch, GPT-5.6 Terra -- is FULLY dormant.
+#     `get_bedrock_client()` REFUSES while the flag is not that value, so no
+#     OpenAI-SDK-against-Bedrock client is constructed and no Bedrock API key
+#     is resolved, and that is a property of the function rather than of the
+#     call graph. `tests/test_agent_bedrock_adapter.py` holds it.
+#   * "openai" is dormant AS STAGE 5's PROVIDER and is NOT otherwise dormant.
+#     `get_openai_client()` is still reached on every run -- Stage 2's dense
+#     retrieval embeds through it -- so the honest claim is narrower than the
+#     one this block used to make about Bedrock: `call_matching_model` no
+#     longer reaches `chat.completions.create`, and `get_openai_client()` has
+#     no flag-keyed refusal to reach because it has a second, live consumer.
+#     THE ARM ITSELF IS STILL COVERED: the tests whose subject is that request
+#     shape PIN the provider back to "openai" for their own process through
+#     `tests/_provider_pin.py`, so the shape is asserted while nobody runs it.
+#   * "bedrock_anthropic" is the live arm. Stage 5 reaches Converse through
+#     boto3, `get_bedrock_anthropic_client()` builds, and its credential guard
+#     and Region validation run.
+#
+# WHAT THE FLIP COST, RECORDED HERE BECAUSE NOTHING ELSE CAN SAY IT. The twelve
+# characterization fixtures are OpenAI-arm recordings and the harness that
+# reads them hooks the OpenAI seam alone, so `fixture_capture.py` and
+# `fixture_replay.py` REFUSE at this value by design -- see
+# `fixtures.capture.assert_provider_is_hookable`. The free twelve-fixture
+# replay gate therefore does not cover the shipped arm, and the shipped arm's
+# Stage 5 behaviour is covered by tests/test_agent_bedrock_anthropic_adapter.py
+# and tests/test_agent_bedrock_anthropic_per_trial.py alone.
+#
+# AND TWO PREMISES OF THIS ARM HAVE NEVER BEEN OBSERVED AGAINST THE LIVE
+# PROVIDER: whether the per-trial warmup's `maxTokens = 1` request shape is
+# accepted (A11), and whether the `cachePoint` prefix actually warms (A12).
+# Both are settled by three billed calls --
+# `python bedrock_probe.py --i-understand-this-bills --provider
+# bedrock_anthropic --probe-per-trial` -- and that is the migration window's
+# FIRST command. A12 failing costs MAX_TRIALS_FOR_EVALUATION x the input price
+# with nothing raising; see the go-live block in
+# oncotriage/agent/bedrock_anthropic_adapter.py.
+#
+# ONE FLAG, THREE WIRE NAMES, AND THE PROVENANCE COLUMN. `MATCHING_MODEL`
+# above stays the PRICED and CONFIGURED identity of the OpenAI judge;
+# `BEDROCK_MATCHING_MODEL` and `BEDROCK_ANTHROPIC_MATCHING_MODEL` below are the
+# strings that go on the wire on their own branches; and `matching_wire_model()`
+# is the one function that answers "what will actually be sent" -- which is why
+# the resume fingerprint gates ITS answer rather than `MATCHING_MODEL`, and why
+# the flip moves that gated field. `inferences.matching_provider` records which
+# of the THREE branches a row was produced by, so no stored row has to be dated
+# to be interpreted. (This paragraph said "two" and named one wire constant; it
+# had been stale since the Converse branch landed.)
 
 MATCHING_PROVIDER_OPENAI = "openai"
 MATCHING_PROVIDER_BEDROCK = "bedrock"
@@ -1196,7 +1236,7 @@ space."""
 # pass 20f-2 deleted BATCH_SIZE and EXPANSION_TEMPERATURE for. Write it when a
 # second site needs it, not before.
 
-MATCHING_PROVIDER = MATCHING_PROVIDER_OPENAI
+MATCHING_PROVIDER = MATCHING_PROVIDER_BEDROCK_ANTHROPIC
 """Which provider Stage 5 calls. THE FLAG. Values: MATCHING_PROVIDERS."""
 
 

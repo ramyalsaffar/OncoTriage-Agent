@@ -511,27 +511,38 @@ def run_node(trials, *, stub=None, node=None, per_trial=True, parallel=None,
 # SECTION 1 — THE FLAG IS OFF AND NOTHING MOVED
 # ===========================================================================
 
-section("1. Flag OFF: the shipped OpenAI path is untouched")
+# THIS SECTION WAS "FLAG OFF: the shipped OpenAI path is untouched" AND THE
+# FLAG IS NOW ON. What it was worth is the DORMANT-ARM property -- the arm this
+# file displaced is unchanged -- and that is worth stating exactly as much now,
+# so nothing here is deleted: the default assertion is inverted, and every
+# check that measures the OpenAI answer PINS the provider instead of relying on
+# it being the default. Pinned, each one measures the arm alone rather than the
+# arm and the default together.
 
-check("the shipped provider is still OpenAI",
-      config.MATCHING_PROVIDER, config.MATCHING_PROVIDER_OPENAI)
+section("1. Flag ON: Converse is shipped, and the OpenAI path it displaced is "
+        "untouched when pinned")
+
+check("the shipped provider is the Converse branch",
+      config.MATCHING_PROVIDER, config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC)
 check("...and per-trial is still the shipped call mode",
       config.matching_call_mode(), config.MATCHING_CALL_MODE_PER_TRIAL)
 
 # --- 1a. The parallel bound resolves to the shared constant -----------------
-check("with the OpenAI provider selected the bound IS the shared constant",
-      config.per_trial_parallel_bound(),
-      config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
-with settings(BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS=1):
-    check("...and a Converse override does NOT reach an OpenAI run, which is "
-          "the whole reason it is a separate constant",
+with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_OPENAI):
+    check("with the OpenAI provider selected the bound IS the shared constant",
           config.per_trial_parallel_bound(),
           config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+    with settings(BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS=1):
+        check("...and a Converse override does NOT reach an OpenAI run, which "
+              "is the whole reason it is a separate constant",
+              config.per_trial_parallel_bound(),
+              config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
 
 # --- 1b. The routing hint is still issued on OpenAI ------------------------
-check("the OpenAI routing hint is unchanged",
-      _evaluation.per_trial_prompt_cache_key("deadbeef"),
-      "oncotriage-stage5-deadbeef")
+with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_OPENAI):
+    check("the OpenAI routing hint is unchanged",
+          _evaluation.per_trial_prompt_cache_key("deadbeef"),
+          "oncotriage-stage5-deadbeef")
 with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC):
     check("...and is None on Converse, which has no such request field, so "
           "the caller never has one to forward",
@@ -572,8 +583,12 @@ try:
     # sturdier answer than sitting a fraction under an entropy threshold. The
     # sibling per-trial suite already passes a short label here for the reason
     # this comment now records.
-    drive(_evaluation.call_matching_model_warmup, "SYSTEM",
-          prompt_cache_key="probe")
+    # PINNED. `call_matching_model_warmup` dispatches on the provider, so at
+    # the shipped default this reaches the Converse warmup and the OpenAI
+    # recorder below stays empty -- four checks comparing against an absence.
+    with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_OPENAI):
+        drive(_evaluation.call_matching_model_warmup, "SYSTEM",
+              prompt_cache_key="probe")
 finally:
     deps.restore_overrides(_saved)
 
@@ -607,10 +622,14 @@ with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC):
 check("the confirming-provider set is closed and names Converse alone",
       list(_evaluation.PER_TRIAL_CACHE_CONFIRMING_PROVIDERS),
       [config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC])
-check("on the SHIPPED OpenAI provider a cache write is NOT confirmable, "
-      "because Chat Completions reports no write count -- enabling the check "
-      "there would fail every patient of the shipped arm",
-      _evaluation.per_trial_cache_is_confirmable(), False)
+with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_OPENAI):
+    check("on the OpenAI provider a cache write is NOT confirmable, because "
+          "Chat Completions reports no write count -- enabling the check "
+          "there would fail every patient of that arm",
+          _evaluation.per_trial_cache_is_confirmable(), False)
+check("...and at the SHIPPED default it IS confirmable, which is what makes "
+      "cache-or-nothing enforceable on the arm that runs",
+      _evaluation.per_trial_cache_is_confirmable(), True)
 with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC):
     check("...and IS confirmable on Converse", 
           _evaluation.per_trial_cache_is_confirmable(), True)
@@ -1128,7 +1147,11 @@ class _OpenAIWaveStub:
         return _r
 
 
-with counters_zeroed() as (_, _mc):
+# PINNED: this drive's whole subject is the arm whose cache write is NOT
+# confirmable, and at the shipped default the node would dispatch to Converse
+# and never touch the OpenAI stand-in installed two lines below.
+with counters_zeroed() as (_, _mc), \
+        settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_OPENAI):
     _ostub = _OpenAIWaveStub()
     _saved = deps.set_overrides({deps.OPENAI_CLIENT: _ostub})
     try:
@@ -1139,7 +1162,7 @@ with counters_zeroed() as (_, _mc):
     finally:
         deps.restore_overrides(_saved)
     _mc9 = dict(_mc)
-check("the shipped OpenAI arm still runs per-trial and completes",
+check("the OpenAI arm still runs per-trial and completes when pinned",
       len(at(_r9, "evaluations") or []), len(TRIALS))
 check("...reporting NO cached figure at all, which is the case the gate is "
       "about", at(_r9, "llm_classifier_cached_input_tokens"), None)
