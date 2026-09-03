@@ -80,6 +80,7 @@ EXIT CODES
 """
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -437,6 +438,18 @@ def main(argv=None):
              "de-identified path -- a hand-written stand-in would measure a "
              "response to a prompt Stage 5 does not send.")
     parser.add_argument(
+        "--dump-replies", metavar="DIR", default=None,
+        help="bedrock_anthropic only, with --probe-output-tokens: write each "
+             "call's RAW reply text and its usage block into DIR, one file "
+             "per call. THE PROBE PERSISTS NEITHER TODAY -- it prints "
+             "`text_chars` and an evaluation count, which is enough to see "
+             "THAT a reply was a well-formed non-answer and not enough to see "
+             "WHAT it said. A reply that cannot be re-read is a reply that "
+             "has to be bought again. DIR is created if absent and REFUSED "
+             "if it already holds replies: the per-call index makes filenames "
+             "unique within one run and IDENTICAL across runs, so re-using a "
+             "directory would overwrite paid-for evidence with no warning.")
+    parser.add_argument(
         "--max-rpm", type=float, default=10.0,
         help="Requests-per-minute ceiling this probe holds itself under. "
              "DEFAULT 10, WHICH IS THIS ACCOUNT'S MEASURED APPLIED QUOTA for "
@@ -503,6 +516,7 @@ def main(argv=None):
                       ("--per-trial-prefix-file", args.per_trial_prefix_file),
                       ("--probe-output-tokens", args.probe_output_tokens),
                       ("--per-trial-user-file", args.per_trial_user_file),
+                      ("--dump-replies", args.dump_replies),
                       ("--probe-throttle", args.probe_throttle))
     if args.provider != "bedrock_anthropic":
         _misused = [name for name, given in _CONVERSE_ONLY if given]
@@ -529,6 +543,11 @@ def main(argv=None):
         return 2
     if args.per_trial_user_file and not args.probe_output_tokens:
         print("REFUSED: --per-trial-user-file only has an effect with "
+              "--probe-output-tokens, which is the phase that reads it.")
+        print("         Nothing was called. Nothing was billed.")
+        return 2
+    if args.dump_replies and not args.probe_output_tokens:
+        print("REFUSED: --dump-replies only has an effect with "
               "--probe-output-tokens, which is the phase that reads it.")
         print("         Nothing was called. Nothing was billed.")
         return 2
@@ -1453,6 +1472,38 @@ def _probe_output_tokens(args, config, adapter, client):
           f"MATCHING_OUTPUT_TOKENS_PER_TRIAL = "
           f"{config.MATCHING_OUTPUT_TOKENS_PER_TRIAL:,}")
 
+    dump_dir = args.dump_replies
+    if dump_dir:
+        # BEFORE THE FIRST CALL, DELIBERATELY. A directory that cannot be
+        # created is a configuration fault, and discovering it after eight
+        # billed calls means the replies those calls paid for are gone.
+        try:
+            os.makedirs(dump_dir, exist_ok=True)
+        except OSError as exc:
+            print(f"  REFUSED: could not create {dump_dir!r}: {exc}")
+            print("  Nothing was called. Nothing was billed.")
+            return
+        # AND IT REFUSES A DIRECTORY THAT ALREADY HOLDS REPLIES. Filenames key
+        # on the per-call index, which restarts at 1 every run -- so a second
+        # run into the same directory overwrites the first run's evidence,
+        # silently, and that evidence was PAID FOR and cannot be recovered.
+        # Same class as the "a flag that silently does nothing" refusals above.
+        try:
+            _existing = sorted(n for n in os.listdir(dump_dir)
+                               if n.startswith("reply_"))
+        except OSError as exc:
+            print(f"  REFUSED: could not read {dump_dir!r}: {exc}")
+            print("  Nothing was called. Nothing was billed.")
+            return
+        if _existing:
+            print(f"  REFUSED: {dump_dir!r} already holds "
+                  f"{len(_existing)} reply file(s) (e.g. {_existing[0]!r}). "
+                  f"Point --dump-replies at a new directory; those were paid "
+                  f"for and this run would overwrite them.")
+            print("  Nothing was called. Nothing was billed.")
+            return
+        print(f"  raw replies -> {dump_dir}")
+
     schema = build_response_schema()
     rows = []
     _first_system = None
@@ -1540,6 +1591,34 @@ def _probe_output_tokens(args, config, adapter, client):
             except Exception as exc:                   # noqa: BLE001
                 problems, n_evals = [f"json.loads: {exc}"], None
 
+        # WRITTEN BEFORE ANYTHING ELSE CAN RAISE. `check()` below can fail
+        # and the loop can `break`; the reply is already paid for by this
+        # point and losing it to a later fault means buying it again.
+        if dump_dir:
+            base = os.path.splitext(os.path.basename(path))[0]
+            stem = os.path.join(dump_dir, f"reply_{i:02d}_{base}")
+            try:
+                with open(stem + ".txt", "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                with open(stem + ".json", "w", encoding="utf-8") as fh:
+                    json.dump({
+                        "message_index": i,
+                        "user_file": path,
+                        "user_chars": len(user),
+                        "stop_reason": raw.get("stopReason"),
+                        "usage": u,
+                        "latency_s": round(latency, 3),
+                        "text_chars": len(text),
+                        "text_sha256": hashlib.sha256(
+                            text.encode("utf-8")).hexdigest(),
+                        "request_id": (raw.get("ResponseMetadata") or {}).get(
+                            "RequestId"),
+                        "translation_error": translation_error,
+                    }, fh, indent=1, sort_keys=True)
+            except OSError as exc:
+                print(f"  could not write the raw reply: {exc}")
+        print(f"  RAW REPLY ({len(text):,} chars): "
+              f"{text[:400]!r}{' ...' if len(text) > 400 else ''}")
         print(f"  elapsed {latency:.1f}s   stopReason "
               f"{raw.get('stopReason')!r}")
         print(f"  outputTokens={u.get('outputTokens')}  "
