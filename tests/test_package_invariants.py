@@ -1353,6 +1353,21 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # module that agrees with itself and measure nothing about
                    # the coupling.
                    "tests/test_agent_summary_allergy_onset.py",
+                   # Plants into in-memory copies of agent/patient.py and
+                   # fhir/parser.py: the renderer's local _ACTIVE_STATUSES set
+                   # and its status normalization, the parser's medication
+                   # dedup rank, and the per-patient counting block. Every one
+                   # is a one-token edit inside a function body or a
+                   # module-level frozenset, so there is no attribute to
+                   # rebind. `git show` can supply none of them: at HEAD the
+                   # code is correct, and the revision that HAS the collapse
+                   # has neither the counters nor the columns nor the era, so
+                   # a blob would produce a module that cannot be probed for
+                   # the property at all. Two of the eight revert ONE half of
+                   # a two-mechanism guard while leaving the other correct --
+                   # a state no commit has ever been in, and the one that
+                   # measures that the two halves are independent.
+                   "tests/test_missing_clinical_status.py",
                    # Plants into in-memory copies of agent/evaluation.py (the
                    # TRIAL_DATA fence render and its marker neutralization) and
                    # agent/prompts.py (the C6 data boundary). `git show` cannot

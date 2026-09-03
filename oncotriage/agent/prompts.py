@@ -398,11 +398,41 @@ from oncotriage.utils import get_age_reference_date
 # interval exactly as before. The GLOBAL INVARIANT has zero exceptions and
 # absence of a status is not evidence that a condition is running -- reading it
 # as ongoing would manufacture a disqualification out of missing data, which is
-# the same fabrication as a wrong rewrite pointing the other way. Note the one
+# the same fabrication as a wrong rewrite pointing the other way.
+#
+# THIS BUMP RECORDED ONE PLACE WHERE THE RECORD COULD NOT MAKE THAT DISTINCTION,
+# AND THAT PLACE IS GONE -- WITHOUT A TEMPLATE EDIT. The note read: "the one
 # place the record cannot make that distinction for the model and does not
 # pretend to: oncotriage/agent/patient.py renders `status: active` for a
-# medication whose parsed status is `unknown`, which is RULE 2's own collapse and
-# predates this bump.
+# medication whose parsed status is `unknown`, which is RULE 2's own collapse
+# and predates this bump." The renderer no longer collapses. A medication whose
+# parsed status is unknown prints `status: unknown`, so it does not satisfy the
+# ongoing gate's "a medication whose status is active" and falls to the
+# OTHERWISE line -- which is what the paragraph above rules for the OTHER family
+# and is now uniform across both. The change is in the RECORD, not in this
+# template: RULE 4's gate and RULE 2's "no status documented" arm are unmoved,
+# and the two Section 2 variants' digests are byte-identical across it.
+#
+# THE TWO FAMILIES AGREE ON THE PRINCIPLE AND NOT ON THE SHAPE, which is worth
+# stating because the obvious reading of "brought into line" is wrong.
+# `_format_condition_line` OMITS the status part for an unknown clinical
+# status; the medication line prints the word. Neither ever says `active`,
+# which is the property this gate depends on. The difference is forced by the
+# two line formats -- a condition line is a list of optional parts, a
+# medication line has a `status:` label that is always present -- and it is
+# argued at `_ACTIVE_STATUSES` in oncotriage/agent/patient.py.
+#
+# WHAT IS NOT CLOSED, so it is not mistaken for closed. RULE 2 lists
+# "ACTIVE / ON-HOLD / no status documented" and does not name the word
+# `unknown` literally, so the model reaches the right arm by reading
+# `status: unknown` AS "no status documented" rather than by matching a listed
+# token. Nothing about that is new: RULE 2's third arm has always been reached
+# by inference rather than by a listed token, since the ONLY thing that can
+# reach it is a record that says nothing -- there was no token to match before
+# this change either. Naming the token in RULE 2
+# would be strictly better and is a TEMPLATE edit with its own middle-number
+# bump, a fixture recapture and a rater-rubric re-slice; it is a recorded
+# follow-up, not a silent rider on a renderer fix.
 #
 # THE CONVERSE IS "UNCHANGED", NOT "JUDGED BY ITS SPAN", AND THE DIFFERENCE IS A
 # FACT ABOUT THE RECORD. A resolved condition has no rendered end date -- the

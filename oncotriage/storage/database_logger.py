@@ -229,6 +229,22 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 10: `inferences.conditions_missing_status` and
+#        `inferences.medications_missing_status`, added together with
+#        INFERENCE_COLUMN_ADDITIONS and its migration loop -- one era, two
+#        columns, on era 5's and era 6's precedent that the number counts SCHEMA
+#        CHANGES rather than objects. They are one change because they are one
+#        measurement taken over two families in one walk, and because either
+#        alone would invite the reading that the other family has no such
+#        records. They record HOW MANY of the patient's rendered conditions and
+#        medications reached the Stage 5 record with no usable status -- the
+#        per-patient half of the two degradation counters
+#        `oncotriage/degradation.py` reports for the run. Before them the
+#        medication family did not merely go uncounted: a missing status was
+#        RENDERED as `status: active`, so the row and the prompt both asserted a
+#        therapy the source never documented. Both additive INTEGER, both NULL
+#        on every existing row and on every caller that did not build
+#        patient_data through parse_fhir_bundle, neither backfilled.
 # ERA 9: THE `run_environment` TABLE AND THE EIGHT `runs` PROVENANCE COLUMNS,
 #        added together -- one era, one table and eight columns, on era 8's and
 #        era 5's precedent that the number counts SCHEMA CHANGES rather than
@@ -304,7 +320,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 9
+SCHEMA_USER_VERSION = 10
 
 
 #------------------------------------------------------------------------------
@@ -805,6 +821,36 @@ INFERENCE_COLUMN_ADDITIONS = {
     # NULL here means the parser did not report — not that the date was exact.
     "age_reference_date":           "TEXT",
     "birth_date_precision":         "TEXT",
+    # --- Missing clinical status, per patient (oncotriage/fhir/parser.py) ----
+    #
+    # HOW MANY of this patient's rendered conditions, and of its rendered
+    # medications, reached the Stage 5 record carrying NO usable status --
+    # absent, empty, the literal FHIR code "unknown", or a value that is not a
+    # string at all. Counted by the parser over the list the renderer actually
+    # printed (after the entered-in-error / refuted filter and after
+    # deduplication), which is why the number cannot be re-derived from a
+    # bundle and had to be carried.
+    #
+    # WHY THE ROW NEEDS IT WHEN THE RUN ALREADY COUNTS IT. The run-end
+    # degradation report has CONDITION_STATUS_MISSING and
+    # MEDICATION_STATUS_MISSING, which say how often it happened across a
+    # campaign and CANNOT say to whom. A criterion decided by RULE 4's interval
+    # branch rather than by an ongoing status is decided that way for ONE
+    # patient, and reviewing that verdict means finding that patient's row.
+    #
+    # 0 IS A MEASUREMENT AND NULL IS NOT, which is ecog_selection's convention
+    # rather than a new one. 0 says the parser walked this patient's rendered
+    # lists and every entry carried a usable status. NULL says no such walk was
+    # recorded -- a row written before this column existed, or a caller that
+    # built patient_data by hand rather than through parse_fhir_bundle. NEVER
+    # fold the two together and never default this to 0 in a reader: a corpus
+    # of NULLs read as zeros reports a perfectly clean cohort.
+    #
+    # THEY ARE NOT BACKFILLED. The count is a function of the parsed record,
+    # and this writer does not have the bundle -- it has whatever patient_data
+    # it was handed, which for an old row no longer exists.
+    "conditions_missing_status":    "INTEGER",
+    "medications_missing_status":   "INTEGER",
     # --- ECOG performance status (File 07 parses it, File 13 carries it) -----
     # The score that reached the Stage 5 prompt, and how it was arrived at.
     # ECOG 0-1 or 0-2 gates nearly every interventional oncology trial, so these
@@ -5400,6 +5446,12 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
         # legitimately None for a patient with no observation, and legitimately
         # 0 -- falsy, and the most eligible score there is -- for a fully active
         # one. Neither can mark presence.
+        # Per-patient missing-status counts. Resolved outside the tuple beside
+        # the ECOG block and for the same reason: `or {}` handles a key that is
+        # present and None, which a hand-built patient dict produces, while the
+        # two `.get`s below must NOT collapse a measured 0.
+        _missing_status = patient_data.get("missing_status_counts") or {}
+
         _patient_ecog = patient_data.get("ecog_performance_status") or {}
         if result.get("ecog_selection") is not None:
             ecog_value              = result.get("ecog_value")
@@ -5461,6 +5513,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 sex_filter_applied, sex_filter_skip_reason,
                 degraded_run,
                 age_reference_date, birth_date_precision,
+                conditions_missing_status, medications_missing_status,
                 ecog_value, ecog_selection, ecog_observations_found, ecog_date,
                 llm_classifier_truncation_splits, llm_classifier_output_tokens_estimated,
                 not_evaluable_truncated, llm_classifier_calls,
@@ -5476,7 +5529,7 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 matching_provider, matching_call_mode,
                 verdict_normalizations, remapped_trials,
                 run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -5604,6 +5657,19 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
              or demographics.get("age_reference_date")),
             (result.get("birth_date_precision")
              or demographics.get("birth_date_precision")),
+            # Missing clinical status, per patient. THE PATIENT DICT IS THE ONLY
+            # SOURCE, unlike the two columns above, and that is not an omission:
+            # oncotriage/fhir/parser.py writes `missing_status_counts` onto
+            # patient_data and nothing carries it through the graph, so there is
+            # no result key to prefer. A caller that built patient_data by hand
+            # stores NULL, which is the honest value -- no walk was recorded.
+            #
+            # `.get(...)` on both levels rather than `or`: the count is
+            # legitimately 0 on a clean patient, and an `or` chain would turn
+            # that measurement into the absence one column over. Same reason the
+            # ECOG block is resolved with `is None` rather than `or`.
+            _missing_status.get("conditions"),
+            _missing_status.get("medications"),
             # ECOG. Resolved above, outside the tuple, because the value needs an
             # `is None` test rather than the `or` chain used for the age columns:
             # `or` would treat a legitimate ECOG 0 -- fully active, the most

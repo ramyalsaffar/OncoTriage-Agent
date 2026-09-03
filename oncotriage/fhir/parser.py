@@ -131,14 +131,189 @@ _CONDITION_STATUS_PRIORITY = {
 #------------------------------------------------------------------------------
 
 
-# All medication statuses passed through to GPT-4o with explicit status labels.
-# Active medications: GPT-4o treats as current.
-# Historical medications (completed, stopped): GPT-4o uses for prior treatment
+# All medication statuses passed through to the classifier with explicit status
+# labels.
+# Active medications: treated as current.
+# Historical medications (completed, stopped): used for prior treatment
 # criteria (e.g., "prior exposure to X", "no platinum within 6 months").
 # Removing historical medications would cause all prior treatment criteria
 # to return not_evaluable — a significant loss of matching signal.
-_ACTIVE_MED_STATUSES          = frozenset({"active", "on-hold", "draft", "intended", "unknown"})
+#
+# "unknown" IS NOT IN THE ACTIVE SET AND THE REMOVAL IS A DECISION.
+# This set is a SORT KEY and nothing else: `deduplicate_by_display` keeps the
+# first entry per display name, so a status that sorts into tier 0 WINS the
+# duplicate. While "unknown" was in here, an entry carrying no status beat a
+# `completed` entry for the same drug -- and a `completed` record is a POSITIVE,
+# DATED statement (the patient took this drug and stopped, with the end date
+# RULE 2 of the system prompt sends the model to for washout arithmetic) while
+# an "unknown" record is the ABSENCE of such a statement. Preferring the absence
+# discarded the end date and the historical/current distinction silently.
+#
+# It is also the same inference this pass removes from the renderer, one layer
+# earlier and with a worse consequence: there it MISLABELS a record, here it
+# DELETES one. So the tiers are three rather than two -- see
+# `_medication_dedup_rank` below for why "unknown" gets its own tier rather
+# than sharing the one `_HISTORICAL_MED_STATUSES` describes.
+_ACTIVE_MED_STATUSES          = frozenset({"active", "on-hold", "draft", "intended"})
 _HISTORICAL_MED_STATUSES      = frozenset({"completed", "stopped", "ended", "cancelled", "not-taken"})
+
+# ===========================================================================
+# A STATUS THE RECORD DOES NOT CARRY IS A DATA-QUALITY EVENT
+# ===========================================================================
+#
+# THE DEFECT THIS NAMES. `oncotriage/agent/patient.py` collapsed a medication
+# whose parsed status was "unknown" into the rendered word `active`, so the
+# ABSENCE of a statement about a drug reached the judge as a POSITIVE statement
+# that the patient is taking it -- and RULE 4's ongoing gate then read that word
+# and answered every lookback window with "present now", on no evidence.
+#
+# THE CONDITION FAMILY WAS NEVER WRONG AND WAS NEVER MEASURED EITHER.
+# `_format_condition_line` OMITS the status part for an unknown clinical status
+# rather than printing a word, so it has never said `active` -- but nothing
+# counted how often it happened there either, so the rate was unmeasurable in
+# both families. Fixing one and counting both is deliberate: the two numbers
+# come from different source elements, and a run where only one moves is a
+# finding about the source rather than about this parser.
+#
+# WHY DEGRADATION AND NOT CENSUS. These move ONLY on a defective record. Every
+# other counter this module owns is a CHARACTERIZATION counter -- every parse
+# increments one of BIRTH_DATE_PRECISION_COUNTS, DEMOGRAPHIC_SOURCE_COUNTS,
+# ECOG_*_COUNTS, so "non-zero" is their normal state and they are excluded from
+# `oncotriage/degradation.py` by name for exactly that reason. A run that moves
+# these two moved them because the source data is incomplete, which is what a
+# degradation report is for. They are registered in `_REGISTRY_SPEC` there, and
+# they are the first counters this module has that belong in it.
+#
+# THE FAIL-SAFE DIRECTION. An unusable status is never read as evidence of
+# activity. That is the same ruling `oncotriage/agent/prompts.py` states for
+# conditions -- "absence of a status is not evidence that a condition is
+# running -- reading it as ongoing would manufacture a disqualification out of
+# missing data" -- applied to the family that was not obeying it.
+
+CONDITION_STATUS_MISSING = Counter()
+"""Conditions that reached the renderer carrying no usable clinicalStatus.
+
+Keyed by WHICH SPELLING of absence: `absent` is a record with no status key at
+all, `unknown` is the literal FHIR code, `empty` is a blank string, and
+`unusable:{type}` is a value that is not a string. Counted over the list AFTER
+the entered-in-error / refuted filter and after deduplication, so the total
+describes what the Stage 5 record actually printed rather than what the bundle
+happened to contain.
+
+ON A PARSER-PRODUCED RECORD ONLY `unknown` IS REACHABLE, and saying so is the
+honest description of what the key set can measure. `_parse_condition` writes
+the literal "unknown" when the clinicalStatus coding list is empty, so a source
+that OMITTED the element and a source that explicitly said "unknown" arrive
+here as one value and this counter cannot tell them apart. The remedy is the
+same for both, so the collapse costs an operator nothing; what it costs is the
+right to read a zero in `absent` as evidence about the source. The other three
+keys exist for a hand-built or non-Synthea record reaching this function, and
+because a key set that silently drops a shape it was handed is the failure this
+whole pass is about.
+
+NOT REBOUND ANYWHERE. `oncotriage/degradation.py` binds the Counter OBJECT, so
+`CONDITION_STATUS_MISSING = Counter()` inside a function would replace the
+object the reader holds and the report would read zero for ever.
+"""
+
+MEDICATION_STATUS_MISSING = Counter()
+"""Medications that reached the renderer carrying no usable status.
+
+Same keys, same placement and same rebinding rule as CONDITION_STATUS_MISSING
+above, including that `_parse_medication` and `_parse_medication_statement`
+both default an omitted `status` to the literal "unknown", so only that key is
+reachable on a parser-produced record. This is the family the RENDER collapse
+was in.
+"""
+
+_MISSING_STATUS_ABSENT   = "absent"
+_MISSING_STATUS_UNKNOWN  = "unknown"
+_MISSING_STATUS_EMPTY    = "empty"
+
+# NO PUBLIC TUPLE OF THE THREE FIXED KEYS, and that is this project's own rule
+# rather than an omission. One was written and deleted: nothing in the package
+# read it, and `tests/test_package_invariants.py` check 2h reported it as the
+# dead declaration it was -- the same finding that deleted BATCH_SIZE and
+# EXPANSION_TEMPERATURE. The vocabulary is not closed anyway (`unusable:{type}`
+# is generated from whatever a malformed source sent), so a tuple could only
+# ever have named three of four shapes. A consumer wanting the vocabulary reads
+# the counter; a reader wanting the shapes reads the two docstrings above.
+
+
+def _missing_status_key(entry: Dict, field: str):
+    """Which spelling of "no usable status" `entry[field]` is, or None.
+
+    A STATUS THIS PIPELINE CAN USE IS A NON-EMPTY STRING OTHER THAN "unknown".
+    Everything else is missing. The rule is TOTAL and raises on nothing, which
+    is required rather than tidy: it runs once per entry per patient on the hot
+    path, and a counter that can take a run down is worse than no counter.
+
+    A NON-STRING IS MISSING RATHER THAN PRESENT-AND-UNREADABLE, and that is the
+    fail-safe direction restated: the consumers all do `.lower().strip()` on
+    this value, so a non-string cannot be compared against any status vocabulary
+    anyway, and calling it present would let it fall through to "treat as
+    current therapy" on a value nobody can read.
+    """
+    if field not in entry:
+        return _MISSING_STATUS_ABSENT
+    value = entry[field]
+    if value is None:
+        return _MISSING_STATUS_ABSENT
+    if not isinstance(value, str):
+        return f"unusable:{type(value).__name__}"
+    normalized = value.lower().strip()
+    if not normalized:
+        return _MISSING_STATUS_EMPTY
+    if normalized == _MISSING_STATUS_UNKNOWN:
+        return _MISSING_STATUS_UNKNOWN
+    return None
+
+
+def _count_missing_statuses(entries, field: str, counter: Counter) -> int:
+    """Count `entries` with no usable `field`, into `counter`; return the count.
+
+    THE RETURN IS THE PER-PATIENT NUMBER AND THE COUNTER IS THE PER-RUN ONE, and
+    both come from ONE walk. A second derivation -- one in the parser for the
+    counter and one in the writer for the column -- is the two-copies shape this
+    project keeps removing, and it would be worse here than usual: the two would
+    agree on every ordinary corpus and disagree on exactly the malformed records
+    the pair exists to measure.
+    """
+    total = 0
+    for entry in entries:
+        key = _missing_status_key(entry, field)
+        if key is not None:
+            counter[key] += 1
+            total += 1
+    return total
+
+
+def _medication_dedup_rank(medication: Dict) -> int:
+    """Sort rank for the medication dedup pre-sort. Lower wins the duplicate.
+
+    THREE TIERS AND NOT TWO, which is the whole change:
+
+        0  a status saying the drug is still running (_ACTIVE_MED_STATUSES)
+        1  any other status the record states -- `completed`, `stopped`, and
+           anything a source sends that this module does not enumerate
+        2  no usable status at all
+
+    Tier 2 is its own rank rather than sharing tier 1 because `sorted` is stable
+    and a tie would let BUNDLE ORDER decide which entry survives -- the
+    non-determinism `oncotriage/extraction/stage.py`'s observation sort had to
+    remove, in a place where the loser is silently deleted rather than merely
+    re-ordered.
+
+    UNENUMERATED STATUSES ARE TIER 1 AND NOT TIER 2. A status this module has
+    never heard of is still a POSITIVE statement by the source; only the four
+    spellings `_missing_status_key` names are the absence of one.
+    """
+    if _missing_status_key(medication, 'status') is not None:
+        return 2
+    if medication.get('status', '').lower().strip() in _ACTIVE_MED_STATUSES:
+        return 0
+    return 1
+
 
 _ACTIVE_ALLERGY_STATUSES      = frozenset({"active", "unknown"})
 _EXCLUDE_ALLERGY_VERIFICATION = frozenset({"refuted", "entered-in-error"})
@@ -519,14 +694,15 @@ def parse_fhir_bundle(bundle_or_path) -> Dict:
         if m.get('status', 'unknown').lower().strip() != 'entered-in-error'
     ]
 
-    # Deduplicate by display name, keeping active over historical when both exist.
-    # Sort active first so deduplicate_by_display keeps the active entry.
+    # Deduplicate by display name, keeping the entry that best describes the
+    # patient's current relationship to the drug: a running status first, then
+    # any other status the record STATES, then no usable status at all. Sorting
+    # first is what makes `deduplicate_by_display` -- which keeps the first
+    # occurrence -- keep that entry. See `_medication_dedup_rank` for why the
+    # third tier exists and why an entry carrying no status now LOSES to a
+    # `completed` one rather than winning against it.
     patient_data['medications'] = deduplicate_by_display(
-        sorted(
-            patient_data['medications'],
-            key=lambda m: (0 if m.get('status', 'unknown').lower().strip()
-                          in _ACTIVE_MED_STATUSES else 1)
-        )
+        sorted(patient_data['medications'], key=_medication_dedup_rank)
     )
 
     # Drop clinically invalid conditions before dedup.
@@ -552,6 +728,39 @@ def parse_fhir_bundle(bundle_or_path) -> Dict:
         if a.get('clinical_status', 'unknown') in _ACTIVE_ALLERGY_STATUSES
         and a.get('verification_status', 'unknown') not in _EXCLUDE_ALLERGY_VERIFICATION
     ])
+
+    # ── WHAT REACHED THE RENDERER WITHOUT A USABLE STATUS ───────────────────
+    #
+    # COUNTED HERE AND NOWHERE ELSE, and the position is the whole meaning of
+    # the number. Both lists have been through their exclusion filter
+    # (entered-in-error for medications; entered-in-error and refuted for
+    # conditions) AND through deduplication, so what is walked is exactly the
+    # list `_create_patient_summary` will print -- not what the bundle carried.
+    # Counted before the filters it would include records no prompt ever saw;
+    # counted before dedup it would count a duplicate this parser dropped.
+    #
+    # TWO NUMBERS FROM ONE WALK: the module-level Counter is the RUN's, read by
+    # `oncotriage/degradation.py`'s run-end block, and the returned int is the
+    # PATIENT's, stored in `inferences.conditions_missing_status` /
+    # `.medications_missing_status`. Neither is derivable from the other -- the
+    # counter cannot say which patient, and the column cannot say which spelling
+    # -- and deriving the column separately in the writer would be a second
+    # definition of "missing" that disagrees exactly where it matters.
+    #
+    # THE DICT IS NOT HASHED, deliberately. `compute_patient_hash` emits named
+    # keys, so a new key is invisible to it unless added -- and this one is a
+    # FUNCTION of the conditions and medications the hash already covers, so
+    # hashing it would move a hash without moving a rendered byte. That is the
+    # `value_shape` mistake `oncotriage/agent/patient.py` records, and this is
+    # the same shape.
+    patient_data['missing_status_counts'] = {
+        'conditions': _count_missing_statuses(
+            patient_data['conditions'], 'clinical_status',
+            CONDITION_STATUS_MISSING),
+        'medications': _count_missing_statuses(
+            patient_data['medications'], 'status',
+            MEDICATION_STATUS_MISSING),
+    }
 
     # Set for every patient, not only for the ones that have a score, so the
     # field's absence never has to be distinguished from a value of None.

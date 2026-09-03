@@ -1180,6 +1180,26 @@ BUCKETS = {
     "test_registries_cancer_code_claims_audit_control.py": (
         _B, "UMLS MRCONSO*.RRF (it runs the audit above as its baseline)",
         "'File 42 exited 1 with NO defect planted, so a non-zero exit proves nothing'"),
+    "test_missing_clinical_status.py": (
+        _A, None,
+        "ran green in 4.3s, 82 checks / 0 failed, against ONLY the directory "
+        "skeleton: a medication whose parsed status is unknown renders "
+        "`status: unknown` rather than `status: active`, the parser's dedup "
+        "prefers a DOCUMENTED status over an absent one, the two degradation "
+        "counters and the two inferences columns, and the era stamp. Every "
+        "patient and every bundle is a literal dict. It DOES build the "
+        "ICD-10-CM registry (parse_fhir_bundle resolves the primary cancer "
+        "through registries.primary_cancer; icd10-cm is a declared "
+        "dependency) and it DOES open SQLite, in section 4 only, inside a "
+        "tempfile.mkdtemp it removes and asserts gone -- and that path is "
+        "asserted to differ from the production inferences path before "
+        "anything is written. No network, no keys, no spend, no live Qdrant, "
+        "no model, no corpus, no git history, no live server. It DOES exec: "
+        "eight in-memory copies of oncotriage/agent/patient.py and "
+        "oncotriage/fhir/parser.py, one plant each, argued at "
+        "_EXEC_ALLOWLIST. NOT in the collision matrix -- the three repository "
+        "files it reads are written by neither of the suite's two writers and "
+        "are sha256-compared at the end"),
     "test_mcp_deidentified_responses.py": (
         _A, None,
         "ran green in 1.2s, 96 checks / 0 failed, against ONLY the directory "

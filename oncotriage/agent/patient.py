@@ -2206,8 +2206,9 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
     # vitamins, eye drops, etc.) are summarized in one line.
     #
     # Status is critical for trial matching:
-    #   active/on-hold/unknown → current treatment criteria (met/violated)
+    #   active/on-hold         → current treatment criteria (met/violated)
     #   completed/stopped      → prior treatment criteria and washout periods
+    #   unknown                → rendered AS "unknown"; see _ACTIVE_STATUSES
     #
     # Both active and historical medications are included so GPT-4o can evaluate:
     #   - Current treatment exclusions ("no concurrent systemic therapy")
@@ -2218,14 +2219,68 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
     med_relevant = []
     med_background = []
 
-    _ACTIVE_STATUSES = {"active", "on-hold", "draft", "intended", "unknown"}
+    # THE RULE: A STATUS THE RECORD DOES NOT CARRY IS RENDERED AS "unknown",
+    # NEVER AS "active". "unknown" used to be a member of this set, so a
+    # medication the source said nothing about was printed to the judge as
+    # `status: active` -- the absence of a statement presented as a positive
+    # one.
+    #
+    # THE CONDITION FAMILY HAS NEVER SAID `active` FOR AN UNKNOWN STATUS, AND
+    # IT DOES NOT SAY `unknown` EITHER -- `_format_condition_line` a few
+    # hundred lines up OMITS the status part for `unknown` and `""`. The two
+    # families therefore agree on the PRINCIPLE (an absence is never rendered
+    # as a presence) and differ in the SHAPE, and the difference is forced by
+    # the lines rather than chosen: a condition line is a ` | `-joined list of
+    # optional parts, so dropping one leaves a well-formed line, while
+    # `status:` here is a LABELLED field that is always present -- dropping it
+    # would be a structural change to every medication line, and leaving the
+    # label with nothing after it says less than either word. `unknown` is also
+    # the token RULE 2's "no status documented" arm and RULE 4's OTHERWISE line
+    # are written to receive.
+    #
+    # WHY IT MATTERS BEYOND THE LABEL. RULE 4 of the system prompt keys its
+    # ongoing gate on the word: "a medication whose status is active ... is
+    # present NOW and therefore present within any window reaching the reference
+    # date, whatever its interval". Under the collapse, a drug with no recorded
+    # status answered every lookback window with "present now" on no evidence.
+    # The same prompt states the principle for the OTHER family in as many
+    # words -- "absence of a status is not evidence that a condition is running
+    # -- reading it as ongoing would manufacture a disqualification out of
+    # missing data". `status: unknown` falls to RULE 4's OTHERWISE line and to
+    # RULE 2's "no status documented" arm, which is where it belongs.
+    #
+    # ON-HOLD / DRAFT / INTENDED ARE UNCHANGED AND ARE A RECORDED FOLLOW-UP.
+    # Each is a real, POSITIVE statement by the source rather than an absence,
+    # so none is this pass's defect -- but none of the three means "the patient
+    # is taking this drug" either, and all three are flattened into `active`
+    # here. This corpus contains zero of them (measured over all 1,000 bundles:
+    # 390,145 `completed` and 6,696 `active`, nothing else), so separating them
+    # would be a behaviour change nothing here can exercise.
+    _ACTIVE_STATUSES = {"active", "on-hold", "draft", "intended"}
 
     for med in unique_meds:
         display = med.get("display")
         if not display:
             continue
 
-        status     = med.get("status", "unknown").lower().strip()
+        # NORMALIZE FIRST, THEN DEFAULT, AND THE ORDER IS THE WHOLE POINT.
+        #
+        # `.get("status", "unknown")` was the shipped form and it has two holes.
+        # A `.get` default does not apply to a key that is PRESENT and None --
+        # which is what a source sending `"status": null` produces -- so
+        # `.lower()` raised AttributeError from inside the render and took the
+        # whole patient down. And a defaulting expression that runs BEFORE the
+        # strip cannot see a whitespace-only status: `("   " or "unknown")` is
+        # `"   "`, which strips to `""`, which is in no status set, so the line
+        # rendered `status: ` with nothing after the colon -- a labelled field
+        # with no value, which is worse than either the old label or the new
+        # one because it says nothing at all.
+        #
+        # The `or ""` absorbs None and an absent key; the `or "unknown"` after
+        # the strip absorbs everything that normalizes to empty. Every one of
+        # the four is the absence this section renders as "unknown", and every
+        # one is what oncotriage/fhir/parser.py counts as a data-quality event.
+        status     = (med.get("status") or "").lower().strip() or "unknown"
         start_date = med.get("start_date", "unknown")
         end_date   = med.get("end_date", "unknown")
 

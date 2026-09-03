@@ -70,12 +70,23 @@ OUT, each for a stated reason rather than by omission:
   * ``mcp/server.py:TOOL_FAILURES``. Already has ``tool_failure_summary()``,
     and an MCP server is a long-lived process rather than a run: there is no
     end for a run-end report to attach to.
-  * ``fhir/parser.py``'s four (BIRTH_DATE_PRECISION_COUNTS,
-    DEMOGRAPHIC_SOURCE_COUNTS, ECOG_VALUE_SHAPE_COUNTS, ECOG_SELECTION_COUNTS).
-    These are CHARACTERIZATION counters, not degradation ones -- every parse
-    increments one of them, so "non-zero" is the normal state and printing them
-    in a degradation report would bury the signal under a census. They are
-    already printed by ``load_all_patients()``.
+  * ``fhir/parser.py``'s CHARACTERIZATION counters -- BIRTH_DATE_PRECISION_COUNTS,
+    DEMOGRAPHIC_SOURCE_COUNTS, ECOG_VALUE_SHAPE_COUNTS, ECOG_SELECTION_COUNTS
+    and ECOG_ANCHOR_COUNTS. Every parse increments one of them, so "non-zero"
+    is the normal state and printing them in a degradation report would bury
+    the signal under a census. They are already printed by
+    ``load_all_patients()``.
+
+    THE EXCLUSION IS ABOUT WHAT THE COUNTER MEANS AND NOT ABOUT WHICH FILE OWNS
+    IT, which this list stated ambiguously until that module grew a counter of
+    the other kind. ``CONDITION_STATUS_MISSING`` and
+    ``MEDICATION_STATUS_MISSING`` are in ``_REGISTRY_SPEC`` below: they move
+    ONLY on a record that reached the Stage 5 summary carrying no usable
+    status, which is a defect in the data rather than a property of every
+    parse. So this module DOES import ``fhir/parser.py`` -- a pure import that
+    opens nothing, in a module already in every matching run's import graph --
+    and the sentence a reader uses this list for ("is this counter accounted
+    for") stays answerable.
   * the four counters in ``_CENSUS_SPEC`` further down this file
     (PROCEDURE_RENDER_COUNTS, TEMPORAL_RENDER_COUNTS and the two
     TEMPORAL_CONFLICT_*_MARKERS). Same reason as the parser's four -- they move
@@ -108,6 +119,7 @@ from oncotriage.agent import filtering as _agent_filtering
 from oncotriage.agent import patient as _agent_patient
 from oncotriage.agent import readiness as _agent_readiness
 from oncotriage.extraction import stage as _extraction_stage
+from oncotriage.fhir import parser as _fhir_parser
 from oncotriage.observability import console, get_logger
 from oncotriage import deid as _deid
 from oncotriage import observability as _observability
@@ -253,6 +265,24 @@ _REGISTRY_SPEC = (
      "or did not run at all"),
     ("PARTIAL_DATE_DEGRADATIONS", _utils.PARTIAL_DATE_DEGRADATIONS,
      "a partial birthDate had an out-of-range component and was anchored"),
+    ("CONDITION_STATUS_MISSING", _fhir_parser.CONDITION_STATUS_MISSING,
+     "a condition that reached the Stage 5 patient record carried NO usable "
+     "clinicalStatus, so the judge was told `unknown` and RULE 4's ongoing "
+     "gate could not fire for it. Keyed by which spelling of absence "
+     "(`unknown` is the only one a parser-produced record can carry; see the "
+     "counter). NOT a rendering fault -- the record is honest about what it "
+     "does not know -- it is a statement about the SOURCE, and a rate that "
+     "climbs means an increasing share of this cohort's conditions are "
+     "decided by RULE 4's interval branch rather than by their status"),
+    ("MEDICATION_STATUS_MISSING", _fhir_parser.MEDICATION_STATUS_MISSING,
+     "the same event for a MEDICATION, and the family the collapse was in: "
+     "until this counter existed `oncotriage/agent/patient.py` rendered such a "
+     "drug as `status: active`, so an absence reached the judge as a positive "
+     "statement that the patient is taking it and every lookback window "
+     "answered 'present now' on no evidence. It renders `status: unknown` now, "
+     "and this is the rate at which that happens. Read it beside "
+     "CONDITION_STATUS_MISSING: the two families come from different source "
+     "elements and a run where only one moves is a source-side finding"),
     ("M_CATEGORY_UNREADABLE", _extraction_stage.M_CATEGORY_UNREADABLE,
      "an AJCC clinical M observation (LOINC 21907-1) carried text the stage "
      "extractor could not read; that patient's M tier contributed nothing"),
