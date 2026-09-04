@@ -229,6 +229,17 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 13: `runs.matching_per_trial_parallel_bound`, added with
+#        RUN_COLUMN_ADDITIONS and its migration loop. A STAMP field --
+#        FINGERPRINT_VERSION 8 gates it -- recording how many of a patient's
+#        Stage 5 trial calls were permitted in flight at once, as the EFFECTIVE
+#        value `config.per_trial_parallel_bound()` resolves rather than either
+#        constant behind it. It reads as a scheduling knob and is here on a
+#        measurement: at a bound of 4 against a 10-RPM account, one measured
+#        patient lost 2 of its 15 trial calls to ThrottlingException and
+#        completed anyway, so the number decides which trials leave Stage 5
+#        with a verdict. Additive INTEGER, NULL on every existing row and on
+#        every run whose caller stamped no fingerprint, never backfilled.
 # ERA 12: `runs.matching_temperature_sent`, added with RUN_COLUMN_ADDITIONS and
 #        its migration loop. A STAMP field -- FINGERPRINT_VERSION 7 gates it --
 #        recording the sampling temperature Stage 5 actually ASKED FOR, or the
@@ -340,7 +351,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 12
+SCHEMA_USER_VERSION = 13
 
 
 #------------------------------------------------------------------------------
@@ -1873,6 +1884,21 @@ RUN_COLUMN_ADDITIONS = {
     # value per state, groups exactly, and needs no float-equality question --
     # nothing sorts or aggregates this column as a number.
     "matching_temperature_sent": "TEXT",
+    # -- ERA 13 ------------------------------------------------------------
+    #
+    # THE STAMP FIELD FOR THE PER-TRIAL PARALLEL BOUND. In this dict for
+    # `matching_call_mode`'s reason -- that is what migrates an existing
+    # database -- and written from the FINGERPRINT, like every other member of
+    # RUN_FINGERPRINT_COLUMNS.
+    #
+    # INTEGER, and the SECOND stamp column that is not TEXT, after
+    # `matching_per_trial_empty_retries` one entry up. It is a count of
+    # concurrent requests, validated at config import to an int >= 1, and a
+    # reader asking "which campaigns ran at a bound above 2" is asking a
+    # numeric question. That makes it a member of
+    # RUN_FINGERPRINT_INTEGER_COLUMNS too, which is what NULLs an unresolvable
+    # value instead of letting the string "unknown" sort above every number.
+    "matching_per_trial_parallel_bound": "INTEGER",
 }
 
 
@@ -2505,6 +2531,16 @@ RUN_FINGERPRINT_COLUMNS = (
     # the column at the INSERT, that dict is what migrates a database that
     # predates it, and `_last_wins` reconciles a column named by both.
     "matching_per_trial_empty_retries",
+    # HOW MANY TRIAL CALLS RAN AT ONCE -- gated since FINGERPRINT_VERSION 8,
+    # and in RUN_COLUMN_ADDITIONS as well for `matching_per_trial_empty_
+    # retries`' reason one line up: this tuple says what fills the column at
+    # the INSERT, that dict is what migrates a database that predates it, and
+    # `_last_wins` reconciles a column named by both. APPENDED rather than
+    # sited beside the other per-trial fields, on that entry's precedent: this
+    # tuple's order IS the physical column order of a fresh database, and
+    # moving an existing member would make a fresh file and a migrated one
+    # disagree about it.
+    "matching_per_trial_parallel_bound",
 )
 """The configuration stamp, as columns, in ``run_fingerprint``'s own order.
 
@@ -2554,6 +2590,14 @@ RUN_FINGERPRINT_INTEGER_COLUMNS = frozenset({
     # reader groups and orders on is the trap above, and the guard costs one
     # set member.
     "matching_per_trial_empty_retries",
+    # THE PER-TRIAL PARALLEL BOUND. An int in `oncotriage/config.py`, validated
+    # there to >= 1, and gated since FINGERPRINT_VERSION 8. Here for the
+    # identical reason as the entry above it: `current()` resolves it with a
+    # function that cannot degrade today, and a stamp is DATA read back out of
+    # an artifact, so a hand-built or future stamp carrying "unknown" in a
+    # column a reader groups and orders on is exactly the trap this frozenset
+    # exists for.
+    "matching_per_trial_parallel_bound",
 })
 """Which stamp fields are stored as numbers, and therefore NULLed when unknown.
 

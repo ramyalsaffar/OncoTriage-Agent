@@ -637,6 +637,25 @@ class TrialMatchState(TypedDict):
     # argument _pipeline_provenance() makes for carrying the prompt hash out of
     # the error paths.
     llm_classifier_call_details: Optional[List[Dict]]
+    # ── THE PER-TRIAL WAVE'S CALL CENSUS ──────────────────────────────────
+    #
+    # HOW MANY TRIAL CALLS THIS PATIENT'S WAVE ISSUED, LOST AND GOT ANSWERS
+    # TO. DECLARED HERE FOR THE REASON THE FOUR ABOVE ARE: a key a node
+    # returns and this class does not declare is dropped by the graph
+    # SILENTLY, and the three of them together are the only per-patient
+    # statement that a wave was incomplete -- `llm_classifier_call_details`
+    # cannot say it, because a call that RAISED appends no row to that list.
+    #
+    # Optional AND None IS NOT 0, twice over. Stage 5 writes them on its
+    # success return and on the all-failed floor, so None means the wave's
+    # accounting does not describe this run -- either no Stage 5 completed at
+    # all, or the run was GROUPED, where neither counter moves and 0 would
+    # make a healthy grouped patient read as a per-trial patient who lost
+    # everything. `llm_classifier_packed_chunks`' tri-state, arrived at from
+    # the other arm.
+    llm_classifier_per_trial_calls_attempted: Optional[int]
+    llm_classifier_per_trial_calls_failed: Optional[int]
+    llm_classifier_per_trial_calls_answered: Optional[int]
 
     # The model string the API answered with (response.model), which is not
     # necessarily MATCHING_MODEL: an alias can resolve to a dated snapshot.

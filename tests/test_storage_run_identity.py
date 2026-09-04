@@ -550,6 +550,17 @@ _STAMP_VALUES = {
     # agrees with the code by construction -- and rather than `"0.0"` so that
     # a writer which quietly substituted the shipped constant would fail here.
     "matching_temperature_sent": "0.25",
+    # AN INT, on `matching_per_trial_empty_retries`' reason directly above: the
+    # column is INTEGER and it is in RUN_FINGERPRINT_INTEGER_COLUMNS, so the
+    # generated "test-matching_per_trial_parallel_bound" exercised the NULL arm
+    # in every check below rather than the round trip they are about -- which
+    # is what the generated fallback is REPORTED for, and it is how this entry
+    # came to be written. 3 rather than a read of
+    # `config.per_trial_parallel_bound()`, on `cross_encoder_revision`'s
+    # reason: a stamp literal read off the module the round trip is checking
+    # agrees with the code by construction -- and rather than the shipped 2, so
+    # a writer that quietly substituted the live bound would fail here.
+    "matching_per_trial_parallel_bound": 3,
 }
 # A FIELD WITH NO LITERAL ABOVE GETS A GENERATED ONE RATHER THAN A KeyError, and
 # that is a repair rather than a convenience. The comment above this dict has
@@ -590,14 +601,16 @@ check("RUN_FINGERPRINT_COLUMNS is exactly the stamp's keys, in order",
       list(_dl.RUN_FINGERPRINT_COLUMNS),
       ["fingerprint_version"] + list(_rf.FINGERPRINT_FIELDS))
 
-check("...and the stamp really has twelve gated fields (non-degenerate: a "
+check("...and the stamp really has thirteen gated fields (non-degenerate: a "
       "check against an empty tuple would pass for free). SIX until the "
       "call-mode pass gated `matching_call_mode`, SEVEN until the cohort pass "
       "gated `campaign_cohort_size` and `campaign_cohort_seed`, NINE until the "
       "environment-record pass gated `cross_encoder_revision`, TEN until the "
       "empty-verdict retry pass gated `matching_per_trial_empty_retries`, "
-      "ELEVEN until the determinism pass gated `matching_temperature_sent`",
-      len(_rf.FINGERPRINT_FIELDS), 12)
+      "ELEVEN until the determinism pass gated `matching_temperature_sent`, "
+      "TWELVE until the pacing pass gated "
+      "`matching_per_trial_parallel_bound`",
+      len(_rf.FINGERPRINT_FIELDS), 13)
 
 check("every gated field has a real literal in this file's stamp, so no check "
       "below is exercising a generated placeholder",
@@ -690,7 +703,7 @@ check("...and the de-duplication is really doing work here (non-degeneracy: "
       sorted(set(_dl.RUN_FINGERPRINT_COLUMNS) & set(_dl.RUN_COLUMN_ADDITIONS)),
       ["campaign_cohort_seed", "campaign_cohort_size", "cross_encoder_revision",
        "matching_call_mode", "matching_per_trial_empty_retries",
-       "matching_temperature_sent"])
+       "matching_per_trial_parallel_bound", "matching_temperature_sent"])
 # DERIVED, NOT `RUN_COLUMNS[-1] == "matching_call_mode"`. That form pinned the
 # overlapping column to the LAST position, which is only where ALTER TABLE puts
 # it for as long as it is the last entry in RUN_COLUMN_ADDITIONS -- so the

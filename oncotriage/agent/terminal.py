@@ -338,6 +338,24 @@ def _pipeline_provenance(state) -> Dict:
         # it exist: LangGraph writes only the channels the schema declares and
         # discards the rest in silence. See the block that declares them.
         "llm_classifier_call_details": state.get("llm_classifier_call_details"),
+        # --- WHETHER THE PER-TRIAL WAVE WAS WHOLE --------------------------
+        #
+        # Same no-default route as everything above, and the three are the only
+        # per-patient statement that a wave lost calls. A call that RAISED
+        # appends no `llm_classifier_call_details` row, so the ledger beside
+        # them can say how many requests came back and cannot say how many were
+        # attempted -- which is exactly the number a reader of `failed` needs.
+        #
+        # None MEANS "THE WAVE'S ACCOUNTING DOES NOT DESCRIBE THIS RUN" and
+        # covers two states on purpose: a run that never completed Stage 5, and
+        # a GROUPED run, where neither counter moves and a 0 would make a
+        # healthy patient read as one whose whole wave was lost.
+        "llm_classifier_per_trial_calls_attempted": state.get(
+            "llm_classifier_per_trial_calls_attempted"),
+        "llm_classifier_per_trial_calls_failed": state.get(
+            "llm_classifier_per_trial_calls_failed"),
+        "llm_classifier_per_trial_calls_answered": state.get(
+            "llm_classifier_per_trial_calls_answered"),
 
         # --- Which Stage 5 system prompt produced this row ------------------
         #

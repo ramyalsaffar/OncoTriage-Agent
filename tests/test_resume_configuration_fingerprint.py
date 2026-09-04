@@ -548,13 +548,17 @@ check("the stamp's version says this field set is version 7. It was 2 until "
       "`matching_call_mode` was gated, 3 until the cohort pass gated "
       "`campaign_cohort_size` and `campaign_cohort_seed`, 4 until the "
       "environment-record pass gated `cross_encoder_revision`, 5 until the "
-      "empty-verdict retry pass gated `matching_per_trial_empty_retries`, and "
-      "6 until the determinism pass gated `matching_temperature_sent` -- which "
+      "empty-verdict retry pass gated `matching_per_trial_empty_retries`, 6 "
+      "until the determinism pass gated `matching_temperature_sent` -- which "
       "moves the distribution EVERY verdict is sampled from while no other "
-      "gated field moves with it; each bump is what makes every older artifact "
-      "answer FP_VERSION once rather than have its missing field compared "
-      "against a live value",
-      _fp.FINGERPRINT_VERSION, 7)
+      "gated field moves with it -- and 7 until the pacing pass gated "
+      "`matching_per_trial_parallel_bound`, which was MEASURED deciding which "
+      "trials leave Stage 5 with a verdict: at a bound of 4 against a 10-RPM "
+      "account, one patient lost 2 of its 15 trial calls to throttling and "
+      "completed anyway. Each bump is what makes every older artifact answer "
+      "FP_VERSION once rather than have its missing field compared against a "
+      "live value",
+      _fp.FINGERPRINT_VERSION, 8)
 
 # --- (b) the module set is DERIVED, not trusted ---------------------------
 # A static closure from the two render entry points over every module-level
@@ -1488,6 +1492,24 @@ try:
          (_config.MATCHING_TEMPERATURE_NOT_SENT
           if _config.matching_temperature_sent() is not None
           else repr(float(_config.MATCHING_TEMPERATURE or 0.0))),
+         _fp.FP_CHANGED),
+        # THE PER-TRIAL PARALLEL BOUND, DRIVEN THROUGH THE REAL GATE. The
+        # concrete harm is MEASURED rather than argued: at a bound of 4 against
+        # an account whose allowance is applied at 10 requests per minute, the
+        # 2026-09-03 sample run observed 12.6 RPM and one patient lost 2 of its
+        # 15 trial calls to ThrottlingException -- each lost trial recorded
+        # `per_trial_call_failed`, the patient COMPLETED, and nothing in the
+        # artifact said the verdict count was short. At a bound of 2 the same
+        # run answered 389 of 389. A campaign resumed across that change holds
+        # two evidence-availability regimes in one table.
+        #
+        # THE STORED VALUE IS DERIVED AS "one more than whatever this process
+        # resolves", so the case is a real mismatch at any setting of either
+        # constant behind `per_trial_parallel_bound()`. A typed literal would
+        # pin today's bound and stop being a mismatch the day it moved -- the
+        # same trap the two entries above it avoid the same way.
+        ("matching_per_trial_parallel_bound",
+         _config.per_trial_parallel_bound() + 1,
          _fp.FP_CHANGED),
     )
     # EVERY GATED FIELD IS EITHER IN THIS TABLE OR HAS ITS OWN SECTION, and the

@@ -953,6 +953,7 @@ check("...and nothing was recorded as a degradation", _warm_seen4, {})
 # out of that file's SOURCE rather than retyped, so a change to either fails
 # here instead of turning every failed patient into one a resume skips forever.
 import ast                                                       # noqa: E402
+import inspect                                                   # noqa: E402
 
 _runner_tree = ast.parse(open(_RUNNER_PATH, encoding="utf-8").read())
 
@@ -1320,13 +1321,48 @@ check("the shared bound is an int >= 1",
       isinstance(config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, int)
       and not isinstance(config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, bool)
       and config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS >= 1, True)
-check("the Converse override ships as None, meaning 'follow the shared bound', "
-      "so nothing moves until an operator sets it",
-      config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS, None)
-check("the retry budget resolves to botocore's TOTAL-attempt convention, which "
-      "is OPENAI_SDK_MAX_RETRIES + 1 -- the conversion is the whole reason it "
-      "is a function", config.bedrock_anthropic_max_attempts(),
-      config.OPENAI_SDK_MAX_RETRIES + 1)
+# --- 9-0. THE SHIPPED PACING, AND THE FALL-THROUGH IT DISPLACED -----------
+#
+# THIS BLOCK PINNED THE FALL-THROUGH (`None`, and `OPENAI_SDK_MAX_RETRIES + 1`)
+# AND IT NOW PINS THE SHIPPED DECISION BESIDE IT. Both constants moved on a
+# MEASUREMENT: run 2026-09-03 against `us.anthropic.claude-sonnet-4-6` on an
+# account whose allowance is applied at 10 requests per minute observed 12.6
+# RPM at (bound 4, attempts 2) and lost 2 of one patient's 15 trial calls to
+# ThrottlingException -- silently, because the patient completed -- and 8.6 RPM
+# at (2, 4) with 389 of 389 answered.
+#
+# WHAT THE OLD CHECKS PROTECTED IS RE-ASSERTED IN A STRONGER FORM rather than
+# deleted, and it is DRIVEN rather than inferred from the shipped value: both
+# constants are FORCED to None and the fall-through is then required to
+# resolve, so "None still means follow the derivation" stays a measurement of
+# the resolver instead of an arithmetic identity that happens to hold today.
+check("the Converse parallel override ships the MEASURED 2 rather than None",
+      config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS, 2)
+check("...and it is what `per_trial_parallel_bound()` answers on this arm",
+      config.per_trial_parallel_bound(), 2)
+check("...NON-DEGENERACY: it differs from the shared bound, so the check above "
+      "distinguishes 'the override is read' from 'the two happen to agree'",
+      config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS
+      == config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS, False)
+with settings(BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS=None):
+    check("...and None STILL means 'follow the shared bound', which is what "
+          "this check protected before the override shipped a value",
+          config.per_trial_parallel_bound(),
+          config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+check("the retry budget ships the MEASURED 4 rather than None",
+      config.BEDROCK_ANTHROPIC_MAX_ATTEMPTS, 4)
+check("...and it is what `bedrock_anthropic_max_attempts()` answers",
+      config.bedrock_anthropic_max_attempts(), 4)
+with settings(BEDROCK_ANTHROPIC_MAX_ATTEMPTS=None):
+    check("...and None STILL resolves through botocore's TOTAL-attempt "
+          "convention, OPENAI_SDK_MAX_RETRIES + 1 -- the conversion is the "
+          "whole reason it is a function, and the shipped 4 must not be "
+          "allowed to hide that the fall-through still works",
+          config.bedrock_anthropic_max_attempts(),
+          config.OPENAI_SDK_MAX_RETRIES + 1)
+    check("...NON-DEGENERACY: the fall-through differs from the shipped value, "
+          "so the two checks above cannot both pass by coincidence",
+          config.OPENAI_SDK_MAX_RETRIES + 1 == 4, False)
 with settings(BEDROCK_ANTHROPIC_MAX_ATTEMPTS=7):
     check("...and the override wins when set",
           config.bedrock_anthropic_max_attempts(), 7)
@@ -1363,6 +1399,54 @@ check("at a bound of 1 the barrier of 2 CANNOT be satisfied, which is the "
       "control: the bound is read rather than ignored",
       _bound1.barrier_broken, True)
 check("...only one call was ever in flight", _bound1.max_in_flight, 1)
+
+# --- 9a-2. THE SHIPPED BOUND REACHES THE EXECUTOR, UNFORCED ---------------
+#
+# EVERY DRIVE ABOVE PASSES `parallel=`, which sets the constant for the block
+# -- so all of them measure that the node reads WHATEVER IS SET, and none of
+# them measures that the SHIPPED value is what it reads. Those are different
+# claims, and only the second is what a campaign runs under. This drive omits
+# the argument entirely, so the bound in force is the module's own.
+#
+# A BARRIER SIZED FROM THE CONSTANT, NOT FROM A LITERAL 2. A literal would stop
+# being a test of the shipped value the day it moved and would instead be a
+# test that it had not; sizing it from the constant keeps this a measurement of
+# "the node honours what config resolves" at any value.
+_shipped = ConverseStub(barrier_size=config.per_trial_parallel_bound(),
+                        barrier_timeout=10.0)
+with counters_zeroed():
+    _r_shipped, _ = run_node(TRIALS, stub=_shipped)
+check("with NO parallel argument the node runs the SHIPPED bound's worth of "
+      "calls at once -- the barrier is sized from config, so this measures the "
+      "shipped value rather than pinning it",
+      _shipped.barrier_broken, False)
+check("...and never more than the shipped bound",
+      _shipped.max_in_flight, config.per_trial_parallel_bound())
+check("...with every trial still judged",
+      len(at(_r_shipped, "evaluations") or []), len(TRIALS))
+check("...NON-DEGENERACY: the shipped bound is above 1, so the barrier above "
+      "could actually have been broken by a sequential dispatcher",
+      config.per_trial_parallel_bound() > 1, True)
+
+# --- 9a-3. THE ATTEMPT BUDGET REACHES THE CLIENT --------------------------
+#
+# STRUCTURALLY, AND THAT IS FORCED RATHER THAN PREFERRED: the value lands in
+# `botocore.config.Config(retries={"max_attempts": ...})` inside
+# `config.get_bedrock_anthropic_client()`, and this file's whole contract is
+# that no AWS client is ever built -- boto3 is not even imported. So what is
+# checkable here is that the builder reaches the OWNER rather than a constant,
+# which is the property that would break if somebody re-hardcoded it.
+_client_src = ast.parse(inspect.getsource(config.get_bedrock_anthropic_client))
+_retry_calls = [n.func.id for n in ast.walk(_client_src)
+                if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)]
+check("the Converse client builder resolves its attempt budget through the "
+      "one owner rather than reading either constant, so the shipped 4 reaches "
+      "botocore by construction",
+      "bedrock_anthropic_max_attempts" in _retry_calls, True)
+check("...NON-DEGENERACY: the walk found calls at all, so the check above is "
+      "not passing over a body it failed to parse",
+      len(_retry_calls) > 0, True)
+
 
 # --- 9b. THE OVERRIDE IS PROVIDER-SCOPED ----------------------------------
 with settings(MATCHING_PROVIDER=config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC,

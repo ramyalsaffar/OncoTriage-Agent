@@ -72,6 +72,23 @@ WHAT IS IN THE STAMP, AND WHY EACH FIELD IS THERE
                                     ARM is gated beside it and a resume that
                                     straddles both is the case this stamp
                                     reports field by field.
+    matching_per_trial_parallel_bound
+                                    HOW MANY OF A PATIENT'S TRIAL CALLS ARE IN
+                                    FLIGHT AT ONCE. A scheduling knob on its
+                                    face, and here on a measurement rather than
+                                    on an argument from shape: at a bound of 4
+                                    on a 10-RPM account, one measured patient
+                                    lost 2 of its 15 trial calls to
+                                    ThrottlingException and COMPLETED anyway,
+                                    with each lost trial recorded
+                                    `per_trial_call_failed`. So the number
+                                    decides which trials leave Stage 5 with a
+                                    verdict, which is the call mode's own test.
+                                    The EFFECTIVE bound -- two constants feed it
+                                    and the provider decides which answers.
+                                    What it does not gate is `MAX_WORKERS`, the
+                                    other factor of the same emergent rate; see
+                                    FINGERPRINT_VERSION 7 -> 8.
     matching_temperature_sent       WHAT SAMPLING TEMPERATURE STAGE 5 ACTUALLY
                                     ASKED FOR, or ``not_sent``. The pipeline
                                     requests 0 on any arm whose model accepts
@@ -206,8 +223,75 @@ log = get_logger(__name__)
 # CONSTANTS
 # ===========================================================================
 
-FINGERPRINT_VERSION = 7
+FINGERPRINT_VERSION = 8
 """Bumped when the FIELD SET changes, never when a field's value changes.
+
+    7 -> 8  added ``matching_per_trial_parallel_bound``. EVERY ARTIFACT
+            STAMPED AT 7 THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS
+            IT ONCE, for the reason spelled out under 1 -> 2 below; the
+            remediation is identical and is printed on the refusal.
+
+            WHAT IT CLOSES, AND IT IS 2 -> 3's TEST REACHED FROM THE TRANSPORT
+            AXIS RATHER THAN THE PACKING ONE. ``config.per_trial_parallel_
+            bound()`` caps how many of a patient's Stage 5 trial calls are in
+            flight at once. On its face that is a scheduling knob and this
+            module's docstring says the tunables are deliberately out of the
+            stamp -- so the field is here on a MEASUREMENT rather than on an
+            argument from shape. Run 2026-09-03 against
+            ``us.anthropic.claude-sonnet-4-6`` on an account whose allowance is
+            applied at 10 requests per minute:
+
+                bound 4   12.6 RPM, and patient 1 lost 2 of its 15 trial calls
+                          to ThrottlingException. Each lost trial was recorded
+                          `per_trial_call_failed` and the patient COMPLETED.
+                bound 2    8.6 RPM, 389 of 389 trial calls answered.
+
+            So this number decides WHICH TRIALS LEAVE STAGE 5 WITH A VERDICT
+            AT ALL, which is the second clause of the test the call mode was
+            gated under, verbatim -- and it decides it WITHOUT failing the
+            patient, which is what made it worth gating rather than merely
+            logging. It changes how many billed calls a patient costs, through
+            the retries a throttled call spends. And nothing else in this stamp
+            moves with it: it is an int no other gated field is a function of,
+            and the judge, the arm, the prompt, the collection and the cohort
+            are identical on both sides of it. A campaign half-run at one bound
+            and resumed at the other holds two evidence-availability regimes
+            with nothing in it saying which patients got which, and every
+            `not_evaluable` and `per_trial_call_failed` rate over it is a
+            number about two pacings presented as one.
+
+            IT GATES THE EFFECTIVE VALUE, ``config.per_trial_parallel_bound()``
+            AND NOT EITHER CONSTANT, on ``matching_temperature_sent``'s and
+            ``matching_model_configured``'s footing: two constants feed it,
+            the provider decides which one answers, and gating a raw constant
+            would refuse a resume across an edit the live arm never reads while
+            missing an edit it does.
+
+            THE OVER-REFUSAL IS STATED RATHER THAN GLOSSED, and it is of two
+            kinds. In the GROUPED arm the bound is inert and this field still
+            moves -- which is exactly ``matching_per_trial_empty_retries``'
+            position one field down, and its answer holds here: the ARM is
+            gated beside it, and a resume that straddles both arms is the case
+            this stamp reports field by field. And on a healthy, unthrottled
+            account a bound change moves no verdict at all, so a refusal there
+            is real over-refusal. That is the direction this project accepts:
+            a refusal costs one deliberate clear, and an artifact holding two
+            pacings costs every number computed over it. What decides it is
+            that the change CAN move a verdict and was MEASURED doing so --
+            unlike the environment hash and the git commit under 4 -> 5, which
+            are excluded precisely because they cannot.
+
+            WHAT IT DOES **NOT** CLOSE, and this is the honest half. Requests
+            per minute is EMERGENT from this bound, from ``MAX_WORKERS``
+            patients running beside each other, and from provider latency --
+            and only the first is gated. Halving ``MAX_WORKERS`` halves the
+            emergent rate with no refusal, so this field gates one factor of a
+            product. ``MAX_WORKERS`` is deliberately excluded from
+            ``tracking.CONFIGURATION_PARAM_NAMES`` on the argument that a
+            concurrency knob "cannot explain a difference in a result", which
+            the measurement above shows is false of THIS one; whether it is
+            false of ``MAX_WORKERS`` too is a wider decision than a stamp
+            field, and it is recorded here rather than taken silently.
 
     6 -> 7  added ``matching_temperature_sent``. EVERY ARTIFACT STAMPED AT 6
             THEREFORE ANSWERS FP_VERSION UNTIL AN OPERATOR CLEARS IT ONCE, for
@@ -607,6 +691,7 @@ FINGERPRINT_FIELDS = (
     "campaign_cohort_seed",
     "cross_encoder_revision",
     "matching_per_trial_empty_retries",
+    "matching_per_trial_parallel_bound",
 )
 
 # How compare() answered. A CLOSED set, for the reason
@@ -1061,6 +1146,22 @@ def current(refresh: bool = False) -> dict:
                 # mechanism grows.
                 "matching_per_trial_empty_retries":
                     config.MATCHING_PER_TRIAL_EMPTY_RETRIES,
+                # HOW MANY TRIAL CALLS ARE IN FLIGHT AT ONCE, THROUGH THE ONE
+                # OWNER. `config.per_trial_parallel_bound()` reconciles the
+                # provider override with the shared bound, and calling it here
+                # rather than reading either constant is the same choice
+                # `_call_mode` and `_temperature_record` make above: the raw
+                # constants are two, only one of them answers, and which one
+                # depends on the provider -- so a stamp built from a constant
+                # would refuse across an edit the live arm never reads.
+                #
+                # NO HELPER AND NO GUARD, on the two cohort lines' argument:
+                # the function reads two module-level ints of a module already
+                # imported and is validated at config import, so an exception
+                # here is an ImportError that already happened. It opens
+                # nothing, so `current()` still answers offline.
+                "matching_per_trial_parallel_bound":
+                    config.per_trial_parallel_bound(),
             }
         # A COPY. The consumers put this straight into a JSON payload they then
         # mutate around, and a shared dict would let one consumer's edit reach
@@ -1097,7 +1198,9 @@ def summary(fingerprint: dict) -> str:
             f"temperature "
             f"{get('matching_temperature_sent', NOT_RECORDED)}, "
             f"empty-retries "
-            f"{get('matching_per_trial_empty_retries', NOT_RECORDED)}), "
+            f"{get('matching_per_trial_empty_retries', NOT_RECORDED)}, "
+            f"parallel "
+            f"{get('matching_per_trial_parallel_bound', NOT_RECORDED)}), "
             f"collection {get('qdrant_collection', NOT_RECORDED)} "
             f"({get('collection_points', NOT_RECORDED)} points), "
             f"snapshot {get('data_snapshot_date', NOT_RECORDED)}, "

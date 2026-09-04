@@ -254,6 +254,41 @@ RUN_STATUSES = (STATUS_OK, STATUS_NOTHING_TO_EVALUATE,
 RESUME_SKIP_STATUSES = (STATUS_OK, STATUS_NOTHING_TO_EVALUATE)
 RESUME_RERUN_STATUSES = (STATUS_PIPELINE_ERROR, STATUS_FAILED)
 
+# WHETHER THIS PATIENT'S PER-TRIAL WAVE WAS WHOLE. Closed for RUN_STATUSES'
+# reason, and read by `trial_call_completeness` below, which is its one writer.
+#
+# A FIELD BESIDE THE STATUS RATHER THAN A FIFTH STATUS, and that is this
+# project's own established ruling rather than a preference. `runs.stop_reason`
+# was argued the same way one module over: `status` answers HOW THIS PATIENT
+# ENDED, it is what `--resume` branches on, and a patient whose wave lost two
+# of fifteen trial calls ends EXACTLY as a clean one does -- a terminal result
+# was produced and persisted, so its resume answer is byte-identical (skip) and
+# re-running it would re-bill fifteen calls to recover two, with no guarantee
+# the same two come back. A member on which no consumer branches differently
+# belongs in a different field. Adding one to RUN_STATUSES would also force a
+# RESUME_SKIP/RERUN partition decision that has only one honest answer, and
+# would have to be learned by the partition guard, the manifest assertion, the
+# post-check and every reader of `by_status`.
+#
+# WHAT WAS ACTUALLY WRONG WITH LEAVING IT AT `ok` is narrower and is the whole
+# reason this exists: `ok` was true and INCOMPLETE. It said a result was
+# produced and said nothing about the result being short, so the 2026-09-03
+# sample run -- which lost 2 of patient 1's 15 trial calls to throttling --
+# produced a manifest in which that patient is indistinguishable from a patient
+# whose wave was whole. This field is the distinction, and `by_status` keeps
+# meaning what it always meant.
+TRIAL_CALLS_COMPLETE = "complete"          # every trial call this wave issued came back
+TRIAL_CALLS_INCOMPLETE = "incomplete"      # at least one was issued and lost
+# THE WAVE'S ACCOUNTING DOES NOT DESCRIBE THIS RUN, which is two states on
+# purpose and NOT an "unknown": Stage 5 in the GROUPED arm issues real calls and
+# moves neither counter, and a run that never completed Stage 5 has no wave at
+# all. Both are "this question does not arise here", and separating them would
+# be a member on which, again, nothing branches differently -- the record
+# already says which it was, through `terminal_node` and the call mode.
+TRIAL_CALLS_NOT_APPLICABLE = "not_applicable"
+TRIAL_CALL_COMPLETENESS = (TRIAL_CALLS_COMPLETE, TRIAL_CALLS_INCOMPLETE,
+                           TRIAL_CALLS_NOT_APPLICABLE)
+
 if (set(RESUME_SKIP_STATUSES) | set(RESUME_RERUN_STATUSES)) != set(RUN_STATUSES) \
         or set(RESUME_SKIP_STATUSES) & set(RESUME_RERUN_STATUSES):
     # A RuntimeError and not an `assert`: this guard's whole job is to survive
@@ -798,6 +833,13 @@ def build_record(row: Dict,
     verdicts = collect_verdicts(result)
     cost = price_run(result)
 
+    # WAS THIS PATIENT'S PER-TRIAL WAVE WHOLE. Its `problems` are folded into
+    # the record's own list rather than kept apart, on the same footing as the
+    # stamp problems and the summary error above: `problems` is the one place a
+    # reader looks for "what was wrong with this record".
+    trial_calls = trial_call_census(result)
+    problems.extend(trial_calls.pop("problems"))
+
     # Everything the result carries except the three verdict lists and the
     # rendered prompt. This is what makes the degradation, refusal and error
     # fields present by construction: they are whatever the terminal node wrote,
@@ -825,6 +867,17 @@ def build_record(row: Dict,
             "llm_classifier_output_tokens": result.get("llm_classifier_output_tokens"),
             "llm_classifier_reasoning_tokens": result.get("llm_classifier_reasoning_tokens"),
             "llm_classifier_calls": result.get("llm_classifier_calls"),
+            # HOW MANY OF THIS PATIENT'S TRIAL CALLS CAME BACK, beside the
+            # total above -- which counts the warmup and cannot say whether any
+            # request was lost. `completeness` is the field a reader branches
+            # on and the three counts are what it is derived from, kept beside
+            # it so a reader can check the verdict rather than take it.
+            #
+            # NOT IN REQUIRED_RUN_KEYS, deliberately: every record written
+            # before this field existed lacks it, and a post-check that refused
+            # them would report a whole earlier campaign as defective for a
+            # field nothing in it could have carried.
+            "trial_calls": trial_calls,
             "llm_classifier_retries": result.get("llm_classifier_retries"),
             "llm_classifier_truncation_splits": result.get("llm_classifier_truncation_splits"),
             # WHETHER THE MODEL REFUSED, AND HOW LONG THE REFUSAL WAS -- NEVER
@@ -862,6 +915,70 @@ def build_record(row: Dict,
         "result": residual,
         "result_omitted_keys": dict(RESULT_OMITTED_KEYS),
     }
+
+
+def trial_call_census(result: Dict) -> Dict:
+    """The per-trial wave's call census for one patient, plus its verdict.
+
+    ONE READER OF THREE RESULT KEYS AND ONE DERIVATION OF THE VERDICT, called
+    by ``build_record`` for the record and by ``main`` for the manifest entry,
+    because two derivations of "was this wave whole" is two answers that can
+    disagree about one patient -- and the manifest is what a reader totals
+    while the record is what they open afterwards.
+
+    THE THREE NUMBERS ARE READ, NEVER RECOMPUTED. ``oncotriage/agent/
+    evaluation.py`` counts them inside the dispatch loop, where a call that
+    RAISED is visible; nothing downstream can recover that, because a failed
+    call appends no ``llm_classifier_call_details`` row and produces no
+    verdict distinguishable from a trial the model merely omitted. Deriving
+    them here from the verdict arrays would count TRIALS recorded
+    ``per_trial_call_failed``, which equals the call count only in the
+    per-trial arm and only when no chunk carried two trials.
+
+    ``attempted`` IS COMPARED AGAINST ``failed + answered``, AND WHAT THAT
+    CHECK CAN AND CANNOT CATCH IS STATED RATHER THAN IMPLIED. The shipped node
+    DERIVES ``attempted`` as that very sum, so the comparison cannot fail
+    against a result this pipeline produced -- it is not a check on the node.
+    What it IS a check on is the other three sources this function reads from:
+    a record loaded off disk, a record written under an earlier era, and a
+    ``run_one_patient`` a harness or an embedder has replaced. Those can carry
+    a census that does not add up, and the disagreement is recorded in
+    ``problems`` rather than repaired by preferring either side -- the
+    post-check's own rule for ``criterion_decision_count``, applied to the one
+    other place this record stores a total beside its parts. If the node ever
+    starts counting ``attempted`` independently, this check starts covering it
+    too and needs no edit.
+
+    Returns a dict with ``attempted``/``failed``/``answered`` (ints or None)
+    and ``completeness`` (a ``TRIAL_CALL_COMPLETENESS`` member), plus a
+    ``problems`` list the caller folds into its own.
+    """
+    attempted = result.get("llm_classifier_per_trial_calls_attempted")
+    failed = result.get("llm_classifier_per_trial_calls_failed")
+    answered = result.get("llm_classifier_per_trial_calls_answered")
+    problems = []
+
+    # THE VERDICT BRANCHES ON `failed` ALONE, and on its ABSENCE first. None
+    # means the wave's accounting does not describe this run (grouped, or no
+    # Stage 5 completed); 0 is a MEASUREMENT that nothing was lost. Testing
+    # truthiness would collapse the two, which is the tri-state this record
+    # keeps everywhere else.
+    if failed is None:
+        completeness = TRIAL_CALLS_NOT_APPLICABLE
+    elif failed > 0:
+        completeness = TRIAL_CALLS_INCOMPLETE
+    else:
+        completeness = TRIAL_CALLS_COMPLETE
+
+    if (attempted is not None and failed is not None and answered is not None
+            and attempted != failed + answered):
+        problems.append(
+            f"trial call census disagrees with itself: attempted "
+            f"{attempted}, failed {failed} + answered {answered} = "
+            f"{failed + answered}")
+
+    return {"attempted": attempted, "failed": failed, "answered": answered,
+            "completeness": completeness, "problems": problems}
 
 
 def run_one_patient(selection_entry: Dict, graph: object) -> Tuple[Dict, Dict]:
@@ -1282,9 +1399,33 @@ def summarise(manifest: Dict) -> Dict:
     contexts = 0
     decisions = 0
     verdicts = 0
+    # HOW MANY TRIAL CALLS THIS RUN LOST, AND OVER HOW MANY PATIENTS. Two
+    # numbers rather than one, because they answer different questions: eight
+    # lost calls spread over eight patients is a pacing problem and eight on
+    # one patient is that patient's problem, and a single total cannot tell
+    # them apart.
+    trial_calls_lost = 0
+    patients_with_lost_trial_calls = 0
+    by_trial_calls = {}
 
     for entry in runs.values():
         by_status[entry["status"]] = by_status.get(entry["status"], 0) + 1
+        # `.get` AND A DEFAULT NAMING THE ABSENCE, not TRIAL_CALLS_NOT_
+        # APPLICABLE: an entry written before this field existed never had a
+        # wave to describe, and folding it into a member of the vocabulary
+        # would claim a measurement that was never taken. Every earlier
+        # manifest keeps totalling.
+        _tc = entry.get("trial_calls") or {}
+        _bucket = _tc.get("completeness") or "not_recorded"
+        by_trial_calls[_bucket] = by_trial_calls.get(_bucket, 0) + 1
+        # `.get("failed")` IS FALSY FOR BOTH 0 AND None, AND BOTH ARE RIGHT TO
+        # SKIP HERE: a wave that lost nothing and a run with no wave both
+        # contribute nothing to a total of losses. The tri-state that DOES
+        # matter is kept in `_bucket` above, which is why the two are read
+        # separately rather than derived from each other.
+        if _tc.get("failed"):
+            trial_calls_lost += _tc["failed"]
+            patients_with_lost_trial_calls += 1
         terminal = entry.get("terminal_node") or "none"
         by_terminal[terminal] = by_terminal.get(terminal, 0) + 1
         contexts += entry.get("contexts") or 0
@@ -1305,6 +1446,13 @@ def summarise(manifest: Dict) -> Dict:
         "verdicted_trials": verdicts,
         "retrieval_contexts": contexts,
         "criterion_decisions": decisions,
+        # WHETHER EVERY PATIENT'S PER-TRIAL WAVE WAS WHOLE. `by_trial_calls`
+        # is the census and the two scalars are what an operator acts on; a
+        # non-zero `trial_calls_lost` means this run's verdict counts are a
+        # FLOOR, in exactly `cost_complete`'s sense one line down.
+        "by_trial_calls": dict(sorted(by_trial_calls.items())),
+        "trial_calls_lost": trial_calls_lost,
+        "patients_with_lost_trial_calls": patients_with_lost_trial_calls,
         "cost_usd": round(cost, 6),
         # False means the number above is a FLOOR: an unpriced model, a run with
         # Stage 5 retries whose earlier attempts are not in the counters, or a
@@ -1340,7 +1488,13 @@ def post_check(output_dir: str) -> Dict:
 
     totals = {"records": 0, "verdicts": 0, "contexts": 0,
               "criterion_decisions": 0, "contexts_with_text": 0,
-              "summaries_present": 0}
+              "summaries_present": 0,
+              # RE-DERIVED FROM THE RECORDS ON DISK, never read out of the
+              # manifest. That is this function's whole contract -- it exists
+              # to catch a writer whose summary and whose records disagree --
+              # and the manifest's own copy is totalled separately by
+              # `summarise`.
+              "trial_calls_lost": 0, "records_with_lost_trial_calls": 0}
 
     for name in files:
         full = os.path.join(output_dir, name)
@@ -1377,6 +1531,21 @@ def post_check(output_dir: str) -> Dict:
         else:
             findings.append(f"{name}: no patient summary text was rendered")
 
+        # A WAVE THAT LOST CALLS IS A FINDING, not a note. The record is
+        # well-formed and its status is `ok`; what is wrong with it is that its
+        # verdict count is a FLOOR, and the post-check is the one place a run
+        # is told what is wrong with what it wrote. A `.get` chain throughout,
+        # because a record written before this field existed is not defective.
+        _tc = (record["run"] or {}).get("trial_calls") or {}
+        _lost = _tc.get("failed")
+        if _lost:
+            totals["trial_calls_lost"] += _lost
+            totals["records_with_lost_trial_calls"] += 1
+            findings.append(
+                f"{name}: {_lost} of {_tc.get('attempted')} per-trial Stage 5 "
+                f"call(s) were lost, so this patient's verdicts are a FLOOR "
+                f"({_tc.get('completeness')})")
+
         for context in record["contexts"]:
             if context.get("trial_text"):
                 totals["contexts_with_text"] += 1
@@ -1406,6 +1575,12 @@ def print_post_check(report: Dict) -> None:
                 f"({totals['contexts_with_text']} with text)")
     console.out(f"  verdicted trials             : {totals['verdicts']}")
     console.out(f"  criterion decisions          : {totals['criterion_decisions']}")
+    # PRINTED EVEN AT ZERO, on tests/test_package_invariants.py's skip-counter
+    # argument: a line that appears only when it is non-zero is
+    # indistinguishable from a checker that does not look, and this one is a
+    # statement that the run's verdict counts are totals rather than floors.
+    console.out(f"  per-trial calls lost         : {totals['trial_calls_lost']}"
+                f" (over {totals['records_with_lost_trial_calls']} record(s))")
     if report["findings"]:
         console.out(f"\n  {len(report['findings'])} FINDING(S):")
         for finding in report["findings"]:
@@ -1756,6 +1931,24 @@ def main(argv=None) -> int:
                 "verdicts": len(record["verdicts"]),
                 "contexts": len(record["contexts"]),
                 "criterion_decisions": record["criterion_decision_count"],
+                # THE WAVE'S CENSUS, IN THE MANIFEST AND NOT ONLY IN THE
+                # RECORD. `summarise` totals it, and a total a reader has to
+                # open a thousand record files to compute is a total nobody
+                # computes. Copied from the record rather than re-derived, so
+                # the two cannot disagree about one patient.
+                #
+                # `.get`, AND THE ABSENCE IS CARRIED AS None RATHER THAN AS A
+                # FABRICATED CENSUS. `trial_calls` is deliberately NOT in
+                # REQUIRED_RUN_KEYS -- every record written before this field
+                # existed lacks it -- and `run_one_patient` is a public
+                # function a harness or an embedder replaces, so a record
+                # without the block is legal here. Defaulting to
+                # `trial_call_census({})` would write TRIAL_CALLS_NOT_
+                # APPLICABLE into the manifest, which is a claim that the
+                # question was asked and did not arise; None is the honest
+                # "nothing recorded", and `summarise` buckets it as
+                # `not_recorded` for exactly that reason.
+                "trial_calls": (record["run"] or {}).get("trial_calls"),
                 "cost": record["run"]["cost"],
                 "duration_s": record["run"]["duration_s"],
                 "problems": record["run"]["problems"] + coercions,
@@ -1765,13 +1958,20 @@ def main(argv=None) -> int:
             write_manifest(output_dir, manifest)
 
             cost_usd = run_entry["cost"]["cost_usd"]
+            # THE LOSS IS ON THE PATIENT'S OWN LINE, and only when there is
+            # one. A zero here would be a column of zeros on every line of a
+            # thousand-patient run, which is how a marker stops being read; the
+            # ALWAYS-PRINTED statement of the same fact is the run-end total,
+            # where silence and zero genuinely are confusable.
+            _lost = (run_entry["trial_calls"] or {}).get("failed")   # None-safe
             console.out(
                 f"  {outcome['status']:<20} {outcome['terminal_node']}  "
                 f"trials={run_entry['contexts']}  "
                 f"verdicts={run_entry['verdicts']}  "
                 f"criteria={run_entry['criterion_decisions']}  "
                 f"{run_entry['duration_s']}s  "
-                + (f"${cost_usd:.5f}" if cost_usd is not None else "cost UNKNOWN"))
+                + (f"${cost_usd:.5f}" if cost_usd is not None else "cost UNKNOWN")
+                + (f"   <- {_lost} TRIAL CALL(S) LOST" if _lost else ""))
             for note in run_entry["problems"]:
                 console.out(f"    ! {note}")
             log.info("patient run finished", event="evaluation_patient_finished",
@@ -1779,6 +1979,12 @@ def main(argv=None) -> int:
                      node=outcome["terminal_node"],
                      evaluated=run_entry["verdicts"],
                      criteria_count=run_entry["criterion_decisions"],
+                     # ALLOWLISTED FIELDS ONLY. `count` is the low-cardinality
+                     # "how many of a thing" field this project's logger
+                     # already carries, and `degraded` is what makes a lossy
+                     # patient findable in a structured log without widening
+                     # LOGGABLE_FIELDS for a name used once.
+                     count=_lost or 0, degraded=bool(_lost),
                      cost_usd=cost_usd)
 
     manifest["totals"] = summarise(manifest)
@@ -1835,6 +2041,14 @@ def main(argv=None) -> int:
     console.out(f"\n  total cost            : ${totals['cost_usd']:.5f}"
                 + ("" if totals["cost_complete"] else "   <- A FLOOR, NOT A TOTAL"))
     console.out(f"  criterion decisions   : {totals['criterion_decisions']}")
+    # PRINTED EVEN AT ZERO, for the reason the post-check's line is: silence
+    # and "nothing was lost" must not look the same. The FLOOR marker follows
+    # the cost line directly above it, because it is the same kind of
+    # statement about the same kind of number.
+    console.out(f"  per-trial calls lost  : {totals['trial_calls_lost']}"
+                + ("" if not totals["trial_calls_lost"] else
+                   f"   <- VERDICT COUNTS ARE A FLOOR, over "
+                   f"{totals['patients_with_lost_trial_calls']} patient(s)"))
     console.out(f"  retrieval contexts    : {totals['retrieval_contexts']}")
     console.out(f"  output directory      : {os.path.abspath(output_dir)}")
 

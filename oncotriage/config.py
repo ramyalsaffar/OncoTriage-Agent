@@ -1832,8 +1832,43 @@ IT REMAINS A KNOB. Set it False to reproduce the old behaviour; the split prefix
 is the only thing that changes, and `PER_TRIAL_CACHE_READ_MISSES` is where it
 shows up."""
 
-BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = None
+BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = 2
 """Per-trial parallelism for THIS provider, or None to follow the shared bound.
+
+IT SHIPS 2 RATHER THAN None, AND THE NUMBER IS MEASURED. Run 2026-09-03 against
+`us.anthropic.claude-sonnet-4-6` on this project's own quota-restricted account,
+which is applied at 10 requests per minute:
+
+    bound 4 (the shared fall-through), attempts 2
+        12.6 RPM observed -- OVER the account's limit
+        patient 1 lost 2 of its 15 trial calls to ThrottlingException, and
+        the loss was SILENT: each lost trial was recorded
+        `per_trial_call_failed`, the patient completed, and nothing outside a
+        module-level counter said the cohort was two verdicts short.
+
+    bound 2, attempts 4 (these defaults)
+        8.6 RPM observed -- UNDER the limit
+        389 of 389 trial calls answered. Zero throttling losses.
+
+WHAT THE ARITHMETIC ACTUALLY SAYS, STATED HONESTLY RATHER THAN AS A GUARANTEE.
+This constant caps the calls IN FLIGHT for one patient; requests per minute is
+EMERGENT from that cap, from `MAX_WORKERS` patients running beside each other,
+and from the provider's latency, none of which this file knows. So 2 is
+MEASURED-SAFE at the latencies of that run and is not a proof of anything at a
+different latency, a different patient mix or a wider `MAX_WORKERS`. What makes
+it the right default anyway is the direction of the two errors: too low costs
+wall-clock time, and too high costs VERDICTS -- and the verdicts are lost
+without failing the patient, which is the class of failure this project exists
+to remove.
+
+THE ESCALATION PATH IS UNCHANGED AND IS THE PROBE'S OWN DOCTRINE. When 429s
+appear, `bedrock_probe.py --probe-throttle` separates BURSTY from SUSTAINED: a
+bursty account rides them out on a larger `BEDROCK_ANTHROPIC_MAX_ATTEMPTS`, and
+a sustained one needs a SMALLER value HERE, because botocore's retry quota
+drains under sustained throttling and no retry budget can compensate for a
+parallel bound set too wide. `BEDROCK_ANTHROPIC_RETRY_MODE`'s `"adaptive"` --
+AWS's own documented answer for a throttled account, and deliberately not the
+default -- is the third step, after both of these.
 
 WHY A SECOND NAME FOR A NUMBER THAT ALREADY HAS ONE.
 `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` is derived from an estimated OpenAI
@@ -1846,8 +1881,10 @@ One number cannot be right for both, and the alternative -- editing the shared
 constant -- would silently re-pace the SHIPPED OpenAI arm to suit a provider it
 does not use.
 
-None MEANS FOLLOW THE SHARED BOUND, so nothing moves until this is set, and
-`config.per_trial_parallel_bound()` is the ONE place the two are reconciled.
+None STILL MEANS FOLLOW THE SHARED BOUND, and it is what this constant held
+until the sample run above. `config.per_trial_parallel_bound()` is the ONE place
+the two are reconciled, and setting this back to None restores the shared
+bound's value exactly.
 
 WHAT HAPPENS WHEN THE QUOTA IS HIT, AND IT IS NOT SILENT. Converse answers
 `ThrottlingException` with HTTP 429 (`API_runtime_Converse.html`, read
@@ -1872,22 +1909,42 @@ remedy is a SMALLER value here rather than a larger retry budget.
 SET IT TO 1 FOR SEQUENTIAL, which is the honest way to turn the scheduling off
 without turning the mode off. 0 or a negative value is refused at import."""
 
-BEDROCK_ANTHROPIC_MAX_ATTEMPTS = None
+BEDROCK_ANTHROPIC_MAX_ATTEMPTS = 4
 """botocore's TOTAL attempt budget, or None to follow the OpenAI derivation.
 
-None RESOLVES TO `OPENAI_SDK_MAX_RETRIES + 1`, which is what shipped and which
-is 2 -- one initial request and ONE retry. The +1 is not arithmetic decoration:
+IT SHIPS 4 RATHER THAN None, WHICH WOULD RESOLVE TO 2. The 2026-09-03 sample
+run measured at `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS` above is the evidence
+for both numbers together, and they were not moved independently: at the
+fall-through pair (bound 4, attempts 2) that run exceeded the account's 10 RPM
+and silently lost 2 of patient 1's 15 trial calls to ThrottlingException; at
+this pair (bound 2, attempts 4) it ran 389 of 389 trial calls clean at 8.6 RPM.
+
+WHAT THE RAISE BUYS, AND IT IS THE SMALLER HALF OF THE PAIR. Two total attempts
+is one initial request and ONE retry, with at most one second of jittered
+backoff -- which is a budget for a healthy endpoint rather than for an account
+whose allowance is applied far below the default. Four gives three retries with
+backoff capped at 20 s, so a burst that clips the limit costs wall-clock time
+instead of a verdict. It does NOT substitute for the bound: botocore's retry
+QUOTA (a 500-token bucket charged 5 per throttling retry) drains under sustained
+throttling and then stops retrying entirely, so under SUSTAINED 429s a larger
+value here does nothing and the remedy is a smaller bound. The probe's
+BURSTY/SUSTAINED split is what tells the two apart.
+
+None STILL RESOLVES TO `OPENAI_SDK_MAX_RETRIES + 1`, which is 2 -- one initial
+request and ONE retry -- and is what this constant held until the sample run
+above. The +1 is not arithmetic decoration:
 botocore counts TOTAL attempts where the OpenAI SDK counts retries after the
 first, and passing one library's number to the other is how a transport budget
 silently halves or doubles.
 
-WHY IT IS SEPARABLE HERE AND NOWHERE ELSE. Two on a healthy endpoint is
-generous. On an account whose requests-per-minute allowance is applied far
-below the default it is one retry, with at most one second of jittered backoff,
-against a limit that is being hit systematically -- and the retry quota above
-means raising this cannot compensate for a parallel bound set too wide. Raise
-it when the probe's throttling behaviour says the 429s are BURSTY (a bigger
-budget rides them out) and lower the parallel bound when they are SUSTAINED.
+WHY IT IS SEPARABLE HERE AND NOWHERE ELSE. The OpenAI derivation's two is
+generous on a healthy endpoint. On an account whose requests-per-minute
+allowance is applied far below the default it is one retry, with at most one
+second of jittered backoff, against a limit that is being hit systematically --
+and the retry quota above means raising this cannot compensate for a parallel
+bound set too wide. Raise it further when the probe's throttling behaviour says
+the 429s are BURSTY (a bigger budget rides them out) and lower the parallel
+bound when they are SUSTAINED.
 
 MUST BE >= 1: botocore's own documentation is that "a max attempts value of 3
 means the SDK makes one initial request and up to two retries. Set max attempts

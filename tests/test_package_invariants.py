@@ -1147,6 +1147,26 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # into and a throwaway namespace would leave every module
                    # constant unread.
                    "tests/test_storage_provenance_persistence.py",
+                   # SIX execs, each an in-memory copy of
+                   # agent/evaluation.py (two plants) or
+                   # evaluation/run_harness.py (four) for the per-trial call
+                   # census -- the three keys that say a patient's Stage 5 wave
+                   # LOST calls. The plants: the census dropped from the node's
+                   # success return; the grouped arm reporting 0 where it must
+                   # report None; two truthiness rewrites of the completeness
+                   # branch, one of which is a RECORDED NO-OP and is labelled
+                   # as one rather than claimed as a catch; the post-check's
+                   # finding removed; and summarise's accumulation removed.
+                   # Every one is a one-token edit to code that exists at HEAD
+                   # AND NOWHERE ELSE, so `git show` has no revision carrying a
+                   # version with one of them broken -- the fields are new. A
+                   # real condition cannot supply them either: there is no
+                   # input that makes a correctly wired node stop returning a
+                   # key. The copies are exec'd into a real ModuleType, because
+                   # a function's globals ARE the dict it was exec'd into and a
+                   # throwaway namespace would leave every module constant
+                   # unread.
+                   "tests/test_harness_lost_trial_call_visibility.py",
                    "tests/test_agent_prompt_version.py",
                    "tests/test_observability_logging.py",
                    "tests/test_indexer_admission_filters.py",

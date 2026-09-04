@@ -560,6 +560,24 @@ BUCKETS = {
         "no network, no keys, NO SPEND, no live Qdrant, no model load, no "
         "corpus, no git history, no subprocess. Not in the collision matrix: "
         "it writes only inside a tempfile.mkdtemp it removes"),
+    "test_harness_lost_trial_call_visibility.py": (
+        _A, None,
+        "ran green in 1.1s, 102 checks, against ONLY the CI directory "
+        "skeleton: a patient whose per-trial Stage 5 wave LOST calls is no "
+        "longer recorded as plain `ok`. The REAL Stage 5 node and the REAL "
+        "node_finalize over a real StateGraph, with the OpenAI client a "
+        "stand-in installed through oncotriage/agent/deps and the provider "
+        "PINNED to the OpenAI arm through tests/_provider_pin.py -- so no "
+        "boto3 client is built and no AWS credential is resolved. No network, "
+        "no keys, NO SPEND, no live Qdrant, NO MODEL LOAD "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the project imports), no "
+        "corpus, no database, no git history, no live server, no subprocess. "
+        "It DOES build the ICD-10-CM registry and the MeSH filter, because "
+        "the renderer resolves both. Not in the collision matrix: it writes "
+        "only inside a tempfile.mkdtemp it removes and asserts gone, and the "
+        "two repository files it reads (agent/evaluation.py, "
+        "evaluation/run_harness.py) are written by neither of the suite's two "
+        "writers and are sha256-compared at the end"),
     "test_agent_stage5_per_trial_calls.py": (
         _A, None,
         "ran green in 10.0s, 239 checks (this line read 139 and was stale "

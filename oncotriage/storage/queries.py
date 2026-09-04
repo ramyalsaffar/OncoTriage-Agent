@@ -2339,12 +2339,19 @@ QUERIES = (
         # FINGERPRINT_VERSION 7. That this mechanism has now caught five
         # consecutive stamp widenings is the argument for the derived check
         # rather than for a bigger comment.
+        # `runs.matching_per_trial_parallel_bound` joins them at era 13 on the
+        # same footing and found the same way for the SIXTH time: it is a
+        # RUN_FINGERPRINT_COLUMNS member as of FINGERPRINT_VERSION 8. Six in a
+        # row is no longer a coincidence worth a comment -- it is what a
+        # GENERATED predicate over a widening tuple does, and the derived check
+        # is the only thing that has ever caught it.
         requires_columns=(("inferences", "run_id"),
                           ("runs", "campaign_cohort_seed"),
                           ("runs", "campaign_cohort_size"),
                           ("runs", "cross_encoder_revision"),
                           ("runs", "matching_call_mode"),
                           ("runs", "matching_per_trial_empty_retries"),
+                          ("runs", "matching_per_trial_parallel_bound"),
                           ("runs", "matching_temperature_sent"),
                           ("runs", "resumed")),
         notes=(

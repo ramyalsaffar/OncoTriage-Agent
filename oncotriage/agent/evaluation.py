@@ -6604,6 +6604,80 @@ CLINICAL TRIALS:
     # the counter that answers.
     per_trial_succeeded = 0
 
+    def _per_trial_call_census() -> Dict:
+        """How many trial calls this invocation issued, lost and got answers to.
+
+        WHY IT LEAVES THE NODE AT ALL. `per_trial_failed_calls` was read by two
+        log lines and by the all-failed floor, and by nothing a caller could
+        see -- so a patient whose wave lost calls to throttling completed, was
+        persisted, and was recorded by `oncotriage/evaluation/run_harness.py`
+        as plain `ok`, with the hole visible only in a module-level counter
+        that is a question about the PROCESS rather than about that patient.
+        The 2026-09-03 sample run is what made that concrete: at the old
+        pacing, patient 1 lost 2 of its 15 trial calls to ThrottlingException
+        and every artifact it produced said the run was fine. These three
+        numbers are that fact, per patient, in the record.
+
+        NONE IN THE GROUPED ARM RATHER THAN 0, which is
+        `llm_classifier_packed_chunks`' tri-state applied honestly rather than
+        an exception to it. Grouped mode issues real calls and increments
+        neither counter, so 0 would make a healthy grouped patient
+        indistinguishable from a per-trial patient whose whole wave was lost.
+        None's documented meaning here is "the per-trial wave's accounting does
+        not describe this run", and that is exactly true of the grouped arm.
+
+        `answered` AND NOT `evaluated`, and the distinction is measured rather
+        than pedantic: a call that returns `{"evaluations": []}` ANSWERED and
+        evaluated nothing, which is the whole subject of
+        `config.MATCHING_PER_TRIAL_EMPTY_RETRIES`. Naming this field
+        `evaluated` would make it disagree with the verdict count on exactly
+        the patients that mechanism exists for. How many trials got a VERDICT
+        is already derivable from the persisted verdict arrays; how many calls
+        came back is not derivable from anything else, because a failed call
+        appends no `llm_classifier_call_details` row.
+
+        `attempted` IS THE SUM OF THE OTHER TWO AND IS CARRIED ANYWAY. It is
+        the denominator every reader of `failed` needs, and deriving it at each
+        of the several places that read it is how two consumers come to
+        disagree about what a rate is over. IT IS NOT COUNTED INDEPENDENTLY,
+        and that is deliberate rather than an omission: the natural site would
+        be immediately above `_obtain`, which is also where the shutdown and
+        spend gates DECLINE a call -- so an independent counter would count
+        requests that were never issued, and every stopped run would then
+        report a census that does not add up. The cost of the derivation is
+        that `run_harness.trial_call_census`'s self-consistency check cannot
+        fail against this node; that function says so.
+
+        ONE PAID CALL IS IN NEITHER COLUMN, and it is named rather than
+        rounded off: a FALLBACK CACHE WRITER whose response arrived and was
+        then WITHHELD because its cache write could not be confirmed. It was
+        billed, `_account_unconsumed()` folds its tokens, and it is not
+        `answered` (nothing consumed it) and not `failed` (it did not raise).
+        Reachable only on the all-failed floor, which is already a hard
+        patient failure, so it costs a denominator on a row whose verdict
+        count is zero either way. `llm_classifier_calls` beside it counts every
+        billed request including that one, which is the figure a reader needing
+        the true request total should use.
+
+        WHAT IT DOES NOT COVER, on `_billed_so_far`'s footing and for its
+        reason: earlier INVOCATIONS of this node. A parse failure routes the
+        graph back in here and both counters restart at zero, so a patient that
+        spent three attempts reports the last one's census. That is the
+        pre-existing behaviour of the token accumulators beside it.
+        """
+        if not _per_trial_calls:
+            return {
+                "llm_classifier_per_trial_calls_attempted": None,
+                "llm_classifier_per_trial_calls_failed": None,
+                "llm_classifier_per_trial_calls_answered": None,
+            }
+        return {
+            "llm_classifier_per_trial_calls_attempted":
+                per_trial_succeeded + per_trial_failed_calls,
+            "llm_classifier_per_trial_calls_failed": per_trial_failed_calls,
+            "llm_classifier_per_trial_calls_answered": per_trial_succeeded,
+        }
+
     while pending:
         chunk, depth = pending.pop()
 
@@ -7749,6 +7823,12 @@ CLINICAL TRIALS:
             "llm_classifier_output_split_threshold": split_threshold,
             "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
             "llm_classifier_raw_response": "",
+            # THE WAVE'S CENSUS, ON A RETURN WHERE IT IS FINAL. This floor is
+            # reached only after `pending` is exhausted or cleared, so both
+            # counters have stopped moving -- unlike the mid-loop returns
+            # above, which leave the wave part-read and would publish a prefix
+            # as a total. See `_per_trial_call_census`.
+            **_per_trial_call_census(),
             **_billed_so_far(),
             "matching_model": model_answered,
             "error": error_msg,
@@ -8749,6 +8829,14 @@ CLINICAL TRIALS:
         # detector did not run" -- the same convention as
         # llm_classifier_prompt_sha256. 0 is therefore a measurement.
         "hallucinated_trials": len(hallucinated_ids),
+        # HOW MANY TRIAL CALLS THIS WAVE ISSUED, LOST AND GOT ANSWERS TO.
+        # Written here and on the all-failed floor, and deliberately NOT on the
+        # mid-loop returns: those end the node with `pending` part-read, so any
+        # census they carried would be a prefix reported as a total -- exactly
+        # `hallucinated_trials`' own argument two lines up. A key that is never
+        # written leaves `state.get()` at None, which is the same tri-state the
+        # grouped arm gets by construction. See `_per_trial_call_census`.
+        **_per_trial_call_census(),
         "llm_classifier_calls": calls_made,
         "llm_classifier_raw_response": response_text,
         "llm_classifier_prompt": prompt,
