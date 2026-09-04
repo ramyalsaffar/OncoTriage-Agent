@@ -2509,6 +2509,143 @@ check("9l  and a 5m write really is cheaper than a 1h write at these rates, "
       drive(lambda: dig(_rates9, "cache_write_5m")
             < dig(_rates9, "cache_write_1h")), True)
 
+# --- 9m -- THE REPLY CEILING IS PER MODE ---------------------------------
+# Item 9 measured 179 of 990 BLIND messages (18.1%) stopping on ``max_tokens``
+# at the shipped ceiling of 300, with 27 still cut off after the harness's 2x
+# retry -- 27 decisions unrated, which is a lost measurement. Output bills on
+# tokens GENERATED, so a higher ceiling costs nothing and cannot change a reply
+# that already fit.
+#
+# THE ANCHORED VALUE IS PINNED HERE ON PURPOSE, AND NOT BECAUSE 300 IS ENOUGH
+# FOR IT. Anchored's own six 300-ceiling runs stop on ``max_tokens`` at 17.8%,
+# the same rate as blind. 300 is kept because ``max_tokens`` is a serialized
+# field of the anchored request body that 8a hashes as comparable history, so
+# moving it would leave 8a passing -- it passes 300 as a literal -- while the
+# property it asserts stopped holding for a real invocation. This check is what
+# turns that from a habit into a pin: raising the anchored default fails HERE,
+# where the reason is written down, rather than nowhere.
+check("9m  the anchored default is unchanged, which is what keeps the 8a "
+      "byte-identity pin true of a real invocation and not only of the "
+      "literal it passes",
+      R.DEFAULT_MAX_TOKENS, 300)
+check("9m  blind gets its own, larger ceiling",
+      R.DEFAULT_MAX_TOKENS_BLIND, 1024)
+check("9m  non-degeneracy: the two really differ, so every check below is "
+      "about the mode rather than about one shared number",
+      R.DEFAULT_MAX_TOKENS_BLIND > R.DEFAULT_MAX_TOKENS, True)
+
+# The table is TOTAL over MODES. A mode with no ceiling is a paid request
+# governed by a number nobody chose.
+check("9m  the table names every mode exactly once",
+      tuple(sorted(R.MAX_TOKENS_BY_MODE)), tuple(sorted(R.MODES)))
+check("9m  ...and each entry is that mode's own constant",
+      (R.MAX_TOKENS_BY_MODE[R.MODE_ANCHORED],
+       R.MAX_TOKENS_BY_MODE[R.MODE_BLIND]),
+      (R.DEFAULT_MAX_TOKENS, R.DEFAULT_MAX_TOKENS_BLIND))
+
+check("9m  resolve_max_tokens gives each mode its own default",
+      (drive(R.resolve_max_tokens, R.MODE_ANCHORED),
+       drive(R.resolve_max_tokens, R.MODE_BLIND)), (300, 1024))
+check("9m  an explicit ceiling wins in either mode -- the mode decides only "
+      "when the operator named nothing",
+      (drive(R.resolve_max_tokens, R.MODE_ANCHORED, 777),
+       drive(R.resolve_max_tokens, R.MODE_BLIND, 777)), (777, 777))
+check("9m  an unknown mode refuses rather than falling through to a ceiling",
+      refusal_code(R.resolve_max_tokens, "sideways"), "unknown_mode")
+
+# A ceiling that cannot produce a rating must not reach a batch. bool is its
+# own case: isinstance(True, int) is True, so True would otherwise resolve to 1.
+for _bad, _label in ((0, "zero"), (-1, "negative"), (True, "a bool"),
+                     (3.5, "a float"), ("300", "a string")):
+    check(f"9m  {_label} is refused before anything is submitted",
+          refusal_code(R.resolve_max_tokens, R.MODE_BLIND, _bad),
+          "bad_max_tokens")
+
+# --- 9m -- ...AND IT REACHES THE WIRE ------------------------------------
+# The two checks above are about a pure function. These are about the request
+# actually built, which is the only thing the API sees.
+check("9m  argparse defaults to None, which is the only value that can mean "
+      "'the operator named none' -- a numeric default cannot be told apart "
+      "from an operator who typed that same number",
+      drive(R._parse_args, ["--dry-run"]).max_tokens, None)
+check("9m  ...and an explicit value survives parsing",
+      drive(R._parse_args, ["--dry-run", "--max-tokens", "777"]).max_tokens,
+      777)
+
+# --help IS A PAID PATH'S FIRST COMMAND AND IT HAD NO CHECK. argparse
+# %-expands every help string, so one literal percent sign anywhere in this
+# parser makes ``--help`` raise instead of printing -- and the percent that
+# belongs in this option's help is the whole reason the default moved. Found by
+# running, not by reading: the first version of this section shipped an
+# unescaped "18.1%" and took --help down with a TypeError from inside argparse.
+def _help_text():
+    import contextlib, io as _io
+    buf = _io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf):
+            R._parse_args(["--help"])
+    except SystemExit:
+        return buf.getvalue()
+    except Exception as exc:                                   # noqa: BLE001
+        return "<RAISED %s: %s>" % (type(exc).__name__, exc)
+    return buf.getvalue()
+
+
+_help = _help_text()
+check("9m  --help renders rather than raising out of argparse's own "
+      "%-expansion", _help.startswith("<RAISED"), False)
+check("9m  ...and it names both ceilings, so an operator reads the mode "
+      "default rather than guessing it",
+      (str(R.DEFAULT_MAX_TOKENS) in _help,
+       str(R.DEFAULT_MAX_TOKENS_BLIND) in _help), (True, True))
+check("9m  ...and the literal percent survives expansion as one percent",
+      "18.1% of the time" in " ".join(_help.split()), True)
+
+_ceil_anch = built(R.MODE_ANCHORED)
+_ceil_blind = built(R.MODE_BLIND)
+check("9m  CONTROL: the 8a pin's request list is still built at 300, so this "
+      "section moves no byte of it",
+      sorted({r["params"]["max_tokens"] for r in _ceil_anch.requests})
+      if hasattr(_ceil_anch, "requests") else [], [300])
+check("9m  build_requests carries whatever ceiling it is handed onto EVERY "
+      "request, in both modes",
+      (sorted({r["params"]["max_tokens"] for r in _ceil_blind.requests})
+       if hasattr(_ceil_blind, "requests") else []), [300])
+
+_wired = drive(R.build_requests, planted_run(),
+               drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_BLIND),
+               {"rubric_sha256": "x"}, _MODEL,
+               drive(R.resolve_max_tokens, R.MODE_BLIND), 0.0, "1h",
+               mode=R.MODE_BLIND,
+               arm_definitions=drive(R.lift_arm_status_definitions,
+                                     _FIXED_RUBRIC))
+check("9m  a blind run that names no ceiling puts 1024 on every request",
+      sorted({r["params"]["max_tokens"] for r in _wired.requests})
+      if hasattr(_wired, "requests") else [], [1024])
+check("9m  non-degeneracy: that request list is not empty",
+      len(_wired.requests) if hasattr(_wired, "requests") else 0, len(_PLANT))
+
+# _prepare owns the resolution and WRITES IT BACK, because the plan banner, the
+# retry's 2x, the manifest and the ledger all read args.max_tokens afterwards.
+# Left at None, three of them would report a ceiling the wire never carried.
+# _prepare needs a run directory, so this drives the flag half of it: the
+# resolution sits above every refusal that needs the corpus, so a bad ceiling
+# is refused before a run is even resolved.
+check("9m  _prepare refuses a bad ceiling from the FLAGS ALONE, before a run "
+      "directory is resolved",
+      refusal_code(R._prepare, drive(R._parse_args,
+                                     ["--dry-run", "--blind",
+                                      "--max-tokens", "0"])),
+      "bad_max_tokens")
+check("9m  CONTROL: the same invocation with a legal ceiling gets PAST the "
+      "ceiling guard -- so the check above reads the ceiling rather than "
+      "some other precondition of the same call",
+      refusal_code(R._prepare, drive(R._parse_args,
+                                     ["--dry-run", "--blind",
+                                      "--max-tokens", "1"]))
+      != "bad_max_tokens", True)
+
+
 print()
 print("=" * 70)
 print("SUMMARY")

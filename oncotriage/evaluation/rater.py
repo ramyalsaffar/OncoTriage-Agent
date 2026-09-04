@@ -3562,7 +3562,77 @@ def write_json(path, payload):
 
 
 DEFAULT_MODEL = "claude-sonnet-4-6"
+
+# THE REPLY CEILING IS PER MODE, AND THE MEASUREMENT THAT MOVED IT ALSO SAYS
+# THE ANCHORED VALUE IS NOT SAFE EITHER. Both halves are recorded because the
+# second one is a finding this item did not act on.
+#
+# OUTPUT IS BILLED ON TOKENS GENERATED, NOT ON THE CEILING REQUESTED, so
+# headroom is free: raising a ceiling cannot cost a cent on a reply that was
+# already going to fit, and it cannot change one either -- a reply under the
+# ceiling is byte-identical whatever the ceiling was. The only thing a ceiling
+# buys is a cut-off, and a cut-off reply is an UNRATED DECISION: a lost
+# measurement, not a lost dollar. ``estimate_tokens`` prices output from
+# ``ASSUMED_OUTPUT_TOKENS`` and never from this number, so a dry-run projection
+# does not move either.
+#
+# MEASURED, item 9 (``eval_run_item9_20260904_logs/step2_output_ceiling.json``,
+# a retrieval of results already paid for -- no completion request was issued):
+# on 990 BLIND messages submitted at 300, the median answer is 84 but **p90 IS
+# THE CEILING** and 179 (18.1%) stopped on ``max_tokens``. The harness retried
+# those at 2x and 27 were STILL cut off at 600, so they are unrated. The
+# 600-token population is censored in both directions -- it is exactly the
+# replies that had already overrun 300, and it was clipped again -- so its p50
+# of 453 is a lower bound and the true tail is not knowable from that run.
+#
+# WHY 1024 FOR BLIND. It is an extrapolation from censored data and is labelled
+# one. P(overrun 300) = 0.181 and P(overrun 600 | overrun 300) = 0.149, so the
+# conditional excess decays by about 0.15 per +300 tokens; carried forward that
+# puts P(overrun 1024) near 0.2%, against 18.1% at the shipped ceiling and 2.7%
+# permanently lost after the retry. It is ~12x the observed blind median, which
+# is ample headroom, and it is deliberately not larger: the ceiling is still the
+# only guard against a reply that loops, and a "one sentence" rationale that
+# needs four figures of tokens is not honouring the contract.
+#
+# WHY ANCHORED KEEPS 300, AND WHY THAT IS NOT A CLAIM THAT 300 IS ENOUGH.
+# It is NOT because the anchored contract is shorter. Read side by side, the two
+# contracts are the same shape -- two enum words and a one-sentence rationale --
+# and anchored adds a third, nullable enum on top, so if anything it is the
+# longer object. That reading is confirmed by anchored's OWN runs: over the six
+# ``rater_pack_validation_20260812`` runs submitted at 300 (3,637 decisions),
+# messages stopping on ``max_tokens`` are 649, or 17.8% -- statistically the
+# same rate as blind's 18.1% -- with 23 decisions (0.63%) still unrated after
+# the retry. The one anchored run submitted at 600
+# (``eval_run_20260811_093337/rater``, 2,212 decisions) stopped on
+# ``max_tokens`` 17 times, 0.76%.
+#
+# SO 300 IS INADEQUATE IN BOTH MODES AND IS KEPT HERE FOR ONE REASON: the
+# anchored request body is PINNED COMPARABLE HISTORY. ``max_tokens`` is a
+# serialized request field, ``tests/test_evaluation_rater.py`` 8a hashes the
+# whole anchored request list against a value measured from the pre-blind
+# module, and that pin's own control perturbs this very field. Moving the
+# anchored default would leave 8a passing -- it passes 300 explicitly -- while
+# the property it asserts stopped being true of a real invocation, which is the
+# check-that-stopped-checking shape this project refuses. Raising it is
+# therefore a decision about that guarantee rather than a one-line default, it
+# needs the pin re-argued and re-measured, and it is a separate item. This item
+# rated no anchored decisions, so it does not take it.
 DEFAULT_MAX_TOKENS = 300
+DEFAULT_MAX_TOKENS_BLIND = 1024
+
+# TOTAL over ``MODES``, guarded at import rather than by an ``assert``, which
+# ``python -O`` deletes. A mode with no ceiling would fall through to whatever
+# the table's ``.get`` default happened to be -- a number nobody chose, governing
+# a paid request.
+MAX_TOKENS_BY_MODE = {
+    MODE_ANCHORED: DEFAULT_MAX_TOKENS,
+    MODE_BLIND: DEFAULT_MAX_TOKENS_BLIND,
+}
+if tuple(sorted(MAX_TOKENS_BY_MODE)) != tuple(sorted(MODES)):
+    raise RuntimeError(
+        f"MAX_TOKENS_BY_MODE must name every rating mode exactly once: "
+        f"modes={MODES}, table={tuple(MAX_TOKENS_BY_MODE)}")
+
 DEFAULT_TEMPERATURE = 0.0
 DEFAULT_POLL_SECONDS = 45
 DEFAULT_POLL_TIMEOUT = 86400
@@ -3607,6 +3677,41 @@ DEFAULT_POLL_TIMEOUT = 86400
 DEFAULT_CACHE_TTL = "5m"
 
 
+def resolve_max_tokens(mode, requested=None):
+    """The reply ceiling for ``mode``, or ``requested`` when one was given.
+
+    ``requested`` is ``--max-tokens``. ``None`` means the operator named none,
+    which is the ONLY reading that lets the mode decide: argparse cannot express
+    "defaulted" and "supplied the same number the default happens to be" as two
+    states, so the default has to be ``None`` and the resolution has to happen
+    here. An explicit value always wins, in either mode.
+
+    A non-positive or non-integer ceiling is a refusal rather than a shrug. It
+    reaches the API as a request that can only produce an empty or malformed
+    reply, once per decision, for a whole batch -- and this function runs inside
+    ``_prepare``, which is everything that must hold before a cent is spent.
+    ``bool`` is excluded explicitly because ``isinstance(True, int)`` is True:
+    argparse's ``type=int`` cannot deliver one, a programmatic caller can, and
+    it would otherwise resolve to a ceiling of 1.
+    """
+    if mode not in MODES:
+        raise RaterRefusal(f"unknown rating mode {mode!r}; expected one of "
+                           f"{MODES}", code="unknown_mode")
+    if requested is None:
+        return MAX_TOKENS_BY_MODE[mode]
+    if isinstance(requested, bool) or not isinstance(requested, int):
+        raise RaterRefusal(
+            f"--max-tokens must be a positive integer; got {requested!r}",
+            code="bad_max_tokens")
+    if requested < 1:
+        raise RaterRefusal(
+            f"--max-tokens must be at least 1; got {requested}. A ceiling of "
+            f"{requested} cannot produce a parseable rating and would spend a "
+            f"whole batch learning that.",
+            code="bad_max_tokens")
+    return requested
+
+
 def _parse_args(argv=None):
     import argparse
     p = argparse.ArgumentParser(
@@ -3629,7 +3734,14 @@ def _parse_args(argv=None):
                       help="skip submission; poll and retrieve this batch "
                            "(repeatable via comma separation)")
     p.add_argument("--model", default=DEFAULT_MODEL)
-    p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
+    p.add_argument("--max-tokens", type=int, default=None,
+                   help="reply ceiling. Default: the mode decides -- "
+                        f"{DEFAULT_MAX_TOKENS} anchored, "
+                        f"{DEFAULT_MAX_TOKENS_BLIND} blind, because a "
+                        "blind reply overran the anchored ceiling 18.1%% "
+                        "of the time on the item 9 run and output bills "
+                        "on tokens generated, so headroom is free. An "
+                        "explicit value wins in either mode.")
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
                    help="pass a negative value to omit the parameter entirely, "
                         "which is required on models that reject non-default "
@@ -3681,6 +3793,13 @@ def _parse_args(argv=None):
 def _prepare(args):
     """Everything that must hold before a cent is spent."""
     mode = MODE_BLIND if getattr(args, "blind", False) else MODE_ANCHORED
+
+    # RESOLVED HERE AND WRITTEN BACK, because four sites downstream read
+    # ``args.max_tokens`` -- the plan banner, the retry's 2x, the manifest's
+    # record of what was sent, and the ledger's own copy. Resolving locally and
+    # leaving ``args`` holding ``None`` would make three of them report a
+    # ceiling the wire never carried.
+    args.max_tokens = resolve_max_tokens(mode, getattr(args, "max_tokens", None))
     retest_fraction = getattr(args, "retest_fraction", 0.0) or 0.0
     if retest_fraction and mode != MODE_BLIND:
         raise RaterRefusal(
