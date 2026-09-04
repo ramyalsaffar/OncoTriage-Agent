@@ -124,15 +124,17 @@ from oncotriage.agent import readiness
 from oncotriage.agent.evaluation import _build_trials_text
 from oncotriage.agent.graph import build_initial_state, build_matching_graph
 from oncotriage.agent.patient import build_patient_record, compute_patient_hash
+from oncotriage import degradation
 from oncotriage.deid import assert_no_identifiers
 from oncotriage.agent.prompts import PROMPT_VERSION
 from oncotriage.agent.state import EXPANSION_PATH_FALLBACK
 from oncotriage.config import (
+    BEDROCK_ANTHROPIC_CACHE_TTL,
     COLLECTION_NAME,
     DATA_SNAPSHOT_DATE,
     EVALUATION_SELECTION_SIZE_DEFAULT,
-    MATCHING_MODEL,
     Project_Name,
+    matching_wire_model,
 )
 from oncotriage.fhir.parser import parse_fhir_bundle
 from oncotriage import run_fingerprint
@@ -140,9 +142,11 @@ from oncotriage.fixtures.capture import scan_cohort
 from oncotriage.observability import console, correlation_scope, get_logger
 from oncotriage.utils import (
     CaffeinateSession,
+    UnknownCachePricingError,
     UnknownModelPricingError,
     get_age_reference_date,
     get_model_cost,
+    get_model_cost_cached,
     resolve_qdrant_collection,
 )
 
@@ -174,6 +178,21 @@ OUTPUT_DIR_PREFIX = "eval_run_"
 #
 # It is NOT in tracking.CONFIGURATION_PARAM_NAMES: --select overrides it, and
 # logging a default the run did not use is a false record.
+
+# WHERE A RECORD'S EFFECTIVE MODEL ID CAME FROM. Closed, and it is the reason
+# `matching_model_effective` is trustworthy: without it that field is a string
+# with no way to tell a provider ATTESTATION from a local DECLARATION, and those
+# are the two things a reader auditing "which judge produced this number" most
+# needs kept apart.
+# A SENTINEL OBJECT, not None and not a string. `summarise` has to tell three
+# states apart for the cached cost -- key absent (an older manifest), key
+# present and None (a model with no cache rate), key present and a number --
+# and None is already taken by the second of them.
+_MISSING = object()
+
+MODEL_SOURCE_ECHO = "echo"            # the API said so, in response.model
+MODEL_SOURCE_CONFIGURED = "configured"  # nothing answered; config.matching_wire_model()
+MODEL_SOURCES = (MODEL_SOURCE_ECHO, MODEL_SOURCE_CONFIGURED)
 
 # The three groups node_finalize splits `evaluations` into, in the order a
 # reader wants them. Kept as a tuple rather than written out at each use so the
@@ -615,7 +634,23 @@ def price_run(result: Dict) -> Dict:
 
     Returns cost_usd, cost_complete, and a `notes` list naming every reason the
     figure is not the whole truth. It NEVER raises and NEVER silently returns a
-    zero for an unpriceable model: this is a terminal report on money that is
+    zero for an unpriceable model
+
+    IT RETURNS A SECOND FIGURE, `cost_cached_usd`, AND THE FIRST IS UNCHANGED.
+    `cost_usd` still prices every input token at the full rate, so a figure in
+    a manifest written months ago and one written today are the same
+    measurement. The second prices the cache tiers separately, through
+    `utils.get_model_cost_cached()`, and `cached_read_tokens` /
+    `cached_write_tokens` are returned beside it so a reader can check the
+    subtraction rather than take it. `cost_cached_usd` is None when the model
+    reported cached tokens PRICING_CONFIG has no rate for, with the reason in
+    `notes`.
+
+    THE SECOND FIGURE IS NOT ALWAYS THE SMALLER ONE. A cache read bills at a
+    tenth of input and a cache WRITE at 1.25x, so a patient whose warmup wrote
+    a prefix that no wave call went on to read prices ABOVE the flat figure.
+    That case gets its own note, because an unlabelled negative saving reads as
+    an arithmetic error rather than as the finding it is: this is a terminal report on money that is
     already spent, so refusing to print a number would fail a run that
     succeeded, and a real 0.0 for an unpriced model is the defect item 38
     removed from the cost query -- a value every aggregate absorbs without
@@ -638,6 +673,9 @@ def price_run(result: Dict) -> Dict:
     retries = result.get("llm_classifier_retries") or 0
     notes = []
 
+    cached_read = result.get("llm_classifier_cached_input_tokens") or 0
+    cached_write = result.get("llm_classifier_cache_write_tokens") or 0
+
     if model is None:
         # No Stage 5 response was ever obtained: node_no_candidates emptied the
         # pool, or the run died before the first call returned. Zero here is a
@@ -647,11 +685,16 @@ def price_run(result: Dict) -> Dict:
                 f"no model was recorded but {tokens_in}+{tokens_out} tokens "
                 f"were: the run cannot be priced")
             return {"cost_usd": None, "cost_complete": False,
-                    "model": None, "tokens_in": tokens_in,
-                    "tokens_out": tokens_out, "notes": notes}
+                    "cost_cached_usd": None, "model": None,
+                    "tokens_in": tokens_in, "tokens_out": tokens_out,
+                    "cached_read_tokens": cached_read,
+                    "cached_write_tokens": cached_write, "notes": notes}
         notes.append("no Stage 5 call was made")
-        return {"cost_usd": 0.0, "cost_complete": True, "model": None,
-                "tokens_in": 0, "tokens_out": 0, "notes": notes}
+        return {"cost_usd": 0.0, "cost_complete": True,
+                "cost_cached_usd": 0.0, "model": None,
+                "tokens_in": 0, "tokens_out": 0,
+                "cached_read_tokens": 0, "cached_write_tokens": 0,
+                "notes": notes}
 
     if retries:
         notes.append(
@@ -662,12 +705,48 @@ def price_run(result: Dict) -> Dict:
         cost = get_model_cost(model, tokens_in, tokens_out)
     except UnknownModelPricingError as exc:
         notes.append(f"{model} is not in PRICING_CONFIG: {exc}")
-        return {"cost_usd": None, "cost_complete": False, "model": model,
+        return {"cost_usd": None, "cost_complete": False,
+                "cost_cached_usd": None, "model": model,
                 "tokens_in": tokens_in, "tokens_out": tokens_out,
-                "notes": notes}
+                "cached_read_tokens": cached_read,
+                "cached_write_tokens": cached_write, "notes": notes}
 
-    return {"cost_usd": cost, "cost_complete": not retries, "model": model,
-            "tokens_in": tokens_in, "tokens_out": tokens_out, "notes": notes}
+    # THE SAME RUN WITH THE CACHE TIERS PRICED SEPARATELY -- a SECOND figure,
+    # beside the first and never instead of it. `cost_usd` keeps its exact
+    # historical meaning (every input token at the full rate) so a figure from
+    # an older manifest and a figure from today are still the same measurement.
+    #
+    # IT IS NOT ALWAYS SMALLER. A cache READ bills at a tenth of input and a
+    # cache WRITE at 1.25x, so a patient whose warmup wrote a prefix that no
+    # wave call went on to read prices ABOVE the flat figure. The note below is
+    # emitted for exactly that case, because a "saving" that is negative and
+    # unlabelled reads as an arithmetic error.
+    #
+    # NEVER RAISES, on this function's own contract. A model with no cache
+    # rate leaves the second figure None and says so in `notes`; the flat
+    # figure is unaffected and the report still prints a number.
+    try:
+        cost_cached = get_model_cost_cached(
+            model, tokens_in, tokens_out,
+            cached_read_tokens=cached_read,
+            cached_write_tokens=cached_write,
+            cache_write_ttl=BEDROCK_ANTHROPIC_CACHE_TTL)
+    except (UnknownCachePricingError, ValueError) as exc:
+        cost_cached = None
+        notes.append(f"cache-aware cost not computed: {exc}")
+    else:
+        if cost_cached > cost:
+            notes.append(
+                f"cache-aware cost EXCEEDS the flat figure by "
+                f"${cost_cached - cost:.5f}: {cached_write} tokens were "
+                f"written into the cache at the write premium and "
+                f"{cached_read} were read back")
+
+    return {"cost_usd": cost, "cost_complete": not retries,
+            "cost_cached_usd": cost_cached, "model": model,
+            "tokens_in": tokens_in, "tokens_out": tokens_out,
+            "cached_read_tokens": cached_read,
+            "cached_write_tokens": cached_write, "notes": notes}
 
 
 def count_criterion_decisions(verdicts: List[Dict]) -> int:
@@ -840,6 +919,18 @@ def build_record(row: Dict,
     trial_calls = trial_call_census(result)
     problems.extend(trial_calls.pop("problems"))
 
+    # WHICH MODEL TO STAMP. Resolved here rather than inline in the literal
+    # below so the three fields are computed once from one reading -- two
+    # `matching_wire_model()` calls inside one record could disagree if a
+    # caller flipped the provider between them, which is exactly the drift the
+    # `tracking.configuration_params` pass found and fixed for the Qdrant
+    # collection.
+    _configured_model = matching_wire_model()
+    _echo_model = result.get("matching_model")
+    _model_source = (MODEL_SOURCE_ECHO if _echo_model
+                     else MODEL_SOURCE_CONFIGURED)
+    _effective_model = _echo_model or _configured_model
+
     # Everything the result carries except the three verdict lists and the
     # rendered prompt. This is what makes the degradation, refusal and error
     # fields present by construction: they are whatever the terminal node wrote,
@@ -855,8 +946,56 @@ def build_record(row: Dict,
             "selection_reason": selection_entry["reason"],
             "selection_note": selection_entry["note"],
             "terminal_node": result.get("terminal_node"),
+            # WHICH MODEL PRODUCED THIS RECORD, IN THREE FIELDS, AND NONE OF
+            # THEM IS `MATCHING_MODEL`.
+            #
+            # THE DEFECT THIS REPLACES, MEASURED RATHER THAN ARGUED. This block
+            # used to stamp `matching_model_configured: MATCHING_MODEL`, which
+            # is the OpenAI arm's priced identity and does not move when the
+            # provider flips. Across the 240 records on disk when this was
+            # measured, 30 were answered by `us.anthropic.claude-sonnet-4-6`
+            # and every one of them recorded `gpt-5.6-terra` as the model it
+            # was configured for -- a run naming a judge that never served it,
+            # in the one field a reader consults when the answered field is
+            # NULL. `config.matching_wire_model()` is the single owner of "what
+            # will this pipeline actually SEND", and it is what the resume
+            # fingerprint already gates on, so the record and the stamp now
+            # name one model.
+            #
+            #   matching_model            the ECHO -- what the API said served
+            #                             the request, read off response.model
+            #                             by Stage 5 and normalised by the
+            #                             Converse adapter. NULL when no Stage
+            #                             5 response was ever obtained, which
+            #                             is a measurement and not a gap.
+            #   matching_model_configured what this build WOULD send, for the
+            #                             configured provider. Never NULL.
+            #   matching_model_effective  the echo when there is one, otherwise
+            #                             the configured id -- the field a
+            #                             consumer should group by, so that a
+            #                             no-candidates record still attributes
+            #                             to the arm that produced it.
+            #   matching_model_source     WHICH of the two answered, from a
+            #                             closed pair. This is the
+            #                             `matching_temperature_sent` /
+            #                             `matching_temperature_capability`
+            #                             arrangement: a value and, beside it,
+            #                             the fact that says whether it was
+            #                             observed or assumed. Without it
+            #                             `effective` is a string that cannot
+            #                             be told from an attestation.
+            #
+            # THE ECHO IS PREFERRED AND IS NOT MERELY THE FIRST NON-NULL. An
+            # attestation from the provider outranks a local declaration by
+            # definition, and Stage 5 already RAISES MatchingModelMismatchError
+            # when the two disagree -- so a record reaching here with an echo
+            # has one that agreed with the configured id at the time of the
+            # call, and one reaching here without an echo has no attestation at
+            # all rather than a contradictory one.
             "matching_model": result.get("matching_model"),
-            "matching_model_configured": MATCHING_MODEL,
+            "matching_model_configured": _configured_model,
+            "matching_model_effective": _effective_model,
+            "matching_model_source": _model_source,
             "qdrant_collection": result.get("qdrant_collection"),
             "collection_alias": COLLECTION_NAME,
             "patient_data_hash": result.get("patient_data_hash"),
@@ -1396,6 +1535,14 @@ def summarise(manifest: Dict) -> Dict:
     by_terminal = {}
     cost = 0.0
     cost_complete = True
+    # THE SAME TOTAL WITH THE CACHE TIERS PRICED, AND ITS OWN COMPLETENESS
+    # FLAG. Separate from `cost_complete` because they fail for different
+    # reasons and a shared flag would make one cause hide the other: the flat
+    # figure is incomplete when a model is unpriced or a run had retries, and
+    # the cached figure is additionally incomplete whenever a model reported
+    # cached tokens PRICING_CONFIG has no rate for.
+    cost_cached = 0.0
+    cost_cached_complete = True
     contexts = 0
     decisions = 0
     verdicts = 0
@@ -1438,6 +1585,16 @@ def summarise(manifest: Dict) -> Dict:
             cost += run_cost
         if not (entry.get("cost") or {}).get("cost_complete", True):
             cost_complete = False
+        # `MISSING` RATHER THAN `.get(..., default)`, because the key's absence
+        # and a stored None are DIFFERENT findings and both must mark the total
+        # incomplete: absent is a manifest written before this figure existed,
+        # None is a run whose model had no cache rate. A default of 0.0 would
+        # silently add nothing and report the total as whole.
+        _cached = (entry.get("cost") or {}).get("cost_cached_usd", _MISSING)
+        if _cached is _MISSING or _cached is None:
+            cost_cached_complete = False
+        else:
+            cost_cached += _cached
 
     return {
         "patients": len(runs),
@@ -1458,6 +1615,12 @@ def summarise(manifest: Dict) -> Dict:
         # Stage 5 retries whose earlier attempts are not in the counters, or a
         # run that produced no priceable record at all.
         "cost_complete": cost_complete,
+        # THE SAME RUN WITH THE CACHE TIERS PRICED. Read the two side by side:
+        # the difference is what the prompt cache was worth, and it is SIGNED
+        # -- a cache write bills at 1.25x input, so a run whose warmups wrote
+        # prefixes its waves never read prices ABOVE the flat figure.
+        "cost_cached_usd": round(cost_cached, 6),
+        "cost_cached_complete": cost_cached_complete,
     }
 
 
@@ -1663,7 +1826,12 @@ def main(argv=None) -> int:
     console.out(f"{'=' * 78}")
     console.out(f"  Output directory : {output_dir}")
     console.out(f"  Prompt version   : {PROMPT_VERSION}")
-    console.out(f"  Model configured : {MATCHING_MODEL}")
+    # THE WIRE MODEL, NOT `MATCHING_MODEL`. That constant is the OpenAI arm's
+    # priced identity and does not move when MATCHING_PROVIDER does, so this
+    # line announced `gpt-5.6-terra` above a run whose every request went to
+    # Claude Sonnet 4.6 over Converse. It is the one line an operator reads
+    # before authorising a paid run, and it named the wrong judge.
+    console.out(f"  Model configured : {matching_wire_model()}")
     console.out(f"  Snapshot date    : {DATA_SNAPSHOT_DATE}  "
                 f"(age reference {get_age_reference_date().isoformat()})")
 
@@ -2040,6 +2208,22 @@ def main(argv=None) -> int:
             console.out(f"    {patient_id}: {error}")
     console.out(f"\n  total cost            : ${totals['cost_usd']:.5f}"
                 + ("" if totals["cost_complete"] else "   <- A FLOOR, NOT A TOTAL"))
+    # THE SAME TOTAL WITH THE CACHE TIERS PRICED, ON THE LINE BELOW THE FLAT
+    # ONE, because it is the same kind of statement about the same money and a
+    # reader needs the pair rather than either alone.
+    #
+    # THE DELTA IS PRINTED WITH ITS SIGN AND ITS DIRECTION NAMED. `saved`
+    # reads as a discount and can be negative -- a cache WRITE bills at 1.25x
+    # input -- so the word is chosen from the sign rather than assumed, which
+    # is what stops "-$0.02 saved" appearing on a terminal.
+    _cached_total = totals.get("cost_cached_usd")
+    if _cached_total is not None:
+        _delta = totals["cost_usd"] - _cached_total
+        _word = "saved by the cache" if _delta >= 0 else "ADDED by cache writes"
+        console.out(f"  cache-aware cost      : ${_cached_total:.5f}"
+                    + ("" if totals.get("cost_cached_complete", False)
+                       else "   <- A FLOOR, NOT A TOTAL"))
+        console.out(f"    {_word:<20}: ${abs(_delta):.5f}")
     console.out(f"  criterion decisions   : {totals['criterion_decisions']}")
     # PRINTED EVEN AT ZERO, for the reason the post-check's line is: silence
     # and "nothing was lost" must not look the same. The FLOOR marker follows
@@ -2051,6 +2235,39 @@ def main(argv=None) -> int:
                    f"{totals['patients_with_lost_trial_calls']} patient(s)"))
     console.out(f"  retrieval contexts    : {totals['retrieval_contexts']}")
     console.out(f"  output directory      : {os.path.abspath(output_dir)}")
+
+    # --- THE RUN'S OWN INSTRUMENTS ------------------------------------------
+    #
+    # THE DEFECT THIS CLOSES. This harness drives all six pipeline stages, so
+    # every counter in oncotriage/degradation.py's registry and census moves
+    # while it runs -- and it printed none of them. The item 7 analysis had to
+    # read them by driving main() from an external script that called
+    # print_report itself, which is the shape this project treats as a defect:
+    # a program whose health record is only visible to somebody who knew to
+    # look for it. `oncotriage/batch/runner.py` has printed both blocks at run
+    # end since the counter-reader pass; this is that arrangement, adopted.
+    #
+    # ONE SNAPSHOT PER BLOCK, TAKEN HERE. `main()` has exactly one consumer of
+    # each, so the snapshot is taken at the consumer -- the batch runner takes
+    # its two in main() only because it has three consumers of the degradation
+    # one that must describe a single instant. Both are taken BEFORE anything
+    # below is printed, because emitting a line can itself move EMIT_FAILURES.
+    #
+    # THE ORDER IS THE RUNNER'S, ARGUED THERE AND KEPT HERE: census first (a
+    # census is not a fault), then degradations, then the post-check, which is
+    # this run's VERDICT and goes last on File 19's rule.
+    #
+    # BOTH ARE CALLED UNCONDITIONALLY, and that is the blocks' own contract
+    # rather than a shortcut here. An all-zero snapshot renders a STATEMENT --
+    # "all N counters are zero, every one was read" -- because a run that
+    # printed nothing about degradation would be indistinguishable from one
+    # whose reporting was never wired up, which is exactly what this harness
+    # looked like before this pass. A first draft of the comment on these four
+    # lines claimed the opposite and was corrected by running the block.
+    _census_snapshot = degradation.census_snapshot()
+    _degradation_snapshot = degradation.snapshot()
+    degradation.print_census_report(_census_snapshot)
+    degradation.print_report(_degradation_snapshot)
 
     report = post_check(output_dir)
     print_post_check(report)

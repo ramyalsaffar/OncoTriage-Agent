@@ -558,6 +558,13 @@ _REGISTRY_SPEC = (
      "database are planned from built-in guesses rather than measured "
      "selectivity. Every answer is still correct; some plans are worse. Keyed "
      "by exception type, and the next run's ANALYZE repairs it"),
+    ("CACHED_PRICING_FAULTS", _database_logger.CACHED_PRICING_FAULTS,
+     "a row's SECOND cost figure, estimated_cost_cached_usd, could not be "
+     "computed because the model reported cached tokens and its PRICING_CONFIG "
+     "row carries no rate for that tier; keyed by model. The row was still "
+     "written and its estimated_cost_usd is unaffected -- what is missing is "
+     "the cache-aware figure beside it. One PRICING_CONFIG entry fixes every "
+     "future row"),
     ("FIELD_DROPS", _observability.FIELD_DROPS,
      "a log field was dropped for not being on LOGGABLE_FIELDS; the field "
      "NAME only, never its value"),

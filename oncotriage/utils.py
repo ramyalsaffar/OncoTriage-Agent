@@ -348,6 +348,159 @@ def get_model_cost(model_name: str, input_tokens: int,
 #------------------------------------------------------------------------------
 
 
+class UnknownCachePricingError(RuntimeError):
+    """A model reported cached tokens and PRICING_CONFIG has no rate for them.
+
+    A SECOND ERROR CLASS RATHER THAN A REUSE OF ``UnknownModelPricingError``,
+    and the difference is what a reader does about it. That one means "this
+    model is not priced at all" and stops a row being written; this one means
+    "this model is priced, the flat figure is sound, and the SECOND figure
+    beside it cannot be computed" -- so its caller records NULL in one column
+    and carries on. Collapsing the two would make a missing cache rate abort a
+    write that has every reason to succeed.
+
+    Deliberately a ``RuntimeError`` and not a ``ValueError``, on
+    ``UnknownModelPricingError``'s own footing: a stray ``except ValueError``
+    around an arithmetic block must not swallow it.
+    """
+
+
+def get_model_cost_cached(model_name: str, input_tokens: int,
+                          output_tokens: int, cached_read_tokens: int = 0,
+                          cached_write_tokens: int = 0,
+                          cache_write_ttl=None) -> float:
+    """USD cost with the cache tiers priced separately. ``get_model_cost``'s twin.
+
+    ADDITIVE, AND ``get_model_cost()`` IS UNTOUCHED. That function is read by 29
+    call sites and by ``inferences.estimated_cost_usd``, whose whole value is
+    that it means the same thing in every row ever written; introducing a cached
+    term there would re-base the entire series. This is a SECOND figure, stored
+    beside the first, so the A13 gap the Converse adapter records is a number a
+    query can subtract rather than a caveat a reader has to remember.
+
+    THE TWO CACHED COUNTS ARE SUBSETS OF ``input_tokens``, NEVER ADDITIONS TO
+    IT. That is the provider's own arithmetic on both arms this function serves:
+    Converse's usage documents ``total input = inputTokens + cacheRead +
+    cacheWrite`` and ``oncotriage/agent/bedrock_anthropic_adapter.py`` sums the
+    three back into ``prompt_tokens`` at the boundary, and OpenAI's
+    ``prompt_tokens`` already includes its ``cached_tokens``. So the
+    full-rate share is ``input_tokens - cached_read - cached_write`` and adding
+    the tiers on top would bill the cached portion twice.
+
+    THE RESULT IS NOT ALWAYS BELOW ``get_model_cost()``'s, and that is worth
+    knowing before using this as a "discount". A cache READ bills at a tenth of
+    input and a cache WRITE at 1.25x (5m) or 2.00x (1h), so a run whose writes
+    are not repaid by later reads is priced ABOVE the flat figure. On a healthy
+    per-trial patient the reads outnumber the write by roughly
+    MAX_TRIALS_FOR_EVALUATION to one and the net is a large saving; on a warmup
+    followed by an empty wave it is a small loss.
+
+    Args:
+        model_name: the wire model id, the same key ``get_model_cost`` takes.
+        input_tokens: the TOTAL input tokens the provider reported.
+        output_tokens: completion tokens.
+        cached_read_tokens: the share of ``input_tokens`` served from a warm
+            prefix. 0 means "measured none"; there is no "unknown" value here,
+            because a caller that does not know must not call this at all.
+        cached_write_tokens: the share of ``input_tokens`` written INTO the
+            cache and billed at the write premium.
+        cache_write_ttl: which write rate applies -- the value of
+            ``config.BEDROCK_ANTHROPIC_CACHE_TTL`` for the run being priced.
+            Required only when ``cached_write_tokens`` is non-zero, because a
+            TTL is a fact about a charge that was made and there is nothing to
+            select a rate for when nothing was written.
+
+    Returns:
+        Total cost in USD.
+
+    Raises:
+        UnknownModelPricingError: ``model_name`` is absent from PRICING_CONFIG.
+            Identical to ``get_model_cost``'s, and raised by the same lookup.
+        UnknownCachePricingError: cached tokens were reported and the row
+            carries no rate for that tier, or ``cache_write_ttl`` names a TTL
+            the row does not price. NEVER a silent fall back to the input rate:
+            that is what the flat figure already is, and a second column that
+            silently equals the first is worse than a NULL, which at least says
+            the answer is not known.
+        ValueError: a negative count, or a cached share larger than the input
+            total it is supposed to be a subset of. Both are contract
+            violations by the caller rather than missing configuration, so they
+            are the builtin rather than one of the two above.
+    """
+    for _name, _value in (("input_tokens", input_tokens),
+                          ("output_tokens", output_tokens),
+                          ("cached_read_tokens", cached_read_tokens),
+                          ("cached_write_tokens", cached_write_tokens)):
+        # bool is excluded on this project's standing footing: isinstance(True,
+        # int) is True, and a token count of 1 that was really a flag is a
+        # number nobody measured.
+        if not isinstance(_value, int) or isinstance(_value, bool):
+            raise ValueError(
+                f"get_model_cost_cached: {_name} must be an int, "
+                f"got {_value!r} ({type(_value).__name__})")
+        if _value < 0:
+            raise ValueError(
+                f"get_model_cost_cached: {_name} is negative ({_value})")
+
+    cached_total = cached_read_tokens + cached_write_tokens
+    if cached_total > input_tokens:
+        # NOT CLAMPED. A cached share larger than the total it is drawn from
+        # means the two numbers came from different populations -- the exact
+        # asymmetry oncotriage/agent/evaluation.py's warmup fold creates and
+        # argues about -- and silently clamping would price a run against a
+        # non-cached share of zero while reporting a figure that looks whole.
+        raise ValueError(
+            f"get_model_cost_cached: cached tokens "
+            f"({cached_read_tokens} read + {cached_write_tokens} write = "
+            f"{cached_total}) exceed the {input_tokens} input tokens they are "
+            f"a subset of. One of the two was measured over a different set of "
+            f"requests.")
+
+    pricing_config = config.PRICING_CONFIG
+    pricing = pricing_config["models"].get(model_name)
+    if not pricing:
+        known = ", ".join(sorted(pricing_config["models"])) or "(none)"
+        raise UnknownModelPricingError(
+            f"No pricing for model '{model_name}' in PRICING_CONFIG "
+            f"(last_updated {pricing_config['last_updated']}). "
+            f"Priced models: {known}. Add it to PRICING_CONFIG in "
+            f"'oncotriage/config.py'.")
+
+    uncached = input_tokens - cached_total
+    total = ((uncached / 1_000_000) * pricing["input"]
+             + (output_tokens / 1_000_000) * pricing["output"])
+
+    if cached_read_tokens:
+        rate = pricing.get("cache_read")
+        if rate is None:
+            raise UnknownCachePricingError(
+                f"'{model_name}' reported {cached_read_tokens} cached-read "
+                f"tokens and its PRICING_CONFIG row carries no 'cache_read' "
+                f"rate. Add one, or stop reading cached input on this model.")
+        total += (cached_read_tokens / 1_000_000) * rate
+
+    if cached_write_tokens:
+        rates = pricing.get("cache_write")
+        if not rates:
+            raise UnknownCachePricingError(
+                f"'{model_name}' reported {cached_write_tokens} cache-write "
+                f"tokens and its PRICING_CONFIG row carries no 'cache_write' "
+                f"rates. Add them, or stop writing the cache on this model.")
+        if cache_write_ttl not in rates:
+            raise UnknownCachePricingError(
+                f"'{model_name}' reported {cached_write_tokens} cache-write "
+                f"tokens at TTL {cache_write_ttl!r}, which its PRICING_CONFIG "
+                f"row does not price. Priced TTLs: {sorted(rates)}. A write "
+                f"rate is NOT interchangeable between TTLs -- they differ by "
+                f"60% on the measured row -- so no fallback is taken.")
+        total += (cached_write_tokens / 1_000_000) * rates[cache_write_ttl]
+
+    return total
+
+
+#------------------------------------------------------------------------------
+
+
 # exec_chain() STOOD HERE AND IS DELETED (pass 20e)
 #--------------------------------------------------
 # It took a list of numbered script names, opened each one relative to the

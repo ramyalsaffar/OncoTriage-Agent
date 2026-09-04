@@ -1513,6 +1513,104 @@ QUERIES = (
     FROM inferences
 """,
     ),
+    # THE TWO-KNOB QUALITY GATE, SPLIT (era 14).
+    #
+    # `quality_filter_effectiveness` above reports the gate's NET effect and
+    # cannot say which knob produced it -- a run that lost trials to a mis-set
+    # absolute floor and a run that lost them to an unusually tight pool report
+    # the same retention rate and need opposite fixes.
+    #
+    # THE THREE COUNTS DO NOT SUM TO THE TOTAL AND ARE NOT ADDED HERE. The two
+    # knobs overlap: a trial below MEDCPT_SCORE_FLOOR is usually also below the
+    # percentile, and is counted by both. `floor_only` is the non-overlapping
+    # share -- what the floor removed that the percentile had not -- and it is
+    # the number that says whether MEDCPT_SCORE_FLOOR is earning its keep. A
+    # sustained 0 there is the same finding that retired RERANK_SCORE_THRESHOLD:
+    # a floor that can never be the deciding knob.
+    #
+    # THE TOTAL IS DERIVED, NOT STORED. `quality_dropped` has no column because
+    # it is exactly `candidates_after_rule_filter - candidates_after_quality_
+    # filter`, both of which have been stored since the first era.
+    #
+    # ROWS THAT NEVER REACHED STAGE 4 ARE EXCLUDED BY THE `IS NOT NULL` GUARD
+    # RATHER THAN COUNTED AS ZERO. NULL there means the gate never ran, and
+    # averaging it in as 0 would report a gate that examined a pool and removed
+    # nothing.
+    Query(
+        key='quality_gate_knob_split',
+        heading='=== QUALITY GATE: WHICH KNOB DROPPED WHICH TRIAL ===',
+        render='transpose',
+        blank_after=True,
+        notes=('The two knobs OVERLAP, so percentile + floor does NOT equal the '
+               'total. floor_only is the share the floor removed that the '
+               'percentile had not; a sustained 0 there means MEDCPT_SCORE_FLOOR '
+               'is never the deciding knob.',),
+        requires_columns=(("inferences", "quality_dropped_percentile"),
+                          ("inferences", "quality_dropped_floor"),
+                          ("inferences", "quality_dropped_floor_only")),
+        sql="""
+    SELECT
+        COUNT(*) as rows_with_a_gate_reading,
+        SUM(candidates_after_rule_filter - candidates_after_quality_filter)
+            as total_dropped_derived,
+        SUM(quality_dropped_percentile) as dropped_by_percentile,
+        SUM(quality_dropped_floor) as dropped_by_floor,
+        SUM(quality_dropped_floor_only) as dropped_by_floor_only,
+        COUNT(CASE WHEN quality_dropped_floor_only > 0 THEN 1 END)
+            as patients_where_floor_was_decisive
+    FROM inferences
+    WHERE quality_dropped_percentile IS NOT NULL
+      AND quality_dropped_floor IS NOT NULL
+      AND quality_dropped_floor_only IS NOT NULL
+""",
+    ),
+    # WHAT THE PROMPT CACHE ACTUALLY SAVED, IN DOLLARS (era 14).
+    #
+    # `stage5_cache_effectiveness` reports whether the cache WORKED, in tokens
+    # and hit rates. This reports what it was WORTH, by subtracting the two
+    # cost columns -- which is the A13 gap the Converse adapter records, stated
+    # as a number rather than as a caveat.
+    #
+    # THE TWO COLUMNS ARE NOT TWO OPINIONS ABOUT ONE FIGURE.
+    # `estimated_cost_usd` prices every input token at the full rate and means
+    # that in every row this project has ever written; `estimated_cost_cached_
+    # usd` prices the read and write tiers separately. The difference is the
+    # discount, and it is signed: a cache WRITE bills at 1.25x input, so a
+    # patient whose warmup wrote a prefix no wave call went on to read is
+    # priced ABOVE the flat figure and contributes a NEGATIVE saving.
+    # `rows_priced_above_flat` is what makes that visible rather than buried in
+    # a net total.
+    #
+    # ROWS WHERE THE CACHED FIGURE COULD NOT BE COMPUTED ARE EXCLUDED AND
+    # COUNTED. A NULL there is either a pre-era-14 row or a model whose
+    # PRICING_CONFIG entry has no cache rate; including it as a zero saving
+    # would dilute the rate with rows nobody measured.
+    Query(
+        key='stage5_cache_savings',
+        heading='=== STAGE 5 PROMPT CACHE: WHAT IT SAVED ===',
+        render='transpose',
+        blank_after=True,
+        notes=('flat_minus_cached is the saving. It can be NEGATIVE for a row '
+               'whose cache WRITE was never repaid by reads -- a write bills at '
+               '1.25x input -- which is why rows_priced_above_flat is reported '
+               'beside the net.',),
+        requires_columns=(("inferences", "estimated_cost_cached_usd"),),
+        sql="""
+    SELECT
+        COUNT(*) as rows_priced_both_ways,
+        SUM(estimated_cost_usd) as flat_cost_usd,
+        SUM(estimated_cost_cached_usd) as cache_aware_cost_usd,
+        SUM(estimated_cost_usd - estimated_cost_cached_usd)
+            as flat_minus_cached_usd,
+        COUNT(CASE WHEN estimated_cost_cached_usd > estimated_cost_usd
+                   THEN 1 END) as rows_priced_above_flat,
+        COUNT(CASE WHEN estimated_cost_cached_usd = estimated_cost_usd
+                   THEN 1 END) as rows_reporting_no_cached_tokens
+    FROM inferences
+    WHERE estimated_cost_cached_usd IS NOT NULL
+      AND estimated_cost_usd IS NOT NULL
+""",
+    ),
     # File 16 line 461, `df_extremes`
     Query(
         key='extreme_cases',

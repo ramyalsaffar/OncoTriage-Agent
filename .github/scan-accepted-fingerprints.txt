@@ -120,7 +120,7 @@ e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
 # BLOCK 2 — A SYNTHETIC SENTINEL IN A TEST. NOT A CREDENTIAL.
 # ===========================================================================
 #
-# FOUR blobs of `tests/test_tracking_mlflow_index.py` — three historical and
+# FIVE blobs of `tests/test_tracking_mlflow_index.py` — four historical and
 # the one at HEAD — each assigning a module-level constant whose name says what
 # it is — a SENTINEL — to a 32-character string beginning `sk-`. That test seeds a fake API key into
 # the environment and then requires the MLflow parameter enumeration to carry it
@@ -143,7 +143,10 @@ e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
 # ANYWHERE in that file produces a new blob carrying the same sentinel, and the
 # new blob needs its own line. The fourth was added by the determinism pass,
 # which edited that test to cover a derived tracking parameter; the offset moved
-# with the insertion, which is why the locators differ.
+# with the insertion, which is why the locators differ. The fifth was added by
+# the provenance-truth pass, which edited that test to pin the EFFECTIVE
+# per-trial pacing bound in the index; the offset moved again for the same
+# reason.
 #
 # THE OBVIOUS ALTERNATIVE IS REFUSED BY THE REMOVAL CONDITION BELOW: assembling
 # the sentinel at run time would stop new blobs from being reported, and it
@@ -152,7 +155,7 @@ e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
 # every blob already in history still carries the literal and this gate scans
 # the whole object database.
 #
-# REMOVAL CONDITION: these four go when history is rewritten, or when the
+# REMOVAL CONDITION: these five go when history is rewritten, or when the
 # sentinel is changed to a shape no detector matches — for which the honest
 # instrument is the staging exclusion manifest rather than a shape chosen to
 # slip past a scanner.
@@ -160,6 +163,7 @@ e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
 5698d07120cc8eb1ff473b60019697d23c5844ec:oncotriage:openai_anthropic_key:21703
 e5932da50468c43e944c296ab71b468a91e2d193:oncotriage:openai_anthropic_key:18436
 f4171675799c6da37ae72bba19b1afd929b1c9b8:oncotriage:openai_anthropic_key:24435
+8c9c5211dbe50cb13454b734dbef248e637766d5:oncotriage:openai_anthropic_key:27814
 
 # ===========================================================================
 # BLOCK 3 — A QUERY REGISTRY KEY. NOT A CREDENTIAL. ALREADY ARGUED IN

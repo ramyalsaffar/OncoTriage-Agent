@@ -476,8 +476,25 @@ check_true("2b  the service scanner found the stack's services "
 
 section("3. The gate is the premise; the ungated worst cases are documented")
 
+# THE EFFECTIVE BOUND, NOT THE SHARED CONSTANT, AND THE DIFFERENCE IS A FACTOR
+# OF TWO ON THE SHIPPED CONFIGURATION.
+#
+# `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` is 4 and is what this line used to
+# read. It is not what Stage 5 paces itself by: `config.per_trial_parallel_
+# bound()` is the single owner of that answer and it lets a provider override
+# the shared number -- `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS` is 2 on the
+# shipped Converse arm, measured against a throttled account. So the real
+# ungated worst case is ceil(15 / 2) = 8 rounds and not ceil(15 / 4) = 4, and
+# this check was reading the pacing knob that does NOT decide the pacing.
+#
+# IT FAILED IN THE DIRECTION THAT LOOKS FINE. The derived figure agreed with
+# the compose file's prose because BOTH were computed from the same wrong
+# owner, so 4d passed while the number an operator reads was half the truth --
+# a check satisfied by the wrong evidence, which is the failure mode this whole
+# section exists to close. Reading the owner is what makes a provider-level
+# pacing change rot the prose loudly.
 _ROUNDS = -(-config.MAX_TRIALS_FOR_EVALUATION
-            // config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)   # ceil
+            // config.per_trial_parallel_bound())   # ceil
 _PER_TRIAL_WORST = _ROUNDS * _BUDGET
 
 # GROUPED: the INPUT packer emits at most MATCHING_MAX_INPUT_PACKED_CHUNKS
@@ -642,7 +659,7 @@ check_true("4c  ...and names MATCHING_REQUEST_TIMEOUT_SECONDS as the term",
 # grouped -- and NOTHING PINNED THOSE. Section 3 derives both worst cases from
 # the constants and asserts the two ANCHOR PHRASES are present, so it fails if
 # the derivations are deleted; it never compares the derived FIGURE against the
-# prose, so a change to `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` or to
+# prose, so a change to the effective bound `per_trial_parallel_bound()` or to
 # `MATCHING_MAX_INPUT_PACKED_CHUNKS` moved the real worst case and left 2400
 # standing, correct-looking and wrong.
 #
@@ -707,7 +724,8 @@ _GR_REGION = _region(_COMPOSE_TEXT, _GR_HEADING)
 
 check_true(f"4d  the PER-TRIAL worst case the constants give ({_PER_TRIAL_WORST}s) "
            f"is the figure the compose file's per-trial derivation states, so "
-           f"moving MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS rots that prose "
+           f"moving EITHER constant behind per_trial_parallel_bound() rots "
+           f"that prose "
            f"loudly instead of leaving it correct-looking",
            str(_PER_TRIAL_WORST) in _PT_REGION)
 

@@ -4854,7 +4854,19 @@ PRICING_CONFIG = {
         # by ~15x or prompt caching were turned on.
         "gpt-5.6-terra": {
             "input": 2.00,
-            "output": 12.00
+            "output": 12.00,
+            # THE CACHED-INPUT RATE THE NOTE ABOVE ALREADY RECORDS, promoted
+            # from prose to a field so `get_model_cost_cached()` can read it.
+            # It changes nothing for `get_model_cost()`, which reads "input"
+            # and "output" and no other key.
+            #
+            # NO "cache_write" KEY, and its absence is a reading rather than an
+            # omission: OpenAI's cache is implicit and bills no separate write
+            # dimension, and this arm's translated usage carries no
+            # `cache_write_tokens` at all -- only Converse emits that field.
+            # An absent key means "no rate is known", which is exactly right
+            # here because there are never any write tokens to price.
+            "cache_read": 0.20
         },
         # ---- The same judge, served by Amazon Bedrock (MATCHING_PROVIDER) ---
         #
@@ -4926,16 +4938,44 @@ PRICING_CONFIG = {
         #     Cache read           $0.30      Cache write (5m)     $3.75
         #     Cache write (1h)     $6.00      Batch in/out   $1.50 / $7.50
         #
-        # NOT MODELLED, for the same reason as every row above: get_model_cost()
-        # takes an {input, output} pair with no cached term, so a run with
-        # prompt caching on prices its cached input at the FULL input rate.
-        # That makes estimated_cost_usd an OVER-estimate rather than a wrong
-        # number, which is the safe direction, and it stops being exact. It
-        # matters more on this branch than on any other, because the per-trial
-        # design's whole affordability rests on the cache: at $0.30 against
-        # $3.00 the modelled figure can be ~10x the billed one for the cached
-        # portion. Closing it means a third pricing term and is a change to a
-        # 29-call-site signature.
+        # THE CACHE DIMENSIONS ARE MODELLED NOW, ADDITIVELY, AND
+        # `get_model_cost()` STILL IS NOT. That function reads "input" and
+        # "output" and no other key, so `estimated_cost_usd` keeps its exact
+        # historical meaning and value: cached input priced at the FULL input
+        # rate. What the two keys below buy is a SECOND figure --
+        # `get_model_cost_cached()` in oncotriage/utils.py, stored beside the
+        # first as `inferences.estimated_cost_cached_usd` -- so the A13 gap is
+        # a number rather than a caveat. Neither the 29 `get_model_cost()` call
+        # sites nor any historical row moves.
+        #
+        # AND THE GAP IS NOT ONE-DIRECTIONAL, which the A13 note in
+        # oncotriage/agent/bedrock_anthropic_adapter.py states more simply than
+        # is true. A cache READ bills at a TENTH of input, so the flat figure
+        # OVER-states it. A cache WRITE bills at 1.25x (5m) or 2.00x (1h)
+        # input, so the flat figure UNDER-states it. Reads outnumber writes by
+        # roughly MAX_TRIALS_FOR_EVALUATION to one on a healthy per-trial
+        # patient, so the net is a large over-estimate -- but a patient whose
+        # wave produced no reads at all (a warmup followed by nothing) is
+        # priced BELOW what it cost, and "estimated_cost_usd is always an
+        # over-estimate" is therefore false as an absolute.
+        #
+        #   "cache_read"    USD per 1M tokens read from a warm prefix.
+        #   "cache_write"   USD per 1M tokens written, KEYED BY TTL, because
+        #                   BEDROCK_ANTHROPIC_CACHE_TTL is an operator knob
+        #                   with two legal non-None values whose rates differ
+        #                   by 60%. A single "cache_write" number would price a
+        #                   1h campaign at the 5m rate and be silently 60% low
+        #                   -- a config knob quietly moving a stored cost
+        #                   column, which is the class of drift this project
+        #                   treats as a defect. The caller passes the TTL and a
+        #                   TTL absent from this map RAISES rather than falling
+        #                   back to either rate.
+        #
+        # AN ABSENT KEY IS "NO RATE IS KNOWN" AND NEVER "ZERO". Every row
+        # without them prices its cached cost only while no cached tokens were
+        # reported; a row reporting cached tokens with no rate to price them
+        # raises UnknownCachePricingError and stores NULL, which is
+        # get_model_cost()'s own refusal applied to the second figure.
         #
         # INFERRED, NOT MEASURED -- the geo and In-Region rows below. That
         # listing publishes Global dimensions only. The +10% premium is carried
@@ -4950,32 +4990,84 @@ PRICING_CONFIG = {
         # bedrock-runtime, global cross-Region profile. MEASURED.
         "global.anthropic.claude-sonnet-4-6": {
             "input": 3.00,
-            "output": 15.00
+            "output": 15.00,
+            # MEASURED, from the same 2026-08-30 listing as the two rates
+            # above: "Cache read $0.30", "Cache write (5m) $3.75", "Cache
+            # write (1h) $6.00". They are 0.10x, 1.25x and 2.00x this row's
+            # own input rate, which is the multiplier set the five INFERRED
+            # rows below apply to their own inferred base.
+            "cache_read": 0.30,
+            "cache_write": {"5m": 3.75, "1h": 6.00}
         },
         # bedrock-runtime, US geographic profile. THE SHIPPED DEFAULT. INFERRED.
         "us.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
-            "output": 16.50
+            "output": 16.50,
+            # INFERRED, exactly as this row's input and output are, and by the
+            # SAME arithmetic rather than by a second guess: the measured
+            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
+            # rate, and those multipliers are applied to the inferred 3.30
+            # base here. So a correction to the geo premium moves all five
+            # numbers in this row together and cannot leave the cache rates
+            # describing a base nobody uses. A6 settles the premium.
+            "cache_read": 0.33,
+            "cache_write": {"5m": 4.125, "1h": 6.60}
         },
         # bedrock-runtime, EU geographic profile. INFERRED.
         "eu.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
-            "output": 16.50
+            "output": 16.50,
+            # INFERRED, exactly as this row's input and output are, and by the
+            # SAME arithmetic rather than by a second guess: the measured
+            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
+            # rate, and those multipliers are applied to the inferred 3.30
+            # base here. So a correction to the geo premium moves all five
+            # numbers in this row together and cannot leave the cache rates
+            # describing a base nobody uses. A6 settles the premium.
+            "cache_read": 0.33,
+            "cache_write": {"5m": 4.125, "1h": 6.60}
         },
         # bedrock-runtime, AU geographic profile. INFERRED.
         "au.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
-            "output": 16.50
+            "output": 16.50,
+            # INFERRED, exactly as this row's input and output are, and by the
+            # SAME arithmetic rather than by a second guess: the measured
+            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
+            # rate, and those multipliers are applied to the inferred 3.30
+            # base here. So a correction to the geo premium moves all five
+            # numbers in this row together and cannot leave the cache rates
+            # describing a base nobody uses. A6 settles the premium.
+            "cache_read": 0.33,
+            "cache_write": {"5m": 4.125, "1h": 6.60}
         },
         # bedrock-runtime, JP geographic profile. INFERRED.
         "jp.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
-            "output": 16.50
+            "output": 16.50,
+            # INFERRED, exactly as this row's input and output are, and by the
+            # SAME arithmetic rather than by a second guess: the measured
+            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
+            # rate, and those multipliers are applied to the inferred 3.30
+            # base here. So a correction to the geo premium moves all five
+            # numbers in this row together and cannot leave the cache rates
+            # describing a base nobody uses. A6 settles the premium.
+            "cache_read": 0.33,
+            "cache_write": {"5m": 4.125, "1h": 6.60}
         },
         # bedrock-runtime, In-Region. Reachable in eu-west-2 alone. INFERRED.
         "anthropic.claude-sonnet-4-6": {
             "input": 3.30,
-            "output": 16.50
+            "output": 16.50,
+            # INFERRED, exactly as this row's input and output are, and by the
+            # SAME arithmetic rather than by a second guess: the measured
+            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
+            # rate, and those multipliers are applied to the inferred 3.30
+            # base here. So a correction to the geo premium moves all five
+            # numbers in this row together and cannot leave the cache rates
+            # describing a base nobody uses. A6 settles the premium.
+            "cache_read": 0.33,
+            "cache_write": {"5m": 4.125, "1h": 6.60}
         },
         "gpt-4o-2024-08-06": {
             "input": 2.50,

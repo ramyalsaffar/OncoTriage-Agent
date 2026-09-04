@@ -290,6 +290,39 @@ def _pipeline_provenance(state) -> Dict:
         "matching_model": state.get("matching_model"),
         "llm_classifier_reasoning_tokens": state.get("llm_classifier_reasoning_tokens"),
 
+        # --- WHICH KNOB OF THE QUALITY GATE DROPPED WHICH TRIAL ------------
+        #
+        # Stage 4's gate is TWO knobs -- a relative percentile of the unboosted
+        # fused score within the pool, and MEDCPT_SCORE_FLOOR on the raw
+        # cross-encoder score -- and a trial must clear both. `quality_dropped`
+        # is the total and has never been enough to act on: a run that lost
+        # trials to a mis-set absolute floor and a run that lost them to an
+        # unusually tight pool report the same number and need opposite fixes.
+        # oncotriage/agent/filtering.py has computed the split since the
+        # two-knob gate shipped, TrialMatchState has declared all three
+        # channels, and this function dropped every one of them -- so the
+        # measurement was made, carried into the state and then lost at the
+        # terminal boundary, which is exactly the shape the packer's four keys
+        # were in before they were given columns.
+        #
+        # THEY DO NOT SUM TO `quality_dropped` AND MUST NOT BE READ AS IF THEY
+        # DID. The two knobs OVERLAP: a trial below the floor is very often
+        # also below the percentile. `quality_dropped_floor_only` is the
+        # non-overlapping share -- what the floor removed that the percentile
+        # had not already removed -- and it is the number that says whether the
+        # floor is earning its keep. filtering.py states this at the counters
+        # and the schema restates it at the columns.
+        #
+        # NO DEFAULT, with hallucinated_trials rather than with the truncation
+        # counters, and the distinction is the one this block already draws
+        # twice. These describe a GATE that either ran or did not: 0 asserts
+        # that the gate examined a pool and removed nothing from it, which is a
+        # claim no run that ended before Stage 4 is entitled to make. A run
+        # that emptied its pool at retrieval never reached the gate at all.
+        "quality_dropped_percentile": state.get("quality_dropped_percentile"),
+        "quality_dropped_floor": state.get("quality_dropped_floor"),
+        "quality_dropped_floor_only": state.get("quality_dropped_floor_only"),
+
         # --- What the Stage 5 INPUT packer did, and what caching returned ---
         #
         # ALL THREE TAKE THE NO-DEFAULT ROUTE, with hallucinated_trials above
@@ -328,6 +361,21 @@ def _pipeline_provenance(state) -> Dict:
         "llm_classifier_packing": state.get("llm_classifier_packing"),
         "llm_classifier_cached_input_tokens": state.get(
             "llm_classifier_cached_input_tokens"),
+        # THE WRITE SIDE OF THE SAME REPORT, on the identical no-default route
+        # and for the identical reason: 0 would assert one request that wrote
+        # nothing rather than "no request was made".
+        #
+        # IT INCLUDES THE WARMUP WHERE THE READ FIGURE ABOVE EXCLUDES IT, and
+        # that is not an inconsistency to be tidied away. The read total is the
+        # WAVE's, so that a silent wave reads NULL rather than 0; the write
+        # total is the PATIENT's, because in per-trial mode the warmup is the
+        # only request that writes and a wave-only figure would be
+        # structurally zero on every healthy patient -- pricing a campaign as
+        # though no cache write were ever billed, which under-states rather
+        # than over-states. oncotriage/agent/evaluation.py argues it at the
+        # accumulator and oncotriage/agent/state.py restates it at the channel.
+        "llm_classifier_cache_write_tokens": state.get(
+            "llm_classifier_cache_write_tokens"),
         # The per-call ledger behind the two token totals above. Same no-default
         # route, and for once the absence is rarer than the presence: Stage 5
         # writes this on EVERY one of its returns, so None here means the node

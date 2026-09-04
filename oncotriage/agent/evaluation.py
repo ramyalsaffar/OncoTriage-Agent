@@ -5374,6 +5374,25 @@ CLINICAL TRIALS:
     # same column. This is a measurement for the validation run.
     cached_input_tokens = 0
     cached_input_reported = False
+    # THE WRITE SIDE OF THE SAME READING, AND IT IS NOT A COST TERM EITHER --
+    # `get_model_cost()` still prices input at one rate. What it feeds is the
+    # SECOND figure, `inferences.estimated_cost_cached_usd`, priced by
+    # `utils.get_model_cost_cached()` from PRICING_CONFIG's `cache_write` map.
+    #
+    # IT INCLUDES THE WARMUP AND THE READ TOTAL ABOVE DOES NOT. That asymmetry
+    # is deliberate and it is the whole reason this pair exists separately.
+    # The read total answers "did the WAVE read the cache", so folding the
+    # warmup's own read into it would flip the column from NULL to 0 on a
+    # silent wave -- the defect the warmup fold's docstring records. The write
+    # total answers "what was this patient BILLED at the write premium", and
+    # in per-trial mode the warmup is the ONLY request that writes: a
+    # wave-only write total would be structurally zero on every healthy
+    # patient, and pricing a campaign as though no cache write were ever
+    # billed is the UNSAFE direction -- a write bills at 1.25x input, so
+    # ignoring it under-states. A partial hit can report a write on a wave
+    # call too, so every fold site contributes.
+    cache_write_tokens = 0
+    cache_write_reported = False
     # THE SAME READINGS, PER CALL, NOT SUMMED. The four accumulators above are
     # totals over every request this stage made, and a total cannot answer the
     # question INPUT packing exists to raise: whether the shared system prefix
@@ -5849,6 +5868,12 @@ CLINICAL TRIALS:
             nonlocal calls_made, input_tokens, output_tokens
             nonlocal reasoning_tokens, reasoning_tokens_reported
             nonlocal model_answered
+            # THE WRITE PAIR IS ACCUMULATED HERE AND THE READ PAIR IS NOT, and
+            # the two lines above deliberately do not name the read pair for
+            # the reason this function's docstring gives. See the declaration
+            # for why the write side takes the opposite decision: this call is
+            # the writer, so excluding it would zero the column it feeds.
+            nonlocal cache_write_tokens, cache_write_reported
             _u = getattr(response_, "usage", None)
             _pt = getattr(_u, "prompt_tokens", None)
             _ct = getattr(_u, "completion_tokens", None)
@@ -5873,6 +5898,11 @@ CLINICAL TRIALS:
             # total the way a `nonlocal` left in place would.
             _cd = getattr(getattr(_u, "prompt_tokens_details", None),
                           "cached_tokens", None)
+            _cw = getattr(getattr(_u, "prompt_tokens_details", None),
+                          "cache_write_tokens", None)
+            if _cw is not None:
+                cache_write_tokens += _cw
+                cache_write_reported = True
             _expected = config.matching_wire_model()
             _returned = getattr(response_, "model", None)
             if _returned is not None and _returned != _expected:
@@ -6509,6 +6539,15 @@ CLINICAL TRIALS:
         nonlocal calls_made, input_tokens, output_tokens
         nonlocal reasoning_tokens, reasoning_tokens_reported
         nonlocal cached_input_tokens, cached_input_reported, model_answered
+        # THE WRITE PAIR, AND ITS ABSENCE HERE WAS A REAL DEFECT CAUGHT BY A
+        # TEST RATHER THAN BY READING. Without this line the two assignments
+        # below make both names LOCAL to this function for the whole of it, so
+        # `cache_write_tokens += _cw` raises UnboundLocalError on the first
+        # unconsumed response -- which is exactly the failure mode
+        # `_account_warmup`'s docstring predicts one function up, arrived at
+        # from the opposite direction. It surfaced as a per-trial patient
+        # COMPLETING where the fallback-writer path must fail it.
+        nonlocal cache_write_tokens, cache_write_reported
         if not _prefetched:
             return 0
         folded = 0
@@ -6547,6 +6586,15 @@ CLINICAL TRIALS:
             if _cd is not None:
                 cached_input_tokens += _cd
                 cached_input_reported = True
+            # The write side, on the identical route. An abandoned response was
+            # still ISSUED and still BILLED -- which is the whole reason this
+            # fold site exists -- so its write premium belongs in the total for
+            # the same reason its prompt tokens do.
+            _cw = getattr(getattr(_u, "prompt_tokens_details", None),
+                          "cache_write_tokens", None)
+            if _cw is not None:
+                cache_write_tokens += _cw
+                cache_write_reported = True
             calls_made += 1
             _choices = getattr(_payload, "choices", None) or []
             call_details.append({
@@ -6925,6 +6973,15 @@ CLINICAL TRIALS:
         if _cached is not None:
             cached_input_tokens += _cached
             cached_input_reported = True
+
+        # And the write side. Non-zero here only on a PARTIAL hit -- Bedrock's
+        # simplified cache management can report a write on a wave call when a
+        # longer prefix matched only in part -- so a zero on this path is the
+        # ordinary healthy reading rather than a missing measurement.
+        _cache_written = getattr(_prompt_details, "cache_write_tokens", None)
+        if _cache_written is not None:
+            cache_write_tokens += _cache_written
+            cache_write_reported = True
 
         # ── DID THIS WAVE CALL ACTUALLY READ THE CACHE? ───────────────────
         #
@@ -8853,6 +8910,23 @@ CLINICAL TRIALS:
         "llm_classifier_cached_input_tokens": (cached_input_tokens
                                                if cached_input_reported
                                                else None),
+        # THE WRITE SIDE, on the identical convention -- a subset of
+        # llm_classifier_input_tokens, never an addition, and None rather than
+        # 0 when no response reported it. UNLIKE its read sibling it INCLUDES
+        # the warmup, which is the only request that writes; the accumulator's
+        # own declaration argues that asymmetry.
+        #
+        # SUCCESS RETURN ONLY, exactly as the read total is, and for
+        # _billed_so_far()'s stated reason: both are subsets of figures that
+        # return carries anyway, and both are recorded PER CALL in
+        # llm_classifier_call_details, which every failure return does carry.
+        # The cost consequence is stated rather than hidden -- a failed row's
+        # estimated_cost_cached_usd is computed with no cached tokens and
+        # therefore equals estimated_cost_usd, which is the same
+        # over-estimate that column already carries and not a new claim.
+        "llm_classifier_cache_write_tokens": (cache_write_tokens
+                                              if cache_write_reported
+                                              else None),
         # The same four readings PER CALL, in the order the calls were issued.
         # Written on every return of this node, not only here -- see the
         # accumulator for why a list is not a count.

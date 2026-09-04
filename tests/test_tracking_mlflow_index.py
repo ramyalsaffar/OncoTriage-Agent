@@ -460,7 +460,8 @@ _DERIVED_PARAM_KEYS = {"prompt_version", "prompt_digest_probe",
                        "prompt_template_sha256_site_unconfirmed",
                        "qdrant_collection_resolved",
                        "matching_call_mode",
-                       "matching_temperature_sent"}
+                       "matching_temperature_sent",
+                       "matching_per_trial_parallel_bound"}
 
 _EXPECTED_PARAM_KEYS = sorted(
     set(tracking.CONFIGURATION_PARAM_NAMES)
@@ -565,6 +566,64 @@ check("2e-viii ...and the two really differ, so the check above is not two "
       != (_temp_incapable or {}).get("matching_temperature_sent"), True)
 check("2e-ix ...and the provider was restored",
       config.MATCHING_PROVIDER, _saved_provider)
+
+# --- THE PACING BOUND, WHICH IS THE THIRD PARAMETER THAT IS NOT A CONSTANT --
+#
+# Same shape again, and the both-directions drive is what separates it from
+# EITHER constant behind it: `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` is the
+# shared number and `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS` is the live
+# provider's override, and only the owner function reconciles them. On the
+# shipped configuration they DISAGREE (4 against 2), so logging either constant
+# would index the run under a pacing it did not use.
+#
+# IT IS IN THE INDEX AT ALL BECAUSE OF A MEASUREMENT, not because it looked
+# tidy there: at a bound of 4 against a 10-RPM account a measured patient lost
+# 2 of its 15 trial calls to ThrottlingException and completed anyway, so the
+# number decides which trials leave Stage 5 with a verdict. That is a
+# difference in a RESULT, which is CONFIGURATION_PARAM_NAMES' own admission
+# test, and it is why the "scheduling knobs are excluded" sentence there had to
+# be narrowed rather than applied.
+check("2e-x  the pacing bound logged is the ONE owner's answer, not either "
+      "constant behind it",
+      _RUN.data.params.get("matching_per_trial_parallel_bound"),
+      str(config.per_trial_parallel_bound()))
+check("2e-xi ...and neither constant is in the enumeration, which cannot "
+      "express the reconciliation and would put a second copy of it in the "
+      "store if it did",
+      ("MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS"
+       in tracking.CONFIGURATION_PARAM_NAMES,
+       "BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS"
+       in tracking.CONFIGURATION_PARAM_NAMES),
+      (False, False))
+
+_saved_bound = config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS
+_saved_provider_b = config.MATCHING_PROVIDER
+try:
+    config.MATCHING_PROVIDER = config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC
+    config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = 1
+    _bound_overridden = drive(tracking.configuration_params, _STUB_COLLECTION)
+    config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = None
+    _bound_shared = drive(tracking.configuration_params, _STUB_COLLECTION)
+finally:
+    config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = _saved_bound
+    config.MATCHING_PROVIDER = _saved_provider_b
+check("2e-xii the bound is read at CALL time and follows the PROVIDER "
+      "OVERRIDE -- an arm carrying one logs it, an arm carrying None falls "
+      "back to the shared constant",
+      ((_bound_overridden or {}).get("matching_per_trial_parallel_bound"),
+       (_bound_shared or {}).get("matching_per_trial_parallel_bound")),
+      # INTS, NOT STRINGS. 2e-x above reads the MLflow store, which stringifies
+      # every parameter on the way in; these two read `configuration_params`
+      # DIRECTLY, so they see the value as this module produced it. Comparing
+      # against strings here would fail on the type rather than on the pacing.
+      (1, config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS))
+check("2e-xiii ...and the two really differ, so the check above is not two "
+      "readings of one value (non-degeneracy)",
+      (_bound_overridden or {}).get("matching_per_trial_parallel_bound")
+      != (_bound_shared or {}).get("matching_per_trial_parallel_bound"), True)
+check("2e-xiv ...and both were restored",
+      (config.BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS, config.MATCHING_PROVIDER),
+      (_saved_bound, _saved_provider_b))
 
 check("2f  the collection was resolved ONCE for the whole start_run, not once "
       "per reader (two live calls can disagree across an alias swap)",

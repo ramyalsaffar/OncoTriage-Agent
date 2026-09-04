@@ -105,7 +105,12 @@ from oncotriage.config import (
 )
 from oncotriage.constants import UNKNOWN_DATE
 from oncotriage.registries.primary_cancer import _resolve_primary_cancer
-from oncotriage.utils import deduplicate_by_display, get_model_cost
+from oncotriage.utils import (
+    UnknownCachePricingError,
+    deduplicate_by_display,
+    get_model_cost,
+    get_model_cost_cached,
+)
 from oncotriage.observability import console, get_logger
 
 log = get_logger(__name__)
@@ -229,6 +234,41 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 14: FIVE `inferences` COLUMNS IN ONE COMMIT -- one era, two changes,
+#        on era 5's precedent that the number counts schema CHANGES and that a
+#        commit is the unit. They are listed as two groups because they answer
+#        two different questions and a reader looking for one must not have to
+#        read past the other.
+#
+#        (a) `llm_classifier_cache_write_tokens` and
+#        `estimated_cost_cached_usd`. The first is the WRITE side of the cache
+#        report whose read side has had a column since the packing pass; the
+#        second is the cost recomputed with both cache tiers priced from
+#        PRICING_CONFIG's new `cache_read` / `cache_write` keys, through
+#        `utils.get_model_cost_cached()`. THE PAIR IS ONE CHANGE because a
+#        cached cost with no record of the tokens behind it is a number nobody
+#        can check, which is the same argument era 6 makes for a measurement
+#        and its denominator. `estimated_cost_usd` is NOT touched and
+#        `get_model_cost()` is NOT touched: the old column keeps its exact
+#        historical meaning -- every input token at the full rate -- so no
+#        stored value and no aggregate over the existing series moves. This
+#        closes the A13 gap the Converse adapter records, ADDITIVELY, which is
+#        what that note asks for.
+#
+#        (b) `quality_dropped_percentile`, `quality_dropped_floor` and
+#        `quality_dropped_floor_only`. Stage 4's gate is two knobs and these
+#        are the split `quality_dropped` has never been able to give. THEY DO
+#        NOT SUM to the total, because the knobs overlap; the total itself
+#        needs no column, being exactly `candidates_after_rule_filter -
+#        candidates_after_quality_filter`, both of which are already stored,
+#        and a value derivable from existing columns is not stored a second
+#        time. `_floor_only` is the non-overlapping share and is the one that
+#        says whether MEDCPT_SCORE_FLOOR is earning its keep.
+#
+#        All five additive, all five NULL on every existing row, none
+#        backfilled. The three quality columns are additionally NULL on every
+#        run that never reached Stage 4, which is the no-default route
+#        `_pipeline_provenance` puts them on.
 # ERA 13: `runs.matching_per_trial_parallel_bound`, added with
 #        RUN_COLUMN_ADDITIONS and its migration loop. A STAMP field --
 #        FINGERPRINT_VERSION 8 gates it -- recording how many of a patient's
@@ -351,7 +391,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 13
+SCHEMA_USER_VERSION = 14
 
 
 #------------------------------------------------------------------------------
@@ -1296,6 +1336,30 @@ INFERENCE_COLUMN_ADDITIONS = {
     # there because the record's whole claim is "these N requests shared one
     # prefix".
     "llm_classifier_cached_input_tokens":    "INTEGER",
+    # THE WRITE SIDE OF THE SAME REPORT (era 14), and the three readings of
+    # this column are NOT the three of the one above it.
+    #
+    #   NULL  no response reported a cache-write count. Every row written
+    #         before era 14; every row on an arm that does not report the
+    #         field (only Converse does); every Stage 5 FAILURE return, which
+    #         carries the per-call ledger and not the summed forms.
+    #   0     a response reported the field and reported zero: nothing was
+    #         written into the cache. On the per-trial arm that is either a
+    #         warmup that found the prefix ALREADY WARM -- the ordinary
+    #         reading for a retried, resumed or resampled patient -- or a
+    #         prefix the provider declined to cache.
+    #   >0    tokens billed at the cache-WRITE premium: 1.25x input at the 5m
+    #         TTL and 2.00x at 1h.
+    #
+    # IT INCLUDES THE WARMUP AND llm_classifier_cached_input_tokens DOES NOT.
+    # Read them side by side knowing that. The read total is the WAVE's, so a
+    # silent wave reads NULL rather than 0; the write total is the PATIENT's,
+    # because the warmup is the only request that writes and a wave-only
+    # figure would be structurally zero on every healthy patient. So
+    # `cached_input + cache_write <= llm_classifier_input_tokens` holds, and
+    # the residual is the full-rate share plus the warmup's own uncached
+    # prompt.
+    "llm_classifier_cache_write_tokens":     "INTEGER",
     "llm_classifier_call_details":           "TEXT",
     "llm_classifier_packed_chunks":          "INTEGER",
     "llm_classifier_packing":                "TEXT",
@@ -1605,6 +1669,76 @@ INFERENCE_COLUMN_ADDITIONS = {
     # the run-identity pass keeps the undeclared one, and the two behave
     # identically because neither is enforced.
     "run_id":                                "INTEGER REFERENCES runs(id)",
+
+    # --- THE SAME RUN, PRICED WITH THE CACHE TIERS (era 14) ----------------
+    #
+    # `estimated_cost_usd` IS NOT TOUCHED AND MUST NOT BE. That column means
+    # one thing in every row this project has ever written -- every input token
+    # at the full rate, priced by `get_model_cost()` -- and its whole value is
+    # that a figure from 2026-08 and a figure from today are the same
+    # measurement. Introducing a cached term there would re-base the entire
+    # series silently. This is a SECOND figure beside it, from
+    # `utils.get_model_cost_cached()` and PRICING_CONFIG's `cache_read` /
+    # `cache_write` keys, so the A13 gap the Converse adapter records is a
+    # SUBTRACTION a query can do rather than a caveat a reader has to carry.
+    #
+    #   NULL  the cached figure could not be computed. Two causes and they are
+    #         not separable in this column alone: the row predates era 14, or
+    #         the model reported cached tokens and PRICING_CONFIG carries no
+    #         rate for that tier (UnknownCachePricingError, recorded in the
+    #         degradation counter rather than raised past the writer). A row
+    #         with a non-NULL `estimated_cost_usd` and a NULL here is the
+    #         second case whenever the database is at era 14 or later.
+    #   equal to estimated_cost_usd   the provider reported NO cached tokens,
+    #         so there is no discount and no premium to apply. That is the
+    #         honest reading on every non-Converse arm and on every failure
+    #         row; it is NOT a defect and it is NOT "the cache is broken".
+    #   below estimated_cost_usd      the ordinary healthy per-trial reading:
+    #         reads outnumber the warmup's write by roughly
+    #         MAX_TRIALS_FOR_EVALUATION to one, and a read bills at a tenth of
+    #         input.
+    #   ABOVE estimated_cost_usd      possible, and the reason the older prose
+    #         calling the flat figure "always an over-estimate" was wrong. A
+    #         cache WRITE bills at 1.25x input, so a patient whose warmup wrote
+    #         a prefix that no wave call went on to read is priced BELOW what
+    #         it cost by the flat column and correctly by this one.
+    "estimated_cost_cached_usd":             "REAL",
+
+    # --- WHICH KNOB OF THE QUALITY GATE DROPPED WHICH TRIAL (era 14) -------
+    #
+    # Stage 4's gate is two knobs -- `QUALITY_THRESHOLD_PERCENTILE` on the
+    # unboosted fused score within the pool, and `MEDCPT_SCORE_FLOOR` on the
+    # raw cross-encoder score -- and a trial must clear both.
+    # `oncotriage/agent/filtering.py` has computed this split since the
+    # two-knob gate shipped and `TrialMatchState` has declared all three
+    # channels; `_pipeline_provenance` dropped every one of them, so the
+    # measurement was made and then lost at the terminal boundary.
+    #
+    # THEY DO NOT SUM TO THE TOTAL AND MUST NOT BE ADDED. The knobs OVERLAP: a
+    # trial below the absolute floor is usually also below the relative
+    # percentile, and is counted by both.
+    #
+    #   percentile   dropped by the relative percentile knob.
+    #   floor        dropped by the absolute MedCPT floor knob.
+    #   floor_only   dropped by the floor that the percentile had NOT already
+    #                dropped. THE ONE THAT ANSWERS "is MEDCPT_SCORE_FLOOR
+    #                earning its keep": the constant it gates was calibrated
+    #                precisely because the value it replaced could never be
+    #                selected, and a persistent 0 here says the same thing has
+    #                happened again.
+    #
+    # THE TOTAL ITSELF GETS NO COLUMN. `quality_dropped` is exactly
+    # `candidates_after_rule_filter - candidates_after_quality_filter`, both of
+    # which have been stored since the schema's first era, and a value
+    # derivable from existing columns is not stored a second time -- the same
+    # rule that keeps the INPUT packing budget out of a column of its own.
+    #
+    # NULL, NEVER 0, ON A RUN THAT DID NOT REACH STAGE 4. 0 asserts that the
+    # gate examined a pool and removed nothing from it, which is a claim a run
+    # that emptied its pool at retrieval is not entitled to make.
+    "quality_dropped_percentile":            "INTEGER",
+    "quality_dropped_floor":                 "INTEGER",
+    "quality_dropped_floor_only":            "INTEGER",
 }
 
 
@@ -3005,6 +3139,45 @@ IT IS ON THE RUN-END REPORT through oncotriage/degradation.py, which is the only
 reader. There is no key for "it was never called": ANALYZE runs once per batch
 run, at a point main() reaches on the success path only, and a run that died
 before it has a KILLED `runs` row saying so.
+"""
+
+
+CACHED_PRICING_FAULTS = Counter()
+"""Rows whose SECOND cost figure could not be computed, keyed by model.
+
+`estimated_cost_cached_usd` is priced by `utils.get_model_cost_cached()` from
+PRICING_CONFIG's `cache_read` / `cache_write` keys. When a response reports
+cached tokens and the model's row carries no rate for that tier, that function
+raises `UnknownCachePricingError` and this writer stores NULL in the second
+column and counts here.
+
+WHY IT COUNTS RATHER THAN RAISING, unlike `get_model_cost()` one function over,
+which aborts the whole write for an unpriced model. The two failures are not
+the same size. An unpriced MODEL means the row's only cost figure would be a
+fabricated zero, which every aggregate absorbs silently -- so refusing to write
+is the honest answer. A missing CACHE rate means the flat figure is sound, the
+row is worth keeping in full, and exactly one derived column cannot be filled.
+Aborting a write that has every reason to succeed, over a second opinion about
+a number the first column already carries, would trade a real record for a
+missing one.
+
+TWO KEY SHAPES, AND THEY SEND A READER TO DIFFERENT FILES.
+
+  `{model}`                        a missing RATE. The actionable fact is which
+                                   row of PRICING_CONFIG needs a `cache_read`
+                                   or `cache_write` entry, so the key is the
+                                   model and one edit to `oncotriage/config.py`
+                                   fixes every future row.
+  `{model}:inconsistent_counts`    the cached share exceeded the input total it
+                                   is supposed to be a subset of. That is a
+                                   defect in the ACCUMULATORS in
+                                   `oncotriage/agent/evaluation.py`, not a gap
+                                   in a price table, and folding it under the
+                                   bare model key would send an operator to
+                                   edit a price list over a bug in the node.
+
+The exception type is NOT in either key: there are exactly two arms, each has
+its own key shape, and the type adds nothing the shape does not already say.
 """
 
 
@@ -5355,6 +5528,63 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None,
         result.get("llm_classifier_output_tokens", 0)
     )
 
+    # THE SAME RUN, PRICED WITH THE CACHE TIERS. A SECOND FIGURE, NEVER A
+    # REPLACEMENT -- `total_cost` above is untouched and so is
+    # `get_model_cost()`, so `estimated_cost_usd` means in this row exactly
+    # what it means in every row written before era 14.
+    #
+    # OUTSIDE THE TRY, WITH ITS SIBLING, AND FOR A DIFFERENT REASON. That one
+    # is outside so an unpriced model aborts the write; this one is outside so
+    # it is not lumped in with the broad `except sqlite3.Error` below, which
+    # exists for database faults alone. What it does NOT do is abort: see
+    # CACHED_PRICING_FAULTS for why a missing cache rate is a smaller failure
+    # than a missing model rate and must not cost the whole row.
+    #
+    # `or 0` ON BOTH CACHED COUNTS, and it is not the tri-state being thrown
+    # away. NULL there means "no response reported this tier", and a tier
+    # nothing reported contributed nothing to the bill -- so 0 is the arithmetic
+    # that describes it. The COLUMNS keep the distinction; the arithmetic
+    # cannot use it. The consequence is stated at the column: a row that
+    # reported no cached tokens gets a cached figure EQUAL to the flat one,
+    # which is the honest answer rather than a missing one.
+    #
+    # THE TTL IS READ LIVE OFF THE CONFIG MODULE, on `matching_provider`'s
+    # patch-point argument a few hundred lines down: a bound name would record
+    # the value this process started with, and this constant can move within a
+    # process.
+    _cached_read = result.get("llm_classifier_cached_input_tokens") or 0
+    _cached_write = result.get("llm_classifier_cache_write_tokens") or 0
+    try:
+        total_cost_cached = get_model_cost_cached(
+            matching_model_used or MATCHING_MODEL,
+            result.get("llm_classifier_input_tokens", 0),
+            result.get("llm_classifier_output_tokens", 0),
+            cached_read_tokens=_cached_read,
+            cached_write_tokens=_cached_write,
+            cache_write_ttl=_config.BEDROCK_ANTHROPIC_CACHE_TTL,
+        )
+    except UnknownCachePricingError as exc:
+        CACHED_PRICING_FAULTS[str(matching_model_used or MATCHING_MODEL)] += 1
+        log.warning("cache-aware cost not computed",
+                    event="cached_pricing_unavailable",
+                    model=str(matching_model_used or MATCHING_MODEL),
+                    reason=str(exc))
+        total_cost_cached = None
+    except ValueError as exc:
+        # THE CONTRACT VIOLATION ARM, AND IT IS SEPARATE ON PURPOSE. A cached
+        # share larger than the input total it is drawn from is a defect in the
+        # accumulators upstream, not a gap in PRICING_CONFIG, and folding it
+        # into the counter above would send an operator to edit a price table
+        # over a bug in oncotriage/agent/evaluation.py. It is keyed distinctly
+        # so the two are never one number.
+        CACHED_PRICING_FAULTS[
+            f"{matching_model_used or MATCHING_MODEL}:inconsistent_counts"] += 1
+        log.warning("cache-aware cost not computed",
+                    event="cached_pricing_inconsistent",
+                    model=str(matching_model_used or MATCHING_MODEL),
+                    reason=str(exc))
+        total_cost_cached = None
+
     # EVERYTHING BELOW THIS LINE TOUCHES THE DATABASE, so it is serialized.
     # The body is a separate function rather than an indented `with` block for
     # one reason: the INSERT statements inside it are triple-quoted strings
@@ -5378,7 +5608,7 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None,
     with _WRITE_LOCK:
         outcome = _write_inference_row_with_retry(
             result, patient_data, db_path, matching_model_used, total_cost,
-            run_id)
+            total_cost_cached, run_id)
 
     # AFTER the finally inside _write_inference_row, not inside it. A return
     # inside a finally block SWALLOWS any exception propagating out of the try
@@ -5411,7 +5641,7 @@ def log_inference(result: Dict, patient_data: Dict, db_path=None,
 
 def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
                                     matching_model_used, total_cost,
-                                    run_id=None):
+                                    total_cost_cached, run_id=None):
     """Attempt the write up to ``SQLITE_WRITE_MAX_ATTEMPTS`` times.
 
     CALLERS HOLD ``_WRITE_LOCK``; see log_inference for why the loop is inside
@@ -5447,7 +5677,7 @@ def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
         attempts += 1
         outcome = _write_inference_row(result, patient_data, db_path,
                                        matching_model_used, total_cost,
-                                       run_id)
+                                       total_cost_cached, run_id)
         outcome["attempts"] = attempts
 
         if outcome["ok"]:
@@ -5496,7 +5726,8 @@ def _write_inference_row_with_retry(result: Dict, patient_data: Dict, db_path,
 
 
 def _write_inference_row(result: Dict, patient_data: Dict, db_path,
-                         matching_model_used, total_cost, run_id=None):
+                         matching_model_used, total_cost, total_cost_cached,
+                         run_id=None):
     """The database half of log_inference. CALLERS HOLD ``_WRITE_LOCK``.
 
     Split out of log_inference in pass 20c-3b so the lock could be taken with a
@@ -5641,7 +5872,8 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_reasoning_tokens,
                 llm_classifier_prompt_version, llm_classifier_prompt_sha256,
                 llm_classifier_patient_record_tokens,
-                llm_classifier_cached_input_tokens, llm_classifier_call_details,
+                llm_classifier_cached_input_tokens,
+                llm_classifier_cache_write_tokens, llm_classifier_call_details,
                 llm_classifier_packed_chunks, llm_classifier_packing,
                 llm_classifier_output_split_threshold,
                 llm_classifier_output_ceiling,
@@ -5649,8 +5881,11 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
                 llm_classifier_input_budget,
                 matching_provider, matching_call_mode,
                 verdict_normalizations, remapped_trials,
-                run_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                run_id,
+                estimated_cost_cached_usd,
+                quality_dropped_percentile, quality_dropped_floor,
+                quality_dropped_floor_only
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             result["patient_id"],
             result["timestamp"],
@@ -5840,6 +6075,11 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # rate, deliberately -- see the migration comment. Anyone folding
             # this into a cost expression is re-basing the whole series.
             result.get("llm_classifier_cached_input_tokens"),
+            # THE WRITE SIDE, on the identical no-default rule. Note that it
+            # INCLUDES the warmup where the read figure above excludes it --
+            # the column's own note in INFERENCE_COLUMN_ADDITIONS argues the
+            # asymmetry and states the invariant it preserves.
+            result.get("llm_classifier_cache_write_tokens"),
             # `is not None`, NOT truthiness, and the difference is the whole
             # point of the column. retrieval_channels above tests truthiness
             # because {} and None mean the same thing there -- Stage 2 either
@@ -5933,6 +6173,29 @@ def _write_inference_row(result: Dict, patient_data: Dict, db_path,
             # knows nothing about it. Reading it off `result` would also let a
             # model response, a fixture or a hand-built dict set it.
             run_id,
+            # --- THE SAME RUN, PRICED WITH THE CACHE TIERS ------------------
+            #
+            # Computed above, outside the try, beside `total_cost`. None when
+            # the model reported cached tokens PRICING_CONFIG has no rate for,
+            # which is counted in CACHED_PRICING_FAULTS rather than raised --
+            # see the column's note for the three readings of this value and
+            # for why one of them is "ABOVE estimated_cost_usd".
+            total_cost_cached,
+            # --- WHICH KNOB OF THE QUALITY GATE DROPPED WHICH TRIAL ---------
+            #
+            # NO DEFAULT ON ANY OF THE THREE, which is hallucinated_trials'
+            # rule and not the truncation counters'. They describe a GATE that
+            # either ran or did not: 0 asserts that Stage 4 examined a pool and
+            # removed nothing, and a run that emptied its pool at retrieval
+            # never reached the gate at all.
+            #
+            # FROM `result`, NOT FROM STATE OR CONFIG: they are facts about how
+            # far THIS PATIENT'S run got, carried by _pipeline_provenance onto
+            # all three terminal results so that a no-candidates row and an
+            # error row report NULL rather than being absent from the column.
+            result.get("quality_dropped_percentile"),
+            result.get("quality_dropped_floor"),
+            result.get("quality_dropped_floor_only"),
         ))
         
         inference_id = cursor.lastrowid

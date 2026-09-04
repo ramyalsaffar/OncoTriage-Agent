@@ -313,6 +313,23 @@ def _import_mlflow():
 # WHAT IS NOT, and why: MAX_WORKERS, the SQLite tunables and the tqdm settings.
 # They change how long a run takes and not one number it produces; a parameter
 # that cannot explain a difference in a result is noise in a comparison.
+#
+# AND ONE KNOB THAT READS LIKE A MEMBER OF THAT LIST AND IS NOT.
+# `config.per_trial_parallel_bound()` -- how many of a patient's Stage 5 trial
+# calls may be in flight at once -- was covered by the sentence above until it
+# was MEASURED, and the measurement says the opposite. At a bound of 4 against
+# a 10-RPM account one patient lost 2 of its 15 trial calls to
+# ThrottlingException and COMPLETED ANYWAY, with two trials recorded
+# `per_trial_call_failed` and no verdict. So the number decides which trials
+# leave Stage 5 with a verdict, which is a difference in a RESULT and not in a
+# duration, and `runs.matching_per_trial_parallel_bound` already gates a resume
+# on it for exactly that reason. It is indexed below, through the derived seam,
+# because a FUNCTION owns the answer.
+#
+# THE TEST THE LIST IS SORTED BY IS "CAN THIS EXPLAIN A DIFFERENCE IN A NUMBER",
+# NOT "IS THIS A SCHEDULING KNOB". MAX_WORKERS stays out because it paces
+# PATIENTS, which are independent of one another; this one paces the requests
+# WITHIN a patient, which compete for one account-level quota.
 
 CONFIGURATION_PARAM_NAMES = (
     # --- the model, and how Stage 5 is called ------------------------------
@@ -689,6 +706,26 @@ def configuration_params(collection=None):
     # spelling in the one index built for cross-run comparison would be the
     # thing that makes the comparison manual.
     out["matching_temperature_sent"] = config.matching_temperature_record()
+    # HOW MANY OF A PATIENT'S TRIAL CALLS RAN AT ONCE. Derived, on the two
+    # seams above and for their reason: the enumeration logs a named CONSTANT,
+    # and this is the value of the one FUNCTION that reconciles two of them --
+    # `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` and the live provider's own
+    # override, `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS`. Logging either constant
+    # instead would be a second derivation of the pacing, free to disagree with
+    # the one Stage 5 actually used: the shared constant is 4 and the shipped
+    # Converse arm runs at 2.
+    #
+    # IT IS IN THE INDEX BECAUSE IT EXPLAINS A DIFFERENCE IN A RESULT, which is
+    # the tuple's own admission test -- see the note at
+    # CONFIGURATION_PARAM_NAMES for the measurement that moved it out of the
+    # "scheduling knob" exclusion. Two runs whose per-trial loss differs need
+    # this number to say whether the pacing changed or the account did.
+    #
+    # THE KEY IS THE COLUMN'S NAME. `runs.matching_per_trial_parallel_bound`
+    # and the fingerprint field of the same name spell it this way; a third
+    # spelling in the one index built for cross-run comparison would be the
+    # thing that makes the comparison manual.
+    out["matching_per_trial_parallel_bound"] = config.per_trial_parallel_bound()
     if collection is None:
         collection, _warnings = qdrant_collection()
     out["qdrant_collection_resolved"] = collection

@@ -741,14 +741,39 @@ services:
     # True):
     #
     #     rounds per patient = ceil(MAX_TRIALS_FOR_EVALUATION / parallel)
-    #                        = ceil(15 / 4) = 4
-    #     worst case         = 4 x 600 = 2400 s = 40 minutes
+    #                        = ceil(15 / 2) = 8
+    #     worst case         = 8 x 600 = 4800 s = 80 minutes
     #
-    # So a `docker stop` on this service could SIGKILL it with up to THREE
+    # So a `docker stop` on this service could SIGKILL it with up to SEVEN
     # further full-price rounds still to be issued.
     #
-    # THE RETAINED GROUPED ARM IS THE SAME NUMBER, WHICH IS WHY THE FLIP DID
-    # NOT MOVE THIS VALUE. Grouped mode is one request per *CHUNK*, not per
+    # `parallel` IS `config.per_trial_parallel_bound()` AND NOT
+    # `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS`. THIS ARITHMETIC READ THE WRONG
+    # OWNER AND WAS HALF THE TRUTH: that shared constant is 4, but the shipped
+    # Converse arm overrides it with `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS = 2`
+    # -- measured against a throttled account -- and the bound function is the
+    # single place that reconciles the two. So the rounds are 8 and not 4, and
+    # the figure above was HALF what it is now. The check that pins this prose
+    # (tests/test_compose_shutdown_grace.py 4d) was reading the same wrong
+    # constant, so it agreed with the stale number instead of failing on it;
+    # both read the owner now.
+    #
+    # THE OLD FIGURE IS DELIBERATELY NOT QUOTED AS A NUMERAL ANYWHERE IN THIS
+    # SECTION. Check 4d looks for the derived per-trial figure INSIDE this
+    # region, so a sentence here containing the superseded number would satisfy
+    # it -- and a revert of the derivation back to the shared constant would
+    # then pass. Measured: the first draft of this comment quoted it and the
+    # revert matrix reported that revert as MISSED.
+    #
+    # THE RETAINED GROUPED ARM IS A DIFFERENT NUMBER. It used to be the
+    # same and the sentence here said so -- true while both derivations divided
+    # by 4. Reading the effective bound doubled the per-trial rounds and did
+    # not touch grouped, which paces on the packer rather than on a parallel
+    # bound. THE SHORTFALL IS STILL ARM-INDEPENDENT, which is what this section
+    # is for: both figures exceed 620 s, so 620 was never sufficient for an
+    # ungated patient in either arm and the flip still does not move it.
+    #
+    # Grouped mode is one request per *CHUNK*, not per
     # patient: the packer splits a patient's trials against the input-token
     # budget, so the number of sequential requests depends on how long the
     # trials' eligibility text is. Driven through the real Stage 5 node with a
@@ -761,9 +786,9 @@ services:
     #     worst case         = 4 further requests x 600 = 2400 s
     #
     # SO THE SHORTFALL WAS ARM-INDEPENDENT, and 620 s was never sufficient for
-    # an UNGATED patient in either arm. Raising it to 2400 s was rejected then
-    # and is still the wrong repair: the fix is a gate, and this service now
-    # has one.
+    # an UNGATED patient in either arm. Raising it to the larger of the two
+    # (4800 s) was rejected then and is still the wrong repair: the fix is a
+    # gate, and this service now has one.
     #
     # ====================== AFTER THE GATE (what is true) ===================
     # `oncotriage/api/server.py` arms a Stage 5 shutdown gate in its lifespan

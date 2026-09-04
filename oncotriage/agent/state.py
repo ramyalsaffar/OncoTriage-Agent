@@ -622,6 +622,19 @@ class TrialMatchState(TypedDict):
     # uncached rate deliberately, so stored costs stay comparable with every
     # historical row.
     llm_classifier_cached_input_tokens: Optional[int]
+    # The WRITE side of the same report: tokens this stage was billed at the
+    # cache-WRITE premium, summed over the calls it made. Also a subset of
+    # llm_classifier_input_tokens, and also not a term in get_model_cost() --
+    # it is priced by utils.get_model_cost_cached() into the SECOND cost
+    # column, estimated_cost_cached_usd, which is stored beside the first
+    # rather than replacing it.
+    #
+    # IT INCLUDES THE WARMUP AND THE READ FIELD ABOVE DOES NOT. The read total
+    # answers "did the WAVE read the cache"; this one answers "what was this
+    # patient billed at the write premium", and in per-trial mode the warmup is
+    # the only request that writes. oncotriage/agent/evaluation.py argues the
+    # asymmetry at the accumulator.
+    llm_classifier_cache_write_tokens: Optional[int]
     # ONE ENTRY PER CALL ACTUALLY ISSUED, in the order they were issued, never
     # summed away. The three fields above are totals, and a total cannot answer
     # the question packing exists to raise: whether the shared prefix is being

@@ -169,6 +169,25 @@ BUCKETS = {
         "(oncotriage/api/server.py, '18- FastAPI Server Test.py') are written "
         "by neither of the suite's two writers and are sha256-compared at the "
         "end"),
+    "test_provenance_truth.py": (
+        _A, None,
+        "ran green in 1.5s, 90 checks, against ONLY the directory skeleton "
+        "(MEASURED against a provision_ci_paths.py root, not assumed). No "
+        "network, no keys, NO SPEND -- no provider client of any kind is built "
+        "and no request is issued; sections 9a/9b assert that torch, "
+        "transformers, boto3 and botocore never entered sys.modules. NO MODEL "
+        "LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports), no live "
+        "Qdrant, no corpus, no git history, no live server. Every database is "
+        "a scratch file inside a tempfile.mkdtemp it removes and asserts gone. "
+        "It EXECS NOTHING and loads no module by location -- every control is "
+        "a different INPUT to a pure function, a real failing condition built "
+        "on disk, a module attribute rebound inside try/finally with the "
+        "restore asserted, or an ast walk over a file it only READS -- so it "
+        "needs no _EXEC_ALLOWLIST entry. NOT in the collision matrix: it "
+        "writes nothing in the repository, and the six files it reads are "
+        "sha256-compared at the end (one of them, config.py, IS rewritten by "
+        "tests/test_config_snapshot_date_rot.py, so an interleaved serial run "
+        "is visible rather than silent)."),
     "test_compose_shutdown_grace.py": (
         _A, None,
         "ran green in 0.8s, 30 checks, against ONLY the directory skeleton: "
