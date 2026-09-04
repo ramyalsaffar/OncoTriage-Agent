@@ -534,6 +534,27 @@ BUCKETS = {
         "collision matrix -- the one repository file it reads, "
         "oncotriage/agent/retrieval.py, is written by neither of the suite's "
         "two writers. It execs nothing, so it needs no _EXEC_ALLOWLIST entry"),
+    "test_matching_chars_per_token.py": (
+        _A, None,
+        "ran green in 1.1s, 49 checks, against ONLY the directory skeleton: "
+        "the Stage 5 estimator's characters-per-token divisor, declared PER ARM "
+        "in config.MATCHING_CHARS_PER_TOKEN_BY_PROVIDER and answered by "
+        "config.matching_chars_per_token(), with config.CHARS_PER_TOKEN kept as "
+        "the OpenAI-arm and INDEXER value. No network, no keys, NO SPEND -- no "
+        "provider client of any kind is built and no request is issued, and "
+        "deps.is_resolved is asserted False for all three client keys at the "
+        "end, so a real client that HAD been built is caught. No model load "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports; torch and "
+        "transformers asserted absent), no live Qdrant, no corpus, no database, "
+        "no git history, no live server. It writes NOTHING anywhere, not even a "
+        "temp directory, and EXECS NOTHING and loads no module by location: "
+        "every control is a different INPUT to a pure function, or "
+        "config.MATCHING_PROVIDER rebound inside try/finally with the restore "
+        "asserted. NOT in the collision matrix -- but the three files it READS "
+        "include oncotriage/config.py, which "
+        "tests/test_config_snapshot_date_rot.py rewrites in place, so all three "
+        "are sha256-compared at the end and an interleaved serial run is "
+        "visible rather than silent."),
     "test_matching_temperature_policy.py": (
         _A, None,
         "ran green in 0.8s, 72 checks, against ONLY the directory skeleton: "

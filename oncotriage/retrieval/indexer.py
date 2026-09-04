@@ -1506,7 +1506,7 @@ class EmbeddingBudgetExceeded(RuntimeError):
 
 # What the FALLBACK estimate was measured with, derived from the divisor rather
 # than typed beside it. Same construction and same reason as
-# PACKING_METHOD_CHARS in oncotriage/agent/evaluation.py: the label a consumer
+# packing_method_chars() in oncotriage/agent/evaluation.py: the label a consumer
 # reads and the arithmetic it describes are one declaration, so a change to
 # CHARS_PER_TOKEN cannot leave the label describing the previous divisor.
 ESTIMATE_METHOD_CHARS = f"chars/{CHARS_PER_TOKEN}"
@@ -1520,7 +1520,7 @@ def estimate_embedding_cost(trials: List[Dict]) -> dict:
     characters/CHARS_PER_TOKEN heuristic the batch sizer uses, and SAYS WHICH,
     because a estimate presented without its method invites the reader to trust
     the wrong digits. The reported method string is DERIVED from the constant
-    the arithmetic divides by, on PACKING_METHOD_CHARS's precedent in
+    the arithmetic divides by, on packing_method_chars()'s precedent in
     oncotriage/agent/evaluation.py: a method label typed out separately is a
     second declaration of the same fact, and the two drift the first time the
     constant moves -- silently, since the label is prose to every reader and to
@@ -1661,8 +1661,15 @@ def index_trials(trials: List[Dict], collection_name: str):
     # Dynamic embedding batch size, from config-owned bounds.
     #
     # Character count is the token proxy, at config.CHARS_PER_TOKEN characters
-    # per token -- the same constant the Stage 5 packer divides by, so the two
-    # estimators cannot drift apart. The average is taken over a sample of the
+    # per token. THE STAGE 5 PACKER NO LONGER DIVIDES BY THIS CONSTANT and the
+    # sentence that said the two estimators cannot drift apart is deleted rather
+    # than softened: Stage 5 reads `config.matching_chars_per_token()`, which is
+    # PER ARM, because a tokenizer is a property of the model and the shipped
+    # judge's is ~3.5 where the OpenAI one is 4.2-4.4. This path talks to the
+    # OpenAI EMBEDDING endpoint whatever Stage 5's judge is, so 4 is still the
+    # conservative direction here and this reading is correct -- what changed is
+    # that the two are separate questions that happened to share an answer while
+    # this project had one provider. The average is taken over a sample of the
     # first 50 trials rather than the whole corpus, because this only has to be
     # roughly right: it sizes a request, it does not price one
     # (estimate_embedding_cost() does that, exactly, with tiktoken).

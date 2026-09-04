@@ -1287,46 +1287,56 @@ MATCHING_REASONING_EFFORT = "none"
 # WHOLE RESPONSE, so no split fires for a chunk of one -- which the reactive
 # splitter could not honour anyway, since `len(chunk) == 1` is its floor and a
 # truncated single trial is a LOST verdict recorded `truncation_floor`.
-# Measured on the shipped judge: the 6b-3 probe's eight trial-shaped calls
-# topped out at 1,356 output tokens, and the 2026-09-03 empty-verdict
-# investigation's twelve verdicts on a 31-criterion trial topped out at 2,234
-# (both tables at MATCHING_OUTPUT_TOKENS_PER_TRIAL). Every one of the twenty
+# Measured on the shipped judge, and the sample that decides it is now the item
+# 7 sample run: 389 verdict-bearing per-trial calls, max 3,277 output tokens,
+# p95 2,393, and ZERO truncated at this ceiling (the table is at
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL). The two earlier readings it supersedes are
+# kept there too -- the 6b-3 probe's eight calls topped out at 1,356 and the
+# empty-verdict investigation's twelve at 2,234, and every one of those twenty
 # reported stopReason 'end_turn'. 32,000 covers the worst observed single
-# response 14.3x over -- 23.6x on the 6b-3 set alone, which is the figure this
-# paragraph carried before the second measurement existed.
+# response 9.8x over, against 14.3x on the 2,234 reading and 23.6x on the 6b-3
+# set alone -- the margin is shrinking as the sample grows, which is what a
+# larger sample does to a maximum, and it is still an order of magnitude.
 #
 # LOWERING IT WAS CONSIDERED AND IS REFUSED, on two measured grounds rather
 # than on caution.
 #
 #   1. IT WOULD DRIVE THE GROUPED ARM INTO DEEPER SPLITS. That arm's proactive
-#      splitter is ARMED as of the 2,500 recalibration --
+#      splitter has been ARMED since the 2,500 recalibration and arms harder at
+#      3,950 --
 #      1.25 x MATCHING_OUTPUT_TOKENS_PER_TRIAL x MAX_TRIALS_FOR_EVALUATION
-#      = 46,875 against MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS
-#      = 28,800 -- so a full-cap grouped batch already halves once, into
-#      chunks of 8 and 7 whose estimates (20,000 and 17,500) are under the
-#      threshold. Lowering this ceiling lowers the threshold with it and buys
-#      a second halving, then a third, each one sending the shared system
-#      prefix again. That is a behaviour change to the retained comparison arm,
-#      made while it is the thing being compared against. THE SENTENCE THIS
-#      REPLACES SAID THE SPLITTER WAS DEAD AND THAT ANY CEILING BELOW 30,209
-#      WOULD ARM IT; that was true at K = 1,450 and is not true now, and the
-#      figure is left here so the change is legible rather than silent.
+#      = 74,062 against MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS
+#      = 28,800 -- so a full-cap grouped batch already halves TWICE. MEASURED
+#      by driving the real node in grouped mode with a stub rather than derived
+#      from the arithmetic: 15 trials of ordinary criteria length issue THREE
+#      requests at 3,950 where they issued two at 2,500, the partition being
+#      [8, 7] -> [4, 4, 7] because the 7 estimates 27,687 and stays under.
+#      Lowering this ceiling lowers the threshold with it and buys a further
+#      halving, each one sending the shared system prefix again. That is a
+#      behaviour change to the retained comparison arm, made while it is the
+#      thing being compared against. THE SENTENCE THIS REPLACES SAID THE
+#      SPLITTER WAS DEAD AND THAT ANY CEILING BELOW 30,209 WOULD ARM IT; that
+#      was true at K = 1,450 and is not true now, and the figure is left here so
+#      the change is legible rather than silent.
 #   2. A HIGH CEILING IS FREE UNLESS IT IS REACHED. Bedrock bills tokens
-#      GENERATED, not the ceiling requested -- confirmed on every call of that
-#      run, which asked for 32,000 and was billed 269 to 1,356. So the only
+#      GENERATED, not the ceiling requested -- confirmed on every call of the
+#      6b-3 run, which asked for 32,000 and was billed 269 to 1,356. So the only
 #      thing a lower ceiling buys is a smaller blast radius on a runaway, and
 #      the only thing it costs is a lost verdict whenever a real response
-#      exceeds it. Nothing in eight calls came within 23x of the ceiling, so
-#      the expected saving is ~zero against a cost that lands on the tail this
-#      measurement cannot see.
+#      exceeds it. Nothing in 389 calls came within 9.7x of the ceiling, so
+#      the expected saving is ~zero against a cost that lands on the tail even
+#      this sample cannot see.
 #
 # WHAT THE BLAST-RADIUS BOUND IS ON THIS PROVIDER, since the figure above is
 # the OpenAI arm's: 32,000 x $16.50/1M = $0.53 for one runaway call on
 # us.anthropic.claude-sonnet-4-6, against $0.38 at gpt-5.6-terra's rate.
 #
 # THE TWO ARMS GENUINELY WANT DIFFERENT CEILINGS AND THIS IS ONE CONSTANT.
-# Per-trial would be well served by ~8,000 (5.9x the worst observed response);
-# grouped needs >= 30,209 to keep its splitter dead. Making the ceiling
+# Per-trial would be well served by ~8,000, though the case for it is thinner
+# at this sample than it was: 8,000 is 2.4x the n = 389 maximum of 3,277 where
+# it was 5.9x the 1,356 that figure was first written against. Grouped needs
+# >= 30,209 to keep its splitter dead, which no value of this constant since
+# 1,450 has allowed. Making the ceiling
 # arm-dependent is the fix that would let both have what they want, and it is
 # NOT taken here: it changes the per-trial wire request, and the case for it
 # rests on a runaway nobody has observed. It is recorded as a follow-up rather
@@ -3632,98 +3642,123 @@ def _assert_bedrock_anthropic_credential_is_visible():
 # should be split BEFORE it is sent.
 #
 # ===========================================================================
-# INTERIM. RAISED TO 2,500 ON 2026-09-03 FROM A MEASURED MAX OF 2,234, AND A
-# RE-DERIVATION IS OWED. THE PROACTIVE SPLITTER NOW ARMS IN THE GROUPED ARM.
+# RAISED TO 3,950 ON 2026-09-03 FROM A MEASURED MAX OF 3,277 OVER n = 389
+# CALLS. THE INTERIM STAMP IS RETIRED: THIS IS A DISTRIBUTION, NOT A SAMPLE
+# OF 12. THE PROACTIVE SPLITTER STAYS ARMED IN THE GROUPED ARM.
 # ===========================================================================
 #
-# WHAT WAS MEASURED, AND IT IS A SECOND MEASUREMENT ON THE SAME JUDGE THE SAME
-# DAY. The empty-verdict investigation
-# (09- Testing/empty_verdict_investigation_20260903/) spent $0.5072 over 15
-# billed calls against us.anthropic.claude-sonnet-4-6, of which 12 produced a
-# verdict -- ten resends of one byte-identical per-trial call, one at half the
-# trial's criteria length, and one of the same trial under a different
-# patient prefix. Per-trial mode, `thinking` disabled, `stopReason` `end_turn`
-# on every one of them.
+# WHAT WAS MEASURED. The item 7 sample run -- a real cohort sample of patients
+# in the shipped per-trial arm against us.anthropic.claude-sonnet-4-6, so one
+# billed call per patient-trial pair and therefore one CLEAN per-trial output
+# figure per call, with no split double-counting to correct for. Over its 389
+# verdict-bearing calls:
 #
-#     max outputTokens over those 12 verdicts:  2,234
-#     range:                                    401 - 2,234
+#     min 222   p50 1,069   p95 2,393   max 3,277
 #
-# 2,500 IS THE MEASURED MAX PLUS ~12% (2,500 / 2,234 = 1.119), rounded to the
-# nearest 50. The rule is unchanged -- the measured max plus a margin -- and
-# only the measurement moved.
+#     calls above the previous constant (2,500):  17 of 389  (4.4%)
+#     calls truncated at MATCHING_MAX_TOKENS:      0 of 389
 #
-# IT SUPERSEDES THE n = 7 WINDOW-MIDPOINT DERIVATION OF 1,450, whose admissible
-# window [measured max, splitter-still-dead] is EMPTY at this measurement:
-# 2,234 is already above that window's upper bound of 1,536, so no value can
-# both bound the observed output and keep the grouped splitter dormant.
+# THE RULE IS STATED BEFORE THE ARITHMETIC, so a later pass re-derives rather
+# than re-argues: at n >= 300 calls, take the measured MAX and apply a 20%
+# margin, rounded UP to the nearest 50 --
+#
+#     ceil_to_50(1.20 x 3,277) = ceil_to_50(3,932.4) = 3,950
+#
+# and 3,950 / 3,277 = 1.205, so the shipped value bounds every call in the
+# sample by 20.5% and bounds the p95 by 65%.
+#
+# WHY THE MAX AND NOT THE p95, WHICH IS THE OBVIOUS OBJECTION AT THIS n. This
+# constant is not an average-case estimate; it is the input to a guard that
+# decides whether a batch can be answered in one response. A p95-based value
+# (2,393 x 1.20 = 2,900) is a value that under-states one call in twenty by
+# construction, and the cost of under-stating is a truncated response that the
+# reactive splitter recovers by re-sending -- paying the shared prefix again
+# for a batch that was already sent. The margin is on the max because the max
+# is what the guard is a guard against.
+#
+# IT SUPERSEDES THE 2,500 INTERIM VALUE, whose whole story is one line: it was
+# the max of TWELVE calls on ONE (patient prefix, trial) pair -- the hardest
+# the project had seen, 31 criteria -- taken from the 2026-09-03 empty-verdict
+# investigation, and it was labelled INTERIM at the time precisely because a
+# maximum of 12 on one pair is not a distribution. The 17 calls above it in
+# this sample are what that label anticipated. The 6b-3 and empty-verdict
+# tables are kept below because they are still the only durable record of
+# those two measurements.
 #
 # ---------------------------------------------------------------------------
-# THE PROACTIVE SPLITTER ARMS IN THE GROUPED ARM, AND THAT IS THE SPLITTER
-# WORKING AS DESIGNED RATHER THAN A COST OF THIS CHANGE.
+# THE PROACTIVE SPLITTER WAS ALREADY ARMED IN THE GROUPED ARM AND STAYS ARMED
 # ---------------------------------------------------------------------------
 #
 #     largest grouped estimate at MAX_TRIALS_FOR_EVALUATION = 15
-#         = 1.25 x K x 15 = 18.75 x 2,500          = 46,875
+#         = 1.25 x K x 15 = 18.75 x 3,950          = 74,062
 #     threshold
 #         = MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS
 #         = 0.90 x 32,000                          = 28,800
-#     46,875 > 28,800  ->  the pre-split fires
+#     74,062 > 28,800  ->  the pre-split fires
 #
-# The count term alone clears it (2,500 x 15 = 37,500), so it fires on a
-# full-cap grouped batch whatever the criteria length; the first N at which it
-# can fire is 10 with the criteria term at its cap and 12 without it.
+# THIS IS NOT A CHANGE. The splitter armed when this constant went to 2,500
+# (46,875 against the same 28,800) and it arms harder now; what moved is the
+# margin, from 1.63x the threshold to 2.57x. The count term alone still clears
+# it (3,950 x 15 = 59,250), so it fires on a full-cap grouped batch whatever
+# the criteria length, and the first N at which it can fire moves from 10 to 6
+# with the criteria term at its cap and from 12 to 8 without it.
 #
-# THIS IS THE GUARD DOING ITS JOB. If one verdict really costs up to 2,234
-# output tokens then fifteen of them is 33,510, which is ABOVE
-# MATCHING_MAX_TOKENS = 32,000 -- a 15-trial grouped request genuinely cannot
-# be answered in one response, and a splitter that stayed dormant would be
-# waiting for the reactive path to discover that by truncating. What arms here
-# is the mechanism that exists for exactly this, reached because the
-# measurement it reads finally says so.
+# IT IS STILL THE GUARD DOING ITS JOB rather than a cost of the recalibration.
+# Fifteen verdicts at the measured maximum of 3,277 is 49,155 tokens, half as
+# much again as MATCHING_MAX_TOKENS = 32,000 -- a 15-trial grouped request
+# genuinely cannot be answered in one response, and by a wider margin than the
+# 2,234 figure said.
 #
-# WHAT IT COSTS THE RETAINED ARM, STATED RATHER THAN GLOSSED. A grouped
-# full-cap patient becomes two requests instead of one: the pre-split halves
-# 15 into 8 and 7 (estimates 20,000 and 17,500, both under the threshold), so
-# `llm_classifier_truncation_splits` reads 1 where it read 0 and the shared
-# system prefix is SENT TWICE, which is the real cost -- output is unchanged
-# and input roughly doubles for that arm. Grouped is the dormant comparison arm
-# (MATCHING_PER_TRIAL_CALLS_ENABLED is True), so no shipped campaign pays it,
-# and a comparison run against the retained arm should be read knowing its
-# request count moved. The grouped call ceiling is unaffected: it is
-# MATCHING_MAX_INPUT_PACKED_CHUNKS x (2 ** (MAX_TRUNCATION_SPLITS + 1) - 1),
-# which bounds this many times over.
+# WHAT IT COSTS THE RETAINED ARM, RE-STATED AT THE NEW VALUE. A grouped
+# full-cap patient is split further than it was: at 2,500 the pre-split halved
+# 15 into 8 and 7 (20,000 and 17,500, both under the threshold) and stopped; at
+# 3,950 those halves estimate 31,600 and 27,650, so the 8 is halved again into
+# 4 and 4 and the run issues three requests instead of two. The shared system
+# prefix is therefore SENT THREE TIMES, which is the real cost -- output is
+# unchanged and input roughly triples for that arm. Grouped is the dormant
+# comparison arm (MATCHING_PER_TRIAL_CALLS_ENABLED is True), so no shipped
+# campaign pays it, and a comparison run against the retained arm should be
+# read knowing its request count moved again. The grouped call ceiling is
+# unaffected: it is MATCHING_MAX_INPUT_PACKED_CHUNKS x
+# (2 ** (MAX_TRUNCATION_SPLITS + 1) - 1), which bounds this many times over.
 #
 # PER-TRIAL, THE SHIPPED ARM, IS UNAFFECTED AND CANNOT BE AFFECTED BY ANY VALUE
-# IN THIS RANGE: the estimate for one trial is 1.25 x 2,500 = 3,125 against the
+# IN THIS RANGE: the estimate for one trial is 1.25 x 3,950 = 4,937 against the
 # same 28,800, and the reactive splitter's floor refuses to halve a singleton
 # anyway.
 #
 # ---------------------------------------------------------------------------
-# WHY THIS IS INTERIM AND WHAT DISCHARGES IT
+# MATCHING_MAX_TOKENS DOES NOT MOVE, AND THAT IS A MEASUREMENT
 # ---------------------------------------------------------------------------
 #
-# n = 12, ON ONE (patient prefix, trial) PAIR, AND THAT PAIR IS THE HARDEST ONE
-# THE PROJECT HAS SEEN. It is the trial that produced both empty replies: the
-# largest rendered block of its patient's fifteen and the most complex, 31
-# criteria against 16 / 19 / 13 / 2 for the others, and its verdicts run 19-24
-# inclusion rows and 10-13 exclusion rows. So 2,234 is a maximum drawn from the
-# tail of the input distribution rather than from the middle of it, which is
-# the right direction for an upper bound and is not a distribution.
+# ZERO of the 389 calls were truncated at 32,000, and the largest reached
+# 3,277 -- 10.2% of the ceiling. So the 6b-3 arithmetic beside MATCHING_MAX_TOKENS
+# stands unchanged: the per-trial requirement is that the ceiling covers one
+# whole response, and it covers the worst observed 9.8x over. Lowering it was
+# refused there on two measured grounds that this sample strengthens rather
+# than weakens -- any ceiling below the grouped pre-split's own arming point
+# changes the retained arm's behaviour, and Bedrock bills tokens GENERATED
+# rather than the ceiling REQUESTED, so a high ceiling is free unless reached.
 #
-# THE RE-DERIVATION OWED IS FROM THE ITEM 7 SAMPLE-RUN DISTRIBUTION -- a real
-# cohort sample of patients rather than one pair -- and it should replace this
-# figure with a percentile of a population rather than a maximum of a sample of
-# 12. Until then this constant is an INTERIM upper bound and the splitter arming
-# in the grouped arm is a consequence of it.
+# ---------------------------------------------------------------------------
+# WHAT IS STILL OWED
+# ---------------------------------------------------------------------------
 #
-# THE "OUTPUT IS FLAT IN CRITERIA LENGTH" CLAIM DID NOT SURVIVE, and it is the
-# claim `estimate_output_tokens`'s own docstring rests on. It was drawn from at
-# most eight points, none of which was a 31-criterion trial that ANSWERED; this
-# pair emits a row per criterion, so its output scales with criterion COUNT.
-# The count term remains the driver of the estimate and the criteria-CHARACTER
-# term remains a capped tie-breaker, but "a trial with 4,000 characters of
-# criteria costs about the same to answer as one with 800" is now known to be
-# false for a trial that carries four times the criteria.
+# THE SAMPLE IS ONE JUDGE IN ONE CONFIGURATION. n = 389 supports the max-plus-
+# margin rule and it does not make the figure portable: it is
+# us.anthropic.claude-sonnet-4-6, `thinking` disabled, per-trial mode, on this
+# project's own rendered prompts.
+#
+# THE "OUTPUT IS FLAT IN CRITERIA LENGTH" CLAIM STILL DOES NOT HOLD, and it is
+# the claim `estimate_output_tokens`'s own docstring rests on. The 2026-09-03
+# empty-verdict investigation measured a 31-criterion trial that ANSWERED at
+# 1,565 to 2,234 output tokens against 269 to 1,356 for the 2 to 19-criterion
+# trials the original fit was drawn from; this sample's 3,277 max is the same
+# shape one step further out. The count term remains the driver of the estimate
+# and the criteria-CHARACTER term remains a capped tie-breaker, but "a trial
+# with 4,000 characters of criteria costs about the same to answer as one with
+# 800" is known to be false for a trial that carries four times the criteria,
+# and the term this estimate does not have is a per-trial CRITERION count.
 #
 # RE-DERIVE THIS WHENEVER MATCHING_MODEL, MATCHING_PROVIDER,
 # BEDROCK_ANTHROPIC_THINKING OR BEDROCK_ANTHROPIC_EFFORT CHANGES. It is a
@@ -3800,22 +3835,23 @@ def _assert_bedrock_anthropic_credential_is_visible():
 # of one patient. THAT RULE IS NOT THE ONE THIS PASS APPLIED, and the difference
 # is n: 27 runs support a p95, 7 do not, so the shipped rule is now "the
 # measured max plus a margin" rather than "between p95 and the max".
-MATCHING_OUTPUT_TOKENS_PER_TRIAL = 2500
+MATCHING_OUTPUT_TOKENS_PER_TRIAL = 3950
 
 # Fraction of MATCHING_MAX_TOKENS the estimate may reach before a batch is
 # split pre-emptively. 0.90 leaves 3,200 tokens between the threshold (28,800)
 # and the ceiling (32,000) for the estimate's own error.
 #
-# THE FRACTION DID NOT MOVE WHEN MATCHING_OUTPUT_TOKENS_PER_TRIAL WAS
-# RAISED TO 2,500, AND WHAT THAT COSTS IS STATED. There is no longer any
-# headroom between the largest possible grouped estimate and this threshold:
-# 1.25 x 2,500 x 15 = 46,875 against 28,800, so the estimate is OVER the
-# threshold by 63% and the proactive splitter fires on every full-cap grouped
-# batch. That is the guard working -- fifteen verdicts at the measured maximum
-# of 2,234 is 33,510 tokens, above MATCHING_MAX_TOKENS -- and it is argued in
-# full at the constant. The two earlier readings, kept so the trend is legible:
-# at 1,450 the estimate was 27,187.5 and left 1,612 tokens of headroom, and at
-# 1,100 it left 8,175.
+# THE FRACTION HAS NOT MOVED THROUGH TWO RECALIBRATIONS OF
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL, AND WHAT THAT COSTS IS STATED. There is no
+# headroom left between the largest possible grouped estimate and this
+# threshold: 1.25 x 3,950 x 15 = 74,062 against 28,800, so the estimate is OVER
+# the threshold by 157% and the proactive splitter fires on every full-cap
+# grouped batch -- and on any batch of 6 or more. That is the guard working --
+# fifteen verdicts at the n = 389 measured maximum of 3,277 is 49,155 tokens,
+# half as much again as MATCHING_MAX_TOKENS -- and it is argued in full at the
+# constant. The three earlier readings, kept so the trend is legible: at 2,500
+# the estimate was 46,875 (over by 63%), at 1,450 it was 27,187.5 and left
+# 1,612 tokens of headroom, and at 1,100 it left 8,175.
 #
 # THE '2.3 sd OF MARGIN' CLAIM THAT STOOD HERE IS DELETED RATHER THAN RESCALED.
 # The ~1,398-token residual sd it rested on is a per-BATCH figure from the
@@ -4021,62 +4057,232 @@ HARNESS_GET_TIMEOUT = (HARNESS_CONNECT_TIMEOUT_SECONDS,
                        HARNESS_GET_TIMEOUT_SECONDS)
 
 
-# Characters per token. ONE OWNER, READ BY BOTH USERS: the Stage 5 input packer
-# in oncotriage/agent/evaluation.py and the embedding batch sizer in
-# oncotriage/retrieval/indexer.py, which held its own local copy of this value
-# until the two were joined here. "Kept identical so the two agree" was the old
-# arrangement and it agreed by coincidence; an import agrees by construction.
-# Kept crude on purpose — tiktoken would be a dependency and an import cost for
-# an estimate whose job is to be roughly right before a call that is about to
-# measure it exactly. (The indexer's estimate_embedding_cost() DOES use tiktoken
-# when it is importable, because that number gates spend; this proxy is its
-# fallback, and the method it reports is derived from this constant so the two
-# cannot disagree.)
-#
-# IT IS ALSO THE INPUT-PACKING DIVISOR (see MATCHING_INPUT_TOKEN_BUDGET below),
-# and there it was chosen to be CONSERVATIVE rather than accurate. On
-# gpt-5.6-terra, measured on this project's own Stage 5 prompts, the true ratio
-# is 4.2-4.4 characters per token, so dividing by 4 OVER-states the token count
-# by 5-10% and the packer closes a chunk slightly early. That is the direction a
-# budget guard must err in: an under-estimate ships a chunk over the threshold
-# the packing exists to stay under, and the threshold is where the measured
-# degradation begins.
+# Characters per token, THE OPENAI-ARM AND INDEXER VALUE. Crude on purpose --
+# tiktoken would be a dependency and an import cost for an estimate whose job
+# is to be roughly right before a call that is about to measure it exactly.
+# (The indexer's estimate_embedding_cost() DOES use tiktoken when it is
+# importable, because that number gates spend; this proxy is its fallback, and
+# the method it reports is derived from this constant so the two cannot
+# disagree.)
 #
 # ===========================================================================
-# THAT IS A FACT ABOUT ONE TOKENIZER AND IT DOES NOT HOLD ON THE SHIPPED ONE.
-# MEASURED 2026-09-03 ON us.anthropic.claude-sonnet-4-6.
+# THIS IS NO LONGER THE DIVISOR STAGE 5 ESTIMATES WITH. READ
+# `matching_chars_per_token()` BELOW FOR THAT.
 # ===========================================================================
 #
-# Read out of the usage blocks of the per-trial probe run -- so these are the
-# model's OWN token counts for this project's OWN rendered Stage 5 text, not an
-# estimate of them:
+# WHAT STILL READS THIS VALUE, and both readings are correct at 4:
+#
+#   * oncotriage/retrieval/indexer.py -- the embedding batch sizer and the
+#     `ESTIMATE_METHOD_CHARS` label beside it. That path talks to an OpenAI
+#     tokenizer, for which 4 is the CONSERVATIVE direction (measured 4.2-4.4 on
+#     this project's own text, so dividing by 4 over-states the token count by
+#     5-10% and the batch closes slightly early). Nothing about the shipped
+#     Stage 5 judge is a fact about the embedding endpoint, and lowering this
+#     value would shrink every embedding batch for no reason.
+#   * `MATCHING_CHARS_PER_TOKEN_BY_PROVIDER` below, for the two arms whose
+#     model IS the OpenAI one -- read from here rather than retyped as 4, so
+#     the OpenAI arm and the indexer cannot come to disagree about a value that
+#     is one measurement.
+#
+# WHY THE STAGE 5 DIVISOR HAD TO STOP BEING THIS CONSTANT. Read out of the
+# usage blocks of the 2026-09-03 per-trial probe -- the model's OWN token
+# counts for this project's OWN rendered Stage 5 text, not an estimate of them:
 #
 #     the rendered system prefix   32,495 chars /  9,281 tokens = 3.50
 #     a rendered trial user block   3,504 chars /    985 tokens = 3.56
 #                                   1,939 chars /    538 tokens = 3.60
 #                                   1,175 chars /    304 tokens = 3.87
 #
-# So on this judge the ratio is ~3.5, not 4.2-4.4, and dividing by 4
-# UNDER-states the token count by ~12.5% on the largest and cleanest sample
-# (the prefix estimates at 8,123 against a measured 9,281). THAT IS THE
-# DIRECTION THE PARAGRAPH ABOVE NAMES AS THE UNSAFE ONE.
-#
-# THE CONSTANT IS NOT CHANGED HERE, and the reason is the blast radius rather
-# than doubt about the measurement. This value has TWO owners' worth of
-# consumers -- the Stage 5 input packer and the indexer's embedding batch sizer
-# -- and the indexer talks to an OpenAI tokenizer for which 4 is still the
-# conservative direction. Lowering it globally would make the embedding sizer
-# batch smaller for no reason, and raising the packer's conservatism on one arm
-# is a change to what Stage 5 SENDS, which is a fixture-invalidating edit. The
-# honest fix is a per-provider ratio with its own measurement on each, and it is
-# recorded as a follow-up.
-#
-# WHAT IT MEANS IN THE MEANTIME, stated so nobody has to re-derive it: on the
-# shipped provider the input packer's chunks are ~12% larger in real tokens than
-# it believes, so MATCHING_INPUT_TOKEN_BUDGET is effectively ~12% looser than
-# its own comment claims. The per-trial arm is unaffected -- it bypasses the
-# packer entirely -- so this binds only on the retained grouped comparison arm.
+# On us.anthropic.claude-sonnet-4-6 the ratio is ~3.5, not 4.2-4.4, so dividing
+# by 4 UNDER-states the token count by up to 12.5% -- the prefix estimates at
+# 8,123 against a measured 9,281. THAT IS THE DIRECTION A BUDGET GUARD MUST NOT
+# ERR IN: an under-estimate ships a chunk over the threshold the packing exists
+# to stay under, and the threshold is where the measured degradation begins.
+# One global value cannot serve both, because the two arms' errors point in
+# opposite directions; a per-provider divisor is what the previous version of
+# this block recorded as the honest fix and declined to build.
 CHARS_PER_TOKEN = 4
+
+
+# ---------------------------------------------------------------------------
+# THE STAGE 5 ESTIMATOR'S DIVISOR, DECLARED PER ARM
+# ---------------------------------------------------------------------------
+#
+# MEASURED PER ARM, NOT ASSUMED FROM ONE. A tokenizer is a property of the
+# model, so a divisor that is right for one judge is a guess about every other
+# one -- and this project has already been through the version of that mistake
+# where a constant calibrated on gpt-5.6-terra was still in force after the
+# judge changed. Each row below states the measurement or the citation behind
+# it; a row without one is the thing this table exists to prevent.
+
+MATCHING_CHARS_PER_TOKEN_BY_PROVIDER = {
+    # gpt-5.6-terra over Chat Completions. MEASURED 4.2-4.4 on this project's
+    # own Stage 5 prompts; the shipped divisor is CHARS_PER_TOKEN = 4, which
+    # over-states by 5-10%. READ FROM THAT CONSTANT rather than retyped, so the
+    # OpenAI arm and the indexer's batch sizer cannot drift apart.
+    MATCHING_PROVIDER_OPENAI: CHARS_PER_TOKEN,
+    # THE SAME MODEL over Bedrock's Responses API, so the same answer. This
+    # entry is not a second measurement and does not pretend to be: a tokenizer
+    # is the MODEL's, the endpoint does not change it, and
+    # `BEDROCK_MATCHING_MODEL` is the cross-Region profile id for the same model
+    # (`us.openai.gpt-5.6-terra`). If that constant is ever pointed at a
+    # different model this row is the one to re-derive.
+    MATCHING_PROVIDER_BEDROCK: CHARS_PER_TOKEN,
+    # Claude Sonnet 4.6 over Converse. MEASURED 2026-09-03 out of the probe's
+    # usage blocks (the four samples are tabulated at CHARS_PER_TOKEN above):
+    # 3.50 on the rendered system prefix and 3.56 / 3.60 / 3.87 on three
+    # rendered trial user blocks. 3.5 IS THE SMALLEST OF THE FOUR, and the
+    # argument for taking it exactly rather than with a margin under it is
+    # below.
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: 3.5,
+}
+"""Characters per token for each arm's MODEL, as the Stage 5 estimators divide.
+
+A FACT ABOUT THE TOKENIZER, not about the endpoint and not about this
+pipeline's preference. `matching_chars_per_token()` is what turns it into an
+answer about the LIVE arm.
+
+THE GUARD DIRECTION IS WHAT PICKS THE VALUE, AND IT IS AN INEQUALITY RATHER
+THAN AN AVERAGE. The estimate is `chars / D` and the truth is `chars / R` for
+the text's real ratio R, so the estimate OVER-states -- which is the direction
+a budget guard must err in -- exactly when `D <= R`. So the admissible values
+are those at or below the SMALLEST ratio the arm has been measured at, and an
+arm's row may never be raised toward its mean.
+
+WHY 3.5 EXACTLY AND NOT A MARGIN BELOW IT, which is the obvious objection and
+which this file's own OpenAI row would suggest (4 against a measured 4.2-4.4 is
+a 5-10% margin). MEASURED, by reproducing the packer's arithmetic on the REAL
+rendered prefix and the REAL rendered trial blocks recorded at
+MATCHING_OUTPUT_TOKENS_PER_TRIAL, over a full-cap grouped batch against
+MATCHING_INPUT_TOKEN_BUDGET = 12,000 and MATCHING_MAX_INPUT_PACKED_CHUNKS = 5:
+
+    divisor   prefix estimate vs 9,281   chunks   effective budget
+      4.00        8,124   (-12.5%)          3         12,000   <- UNDER-states
+      3.50        9,285   ( +0.0%)          4         12,000
+      3.46        9,392   ( +1.2%)          5         12,000
+      3.40        9,558   ( +3.0%)          5         12,000
+      3.325       9,773   ( +5.3%)          5         12,000   <- a 5% margin
+      3.15       10,316   (+11.2%)          8         12,544   <- RELAXED
+      2.917      11,140   (+20.0%)         14         13,544   <- RELAXED
+
+The last column is the point. Past the chunk cap the packer RAISES the
+per-chunk budget uniformly to whatever fits (see
+MATCHING_MAX_INPUT_PACKED_CHUNKS), so a divisor conservative enough to blow
+through the cap does not make the budget stricter -- it makes the budget stop
+being 12,000 at all, for every chunk, which is a WORSE guard than a divisor
+with no margin. The boundary sits between 3.47 and 3.46, so any margin worth
+having costs the one chunk of headroom that separates the shipped arm from its
+own relaxation. So the value is the measured minimum truncated to one decimal
+place -- 32,495 / 9,281 = 3.5013, and 3.5 is the largest one-decimal value at
+or below it -- rather than that quotient with a margin taken off it.
+
+WHAT THAT LEAVES UNCOVERED, stated rather than glossed: at 3.5 the prefix is
+over-stated by FOUR TOKENS out of 9,281, so a text denser than any of the four
+samples would be UNDER-stated. The prefix is the densest of the four and the
+largest -- 83% of the characters they measure between them, and essentially the
+whole of a request's FIXED cost, since the user-message wrapper it is added to
+is nineteen characters -- and it carries the patient record's codes, dates and
+lab values, which is what makes it dense. That is why it and not the trial
+blocks sets the value. A fifth sample below 3.50 is what would move this row,
+and it moves it DOWN.
+
+TOTAL OVER `MATCHING_PROVIDERS`, guarded at import below: an arm added to the
+vocabulary without a row here would fall through to a default, and every
+available default is a claim -- CHARS_PER_TOKEN silently estimates the new arm
+with a tokenizer nobody measured it against.
+"""
+
+# ONE-SHOT TOTALITY AND VALUE GUARD, on `MATCHING_TEMPERATURE_MODEL_ACCEPTS`'s
+# footing. A RuntimeError at import and not an `assert`: `python -O` deletes
+# those, and this file is imported by every entry point in the project.
+if set(MATCHING_CHARS_PER_TOKEN_BY_PROVIDER) != set(MATCHING_PROVIDERS):
+    raise RuntimeError(
+        "MATCHING_CHARS_PER_TOKEN_BY_PROVIDER must have exactly one row per "
+        f"member of MATCHING_PROVIDERS. Declared: "
+        f"{sorted(MATCHING_CHARS_PER_TOKEN_BY_PROVIDER)}; providers: "
+        f"{sorted(MATCHING_PROVIDERS)}. Add the missing row in "
+        "oncotriage/config.py, with the measurement behind it.")
+def validate_matching_chars_per_token(table=None) -> None:
+    """Refuse a divisor that is not a positive number. Called at import.
+
+    A FUNCTION RATHER THAN AN INLINE `for` AT THE TABLE, and that is what makes
+    it exercisable. An import-time loop inside a 4,000-line module can only be
+    driven by exec'ing a patched copy of the file; a function of its argument is
+    driven over a table of inputs, which is the natural control for one -- the
+    arrangement `validate_matching_temperature()` already carries in this file,
+    and the reason the guard it replaced was MISSED by a revert matrix that
+    reverted it.
+
+    Args:
+        table: the mapping to check. Defaults to the shipped one, which is what
+            the import-time call passes.
+
+    Raises:
+        RuntimeError: naming the provider and the value. Not an `assert`:
+            `python -O` deletes those, and this file is imported by every entry
+            point in the project.
+    """
+    for provider, ratio in sorted((table if table is not None
+                                   else MATCHING_CHARS_PER_TOKEN_BY_PROVIDER
+                                   ).items()):
+        # `bool` EXCLUDED EXPLICITLY: isinstance(True, int) is True, and a True
+        # here would divide every length by 1 and estimate a token per
+        # character -- an over-statement so large the packer would relax its
+        # budget on every patient, which is the failure the table above
+        # measures.
+        if isinstance(ratio, bool) or not isinstance(ratio, (int, float)):
+            raise RuntimeError(
+                f"MATCHING_CHARS_PER_TOKEN_BY_PROVIDER[{provider!r}] is "
+                f"{ratio!r}. It must be a positive number of characters per "
+                "token. Edit it in oncotriage/config.py.")
+        if not ratio > 0:
+            raise RuntimeError(
+                f"MATCHING_CHARS_PER_TOKEN_BY_PROVIDER[{provider!r}] is "
+                f"{ratio!r}. A divisor must be positive: zero divides by zero "
+                "and a negative one estimates a negative token count. Edit it "
+                "in oncotriage/config.py.")
+
+
+validate_matching_chars_per_token()
+
+
+def matching_chars_per_token():
+    """Characters per token for the LIVE matching arm. THE ONE OWNER.
+
+    ONE OWNER, THREE KINDS OF CONSUMER -- `estimate_prompt_tokens`,
+    `estimate_output_tokens`'s criteria term and the `packing_method_chars()`
+    provenance label -- which is the whole reason this is a function rather
+    than a constant read at three sites. `matching_call_mode()`,
+    `matching_wire_model()` and `matching_temperature_capability()` are the
+    same shape for the same reason: a fact DERIVED from more than one constant
+    must be derived once, or the request and the record can disagree.
+
+    READ AT CALL TIME, NEVER CACHED, on `matching_call_mode()`'s argument:
+    `MATCHING_PROVIDER` is a module attribute a process may move (a probe does;
+    a test does), and a cached answer would describe the configuration this
+    module was imported with rather than the one that planned the request.
+
+    IT IS NOT THE INDEXER'S DIVISOR AND MUST NOT BECOME IT. `CHARS_PER_TOKEN`
+    is what the embedding batch sizer reads, and that path talks to an OpenAI
+    tokenizer whatever Stage 5's judge is. The two are separate questions that
+    happened to share an answer while this project had one provider.
+
+    Returns:
+        A positive number of characters per token, validated at import.
+
+    Raises:
+        RuntimeError: through ``validate_matching_provider_config()``, on an
+            unrecognised provider. Never returns a default for one -- an
+            estimate made with a tokenizer ratio nobody chose is exactly the
+            silent-wrong-provider failure the closed vocabulary exists to
+            prevent.
+    """
+    ratio = MATCHING_CHARS_PER_TOKEN_BY_PROVIDER.get(MATCHING_PROVIDER)
+    if ratio is None:
+        validate_matching_provider_config()      # raises, naming the constant
+        raise RuntimeError(                      # unreachable; belt and braces
+            f"MATCHING_PROVIDER is {MATCHING_PROVIDER!r}")
+    return ratio
 
 
 # ---------------------------------------------------------------------------

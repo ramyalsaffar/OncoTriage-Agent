@@ -4008,8 +4008,21 @@ control(
     # reverse=True)` here would NOT do it: it reverses the seeding and the pop
     # order comes back to batch order, which is what the first attempt at this
     # control did and why it reported the plant as uncaught.)
+    # BOTH SEEDING LINES ARE PLANTED, and that is what keeps this control
+    # discriminating rather than a statement about which branch today's
+    # constants happen to take. `pending` reaches the loop from the ELSE branch
+    # (the batch's output estimate is under the pre-split threshold) or from
+    # the IF branch (it is over, and the proactive `while` halved nothing --
+    # which is what happens to a per-trial batch, whose chunks are singletons
+    # the splitter's `len(c) > 1` floor refuses to halve). Planting only the
+    # ELSE line was VACUOUS the moment MATCHING_OUTPUT_TOKENS_PER_TRIAL rose to
+    # 3,950 and a ten-trial batch started clearing the threshold: the plant
+    # reached nothing, the run behaved normally, and the control reported the
+    # fix as broken.
     [("        pending = [(c, 0) for c in reversed(initial_chunks)]",
-      "        pending = [(c, 0) for c in initial_chunks]")],
+      "        pending = [(c, 0) for c in initial_chunks]"),
+     ("        pending = [(c, depth) for c in reversed(initial_chunks)]",
+      "        pending = [(c, depth) for c in initial_chunks]")],
     lambda m: PackingBlockMismatchError.__name__ in repr(
         run_node(_TEN, per_trial=True, parallel=4, node=node_of(m))[0]),
     True,
@@ -4022,6 +4035,8 @@ control(
     "batch's is CAUGHT [4d]",
     [("        pending = [(c, 0) for c in reversed(initial_chunks)]",
       "        pending = [(c, 0) for c in initial_chunks]"),
+     ("        pending = [(c, depth) for c in reversed(initial_chunks)]",
+      "        pending = [(c, depth) for c in initial_chunks]"),
      ("            if _chunk_key(_c) != (trials[_i][\"trial\"][\"nct_id\"],):",
       "            if False:"),
      ("            _prompts[_chunk_key(_c)] = _wrap_trials(trial_blocks[_i])",

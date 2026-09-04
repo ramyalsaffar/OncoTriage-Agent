@@ -107,13 +107,13 @@ from oncotriage.agent import evaluation as _evaluation
 from oncotriage import deid as _deid
 from oncotriage.agent import prompts as _prompts
 from oncotriage.agent.evaluation import (
-    PACKING_METHOD_CHARS,
     PackingBlockMismatchError,
     _build_trials_text,
     _minimum_budget_for,
     _pack_greedy,
     _render_trial_blocks,
     estimate_prompt_tokens,
+    packing_method_chars,
     node_llm_classifier_evaluation,
     pack_trials_by_input_tokens,
 )
@@ -459,9 +459,40 @@ section("SECTION 1 -- the token estimator, and what it is measuring")
 
 check("1a  the estimation method is recorded and names the divisor actually "
       "used (a packing decision nobody can reproduce is not provenance)",
-      PACKING_METHOD_CHARS, f"characters/{config.CHARS_PER_TOKEN}")
-check("1b  the divisor is the project's one CHARS_PER_TOKEN, not a second copy",
-      config.CHARS_PER_TOKEN, 4)
+      packing_method_chars(), f"characters/{config.matching_chars_per_token()}")
+# THE LABEL FOLLOWS THE ARM, WHICH IS THE WHOLE REASON IT STOPPED BEING A
+# MODULE CONSTANT. A label built once at import states the divisor of whichever
+# arm this module was imported under -- and this file's own OpenAI pin means it
+# would have been imported under one arm and read under another the moment the
+# shipped provider moved. Driven across every member of the vocabulary rather
+# than argued, with the two answers required to DIFFER so the check is not
+# three readings of one value.
+_LABELS = {}
+_saved_provider = config.MATCHING_PROVIDER
+try:
+    for _p in config.MATCHING_PROVIDERS:
+        config.MATCHING_PROVIDER = _p
+        _LABELS[_p] = packing_method_chars()
+finally:
+    config.MATCHING_PROVIDER = _saved_provider
+check("1a-i  the recorded method names the LIVE arm's divisor, so a process "
+      "that moved the provider records the divisor it packed with",
+      _LABELS, {p: f"characters/{config.MATCHING_CHARS_PER_TOKEN_BY_PROVIDER[p]}"
+                for p in config.MATCHING_PROVIDERS})
+check("1a-ii  ...non-degeneracy: the arms do not all answer the same string, "
+      "so 1a-i is not one value read three times",
+      len(set(_LABELS.values())) > 1, True)
+check("1a-iii  ...and the provider this file pinned was restored",
+      config.MATCHING_PROVIDER, config.MATCHING_PROVIDER_OPENAI)
+check("1b  the divisor is the LIVE ARM's, read through the one owner -- and "
+      "under this file's OpenAI pin that is CHARS_PER_TOKEN, which is also "
+      "what the indexer's embedding batch sizer reads",
+      (config.matching_chars_per_token(), config.CHARS_PER_TOKEN), (4, 4))
+check("1b-i  ...and the shipped Converse arm's divisor is a DIFFERENT, "
+      "measured value, so 1b is a statement about the pin rather than about a "
+      "constant that is the same everywhere",
+      config.MATCHING_CHARS_PER_TOKEN_BY_PROVIDER[
+          config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC], 3.5)
 check("1c  empty text costs nothing", estimate_prompt_tokens(""), 0)
 check("1d  it rounds UP, so a fractional remainder is never a free token "
       "(int() truncation would under-count a guard once per trial)",
@@ -838,19 +869,35 @@ _PACKING_CONSTANTS = ("MATCHING_INPUT_PACKING_ENABLED",
                       "MATCHING_MAX_INPUT_PACKED_CHUNKS")
 
 
+# THE OUTPUT CONSTANT IS OVERRIDABLE TOO, AND IT IS DELIBERATELY NOT A MEMBER
+# OF _PACKING_CONSTANTS. That tuple is the three INPUT-packing knobs and check
+# 4a is an assertion about them; folding a fourth, unrelated constant into it
+# would make 4a's restore check say something it does not mean. This one has
+# its own save and its own restore for the same reason it exists at all: one
+# scenario below needs the PROACTIVE OUTPUT splitter to stay dormant while the
+# reactive one is measured, and whether it is dormant is a function of
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL -- a constant that has been recalibrated
+# three times and will be again.
+_OUTPUT_CONSTANT = "MATCHING_OUTPUT_TOKENS_PER_TRIAL"
+
+
 def run_node(trials, *, packing=True, budget=None, max_chunks=5, cached=None,
-             node=None, patient_data=None, truncate=False):
+             node=None, patient_data=None, truncate=False,
+             output_per_trial=None):
     """Drive Stage 5 once and return (result, stub)."""
     node = node or node_llm_classifier_evaluation
     stub = _StubClient(cached=cached, truncate=truncate)
     globals_of_node = node.__globals__
     saved = {k: globals_of_node[k] for k in _PACKING_CONSTANTS}
+    saved_output = globals_of_node[_OUTPUT_CONSTANT]
     deps.set_override(deps.OPENAI_CLIENT, stub)
     try:
         globals_of_node["MATCHING_INPUT_PACKING_ENABLED"] = packing
         if budget is not None:
             globals_of_node["MATCHING_INPUT_TOKEN_BUDGET"] = budget
         globals_of_node["MATCHING_MAX_INPUT_PACKED_CHUNKS"] = max_chunks
+        if output_per_trial is not None:
+            globals_of_node[_OUTPUT_CONSTANT] = output_per_trial
         state = {
             "patient_data": patient_data or PATIENT,
             "filtered_trials": trials,
@@ -863,6 +910,7 @@ def run_node(trials, *, packing=True, budget=None, max_chunks=5, cached=None,
         return result, stub
     finally:
         globals_of_node.update(saved)
+        globals_of_node[_OUTPUT_CONSTANT] = saved_output
         deps.clear_override(deps.OPENAI_CLIENT)
 
 
@@ -942,7 +990,7 @@ check("4g  ...and a token estimate per chunk",
       all(isinstance(c["tokens_estimated"], int) and c["tokens_estimated"] > 0
           for c in _packing.get("chunks", [])), True)
 check("4g  ...and the estimation method",
-      _packing.get("method"), PACKING_METHOD_CHARS)
+      _packing.get("method"), packing_method_chars())
 check("4g  ...and the identity of the prefix those chunks shared, which is the "
       "same value as the run's prompt hash",
       _packing.get("prefix_sha256"),
@@ -1042,11 +1090,13 @@ section("SECTION 5 -- packing composes with the output pre-split")
 # ── THE GROUPED PROACTIVE SPLITTER IS ARMED, AND THAT IS THE DOCUMENTED STATE ─
 #
 # IT WAS DORMANT AND IT IS NOT ANY MORE. Raising
-# MATCHING_OUTPUT_TOKENS_PER_TRIAL to 2,500 from the 2026-09-03 measured max of
-# 2,234 put the largest possible grouped estimate -- 1.25 x K x
-# MAX_TRIALS_FOR_EVALUATION -- above MATCHING_OUTPUT_SPLIT_FRACTION x
-# MATCHING_MAX_TOKENS, so a full-cap grouped batch now pre-splits where it used
-# to be sent whole. `oncotriage/config.py` states that at the constant, at
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL to 2,500 from a measured max of 2,234 put
+# the largest possible grouped estimate -- 1.25 x K x MAX_TRIALS_FOR_EVALUATION
+# -- above MATCHING_OUTPUT_SPLIT_FRACTION x MATCHING_MAX_TOKENS, and the item 7
+# recalibration to 3,950 from a measured max of 3,277 over n = 389 calls moved
+# it further out again: 74,062 against 28,800, where 2,500 gave 46,875. So a
+# full-cap grouped batch pre-splits where it used to be sent whole, and now
+# pre-splits TWICE. `oncotriage/config.py` states that at the constant, at
 # MATCHING_MAX_TOKENS and at MATCHING_OUTPUT_SPLIT_FRACTION, in prose.
 #
 # THIS IS THE ARITHMETIC BEHIND THAT PROSE, WHICH IS THE HALF PROSE CANNOT
@@ -1056,9 +1106,51 @@ section("SECTION 5 -- packing composes with the output pre-split")
 # claim this project keeps having to correct.
 #
 # IT IS THE SPLITTER WORKING RATHER THAN A COST OF THE RECALIBRATION: fifteen
-# verdicts at the measured maximum of 2,234 is 33,510 tokens, which is ABOVE
-# MATCHING_MAX_TOKENS, so a full-cap grouped request genuinely cannot be
-# answered in one response.
+# verdicts at the n = 389 measured maximum of 3,277 is 49,155 tokens, half as
+# much again as MATCHING_MAX_TOKENS, so a full-cap grouped request genuinely
+# cannot be answered in one response -- and by a wider margin than the 2,234
+# reading (33,510) said.
+# ── THE DECISION, PINNED, WHICH THE ARITHMETIC BELOW DELIBERATELY IS NOT ─────
+#
+# EVERY OTHER CHECK IN THIS SECTION IS DERIVED FROM THE CONSTANT and would
+# follow it wherever it went -- which is the right shape for a mechanism and
+# the wrong shape for a value that is a MEASUREMENT. A revert matrix put
+# MATCHING_OUTPUT_TOKENS_PER_TRIAL back to its previous 2,500 and NOTHING IN
+# THE SUITE FAILED: the splitter still armed, so the prose still held, and the
+# only thing that had changed was that the constant no longer bounded the calls
+# it was calibrated against.
+#
+# THE RULE IS PINNED WITH THE VALUE, so a re-derivation has to restate both.
+# `MATCHING_OUTPUT_TOKENS_PER_TRIAL` is the measured MAX plus a 20% margin,
+# rounded up to the nearest 50, over the item 7 sample run's 389 verdict-bearing
+# per-trial calls against us.anthropic.claude-sonnet-4-6:
+#
+#     min 222   p50 1,069   p95 2,393   max 3,277
+#     17 of 389 calls above the previous 2,500;  0 truncated at 32,000
+#     ceil_to_50(1.20 x 3,277) = 3,950
+#
+# THIS IS THE ONE CHECK IN THIS FILE THAT PINS A DECISION rather than a
+# mechanism, and it is the one to read first when it fails: a failure here means
+# the constant moved without its rule, or the rule was applied to a different
+# measurement. Re-deriving it legitimately means editing these three numbers and
+# the block in `oncotriage/config.py` together -- which is the point.
+_ITEM7_MAX = 3277
+_ITEM7_MARGIN = 1.20
+_ITEM7_ROUND_TO = 50
+check("5-0-a MATCHING_OUTPUT_TOKENS_PER_TRIAL is the item 7 sample run's "
+      "measured max plus a 20% margin, rounded up to the nearest 50 -- the "
+      "value AND the rule that produced it, so a value moved without a "
+      "measurement fails here",
+      config.MATCHING_OUTPUT_TOKENS_PER_TRIAL,
+      -(-int(_ITEM7_MARGIN * _ITEM7_MAX) // _ITEM7_ROUND_TO) * _ITEM7_ROUND_TO)
+check("5-0-a-i ...and it BOUNDS the measurement it was derived from, which is "
+      "the property a guard needs and a p95-based value would not have",
+      config.MATCHING_OUTPUT_TOKENS_PER_TRIAL > _ITEM7_MAX, True)
+check("5-0-a-ii ...and MATCHING_MAX_TOKENS still covers a whole single "
+      "response several times over, so the ceiling did not have to move with "
+      "it -- 0 of the 389 calls were truncated there",
+      config.MATCHING_MAX_TOKENS > 5 * _ITEM7_MAX, True)
+
 _FULL_CAP = [trial(i) for i in range(config.MAX_TRIALS_FOR_EVALUATION)]
 check("5-0 the grouped full-cap batch's output estimate is OVER the pre-split "
       "threshold, so the proactive splitter arms -- the state config.py's "
@@ -1131,24 +1223,52 @@ check("5e  non-degeneracy: the truncation batch is sized to the split budget, "
 # THE PREMISE THIS SECTION NEEDS IS ABOUT THE CHUNKS, NOT ABOUT THE BATCH, and
 # it used to be stated as the batch because the two agreed. They stopped
 # agreeing when MATCHING_OUTPUT_TOKENS_PER_TRIAL was raised to 2,500: the whole
-# 16-trial batch is now over the threshold, so the node ENTERS the proactive
-# branch -- and its `while` loop halves NOTHING, because every chunk the packer
-# produced is under the threshold, so `depth` is still 0 and the chunks still
-# reach the loop with the full truncation budget. What 5e measures is unmoved;
-# what changed is which line of the node delivered the 0. Asserting the chunk
-# estimate says the thing the scenario actually depends on, and it is true at
-# both values of the constant rather than pinning today's.
-check("5e  ...and every chunk the packer produced has an output estimate UNDER "
-      "the pre-split threshold, so the proactive splitter halves nothing "
-      "whatever the WHOLE batch's estimate is -- the chunks enter at depth 0 "
-      "and this measures the reactive splitter alone",
-      _evaluation.estimate_output_tokens(
-          _CUT_OFF[:len(_CUT_OFF) // 2]) > _threshold, False)
-check("5e  ...non-degeneracy: the packer really did produce half-batches, so "
-      "the reading above is about the chunks this run sent",
-      len(_CUT_OFF) // 2, _FLOOR_SIZE)
+# 16-trial batch went over the threshold, so the node ENTERS the proactive
+# branch -- and its `while` loop halved NOTHING, because every chunk the packer
+# produced was still under the threshold, so `depth` was still 0.
+#
+# AT 3,950 THAT STOPPED BEING TRUE AND THE SCENARIO PINS ITS OWN CONSTANT
+# RATHER THAN ITS OWN LUCK. A chunk of _FLOOR_SIZE = 8 estimates 8 x K, so the
+# proactive splitter goes dormant at K <= ~3,600 and armed above it; the
+# constant has now crossed that line, and it has been recalibrated three times.
+# This section's subject is the REACTIVE splitter and the depth a packed chunk
+# is charged -- neither of which is a fact about K -- so it forces the largest
+# K at which the proactive one is dormant, DERIVED by asking the shipped
+# estimator rather than typed. A scenario whose meaning depends on where an
+# unrelated constant happens to sit is a scenario that silently stops testing
+# what it names, which is exactly what 5e did between two recalibrations.
+def _output_estimate_at(k, trials):
+    """estimate_output_tokens for ``trials`` with the output constant forced."""
+    saved = _evaluation.__dict__[_OUTPUT_CONSTANT]
+    try:
+        _evaluation.__dict__[_OUTPUT_CONSTANT] = k
+        return _evaluation.estimate_output_tokens(trials)
+    finally:
+        _evaluation.__dict__[_OUTPUT_CONSTANT] = saved
 
-_r5e, _s5e = run_node(_CUT_OFF, budget=1, max_chunks=2, truncate=True)
+
+_5E_CHUNK = _CUT_OFF[:_FLOOR_SIZE]
+_5E_K = max(k for k in range(100, 10001, 10)
+            if _output_estimate_at(k, _5E_CHUNK) <= _threshold)
+check("5e  ...and the K this scenario forces keeps every chunk the packer "
+      "produces UNDER the pre-split threshold, so the proactive splitter "
+      "halves nothing and the chunks enter at depth 0 -- which is what makes "
+      "this a measurement of the reactive splitter alone",
+      _output_estimate_at(_5E_K, _5E_CHUNK) > _threshold, False)
+check("5e  ...non-degeneracy: at that same K the WHOLE batch is still OVER the "
+      "threshold, so the node really does enter the proactive branch and the "
+      "0 above is delivered by a `while` loop that ran and halved nothing "
+      "rather than by a branch that was never taken",
+      _output_estimate_at(_5E_K, _CUT_OFF) > _threshold, True)
+check("5e  ...non-degeneracy: the packer really did produce half-batches, so "
+      "the readings above are about the chunks this run sent",
+      len(_CUT_OFF) // 2, _FLOOR_SIZE)
+check("5e  ...and the forced constant was restored",
+      _evaluation.__dict__[_OUTPUT_CONSTANT],
+      config.MATCHING_OUTPUT_TOKENS_PER_TRIAL)
+
+_r5e, _s5e = run_node(_CUT_OFF, budget=1, max_chunks=2, truncate=True,
+                      output_per_trial=_5E_K)
 check("5e  packed chunks enter the loop at depth 0, so every trial in a "
       "always-truncating run reaches the TRUNCATION FLOOR rather than exhausting "
       "the split budget one level early",
@@ -1474,8 +1594,14 @@ control(
 control(
     "c6  an estimator that truncates is CAUGHT [1d]",
     _EVAL_SRC,
-    [("    return -(-len(text) // CHARS_PER_TOKEN)",
-      "    return len(text) // CHARS_PER_TOKEN")],
+    # THE ANCHOR MOVED WITH THE BODY. estimate_prompt_tokens rounded up with
+    # the integer idiom `-(-n // d)` while the divisor was always an int; it is
+    # `math.ceil(n / d)` now, because the per-arm divisor may be a float and
+    # that idiom returns a FLOAT for one -- which would put a float in an
+    # INTEGER column. The plant models the same defect at the new line: an
+    # estimator that TRUNCATES instead of rounding up.
+    [("    return math.ceil(len(text) / config.matching_chars_per_token())",
+      "    return int(len(text) / config.matching_chars_per_token())")],
     lambda m: (m.estimate_prompt_tokens("a"), m.estimate_prompt_tokens("a" * 5)),
     (0, 1),
 )
@@ -1707,7 +1833,11 @@ control(
     # implement. Planting only the ELSE line was VACUOUS the moment
     # MATCHING_OUTPUT_TOKENS_PER_TRIAL rose to 2,500 and the IF branch started
     # being taken: the plant reached nothing, the run behaved normally, and the
-    # control reported the fix as broken.
+    # control reported the fix as broken. WHICH BRANCH IS TAKEN IS NOW PINNED
+    # BY THE SCENARIO rather than by the shipped constant -- `output_per_trial`
+    # forces the K at which the proactive splitter is dormant -- so it is the
+    # ELSE line that runs today; both plants stay, because the property is "a
+    # packed chunk is charged no truncation level" and both lines implement it.
     [("        pending = [(c, 0) for c in reversed(initial_chunks)]",
       "        pending = [(c, 1) for c in reversed(initial_chunks)]"),
      ("        pending = [(c, depth) for c in reversed(initial_chunks)]",
@@ -1715,6 +1845,7 @@ control(
     lambda m: sorted({e.get("not_evaluable_reason")
                       for e in (run_node(_CUT_OFF, budget=1, max_chunks=2,
                                          truncate=True,
+                                         output_per_trial=_5E_K,
                                          node=m.node_llm_classifier_evaluation
                                          )[0].get("evaluations") or [])}),
     [_evaluation.NOT_EVALUABLE_SPLIT_BUDGET],

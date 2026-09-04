@@ -25,9 +25,11 @@ WHAT CAN GO WRONG, AND IS THEREFORE ASKED HERE
        section 2 makes the raw/neutralized distinction OBSERVABLE by driving a
        patient whose summary carries a fence-marker run, where the two differ.
     2. IT USES A SECOND FORMULA. A private ``len(x) // 4`` would agree with the
-       estimator until CHARS_PER_TOKEN moved or the rounding changed. Section 1
-       compares against the shipped function and section 6c re-derives the
-       relationship from the constant.
+       estimator until the divisor moved or the rounding changed -- and the
+       divisor is PER ARM now (``config.matching_chars_per_token()``), so such a
+       formula would also be silently right on this file's pinned OpenAI arm and
+       silently wrong on the shipped one. Section 1 compares against the shipped
+       function and section 6c re-derives the relationship from the owner.
     3. IT REPORTS A FABRICATED ZERO. A run that never rendered a prompt has no
        record size, and 0 is a genuine reading of an empty record. Section 3
        drives both terminal nodes that never reach Stage 5 and requires None.
@@ -832,11 +834,23 @@ print("\n  6a. it is the pipeline's estimator, re-derived from the constant")
 #
 # NOT a second formula: the value must be the ceiling division the shipped
 # estimator performs, over the neutralized record's characters. Re-derived here
-# from CHARS_PER_TOKEN so that a change to either the constant or the rounding
-# has to be made in both places deliberately.
-check("the value is ceil(len(record) / CHARS_PER_TOKEN)",
+# from the divisor so that a change to either it or the rounding has to be made
+# in both places deliberately.
+#
+# THE DIVISOR IS READ FROM `config.matching_chars_per_token()` RATHER THAN FROM
+# `CHARS_PER_TOKEN`, and under this file's OpenAI pin the two are the same 4.
+# Reading the OWNER is what keeps this section true of whatever arm it is run
+# on: the divisor became PER ARM when the shipped judge's tokenizer was measured
+# at ~3.5 against the OpenAI one's 4.2-4.4, and a section that re-derived the
+# expectation from the OpenAI-arm constant while the estimator read the owner
+# would be two formulas agreeing only because of the pin above it.
+_DIVISOR = config.matching_chars_per_token()
+check("the divisor this section re-derives with is the LIVE arm's, and under "
+      "this file's OpenAI pin that is CHARS_PER_TOKEN",
+      (_DIVISOR, CHARS_PER_TOKEN), (4, 4))
+check("the value is ceil(len(record) / the live arm's divisor)",
       get(_returned, KEY),
-      -(-len(_neutralize_fence_markers(_summary)[0]) // CHARS_PER_TOKEN))
+      -(-len(_neutralize_fence_markers(_summary)[0]) // _DIVISOR))
 
 # THE DISCRIMINATION USED TO RIDE ON THIS FIXTURE'S LENGTH AND NO LONGER DOES.
 # It read `len(_summary) % CHARS_PER_TOKEN != 0` -- true of the record this
@@ -852,15 +866,18 @@ check("the value is ceil(len(record) / CHARS_PER_TOKEN)",
 # disagrees at the other three, so this fails for a truncating estimator on any
 # day and for any record.
 _CEIL_PROBE = [(n, estimate_prompt_tokens("x" * n))
-               for n in range(CHARS_PER_TOKEN, 2 * CHARS_PER_TOKEN + 1)]
+               for n in range(_DIVISOR, 2 * _DIVISOR + 1)]
 check("the shipped estimator rounds UP at every remainder, so 6a is "
       "discriminating whatever this patient's record happens to measure",
       _CEIL_PROBE,
-      [(n, -(-n // CHARS_PER_TOKEN))
-       for n in range(CHARS_PER_TOKEN, 2 * CHARS_PER_TOKEN + 1)])
+      [(n, -(-n // _DIVISOR)) for n in range(_DIVISOR, 2 * _DIVISOR + 1)])
 check("...and a truncating estimator would disagree on at least one of them, "
       "which is what makes the check above worth running",
-      [n for n, got in _CEIL_PROBE if got != n // CHARS_PER_TOKEN] != [], True)
+      [n for n, got in _CEIL_PROBE if got != n // _DIVISOR] != [], True)
+check("...and every one of those readings is an int, which the integer "
+      "ceiling idiom stops being the moment a divisor is a float -- the reason "
+      "the shipped estimator is math.ceil now",
+      sorted({type(t).__name__ for _n, t in _CEIL_PROBE}), ["int"])
 
 print("\n  6b. the record is a proper part of the fixed prefix")
 #

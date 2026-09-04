@@ -35,6 +35,7 @@ nothing, replay would go to the network instead of serving its recording.
 import contextvars
 import html
 import json
+import math
 import re
 import time
 from collections import Counter
@@ -67,7 +68,6 @@ from oncotriage.agent.state import (
     normalize_trial_verdict,
 )
 from oncotriage.config import (
-    CHARS_PER_TOKEN,
     MATCHING_CALL_MODE_PER_TRIAL,
     MATCHING_INPUT_PACKING_ENABLED,
     MATCHING_INPUT_TOKEN_BUDGET,
@@ -2959,8 +2959,8 @@ def estimate_output_tokens(trials: List[Dict]) -> int:
     with a residual standard deviation of 1,935 tokens, identical to the
     trial-count-only model. The criteria-length term is negative, negligible,
     and carries no signal. The estimate is therefore linear in trial count
-    alone, and the CHARS_PER_TOKEN proxy is applied to the criteria only as a
-    tie-breaker for pathological inputs, not as a driver.
+    alone, and the characters-per-token proxy is applied to the criteria only
+    as a tie-breaker for pathological inputs, not as a driver.
 
     THE SENTENCE THAT USED TO FOLLOW IS WITHDRAWN, and it is left named rather
     than deleted because the estimate still rests on the half of it that
@@ -2994,7 +2994,12 @@ def estimate_output_tokens(trials: List[Dict]) -> int:
         eligibility = trial_obj.get("trial", {}).get("eligibility", {})
         criteria_chars += len(eligibility.get("inclusion_criteria") or "")
         criteria_chars += len(eligibility.get("exclusion_criteria") or "")
-    criteria_tokens = criteria_chars / CHARS_PER_TOKEN
+    # THE LIVE ARM'S DIVISOR, NOT `CHARS_PER_TOKEN`. Read through the one
+    # owner, at call time, for `estimate_prompt_tokens`'s reason; this term is
+    # a capped tie-breaker rather than the driver, so the arm only moves it at
+    # the margin -- but a criteria term measured with one arm's tokenizer while
+    # the count term is calibrated on another's is two judges in one estimate.
+    criteria_tokens = criteria_chars / config.matching_chars_per_token()
     criteria_component = min(
         criteria_tokens * 0.05,
         0.25 * MATCHING_OUTPUT_TOKENS_PER_TRIAL * len(trials),
@@ -3682,11 +3687,27 @@ def _build_trials_text(trials: List[Dict], *, log_events: bool = True) -> str:
 # reconciliation is duplicated here -- all of it is already chunk-aware, and
 # packing only changes how the first generation of chunks is produced.
 
-# What the token figures in the packing record were measured with. Recorded in
-# provenance rather than left implicit: the packer's decisions are only
-# reproducible if the estimator that made them is named, and this project has
-# been through one estimator change already.
-PACKING_METHOD_CHARS = f"characters/{CHARS_PER_TOKEN}"
+def packing_method_chars() -> str:
+    """What the token figures in the packing record were measured with.
+
+    Recorded in provenance rather than left implicit: the packer's decisions
+    are only reproducible if the estimator that made them is named, and this
+    project has been through two estimator changes already.
+
+    A FUNCTION RATHER THAN THE MODULE CONSTANT IT REPLACES, and that is forced
+    rather than a preference. The divisor is per-arm as of
+    ``config.matching_chars_per_token()``, so a label built once at import
+    would state the divisor of whichever arm this module was imported under and
+    would keep stating it after a process moved the provider -- naming a
+    divisor the packer did not use, in the field that exists so nobody has to
+    guess which divisor the packer used. Recording the wrong estimator is worse
+    than recording none, because a reader can act on it.
+
+    Returns:
+        e.g. ``"characters/4"`` on the OpenAI arm, ``"characters/3.5"`` on the
+        Converse one.
+    """
+    return f"characters/{config.matching_chars_per_token()}"
 
 
 class PackingBlockMismatchError(RuntimeError):
@@ -3710,23 +3731,46 @@ class PackingBlockMismatchError(RuntimeError):
 def estimate_prompt_tokens(text: str) -> int:
     """Estimated tokens for a piece of prompt text.
 
-    The same characters/CHARS_PER_TOKEN proxy File 11 uses for embedding batch
-    sizing and estimate_output_tokens uses for its criteria term, applied to the
-    request instead of the response. No tokenizer: tiktoken would be a new heavy
-    dependency and an import cost, and it would still not be the model's own
-    tokenizer -- gpt-5.6-terra publishes none.
+    The same characters-per-token proxy estimate_output_tokens uses for its
+    criteria term, applied to the request instead of the response. No
+    tokenizer: tiktoken would be a new heavy dependency and an import cost, and
+    it would still not be the model's own tokenizer -- neither shipped judge
+    publishes one this project could load.
 
-    CHARS_PER_TOKEN is 4 against a measured 4.2-4.4 on this project's prompts,
-    so this OVER-states by 5-10%. That is the direction a budget guard has to
-    err in; see the constant.
+    THE DIVISOR IS THE LIVE ARM'S, NOT `CHARS_PER_TOKEN`, and that is the whole
+    of this pass. `config.matching_chars_per_token()` answers 4 on the two
+    gpt-5.6-terra arms -- where 4 against a measured 4.2-4.4 OVER-states by
+    5-10% -- and 3.5 on the shipped Converse arm, where 4 against a measured
+    3.50-3.87 UNDER-stated by up to 12.5%. That is the direction a budget guard
+    must not err in: an under-estimate ships a chunk over the threshold the
+    packing exists to stay under. The table and the argument are at the
+    constant.
 
-    Rounded UP, for the same reason. int() truncation would let a chunk sit one
-    token over the budget for every fractional remainder in it, which across
-    fifteen trials is a systematic under-count of a guard.
+    READ AT CALL TIME rather than bound at import, on `matching_call_mode()`'s
+    argument: `MATCHING_PROVIDER` is a module attribute a process may move, and
+    an estimate made with the divisor this module was imported under would
+    price a request the live arm is not going to send. Every figure ONE Stage 5
+    dispatch publishes is computed within that dispatch, so the arm cannot move
+    underneath a single patient's arithmetic in any way this pipeline produces.
+
+    Rounded UP. int() truncation would let a chunk sit one token over the
+    budget for every fractional remainder in it, which across fifteen trials is
+    a systematic under-count of a guard.
+
+    `math.ceil` RATHER THAN THE `-(-n // d)` INTEGER IDIOM IT REPLACES, because
+    the divisor is no longer necessarily an int and that idiom returns a FLOAT
+    for a float divisor -- which would put a float in an INTEGER column and in
+    the packing JSON. The two shipped divisors are both exactly representable
+    in binary (4 and 7/2), and IEEE-754 division returns an exactly
+    representable quotient exactly, so on both arms this agrees with the old
+    idiom for every input rather than merely almost always.
+
+    Returns:
+        A non-negative int.
     """
     if not text:
         return 0
-    return -(-len(text) // CHARS_PER_TOKEN)
+    return math.ceil(len(text) / config.matching_chars_per_token())
 
 
 def _trial_input_tokens(block: str) -> int:
@@ -3762,7 +3806,7 @@ def _trial_input_tokens(block: str) -> int:
 
     Returns:
         The token estimate for that block, by the same
-        characters/CHARS_PER_TOKEN proxy every other input figure uses.
+        characters-per-token proxy every other input figure uses.
     """
     return estimate_prompt_tokens(block)
 
@@ -3899,7 +3943,7 @@ def pack_trials_by_input_tokens(trials: List[Dict], fixed_tokens: int,
     """
     report = {
         "enabled": True,
-        "method": PACKING_METHOD_CHARS,
+        "method": packing_method_chars(),
         "fixed_tokens": fixed_tokens,
         "budget_tokens_configured": budget,
         "budget_tokens": budget,
@@ -4857,7 +4901,7 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     # them here would make a per-patient figure carry a per-template constant.
     #
     # THROUGH THE PIPELINE'S OWN ESTIMATOR, never a second formula. This is the
-    # same characters/CHARS_PER_TOKEN proxy fixed_input_tokens below is built
+    # same characters-per-token proxy fixed_input_tokens below is built
     # from, so "record tokens" and "fixed tokens" are commensurable and a reader
     # can subtract one from the other. A private len()//4 here would be free to
     # drift from the estimator the packer actually spends its budget with.
@@ -5137,7 +5181,7 @@ CLINICAL TRIALS:
         # changed the stored JSON of every OFF-arm row for a fact those rows
         # already state by omission -- and would have broken this pass's own
         # byte-equivalence promise.
-        packing_report = {"enabled": False, "method": PACKING_METHOD_CHARS,
+        packing_report = {"enabled": False, "method": packing_method_chars(),
                           "fixed_tokens": fixed_input_tokens,
                           "budget_tokens_configured": MATCHING_INPUT_TOKEN_BUDGET,
                           "budget_tokens": None, "max_chunks": None,
@@ -5179,7 +5223,7 @@ CLINICAL TRIALS:
         # provenance has to be able to state, and it is different from "packing
         # ran and produced one chunk" -- which is the comparison the validation
         # experiment is built on.
-        packing_report = {"enabled": False, "method": PACKING_METHOD_CHARS,
+        packing_report = {"enabled": False, "method": packing_method_chars(),
                           "fixed_tokens": fixed_input_tokens,
                           "budget_tokens_configured": MATCHING_INPUT_TOKEN_BUDGET,
                           "budget_tokens": None, "max_chunks": None,
