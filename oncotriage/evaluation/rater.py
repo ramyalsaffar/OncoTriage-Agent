@@ -4424,6 +4424,109 @@ def require_state_subset(state, index, state_path):
         code="state_subset_mismatch")
 
 
+STATE_SHAPE_KEY = "request_shape_version"
+"""The key a state file records its submission shape under.
+
+Deliberately the SAME NAME the three written artifacts use, so an operator
+comparing a refusal against the manifest beside it is comparing one spelling
+rather than two. It is a module constant because the refusal below quotes it in
+the remedy it offers, and a remedy naming a key that does not exist is worse
+than no remedy.
+"""
+
+
+def require_state_shape(state, shape_version, state_path):
+    """Refuse a state file whose batches were submitted at a DIFFERENT shape.
+
+    ``require_state_mode`` and ``require_state_subset`` guard WHICH POPULATION
+    a resume joins onto. This guards WHICH INSTRUMENT produced the answers
+    being joined. Nothing else catches it: primary custom_ids are identical
+    across shapes, every returned id is in the rebuilt index, the join succeeds
+    and every rating parses -- so a shape-1 batch resumed by shape-2 code
+    produces a complete, clean-looking session whose ``rater_manifest.json``,
+    ``ratings.json`` and ``summary.json`` all record shape 2 over answers that
+    were never shown a trial's criteria. There is no parse failure, no coverage
+    hole and no counter that moves; the artifacts simply name the wrong
+    instrument, permanently, and a later reader comparing two summaries by
+    ``request_shape_version`` is comparing a label to a lie.
+
+    **ABSENT REFUSES. IT IS NOT READ AS SHAPE 1, AND THAT IS FROM EVIDENCE
+    RATHER THAN FROM CAUTION.** ``require_state_mode`` reads an absent ``mode``
+    as anchored on the argument that every such file on disk was in fact
+    written by an anchored run -- a claim about the artifacts, and it holds.
+    The same claim about the shape is FALSE: the criteria-reference probe
+    submitted batch ``batch_6aa1bde246708190a634a42b8104e137`` at shape 2
+    before this field existed, and its state file at
+    ``09- Testing/Evaluation Runs/criteria_reference_probe_20260909/
+    rater_shape2/rater_state_blind.json`` records no shape while the
+    ``rater_manifest.json`` written beside it records shape 2. So the absent
+    population contains at least one shape-2 member, "absent means 1" would
+    relabel it, and the only honest answer is to refuse and say so.
+
+    **THE REMEDY IS EXPLICIT ADOPTION, NOT A FLAG.** A refusal with no way
+    forward would strand money already spent: a legitimately interrupted
+    legacy batch is retrievable and would become unresumable. So the message
+    offers the operator the one thing this module cannot do for them -- write
+    the shape into the file themselves, having established it. That makes the
+    claim theirs, auditable in the file, and impossible to make by accident,
+    which is exactly what distinguishes it from this module guessing.
+
+    Returns the shape the recorded batches were submitted at, which past this
+    point is equal to ``shape_version`` by construction -- see the call site
+    for why nothing downstream reads it.
+    """
+    if not state:
+        # NO STATE FILE IS NOT A DISAGREEMENT. This is the first submit, and
+        # it is also `--resume` against a fresh --output-dir, which
+        # `refuse_batch_from_other_mode` documents as a real workflow. Nothing
+        # is recorded, so nothing can be compared; see the call site for the
+        # residual this leaves.
+        return None
+    found = state.get(STATE_SHAPE_KEY)
+    # ``bool`` AND ``float`` ARE EXCLUDED, and neither is fastidiousness. This
+    # refusal invites a hand edit, so a hand-editable file is exactly where a
+    # JSON ``true`` or ``1.0`` shows up -- and ``True == 1`` and ``1.0 == 1``
+    # are both True in Python, so either would be ADOPTED as shape 1 by a bare
+    # comparison. A resume proceeding on a claim nobody made is the one thing
+    # this guard exists to prevent. Both land in the mismatch branch below,
+    # where ``{found!r}`` renders ``True`` / ``1.0`` and is the tell.
+    matched = (isinstance(found, int) and not isinstance(found, bool)
+               and found == shape_version)
+    if matched:
+        return found
+    if found is None:
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records no request shape, so "
+            f"what its batches were submitted at cannot be established from "
+            f"it. An absent shape is NOT read as "
+            f"{REQUEST_SHAPE_HISTORICAL}: a shape-"
+            f"{REQUEST_SHAPE_CRITERIA_REFERENCE} batch was submitted before "
+            f"this field existed, so guessing would attribute real answers to "
+            f"an instrument that did not produce them -- which is the one "
+            f"thing versioning the shape exists to make impossible. Submit "
+            f"afresh with --output-dir, or, if you can establish which code "
+            f"submitted those batches, record it yourself by adding "
+            f"\"{STATE_SHAPE_KEY}\": <one of {REQUEST_SHAPES}> to that file. "
+            f"The rater_manifest.json written beside a state file records "
+            f"the shape of the session that wrote it, where one exists -- "
+            f"it records no batch ids, so it is evidence rather than "
+            f"proof for any particular batch.",
+            code="state_shape_absent")
+    describe = (lambda v: REQUEST_SHAPE_NOTES.get(
+        v, "a shape this module does not know how to build"))
+    raise RaterRefusal(
+        f"the state file at {state_path!r} records request shape {found!r} "
+        f"and this code builds shape {shape_version!r}. They are different "
+        f"instruments -- {found!r} is {describe(found)} and {shape_version!r} "
+        f"is {describe(shape_version)} -- so resuming across them would join "
+        f"answers produced by {found!r}-shaped requests onto a session whose "
+        f"rater_manifest.json, ratings.json and summary.json all record "
+        f"{shape_version!r}, attributing every figure to an instrument that "
+        f"did not produce it. Resume with the code that submitted them, or "
+        f"use --output-dir to keep the two apart.",
+        code="state_shape_mismatch")
+
+
 def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
     """Refuse to resume a batch that the OTHER mode's state file claims.
 
@@ -6331,6 +6434,32 @@ def main(argv=None):
     try:
         require_state_mode(state, index.mode, state_path)
         require_state_subset(state, index, state_path)
+        # ── WHICH INSTRUMENT PRODUCED THE ANSWERS BEING JOINED ────────
+        #
+        # The two above guard which POPULATION a resume joins onto. This
+        # guards which REQUEST SHAPE produced it, and it is the only thing
+        # that can: primary custom_ids are identical across shapes, so the
+        # join succeeds, every rating parses, and the session looks clean
+        # while its three artifacts name an instrument that did not run.
+        #
+        # ITS RETURN IS DELIBERATELY NOT READ, AND THAT IS THE ARGUMENT FOR
+        # THE ARTIFACTS BELOW. Past this line the recorded shape and
+        # `index.shape_version` are EQUAL -- a mismatch and an absence both
+        # raised -- so the manifest, ratings.json and summary.json reading
+        # `index.shape_version` ARE reporting the shape the requests were
+        # built with. Reading the state's copy instead would be a second
+        # source for a value just proved identical, and would have to invent
+        # an answer for the first submit, where there is no state to read.
+        #
+        # THE RESIDUAL, NAMED: `--resume <id>` against a directory with NO
+        # state file records nothing, so nothing is compared and the
+        # artifacts carry today's shape. That is the workflow
+        # `refuse_batch_from_other_mode` exists for -- it consults the other
+        # mode's state files at two known paths -- and there is no
+        # equivalent evidence for a shape, because the state file is the
+        # only place a shape is ever written. Refusing it would refuse a
+        # legitimate resume.
+        require_state_shape(state, index.shape_version, state_path)
     except RaterRefusal as exc:
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="state", reason=exc.code)
@@ -6373,6 +6502,14 @@ def main(argv=None):
                   "retest_requests": len(index.retest_ids),
                   "requests": len(index.requests),
                   "include_keys_sha256": include_keys_fingerprint(index),
+                  # THE SHAPE, RECORDED AT SUBMISSION TIME. This dict is
+                  # applied before the first `write_state` -- which happens
+                  # inside `submit_batches`, after the first batch id exists
+                  # -- so no state file can name a batch without also naming
+                  # the shape it was submitted at. On a resume it re-writes a
+                  # value `require_state_shape` has just proved equal, so it
+                  # is a no-op there rather than a silent adoption.
+                  STATE_SHAPE_KEY: index.shape_version,
                   "rubric_sha256": index.rubric_meta["rubric_sha256"]})
 
     plan = None

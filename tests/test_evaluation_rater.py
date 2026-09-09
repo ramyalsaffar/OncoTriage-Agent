@@ -2776,6 +2776,291 @@ check("9k  the message names both populations and the fix",
           {"include_keys_sha256": _SUB_SHA}, _full_idx, "/s")))
           for w in ("whole run", _SUB_SHA[:12], "--output-dir")), True)
 
+# --- 9k -- ...AND NOT ACROSS REQUEST SHAPES ----------------------------
+#
+# The subset guard above asks WHICH POPULATION a resume joins onto. This asks
+# WHICH INSTRUMENT produced the answers being joined, and nothing else can:
+# primary custom_ids are identical across shapes, so a shape-1 batch resumed by
+# shape-2 code joins cleanly, parses cleanly, reports no coverage hole and
+# moves no counter -- and writes three artifacts all recording shape 2 over
+# answers that were never shown a trial's criteria.
+#
+# MEASURED BEFORE THE GUARD WAS WRITTEN, AND PINNED HERE: with `mode`, the
+# subset and the batch id all matching, `require_state_mode`,
+# `require_state_subset` and `refuse_batch_from_other_mode` ALL pass on a
+# shape-1 state resumed by shape-2 code. The first check below is those three,
+# so the section states the gap it closes rather than only the closure.
+import ast as _ast9k                                             # noqa: E402
+import io as _io9k                                               # noqa: E402
+import os as _os9k                                               # noqa: E402
+import shutil as _shutil9k                                       # noqa: E402
+import tempfile as _tempfile9k                                   # noqa: E402
+
+
+def _fn9k(name):
+    """``R.<name>``, or a stand-in that makes every check FAIL by name.
+
+    ``refusal_code(R.require_state_shape, ...)`` looks the attribute up while
+    ``check``'s ARGUMENTS are being evaluated, so a revert that deletes the
+    guard raises there and aborts the file -- one traceback where it owes 463
+    results. This project has shipped that shape eighteen times, and the revert
+    matrix for this section found it here on its first run.
+    """
+    fn = getattr(R, name, None)
+    if fn is not None:
+        return fn
+
+    def _absent(*_a, **_k):
+        raise AttributeError("oncotriage.evaluation.rater has no %r" % name)
+
+    return _absent
+
+
+# Bound ONCE, defensively, for the same reason: a revert that deletes the
+# constant must FAIL the checks below rather than abort them.
+_SHAPE_KEY = getattr(R, "STATE_SHAPE_KEY", "<no STATE_SHAPE_KEY>")
+_SHAPE_STATE = {"mode": R.MODE_BLIND, "include_keys_sha256": None,
+                "batches": [{"id": "batch_shape", "tag": "primary"}]}
+_shape_idx = built(R.MODE_BLIND)
+check("9k  the index under test really is an index, built at the shipped "
+      "shape (probe, so nothing below passes or aborts for the wrong reason)",
+      getattr(_shape_idx, "shape_version", "<no attr>"),
+      R.REQUEST_SHAPE_VERSION)
+check("9k  the OTHER guards do not see a shape at all -- mode, subset and the "
+      "cross-mode batch check all pass on a state submitted at another shape",
+      tuple(refusal_code(fn, *args) for fn, args in (
+          (R.require_state_mode, (dict(_SHAPE_STATE, request_shape_version=1),
+                                  R.MODE_BLIND, "/s")),
+          (R.require_state_subset, (dict(_SHAPE_STATE,
+                                         request_shape_version=1),
+                                    _shape_idx, "/s")),
+          (R.refuse_batch_from_other_mode, (["batch_shape"], R.MODE_BLIND,
+                                            "/nonexistent-out", None)))),
+      ("<did not raise>",) * 3)
+
+check("9k  a shape-1 state file resumed by shape-2 code refuses",
+      refusal_code(_fn9k("require_state_shape"),
+                   dict(_SHAPE_STATE, request_shape_version=1),
+                   R.REQUEST_SHAPE_CRITERIA_REFERENCE, "/s"),
+      "state_shape_mismatch")
+check("9k  and the reverse -- a shape-2 state file resumed by shape-1 code",
+      refusal_code(_fn9k("require_state_shape"),
+                   dict(_SHAPE_STATE, request_shape_version=2),
+                   R.REQUEST_SHAPE_HISTORICAL, "/s"),
+      "state_shape_mismatch")
+check("9k  a value outside REQUEST_SHAPES is a mismatch and names itself "
+      "rather than raising KeyError on the notes table",
+      refusal_code(_fn9k("require_state_shape"),
+                   dict(_SHAPE_STATE, request_shape_version=99),
+                   R.REQUEST_SHAPE_VERSION, "/s"),
+      "state_shape_mismatch")
+# `True == 1` and `1.0 == 1` are both True in Python, and this refusal invites a
+# hand edit -- so a hand-editable file is exactly where a JSON `true` or `1.0`
+# turns up. A bare `==` would ADOPT either as shape 1 and resume on a claim
+# nobody made, which is the one thing the guard exists to prevent.
+check("9k  a bool is NOT read as the shape it equals -- True would otherwise "
+      "sail through as shape 1",
+      refusal_code(_fn9k("require_state_shape"),
+                   dict(_SHAPE_STATE, request_shape_version=True),
+                   R.REQUEST_SHAPE_HISTORICAL, "/s"), "state_shape_mismatch")
+check("9k  ...and neither is a float, for the same reason",
+      refusal_code(_fn9k("require_state_shape"),
+                   dict(_SHAPE_STATE, request_shape_version=1.0),
+                   R.REQUEST_SHAPE_HISTORICAL, "/s"), "state_shape_mismatch")
+check("9k  ...and a shape recorded as a STRING is a mismatch, not a match",
+      refusal_code(_fn9k("require_state_shape"),
+                   dict(_SHAPE_STATE, request_shape_version="2"),
+                   R.REQUEST_SHAPE_CRITERIA_REFERENCE, "/s"),
+      "state_shape_mismatch")
+check("9k  non-degeneracy: those three really do compare equal to the shape "
+      "they are refused against, so the checks above are about the TYPE test "
+      "rather than about the value",
+      (True == R.REQUEST_SHAPE_HISTORICAL, 1.0 == R.REQUEST_SHAPE_HISTORICAL,
+       "2" == R.REQUEST_SHAPE_CRITERIA_REFERENCE), (True, True, False))
+check("9k  CONTROL: the matching shape does not refuse, at either shape",
+      tuple(refusal_code(_fn9k("require_state_shape"),
+                         dict(_SHAPE_STATE, request_shape_version=s), s, "/s")
+            for s in R.REQUEST_SHAPES),
+      ("<did not raise>",) * len(R.REQUEST_SHAPES))
+check("9k  CONTROL: no state file at all is not a refusal -- that is the "
+      "first submit, and --resume against a fresh --output-dir",
+      tuple(refusal_code(_fn9k("require_state_shape"), s, R.REQUEST_SHAPE_VERSION,
+                         "/s") for s in ({}, None)),
+      ("<did not raise>",) * 2)
+
+# ABSENT REFUSES, AND THE POLICY IS FROM EVIDENCE RATHER THAN FROM CAUTION.
+# `require_state_mode` reads an absent `mode` as anchored because every such
+# file on disk was in fact written by an anchored run -- a claim about the
+# artifacts, and it holds. The same claim about the shape is FALSE: the
+# criteria-reference probe submitted at shape 2 before this field existed, and
+# its state file records no shape while the manifest beside it records 2. So
+# the absent population has at least one shape-2 member and "absent means 1"
+# would relabel it. This is the check that fails if anyone later "fixes" the
+# refusal by defaulting.
+check("9k  an ABSENT shape refuses rather than being read as shape 1",
+      refusal_code(_fn9k("require_state_shape"), dict(_SHAPE_STATE),
+                   R.REQUEST_SHAPE_VERSION, "/s"), "state_shape_absent")
+check("9k  ...and refuses under shape-1 code too, so it is 'unknown' rather "
+      "than 'not the shipped shape'",
+      refusal_code(_fn9k("require_state_shape"), dict(_SHAPE_STATE),
+                   R.REQUEST_SHAPE_HISTORICAL, "/s"), "state_shape_absent")
+check("9k  the absent refusal is a DIFFERENT code from the mismatch, because "
+      "the remedies differ -- resume with matching code, versus establish the "
+      "shape or submit afresh",
+      refusal_code(_fn9k("require_state_shape"), dict(_SHAPE_STATE),
+                   R.REQUEST_SHAPE_VERSION, "/s")
+      != refusal_code(_fn9k("require_state_shape"),
+                      dict(_SHAPE_STATE, request_shape_version=1),
+                      R.REQUEST_SHAPE_CRITERIA_REFERENCE, "/s"), True)
+check("9k  the absent message refuses to guess out loud, and offers the one "
+      "remedy this module cannot apply for the operator",
+      all(w in str(drive(lambda: _fn9k("require_state_shape")(
+          dict(_SHAPE_STATE), R.REQUEST_SHAPE_VERSION, "/s")))
+          for w in ("records no request shape", "NOT read as",
+                    _SHAPE_KEY, "--output-dir")), True)
+check("9k  the mismatch message names both shapes, what joining them would "
+      "corrupt, and the fix",
+      all(w in str(drive(lambda: _fn9k("require_state_shape")(
+          dict(_SHAPE_STATE, request_shape_version=1),
+          R.REQUEST_SHAPE_CRITERIA_REFERENCE, "/s")))
+          for w in ("records request shape 1", "builds shape 2",
+                    "rater_manifest.json", "ratings.json", "summary.json",
+                    "--output-dir")), True)
+# DERIVED, NOT RETYPED: both shapes are described from REQUEST_SHAPE_NOTES, so
+# a note edited in one place cannot leave the refusal describing the old one.
+check("9k  both descriptions come from REQUEST_SHAPE_NOTES",
+      all(R.REQUEST_SHAPE_NOTES[s] in str(drive(lambda: _fn9k("require_state_shape")(
+          dict(_SHAPE_STATE, request_shape_version=1),
+          R.REQUEST_SHAPE_CRITERIA_REFERENCE, "/s")))
+          for s in R.REQUEST_SHAPES), True)
+
+# --- 9k -- ...AND THE SHAPE REACHES THE STATE FILE AT SUBMISSION -------
+#
+# TWO HALVES, AND NEITHER REPLACES THE OTHER. An AST scan cannot see a value
+# carried and then serialized wrongly; a round trip cannot see a field that was
+# never put in the dict main() writes. The guard above is worth nothing if the
+# field never lands -- it would then refuse EVERY resume forever.
+_MAIN_SRC = _ast9k.parse(_io9k.open(R.__file__, encoding="utf-8").read())
+_main_fn = next((n for n in _ast9k.walk(_MAIN_SRC)
+                 if isinstance(n, _ast9k.FunctionDef) and n.name == "main"),
+                None)
+check("9k  main() was located (probe, so the scans below cannot pass over an "
+      "empty walk)", _main_fn is not None, True)
+
+
+def _state_update_pairs(fn):
+    """(key source, value source) for main()'s ``state.update({...})``."""
+    for node in _ast9k.walk(fn) if fn is not None else ():
+        if not (isinstance(node, _ast9k.Call)
+                and isinstance(node.func, _ast9k.Attribute)
+                and node.func.attr == "update"
+                and isinstance(node.func.value, _ast9k.Name)
+                and node.func.value.id == "state"
+                and node.args and isinstance(node.args[0], _ast9k.Dict)):
+            continue
+        d = node.args[0]
+        return [(_ast9k.unparse(k), _ast9k.unparse(v))
+                for k, v in zip(d.keys, d.values)]
+    return "<no state.update({...}) in main()>"
+
+
+_UPDATE = _state_update_pairs(_main_fn)
+check("9k  main()'s state.update({...}) was located (probe)",
+      isinstance(_UPDATE, list) and len(_UPDATE) > 1, True)
+check("9k  it records the request shape, under the module's own key constant "
+      "rather than a retyped string, from the index the requests were built "
+      "from",
+      [v for k, v in (_UPDATE if isinstance(_UPDATE, list) else [])
+       if k == "STATE_SHAPE_KEY"], ["index.shape_version"])
+check("9k  the state key is the same spelling the three written artifacts "
+      "use, so a refusal and the manifest beside it can be compared",
+      _SHAPE_KEY, "request_shape_version")
+
+
+class _SubmitStub(object):
+    """``files.create`` + ``batches.create``, and nothing else. No network.
+
+    ``_StubClient`` above serves a canned OUTPUT file for ``collect_results``;
+    this is the other half of the API surface, and it exists so the check below
+    can drive the REAL ``submit_batches`` -- the only place a state file is
+    written on the submit path -- rather than asserting about ``write_state``
+    in isolation.
+    """
+
+    def __init__(self):
+        outer = self
+        self.uploaded = []
+
+        class _Files(object):
+            def create(self, file, purpose):
+                outer.uploaded.append(file[0])
+                return types.SimpleNamespace(id="file-stub")
+
+        class _Batches(object):
+            def create(self, **kw):
+                return types.SimpleNamespace(
+                    id="batch-stub-%d" % len(outer.uploaded))
+
+        self.files = _Files()
+        self.batches = _Batches()
+
+
+_shape_tmp = _tempfile9k.mkdtemp(prefix="oncotriage-rater-shape-")
+try:
+    _state_path = _os9k.path.join(_shape_tmp, R.state_filename(R.MODE_BLIND))
+    # The dict main() holds when `submit_batches` is entered, with the one
+    # field under test taken FROM THE INDEX rather than typed here -- so a
+    # defect that stops `build_requests` recording a shape fails this too.
+    _live = {"mode": R.MODE_BLIND,
+             _SHAPE_KEY: getattr(_shape_idx, "shape_version", None)}
+    _submitted = drive(R.submit_batches, _SubmitStub(),
+                       [[{"custom_id": "c0", "params": {"model": "m"}}]],
+                       _live, _state_path, "primary")
+    _written = drive(R.read_state, _state_path)
+    check("9k  submit_batches really wrote the state file (probe)",
+          isinstance(_written, dict) and bool(_written.get("batches")), True)
+    check("9k  and the shape is in it, at submission time, beside the batch "
+          "id it was submitted with",
+          walk(_written, _SHAPE_KEY), R.REQUEST_SHAPE_VERSION)
+    # A resume of exactly that file, by this code, must proceed. Without this
+    # the guard could be satisfied by a field that never matches anything.
+    check("9k  and a resume of that very file by this code proceeds",
+          refusal_code(_fn9k("require_state_shape"), _written,
+                       R.REQUEST_SHAPE_VERSION, _state_path),
+          "<did not raise>")
+finally:
+    _shutil9k.rmtree(_shape_tmp, ignore_errors=True)
+check("9k  the temp directory is gone", _os9k.path.isdir(_shape_tmp), False)
+
+# THE GUARD IS CALLED, AND FROM THE SAME try/except AS THE OTHER TWO. A refusal
+# raised outside that block would escape main() as a traceback instead of the
+# "REFUSED: ..." line and the exit 1 the other two produce.
+check("9k  main() calls require_state_shape, with the index's shape and the "
+      "state file path",
+      "require_state_shape(state, index.shape_version, state_path)"
+      in (_ast9k.unparse(_main_fn) if _main_fn is not None else ""), True)
+
+
+def _calls_inside_try(fn, name):
+    """How many times ``name`` is called from inside a ``try`` body of ``fn``."""
+    found = 0
+    for node in _ast9k.walk(fn) if fn is not None else ():
+        if not isinstance(node, _ast9k.Try):
+            continue
+        for stmt in node.body:
+            for call in _ast9k.walk(stmt):
+                if (isinstance(call, _ast9k.Call)
+                        and isinstance(call.func, _ast9k.Name)
+                        and call.func.id == name):
+                    found += 1
+    return found
+
+
+check("9k  and the call is inside a try, exactly as often as the subset guard "
+      "it sits beside, so the refusal prints and exits 1 rather than escaping",
+      (_calls_inside_try(_main_fn, "require_state_shape"),
+       _calls_inside_try(_main_fn, "require_state_subset")), (1, 1))
+
 # --- 9l -- THERE IS NO CACHE TTL, AND THE FLAGS THAT SET ONE ARE GONE ----
 #
 # WHAT THIS BLOCK USED TO PIN, and why it could not simply be deleted. It held

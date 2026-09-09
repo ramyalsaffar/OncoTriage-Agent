@@ -892,7 +892,7 @@ BUCKETS = {
         "asserted"),
     "test_evaluation_rater.py": (
         _A, None,
-        "ran green in 1.1s, 311 checks, against ONLY the directory skeleton, "
+        "ran green in 0.9s, 463 checks, against ONLY the directory skeleton, "
         "identical in a depth-1 clone: the blind rater harness. IT DOES NOT "
         "NEED ragas INSTALLED -- measured, the interpreter that ran it green "
         "has no ragas distribution at all; `09- Testing/ragas-venv/` is a "
@@ -900,9 +900,11 @@ BUCKETS = {
         "cannot be input-based and says so: section 7j rebinds "
         "rater.render_system_prompt inside try/finally and asserts the "
         "restore BY IDENTITY, which is an attribute rebind rather than a "
-        "patched source, so it execs nothing. The one thing it writes is a "
-        "fresh tempfile.mkdtemp holding two state files, removed in a finally "
-        "with the removal then ASSERTED -- nothing in the repository, so it "
+        "patched source, so it execs nothing. All it writes is two fresh "
+        "tempfile.mkdtemp trees -- two state files in one, and the state "
+        "file the real submit_batches writes in the other -- each removed "
+        "in a finally with the removal then ASSERTED. Nothing in the "
+        "repository, so it "
         "is not in the collision matrix. No network, no keys, no spend, no "
         "corpus"),
     "test_evaluation_ragas_manifest.py": (
