@@ -592,12 +592,40 @@ M_CATEGORY_UNREADABLE: Dict[str, int] = Counter()
 _M_KEY_MAX_LEN: int = 60
 
 
+class MCategoryStage(NamedTuple):
+    """What ``_m_category_stage_with_date`` answers: the ordinal this axis
+    implies, the date of the Observation that said so, and that Observation.
+
+    A NamedTuple rather than a bare 3-tuple, for the reason ``PatientStage``
+    gives one member down -- and the reason is measured rather than
+    anticipated. This return was a 2-tuple until the stage-attribution item
+    needed the answering record itself; widening it broke NINE positional pins
+    across two test files in a single edit, every one of them a check that had
+    written ``[1:]`` or compared against a literal 2-tuple. Read by name they
+    cannot break that way, and a future member costs nobody an edit.
+
+    Attributes:
+        ordinal:     4 or None. None means "this axis says nothing", never
+                     "stage 0".
+        date:        the RAW ``date`` of the answering Observation, or None.
+        observation: the answering Observation itself, or None. Returned so a
+                     caller can ask a further question OF THE RECORD THAT
+                     ANSWERED -- today, which Condition the record links it to.
+                     Asking that of any other member of the list would attach a
+                     cancer name to an ordinal a different record produced.
+    """
+
+    ordinal: Optional[int]
+    date: Optional[str]
+    observation: Optional[Dict]
+
+
 def _m_category_stage_with_date(
     cancer_metastasis_observations: Optional[List[Dict]],
-) -> Tuple[Optional[int], Optional[str]]:
+) -> MCategoryStage:
     """
-    Stage IV if any AJCC clinical M observation reports M1, else None — and the
-    DATE of the observation that said so.
+    Stage IV if any AJCC clinical M observation reports M1, else None — the
+    DATE of the observation that said so, and that observation ITSELF.
 
     THE ONE IMPLEMENTATION OF THIS TIER. ``_stage_from_m_category`` below is a
     thin delegate over it, the same shape ``extract_patient_stage`` is over
@@ -613,12 +641,21 @@ def _m_category_stage_with_date(
     COUNTS on the N axis. Keying on the ``metastasis_category == "M"`` field
     instead of the code would pull 44667-4 in.
 
-    Returns ``(4, date)`` or ``(None, None)``. None means "this axis says
-    nothing", never "stage 0". ``date`` is the RAW ``date`` field of the
-    answering observation, exactly as the record carries it, and is None when
-    that observation carries none — an observation with no date is an ordinary
-    record, not a degradation, and inventing one from a sibling observation is
-    the defect this return exists to make impossible.
+    Returns an ``MCategoryStage``: ``(4, date, observation)`` or
+    ``(None, None, None)``. None means
+    "this axis says nothing", never "stage 0". ``date`` is the RAW ``date``
+    field of the answering observation, exactly as the record carries it, and
+    is None when that observation carries none — an observation with no date is
+    an ordinary record, not a degradation, and inventing one from a sibling
+    observation is the defect this return exists to make impossible.
+
+    THE OBSERVATION IS RETURNED FOR THE SAME REASON THE DATE IS, and it is the
+    same observation. Attribution asks "which Condition does the record link
+    THIS observation to", and answering it from any other member of the list
+    would attach a cancer name to an ordinal a different record produced —
+    the exact defect the date's own paragraph below describes, one field over.
+    It is the caller's job to resolve; this function only makes it possible to
+    ask about the right record.
 
     THE DATE IS THE ANSWERING OBSERVATION'S, AND THE ANSWERING OBSERVATION IS
     THE FIRST cM1 IN LIST ORDER — a stated limit rather than a claim. Unlike
@@ -643,16 +680,17 @@ def _m_category_stage_with_date(
             continue
 
         if match.group("category") == "1":
-            return _STAGE_MAX_ORDINAL, obs.get("date")
+            return MCategoryStage(_STAGE_MAX_ORDINAL, obs.get("date"), obs)
 
-    return None, None
+    return MCategoryStage(None, None, None)
 
 
 def _stage_from_m_category(
     cancer_metastasis_observations: Optional[List[Dict]],
 ) -> Optional[int]:
-    """The ordinal this tier implies, with the answering observation's date
-    dropped. See ``_m_category_stage_with_date`` for the rule and the reasoning.
+    """The ordinal this tier implies, with the answering observation and its
+    date dropped. See ``_m_category_stage_with_date`` for the rule and the
+    reasoning.
 
     A THIN DELEGATE, and deliberately not a second walk of the list: the M rule
     lives in exactly one function, so "the ordinal" and "the ordinal and its
@@ -736,6 +774,262 @@ if not (set(STAGE_SOURCES_OBSERVATION_BACKED) < set(STAGE_SOURCES)):
         f"STAGE_SOURCES: {sorted(STAGE_SOURCES_OBSERVATION_BACKED)} vs "
         f"{sorted(STAGE_SOURCES)}"
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WHICH CANCER THE STAGE BELONGS TO
+# ═══════════════════════════════════════════════════════════════════════════════
+# This function answers ONCE per patient, and until this item its answer named
+# no cancer. On a record carrying one neoplasm that is tolerable; on a record
+# carrying several it is a stage the model can bind to the wrong disease, and
+# the Stage 5 prompt gave it nothing to bind it with. MEASURED over all 1,000
+# corpus bundles: of the 312 patients this extractor produces a stage for,
+# 48 -- 15.4% -- carry more than one Tier A neoplasm (40 carry two, 7 three,
+# 1 four).
+#
+# A CLOSED VOCABULARY OF HOW THE ATTRIBUTION WAS ESTABLISHED, never of whether
+# it was: "not established" is the ABSENCE of a member (None), on exactly the
+# footing `source` is None when no tier answered. A fifth member spelling
+# "unknown" would be a claim that something was determined.
+#
+# THE TWO CLASSES OF MEMBER ARE NOT THE SAME STRENGTH OF EVIDENCE, and the
+# renderer states the tier beside the attribution so a reader can tell them
+# apart:
+#
+#   diagnosis_text            the ordinal was READ OUT OF that condition's own
+#                             display. The attribution is not an inference at
+#                             all -- it is the same string match that produced
+#                             the number, so it cannot be wrong about which
+#                             condition it came from.
+#   condition_stage_assessment  a Condition's `stage.assessment` names the
+#                             answering Observation. The element FHIR R4
+#                             defines for exactly this statement.
+#   observation_focus         the answering Observation's `focus` names a
+#                             Condition. The generic "what this observation is
+#                             about" element, correct here and weaker than the
+#                             one above because it is not staging-specific --
+#                             which is why the one above wins when both fire.
+STAGE_ATTRIBUTION_DIAGNOSIS_TEXT: str = "diagnosis_text"
+STAGE_ATTRIBUTION_CONDITION_ASSESSMENT: str = "condition_stage_assessment"
+STAGE_ATTRIBUTION_OBSERVATION_FOCUS: str = "observation_focus"
+
+STAGE_ATTRIBUTIONS: Tuple[str, ...] = (
+    STAGE_ATTRIBUTION_DIAGNOSIS_TEXT,
+    STAGE_ATTRIBUTION_CONDITION_ASSESSMENT,
+    STAGE_ATTRIBUTION_OBSERVATION_FOCUS,
+)
+
+# WHICH MEMBERS AN OBSERVATION-BACKED TIER CAN PRODUCE. The two structured
+# tiers read an Observation and can only be attributed through an explicit
+# reference; the two diagnosis-text tiers read a condition's NAME and can only
+# be attributed to that condition. Neither set can produce the other's members,
+# and the guard below says so, because a set that had silently grown to cover
+# everything would make the distinction the renderer states unenforced.
+STAGE_ATTRIBUTIONS_FROM_REFERENCE: Tuple[str, ...] = (
+    STAGE_ATTRIBUTION_CONDITION_ASSESSMENT,
+    STAGE_ATTRIBUTION_OBSERVATION_FOCUS,
+)
+
+if not (set(STAGE_ATTRIBUTIONS_FROM_REFERENCE) < set(STAGE_ATTRIBUTIONS)):
+    raise RuntimeError(
+        "STAGE_ATTRIBUTIONS_FROM_REFERENCE must be a non-empty PROPER subset "
+        f"of STAGE_ATTRIBUTIONS: {sorted(STAGE_ATTRIBUTIONS_FROM_REFERENCE)} "
+        f"vs {sorted(STAGE_ATTRIBUTIONS)}"
+    )
+
+if STAGE_ATTRIBUTION_DIAGNOSIS_TEXT in STAGE_ATTRIBUTIONS_FROM_REFERENCE:
+    raise RuntimeError(
+        "the diagnosis-text attribution is not established from a reference; "
+        "STAGE_ATTRIBUTIONS_FROM_REFERENCE must not contain it"
+    )
+
+# EXPLICIT LINKAGE WAS PRESENT AND ATTRIBUTION STILL COULD NOT BE ESTABLISHED.
+# Module-level, following M_CATEGORY_UNREADABLE above and AGE_PARSE_FAILURES in
+# oncotriage/agent/filtering.py, and NOT a new key in any returned dict: the
+# twelve characterization fixtures diff Stage 4's output field by field.
+#
+# THE TOTAL IS THE NUMBER OF ANSWERING OBSERVATIONS WHOSE OWN RECORD CLAIMED
+# THEM AND WHOSE ATTRIBUTION WAS REFUSED ANYWAY -- which is the only population
+# an operator can act on. An observation carrying NO linkage is not counted:
+# that is this corpus's every record, it is not a degradation, and counting it
+# would put one entry per staged patient into a counter whose whole purpose is
+# to make the rare failure visible.
+#
+# TWO KEY FAMILIES, because the two have different remedies:
+#   ambiguous:{direction}:{n}  n distinct condition NAMES claim one staging
+#                              observation. The record contradicts itself about
+#                              which cancer was staged and nothing here can
+#                              choose; the remedy is in the source system.
+#   unnamed_claimant:{direction}  exactly one condition claims it and that
+#                              condition carries no display text, so the link
+#                              resolved and there is nothing to print. The
+#                              remedy is a display on that Condition.
+#
+# KEYED BY DIRECTION AND COUNT, NEVER BY THE CONDITION DISPLAY. A display is
+# free clinical text of unbounded content and this counter reaches the run-end
+# console block; the same rule the empty-verdict retry counters are keyed under.
+STAGE_ATTRIBUTION_UNRESOLVED: Dict[str, int] = Counter()
+
+STAGE_ATTRIBUTION_AMBIGUOUS_KEY: str = "ambiguous"
+STAGE_ATTRIBUTION_UNNAMED_KEY: str = "unnamed_claimant"
+
+
+def _id_list(value) -> List[str]:
+    """`value` as a list of ids, or an empty list.
+
+    A GUARD AGAINST `in` ON A STRING, which is the worst failure this module
+    can have: `"o1" in "xxo1xx"` is True, so a caller that handed a bare
+    reference string where a list belongs would produce a SUBSTRING match and
+    a confidently WRONG cancer name on the Stage 5 line -- silently, and only
+    for the records that happen to collide. oncotriage/fhir/parser.py always
+    emits a list, so this is about a hand-built record (a test, an MCP caller,
+    a future parser) rather than about today's data; the cost is one isinstance
+    and the failure it prevents is the one nothing downstream could catch.
+
+    A non-list, non-tuple value is DROPPED rather than coerced: wrapping a
+    string would turn a malformed record into a plausible link, which is the
+    same invention one level down.
+    """
+    if isinstance(value, (list, tuple)):
+        return [v for v in value if isinstance(v, str) and v]
+    return []
+
+
+def _attribute_observation(
+    observation: Optional[Dict],
+    conditions: Optional[List[Dict]],
+    count: bool = True,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Which Condition an answering staging Observation is EXPLICITLY about.
+
+    Returns ``(display, attribution)`` -- the condition's display text and the
+    STAGE_ATTRIBUTIONS_FROM_REFERENCE member naming how it was established --
+    or ``(None, None)`` when it was not established.
+
+    NEVER FROM PROXIMITY, AND THE CORPUS IS WHY THAT HAD TO BE WRITTEN DOWN
+    RATHER THAN ASSUMED. Every one of this corpus's 880 staging/M Observations
+    shares its encounter with EXACTLY ONE Condition -- measured -- so a
+    shared-encounter rule would look like a clean 1:1 link and would resolve for
+    100% of them. It would still be wrong: an encounter groups what happened at
+    one visit, not what a measurement is about, and the single Condition on that
+    encounter is frequently a comorbidity recorded at the same visit rather than
+    the cancer. Nor is "the patient has only one cancer" a link: one recorded
+    cancer does not prove the stage is its, and on a real extract the second
+    cancer is often the one that is not coded.
+    
+    So the ONLY evidence admitted is a reference the record itself wrote, in
+    either of the two directions FHIR R4 defines for it:
+
+        Condition.stage.assessment -> this Observation      (preferred)
+        this Observation.focus     -> a Condition
+
+    BOTH DIRECTIONS ARE UNIONED BEFORE THE AMBIGUITY TEST, rather than the
+    second being consulted only when the first is silent. A record whose
+    Condition A claims the observation while the observation points at
+    Condition B is contradicting itself, and taking the preferred direction
+    there would report a confident attribution over a record that states two.
+    The preference decides only the LABEL when the two agree.
+
+    CLAIMANTS ARE DEDUPLICATED BY DISPLAY, NOT BY RESOURCE. Two Condition
+    resources carrying the same display are one answer to "which cancer", and
+    duplicate condition resources are ordinary in real extracts; refusing to
+    attribute there would lose a determinate answer for a bookkeeping artifact.
+    Two DIFFERENT displays are a genuine contradiction and refuse.
+
+    NO CANCER FILTER, DELIBERATELY. This module may not import the cancer
+    registry -- oncotriage/extraction/ is a leaf that the INDEXER also reads,
+    and the registry is built on top of extracted facts rather than underneath
+    them (the observation-sort item argues the same edge). So the attributed
+    condition is whatever the record says the staging is about, even when that
+    is not a neoplasm. A record that links its cancer stage to a non-cancer
+    Condition is a source defect this function reports faithfully rather than
+    hides; the renderer prints the name, so a reader sees it.
+
+    Counts into STAGE_ATTRIBUTION_UNRESOLVED when linkage was PRESENT and
+    attribution was refused anyway. Silent when there was no linkage at all,
+    which on this corpus is every record.
+
+    ``count=False`` RESOLVES AND RECORDS NOTHING, and it exists for exactly one
+    caller: ``oncotriage/agent/patient.py:compute_patient_hash``, which asks
+    this question of EVERY staging and metastasis Observation on the record in
+    order to hash the linkage relation. That counter's stated meaning is "an
+    observation that ANSWERED for a patient carried a link and the stage still
+    could not be attributed", and a hash pass would break it in both
+    directions at once: it would count observations that answered for nobody,
+    and it would count the answering one a SECOND time, because the pipeline
+    hashes and extracts the same patient. Measured before the parameter
+    existed: computing one hash moved `ambiguous:...` by 1 for a record whose
+    ambiguous observation was not the one that answered.
+
+    The DEFAULT IS True so the seam has to be asked for. A default of False
+    would make a caller that forgot it silently uncounted, which is the
+    failure mode this project removes rather than the one it accepts.
+    """
+    if not observation:
+        return None, None
+
+    obs_id = observation.get("id")
+    focus_ids = _id_list(observation.get("focus_ids"))
+
+    # {display: direction} for every condition the record links to this
+    # observation, in the two directions, preferring the staging-specific one.
+    # KEYED BY DISPLAY, so two Condition RESOURCES carrying one name are one
+    # claimant -- duplicate resources are ordinary in a real extract and are
+    # one answer to "which cancer".
+    claims: Dict[str, str] = {}
+
+    for cond in conditions or []:
+        if not isinstance(cond, dict):
+            continue
+
+        assessment_ids = _id_list(cond.get("stage_assessment_ids"))
+        cond_id = cond.get("id")
+
+        by_assessment = bool(obs_id) and obs_id in assessment_ids
+        by_focus = bool(cond_id) and cond_id in focus_ids
+        if not (by_assessment or by_focus):
+            continue
+
+        display = (cond.get("display") or "").strip()
+        direction = (STAGE_ATTRIBUTION_CONDITION_ASSESSMENT if by_assessment
+                     else STAGE_ATTRIBUTION_OBSERVATION_FOCUS)
+        # Preferred direction wins the label when one condition is claimed both
+        # ways; setdefault would let whichever condition came first in the list
+        # decide, which is parse order deciding a label.
+        if (display not in claims
+                or direction == STAGE_ATTRIBUTION_CONDITION_ASSESSMENT):
+            claims[display] = direction
+
+    if not claims:
+        # No link at all. Silent: that is this corpus's every record.
+        return None, None
+
+    if len(claims) > 1:
+        # More than one distinct claimant. THE UNNAMED ONE COUNTS AS A
+        # CLAIMANT HERE, and that is the strict reading of the rule rather
+        # than an oversight: a record linking this observation to a named
+        # Condition AND to a nameless one is a record naming two, and taking
+        # the one that happens to have a display would be choosing by which
+        # claimant is printable rather than by what the record says.
+        if count:
+            directions = sorted(set(claims.values()))
+            STAGE_ATTRIBUTION_UNRESOLVED[
+                f"{STAGE_ATTRIBUTION_AMBIGUOUS_KEY}:"
+                f"{'+'.join(directions)}:{len(claims)}"] += 1
+        return None, None
+
+    display, direction = next(iter(claims.items()))
+    if not display:
+        # Exactly one claimant and it carries no name to print. Counted, not
+        # silent: a link existed and was unusable, which is a different
+        # finding from no link at all and has a different remedy.
+        if count:
+            STAGE_ATTRIBUTION_UNRESOLVED[
+                f"{STAGE_ATTRIBUTION_UNNAMED_KEY}:{direction}"] += 1
+        return None, None
+
+    return display, direction
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -913,8 +1207,10 @@ class PatientStage(NamedTuple):
     ``source`` and ``observation_date`` are both ``Optional[str]``, so a caller
     unpacking them positionally in the wrong order gets two plausible strings
     and a summary that states a date as a provenance; read by name they cannot
-    be confused. It is still a tuple, so ``== (None, None, None)`` works and a
-    caller may unpack it.
+    be confused. It is still a tuple, so ``== (None, None, None, None, None)``
+    works and a caller may unpack it -- but every consumer in this repository
+    reads by NAME, which is what made adding the last two members a widening
+    rather than a break.
 
     Attributes:
         ordinal:          0-4, or None when no tier answered. None -> Stage 4's
@@ -931,11 +1227,30 @@ class PatientStage(NamedTuple):
                           when the answering Observation simply carries no date.
                           Those two are told apart by ``source``, which is why
                           the renderer branches on that and not on this.
+        attributed_condition:
+                          the DISPLAY of the condition this stage was
+                          established to belong to, or None when that was not
+                          established. Never a guess: see
+                          ``_attribute_observation`` for what is and is not
+                          admitted as evidence.
+        attribution:      the STAGE_ATTRIBUTIONS member naming HOW it was
+                          established, None exactly when
+                          ``attributed_condition`` is None. The two are set and
+                          cleared together, so a caller may test either.
+
+    ``attribution`` is None in three different situations and the caller must
+    not confuse them: no tier answered at all (``ordinal`` is None too), a tier
+    answered from a diagnosis name (which always attributes, so this cannot
+    happen), or an observation-backed tier answered and the record stated no
+    usable link. The last is the ordinary case on Synthea data and on any
+    source that does not write mCODE staging links.
     """
 
     ordinal: Optional[int]
     source: Optional[str]
     observation_date: Optional[str]
+    attributed_condition: Optional[str] = None
+    attribution: Optional[str] = None
 
 # The clinical numeral for each ordinal, which is what trial criteria text is
 # written in ("Stage IV or recurrent disease", "Stage IB-IIIA"). A fact about
@@ -1080,19 +1395,24 @@ def extract_patient_stage_with_source(
                     # recent observation whose display did not parse, so those
                     # two are different values whenever a restaged patient
                     # carries an unreadable later record.
+                    _display, _attr = _attribute_observation(obs, conditions)
                     return PatientStage(ordinal, STAGE_SOURCE_STAGE_GROUP,
-                                        obs.get('date'))
+                                        obs.get('date'), _display, _attr)
             # Fallback: "metastatic" in display
             if 'metastatic' in display.lower() and 'non-metastatic' not in display.lower():
-                return PatientStage(4, STAGE_SOURCE_STAGE_GROUP, obs.get('date'))
+                _display, _attr = _attribute_observation(obs, conditions)
+                return PatientStage(4, STAGE_SOURCE_STAGE_GROUP,
+                                    obs.get('date'), _display, _attr)
 
     # Tier 1: AJCC clinical M category Observation — structured, and the one
     # TNM axis that determines a stage group on its own.
-    m_category_stage, m_category_date = _m_category_stage_with_date(
+    (m_category_stage, m_category_date,
+     m_category_obs) = _m_category_stage_with_date(
         cancer_metastasis_observations)
     if m_category_stage is not None:
+        _display, _attr = _attribute_observation(m_category_obs, conditions)
         return PatientStage(m_category_stage, STAGE_SOURCE_M_CATEGORY,
-                            m_category_date)
+                            m_category_date, _display, _attr)
 
     # Tier 2: Condition display text regex (covers all cancer types, all SNOMED displays)
     #
@@ -1129,8 +1449,16 @@ def extract_patient_stage_with_source(
                 # which anybody staged anything. Reporting the onset here would
                 # answer "staged within the last six months" with the date the
                 # cancer started.
+                # ATTRIBUTED TO `cond` AND TO NOTHING ELSE, and this is the
+                # one tier where the attribution is not an inference: the
+                # ordinal was read out of THIS condition's own display by the
+                # match immediately above, so the condition that produced the
+                # number and the condition the number is about are the same
+                # record by construction.
                 return PatientStage(ordinal, STAGE_SOURCE_CONDITION_DISPLAY,
-                                    None)
+                                    None,
+                                    (cond.get("display") or "").strip() or None,
+                                    STAGE_ATTRIBUTION_DIAGNOSIS_TEXT)
 
     # Tier 3: Metastatic keyword in Condition display
     #
@@ -1158,8 +1486,14 @@ def extract_patient_stage_with_source(
     for cond in conditions:
         display = (cond.get("display") or "").lower()
         if "metastatic" in display and "non-metastatic" not in display:
-            # No date, for the reason at the tier above.
-            return PatientStage(4, STAGE_SOURCE_METASTATIC_KEYWORD, None)
+            # No date, for the reason at the tier above. Attributed to
+            # `cond`, whose display carried the keyword -- the same
+            # by-construction attribution as the tier above. The display is
+            # taken from the record rather than from `display`, which was
+            # lower-cased for the keyword test.
+            return PatientStage(4, STAGE_SOURCE_METASTATIC_KEYWORD, None,
+                                (cond.get("display") or "").strip() or None,
+                                STAGE_ATTRIBUTION_DIAGNOSIS_TEXT)
 
     return PatientStage(None, None, None)
 

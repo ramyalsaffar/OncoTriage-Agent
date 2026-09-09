@@ -532,12 +532,13 @@ check("6f  NON-DEGENERACY: the walk did find that function and it does call "
                           if isinstance(n, ast.Call)]) > 0), True)
 check("6g  an undated cM1 still answers, reporting 'unknown' verbatim for "
       "oncotriage/agent/patient.py:_stage_date_clause to guard",
-      guarded(lambda: extract_patient_stage_with_source(
-          [], cancer_metastasis_observations=[{
-              "code": "21907-1", "display": "", "value":
-              "American Joint Committee on Cancer cM1 (qualifier value)",
-              "unit": None, "date": "unknown",
-              "metastasis_category": "M"}])[1:]),
+      guarded(lambda: (lambda st: (st.source, st.observation_date))(
+          extract_patient_stage_with_source(
+              [], cancer_metastasis_observations=[{
+                  "code": "21907-1", "display": "", "value":
+                  "American Joint Committee on Cancer cM1 (qualifier value)",
+                  "unit": None, "date": "unknown",
+                  "metastasis_category": "M"}]))),
       ("m_category_observation", "unknown"))
 
 

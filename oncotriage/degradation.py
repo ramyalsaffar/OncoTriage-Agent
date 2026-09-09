@@ -287,6 +287,17 @@ _REGISTRY_SPEC = (
     ("M_CATEGORY_UNREADABLE", _extraction_stage.M_CATEGORY_UNREADABLE,
      "an AJCC clinical M observation (LOINC 21907-1) carried text the stage "
      "extractor could not read; that patient's M tier contributed nothing"),
+    ("STAGE_ATTRIBUTION_UNRESOLVED",
+     _extraction_stage.STAGE_ATTRIBUTION_UNRESOLVED,
+     "a staging Observation that ANSWERED for a patient carried an explicit "
+     "link to a Condition and the stage still could not be attributed to a "
+     "cancer, so the Stage 5 line read 'associated cancer not established' "
+     "over a record that tried to say. 'ambiguous:' keys mean several "
+     "differently-named Conditions claimed one staging Observation -- the "
+     "record contradicts itself and the remedy is in the source system; "
+     "'unnamed_claimant:' keys mean the one claiming Condition carries no "
+     "display text. A record stating NO link is not counted: that is this "
+     "corpus's every observation and it is not a degradation"),
     ("LAB_UNIT_DEGRADATIONS", _agent_patient.LAB_UNIT_DEGRADATIONS,
      "a lab value was not unit-converted; 'unconverted:' keys are the ones "
      "that want a new row in _LAB_UNIT_CONVERSIONS"),

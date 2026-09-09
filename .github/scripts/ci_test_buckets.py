@@ -963,6 +963,26 @@ BUCKETS = {
         _A, None, "ran green in 2.8s; every fixture is a literal dict"),
     "test_extraction_stage_non_oncology_guard.py": (
         _A, None, "ran green in 2.6s; no corpus, no git"),
+    "test_extraction_stage_attribution.py": (
+        _A, None,
+        "ran green in 1.33s, 101 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED with ONCOTRIAGE_MAIN_PATH pointed at a "
+        "provision_ci_paths.py root, not assumed): the stage line now states "
+        "WHICH cancer the stage belongs to, and states that it does not know "
+        "when the record establishes no link. No network, no keys, NO SPEND, "
+        "no live Qdrant, no model load, no database, no git history, no live "
+        "server, NO CORPUS -- every fixture is a literal dict in the shape "
+        "oncotriage/fhir/parser.py emits. It writes NOTHING anywhere, not "
+        "even a temp directory. NOT in the collision matrix: the two "
+        "repository files it reads (extraction/stage.py, agent/patient.py) "
+        "are written by neither of the suite's two writers and both are "
+        "sha256-compared at the end, with a non-degeneracy probe so that "
+        "comparison cannot be one hash against itself. It DOES exec: "
+        "in-memory copies of stage.py, one plant each, argued at "
+        "_EXEC_ALLOWLIST -- `git show` can supply none of them, because every "
+        "one reverts a fix that is AT HEAD and the resolver they break "
+        "existed in no earlier revision.",
+    ),
     "test_extraction_stage_observation_sort.py": (
         _A, None,
         "ran green in 0.05s, 57 checks, against ONLY the provisioned CI "

@@ -653,6 +653,11 @@ def parse_fhir_bundle(bundle_or_path) -> Dict:
                 elif obs_loinc in _METASTASIS_LOINCS:
                     _met = _parse_observation(resource)
                     _met['metastasis_category'] = _METASTASIS_LOINCS[obs_loinc]
+                    # The linkage pair, on metastasis_category's own precedent:
+                    # annotated HERE rather than inside _parse_observation,
+                    # which parses every general observation in the bundle and
+                    # would gain two keys per record for no reader.
+                    _met.update(_observation_link_fields(resource))
                     patient_data['cancer_metastasis_observations'].append(_met)
                 elif obs_loinc == _ECOG_LOINC_CODE:
                     # Routed out of the general pool deliberately. Pooled in
@@ -920,6 +925,163 @@ def _parse_demographics(patient_resource: Dict) -> Dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# EXPLICIT STAGING LINKAGE: WHICH CANCER A STAGING OBSERVATION BELONGS TO
+# ---------------------------------------------------------------------------
+# FHIR R4 defines two elements that state, explicitly, which Condition a staging
+# Observation is about, and this parser captured NEITHER:
+#
+#   Condition.stage.assessment -> a Reference to the Observation that carries
+#                                 the stage. The element FHIR defines for
+#                                 exactly this purpose.
+#   Observation.focus          -> a Reference to what the Observation is
+#                                 *about* when that is not simply the subject.
+#
+# Without them oncotriage/extraction/stage.py can report a stage and cannot say
+# which of a patient's cancers it belongs to, and 15.4% of this corpus's
+# stage-producing patients carry more than one (measured; see the attribution
+# item). Capturing the references is what makes attribution possible at all;
+# whether it RESOLVES is that module's question, not this one's.
+#
+# REFERENCES ONLY. These functions add reference material and read no clinical
+# content, so nothing that was parsed before is parsed differently. Every
+# existing key of every existing dict is preserved with its existing value.
+#
+# THIS CORPUS CARRIES NEITHER ELEMENT. Measured over all 1,000 bundles: 880
+# staging/M Observations, none with focus/partOf/basedOn/derivedFrom/hasMember;
+# 254,494 Conditions, none with a `stage` element at all. So on Synthea data
+# every one of these fields comes back empty and attribution from an Observation
+# is impossible -- which is a fact about the generator, not about the design.
+# The capture ships anyway because a real EHR (Epic, Cerner) writing mCODE does
+# carry them, and because a mechanism that only appears when the data appears is
+# a mechanism nobody has ever run.
+
+
+def _reference_id(reference: Optional[str]) -> Optional[str]:
+    """The logical id a FHIR Reference.reference string points at, or None.
+
+    Handles every form this project can meet, because a reference is a string
+    whose shape depends on how the bundle was assembled rather than on what it
+    means:
+
+        "urn:uuid:37fdfb01-..."          -> "37fdfb01-..."   (Synthea, and any
+                                                              transaction bundle)
+        "Condition/37fdfb01-..."         -> "37fdfb01-..."   (relative, the
+                                                              common REST form)
+        "http://host/fhir/Condition/37f" -> "37f"            (absolute)
+        "#contained-1"                   -> "contained-1"    (contained resource)
+
+    A QUERY OR FRAGMENT SUFFIX IS STRIPPED because a versioned reference is
+    written "Condition/1/_history/2" and a fragment can be appended to an
+    absolute URL; taking the last path segment of the former would return the
+    version number rather than the id. The version is deliberately discarded:
+    two versions of one Condition are one Condition for the purpose of "which
+    cancer is this stage about".
+
+    THE EXISTING `ref.replace('urn:uuid:', '')` IN THE MEDICATION PATHS IS
+    NARROWER THAN THIS AND IS LEFT ALONE. It resolves a Synthea-shaped
+    reference into a lookup built from Synthea-shaped fullUrls, so widening it
+    would change which medications resolve on a corpus this project has
+    measured; that is its own item. This function is used only by the two
+    linkage captures below, which have no such history.
+
+    Returns None for anything that is not a non-empty string, and for a string
+    that is empty after normalisation -- both mean "this reference names
+    nothing", which a caller must not confuse with an id.
+    """
+    if not isinstance(reference, str):
+        return None
+
+    text = reference.strip()
+    if not text:
+        return None
+
+    # Drop a fragment or query suffix before taking the last path segment: a
+    # "_history" suffix would otherwise make the version number the id.
+    for cut in ('/_history/', '?'):
+        idx = text.find(cut)
+        if idx != -1:
+            text = text[:idx]
+
+    if text.startswith('#'):
+        text = text[1:]
+    elif text.startswith('urn:uuid:'):
+        text = text[len('urn:uuid:'):]
+    elif '/' in text:
+        text = text.rsplit('/', 1)[-1]
+
+    text = text.strip()
+    return text or None
+
+
+def _reference_ids(references) -> List[str]:
+    """Every logical id in a list of FHIR References, in source order, deduped.
+
+    Source order is kept rather than sorted because a reference list is the
+    record's own statement and this function reports it rather than ranking it;
+    dedupe is by first occurrence, so the order is total and stable. An entry
+    that resolves to nothing is dropped rather than carried as None: a caller
+    testing membership must never match on an absence.
+    """
+    out: List[str] = []
+    seen = set()
+    for ref in references or []:
+        if not isinstance(ref, dict):
+            continue
+        rid = _reference_id(ref.get('reference'))
+        if rid is not None and rid not in seen:
+            seen.add(rid)
+            out.append(rid)
+    return out
+
+
+def _condition_stage_assessment_ids(condition_resource: Dict) -> List[str]:
+    """Every Observation id this Condition's `stage.assessment` points at.
+
+    Condition.stage is 0..*, and each stage entry carries assessment 0..*, so a
+    Condition may name several staging Observations (a clinical and a
+    pathologic group, or a restaging). All of them are collected: this says
+    "these Observations state my stage", and the extractor asks the reverse
+    question of ONE answering Observation.
+    """
+    out: List[str] = []
+    seen = set()
+    for entry in condition_resource.get('stage') or []:
+        if not isinstance(entry, dict):
+            continue
+        for rid in _reference_ids(entry.get('assessment')):
+            if rid not in seen:
+                seen.add(rid)
+                out.append(rid)
+    return out
+
+
+def _observation_link_fields(obs_resource: Dict) -> Dict:
+    """The two linkage fields every parsed Observation this project attributes
+    needs: its own id, and the ids its `focus` points at.
+
+    ONE HELPER FOR BOTH OBSERVATION PATHS. The mCODE stage-group parser and the
+    metastasis routing site both need exactly these two fields, and a second
+    copy is a second thing to get wrong -- the shape this project removed for
+    the cross-encoder checkpoint and the BM25 model name. It is deliberately
+    NOT folded into _parse_observation(): that function parses every general
+    observation in the bundle (3,660 on one corpus patient), none of which is
+    ever attributed, and widening it would put two keys on every one of them
+    for no reader.
+
+    `focus` is the ONLY back-reference read. `partOf`, `basedOn`, `derivedFrom`
+    and `hasMember` are all References on Observation and none of them means
+    "this observation is about that condition": partOf names a procedure or
+    administration, basedOn names the order, derivedFrom names a source
+    observation and hasMember names panel members. Reading any of them as
+    ownership would attribute a stage on the strength of an element that says
+    something else.
+    """
+    return {
+        'id': (obs_resource.get('id') or '').strip() or None,
+        'focus_ids': _reference_ids(obs_resource.get('focus')),
+    }
+
 def _parse_condition(condition_resource: Dict) -> Dict:
     """
     Extract condition (diagnosis) information.
@@ -1012,6 +1174,13 @@ def _parse_condition(condition_resource: Dict) -> Dict:
         'onset_date':          onset_date,
         'clinical_status':     clinical_status,
         'verification_status': verification_status,
+        # The two linkage fields, and nothing else about linkage. `id` is what
+        # an Observation's `focus` points AT; `stage_assessment_ids` is what
+        # this Condition points at. Both are empty on this corpus -- see the
+        # block above _reference_id for the measurement -- and both are what a
+        # real mCODE EHR uses to say which cancer a stage belongs to.
+        'id':                  (condition_resource.get('id') or '').strip() or None,
+        'stage_assessment_ids': _condition_stage_assessment_ids(condition_resource),
     }
 
 
@@ -1184,12 +1353,17 @@ def _parse_mcode_stage_observation(obs_resource: Dict) -> Dict:
     if display_normalized and not re.search(r'\bstage\b', display_normalized, re.IGNORECASE):
         display_normalized = f"Stage {display_normalized}"
 
-    return {
+    out = {
         'stage_display': display_normalized,
         'stage_code':    stage_code.strip(),
         'date':          date,
         'loinc':         loinc,
     }
+    # `id` and `focus_ids`, through the one helper both observation paths use.
+    # update() rather than two literal keys so the pair cannot come apart from
+    # the metastasis path's copy of the same fact.
+    out.update(_observation_link_fields(obs_resource))
+    return out
 
 # ---------------------------------------------------------------------------
 # ECOG performance status Observation (mCODE ECOGPerformanceStatus)

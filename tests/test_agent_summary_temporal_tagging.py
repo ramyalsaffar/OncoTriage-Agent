@@ -162,6 +162,7 @@ from oncotriage import config
 from oncotriage.agent import deps
 from oncotriage.agent import patient as patient_mod
 from oncotriage.agent.patient import (
+    STAGE_ATTRIBUTION_UNKNOWN_CLAUSE,
     BEFORE_REFERENCE_PHRASE,
     ELAPSED_UNDER_DAY,
     ELAPSED_UNDER_MONTH,
@@ -1034,7 +1035,13 @@ _bare7s = render_bare(_p7_staged)
 
 check("cancer stage: the staging date and its interval, on one line",
       stage_line(_after7s),
-      f"Cancer Stage: Stage III (from a recorded stage group observation; "
+      # "recorded; associated cancer not established": this fixture's staging
+      # Observation states no link to a Condition, which is the shape every
+      # observation in this corpus has, so the line names no cancer. The
+      # attribution item owns that wording; what THIS file is about is the
+      # date and its interval, which are unmoved.
+      f"Cancer Stage: Stage III {STAGE_ATTRIBUTION_UNKNOWN_CLAUSE} "
+      f"(from a recorded stage group observation; "
       f"staged {_ECOG_DATE}, {event('214 days')})")
 check("...and the sweep sees it, which the `- ` filter could not",
       len(date_bearing(_after7s)), 10)

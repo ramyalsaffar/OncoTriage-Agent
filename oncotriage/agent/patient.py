@@ -47,6 +47,7 @@ from oncotriage.extraction.stage import (
     STAGE_SOURCE_STAGE_GROUP,
     STAGE_SOURCES,
     STAGE_SOURCES_OBSERVATION_BACKED,
+    _attribute_observation,
     extract_patient_stage_with_source,
 )
 from oncotriage.utils import (
@@ -200,6 +201,12 @@ def compute_patient_hash(patient_data: Dict) -> str:
       - cancer_genomic_variants: display, gene_symbol, hgvs_protein, hgvs_cdna,
         result_value, interpretation, date
       - cancer_stage_observations: stage_display, date, loinc
+      - stage_link (CONDITIONAL, and the one RESOLVED entry): for each staging
+        or metastasis Observation the record EXPLICITLY links to a Condition,
+        that observation's already-emitted identity and the linked condition's
+        display. Read by the Cancer Stage line, which names that condition.
+        Emitted only when such a link exists; see the block at the emission for
+        why it is resolved rather than raw and what that costs.
 
     Each name above is the patient_data KEY, not a nickname for it. The ECOG
     line used to read "ecog", which is not a field of anything --
@@ -481,6 +488,73 @@ def compute_patient_hash(patient_data: Dict) -> str:
         f"|{s.get('loinc') or ''}"
         for s in stage_obs
     ])
+
+    # WHICH CANCER EACH STAGING OBSERVATION IS EXPLICITLY LINKED TO, emitted
+    # ONLY when the record states at least one such link.
+    #
+    # IT IS HERE BECAUSE RENDERING THE ATTRIBUTION CREATED THE CONSUMER. Until
+    # the stage line named a cancer, `Condition.stage.assessment` and
+    # `Observation.focus` changed no prompt byte and were correctly excluded by
+    # this function's own rule -- the rule is that a sub-field is hashed when
+    # what it changes is the rendered text. Now two bundles identical except
+    # for which Condition their staging Observation is linked to render "for A"
+    # and "for B", and without this block they would hash the SAME. That is the
+    # guarantee at the top of this docstring being false, so the entry is not
+    # optional. Same reversal, and the same reason, as `allergies.onset_date`.
+    #
+    # EMITTED ONLY WHEN PRESENT, on the precedent of the five conditional
+    # entries above: a patient carrying no linkage emits no line and hashes
+    # EXACTLY as they did before this entry existed. MEASURED: this corpus
+    # states no link on any of its 880 staging/M Observations, so all 1,000
+    # corpus hashes are unchanged by this addition -- which is the whole reason
+    # it can be added without invalidating the stored series.
+    #
+    # THIS IS THE ONE RESOLVED ENTRY IN THIS FUNCTION AND THE TRADE IS STATED.
+    # Everything else here is a raw parsed field, on the birth_date-not-age
+    # rule. Hashing the raw material instead would mean hashing every
+    # Condition's and every Observation's `id` unconditionally -- UUIDs that
+    # are an artifact of how the bundle was generated -- which moves EVERY hash
+    # in the corpus to record a relation the corpus does not contain, and still
+    # would not be enough on its own: two bundles that SWAP the displays of two
+    # linked conditions while keeping their ids render differently and would
+    # emit identical id and reference lines. The id-to-display pairing is what
+    # has to be hashed, and pairing them IS the resolution. So the resolution
+    # is run, and the reason the birth_date rule does not bite is that its own
+    # stated purpose is keeping the hash independent of how a derivation is
+    # CONFIGURED -- age depends on DATA_SNAPSHOT_DATE, and reference resolution
+    # depends on nothing tunable. A change to the resolver's CODE is covered by
+    # `llm_classifier_renderer_digest` in oncotriage/run_fingerprint.py, which
+    # is the mechanism this project built for exactly that split: the digest
+    # gates code, this hash gates data.
+    #
+    # PER OBSERVATION AND NOT PER PATIENT. `_attribute_observation` is a local
+    # question about one record; running the TIER logic here would couple the
+    # hash to the tier order and to the sort, which is a much heavier
+    # dependency for no additional discrimination -- the answering observation
+    # is already determined by the fields emitted above.
+    #
+    # THE OBSERVATION IS NAMED BY THE FIELDS ALREADY EMITTED FOR IT, never by
+    # its UUID, so re-serialising a bundle that keeps its content and changes
+    # its ids leaves this line alone.
+    _stage_links = []
+    for _obs, _kind in (
+            [(o, "stage") for o in stage_obs]
+            + [(o, "met") for o in (
+                patient_data.get("cancer_metastasis_observations") or [])]):
+        # count=False: this loop asks about EVERY staging observation,
+        # including ones that answer for nobody, and the pipeline
+        # hashes and extracts the same patient -- so counting here
+        # would both invent degradations and double the real ones.
+        _display, _attr = _attribute_observation(_obs, conditions,
+                                                 count=False)
+        if _attr is None:
+            continue
+        _ident = (f"{_obs.get('stage_display') or _obs.get('display') or ''}"
+                  f"|{_obs.get('date') or ''}"
+                  f"|{_obs.get('loinc') or _obs.get('code') or ''}")
+        _stage_links.append(f"{_kind}|{_ident}|{_display}")
+    if _stage_links:
+        _emit("stage_link", _stage_links)
 
     hash_input = "\n".join(parts)
     return hashlib.sha256(hash_input.encode('utf-8')).hexdigest()[:16]
@@ -1134,6 +1208,38 @@ STAGE_DATE_CLAUSE_PREFIX = "staged"
 # "date unknown", because it is a clause inside a sentence rather than a field
 # standing where a date would be.
 STAGE_DATE_UNKNOWN_CLAUSE = "staging date not recorded"
+
+# WHAT THE STAGE LINE CALLS THE CANCER THE STAGE BELONGS TO, and what it says
+# when the record does not establish one.
+#
+# THE LINE ANSWERED "WHAT STAGE" AND NEVER "WHAT STAGE OF WHAT". The extractor
+# answers once per patient, and 15.4% of this corpus's stage-producing patients
+# carry more than one Tier A neoplasm (measured, 48 of 312) -- so on those the
+# model was handed a bare "Stage III" and a condition list holding two cancers,
+# and nothing in the prompt bound the number to either. Binding it to the wrong
+# one is a wrong answer to every stage-gated criterion of the other.
+#
+# TWO SHAPES, AND THE SECOND IS A STATEMENT RATHER THAN SILENCE. Rendering the
+# unattributed line exactly as it read before would leave the model unable to
+# tell "this stage is this cancer's" from "nobody said" -- which is the
+# STAGE_DATE_UNKNOWN_CLAUSE argument one clause over, and the same remedy:
+# under the system prompt's conservatism rule a stated absence is something the
+# model can resolve a criterion to not_evaluable from, and silence is something
+# it can only guess past.
+#
+# IT APPLIES TO A ONE-CANCER RECORD TOO, and that is the deliberate half. A
+# patient with a single recorded neoplasm and an unlinked staging Observation
+# gets "associated cancer not established" like everybody else, because one
+# recorded cancer does not PROVE the stage is its -- the second cancer is
+# routinely the one that is not coded, and a rule that attributes on
+# single-ness would be confidently wrong on exactly those records.
+STAGE_ATTRIBUTION_CLAUSE_PREFIX = "for"
+
+# The head of the unattributed line. It reads as a sentence with the numeral --
+# "Stage III recorded; associated cancer not established" -- rather than as a
+# parenthetical, because it qualifies the NUMBER rather than the evidence for
+# it: the number is as good as it ever was and what is missing is its subject.
+STAGE_ATTRIBUTION_UNKNOWN_CLAUSE = "recorded; associated cancer not established"
 
 # What the Allergies section labels its date with. A SEPARATE CONSTANT FROM
 # ONSET_CLAUSE_PREFIX above even though the two spell the same word today, and
@@ -2077,11 +2183,31 @@ def render_patient_record(record: DeidentifiedRecord) -> str:
         cancer_metastasis_observations=record.fields.get('cancer_metastasis_observations') or [],
     )
     if stage.ordinal is not None:
-        stage_detail = [_STAGE_SOURCE_PHRASES[stage.source]]
+        # WHICH CANCER, WHEN THE RECORD ESTABLISHES ONE. The name leads the
+        # parenthetical because it is the thing the ordinal is ABOUT and the
+        # rest of the parenthetical is evidence FOR it; a reader meeting
+        # "Stage III (for X; from a recorded stage group observation; staged
+        # ...)" gets subject, grade of evidence and recency in that order.
+        #
+        # THE TEST IS THE DISPLAY, NOT `attribution`. The two are set and
+        # cleared together, so either would branch the same way today -- and
+        # this line needs a NAME TO PRINT, so it asks for the thing it needs.
+        # Truthiness rather than `is not None` is correct here and is not the
+        # ECOG-0 trap: an empty display is not a falsy-but-real value, it is a
+        # condition with no name, which cannot be rendered and which
+        # _attribute_observation already refuses (and counts).
+        stage_detail = []
+        if stage.attributed_condition:
+            stage_detail.append(f"{STAGE_ATTRIBUTION_CLAUSE_PREFIX} "
+                                f"{stage.attributed_condition}")
+        stage_detail.append(_STAGE_SOURCE_PHRASES[stage.source])
         if stage.source in STAGE_SOURCES_OBSERVATION_BACKED:
             stage_detail.append(
                 _stage_date_clause(stage.observation_date, reference_date))
-        summary += (f"\n\nCancer Stage: {STAGE_NUMERALS[stage.ordinal]} "
+        stage_head = STAGE_NUMERALS[stage.ordinal]
+        if not stage.attributed_condition:
+            stage_head = f"{stage_head} {STAGE_ATTRIBUTION_UNKNOWN_CLAUSE}"
+        summary += (f"\n\nCancer Stage: {stage_head} "
                     f"({'; '.join(stage_detail)})\n")
     else:
         summary += "\n\nCancer Stage: not recorded in this record\n"

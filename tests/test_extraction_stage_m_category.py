@@ -385,17 +385,31 @@ print("=" * 70)
 # staging was recorded beside the stage, so a restaging criterion is answerable
 # and a decades-old staging is visible as one. The renderer prints what this
 # function hands it, so "which observation's date" is decided here.
+
+def _od(result):
+    """``(ordinal, date)`` of an ``MCategoryStage``, read BY NAME.
+
+    These checks are about the ordinal and the date of the answering
+    observation, and they used to compare the whole return against a literal
+    2-tuple. When the stage-attribution item widened that return to carry the
+    answering OBSERVATION as well, six of them failed -- correctly, and for a
+    reason that had nothing to do with what they assert. Naming the two members
+    says what the checks mean and cannot go stale when a third fact is added.
+    """
+    return (result.ordinal, result.date)
+
+
 check("a positive cM1 reports its own date beside the ordinal",
-      _m_category_stage_with_date([met_obs(_CM1_DISPLAY, date="2020-02-02")]),
+      _od(_m_category_stage_with_date([met_obs(_CM1_DISPLAY, date="2020-02-02")])),
       (4, "2020-02-02"))
 check("no cM1 reports no date either -- never a sibling observation's",
-      _m_category_stage_with_date([met_obs(_CM0_DISPLAY, date="2024-01-01")]),
+      _od(_m_category_stage_with_date([met_obs(_CM0_DISPLAY, date="2024-01-01")])),
       (None, None))
-check("an empty list likewise", _m_category_stage_with_date([]), (None, None))
+check("an empty list likewise", _od(_m_category_stage_with_date([])), (None, None))
 check("an observation with no date at all reports None rather than inventing "
       "one -- an undated record is an ordinary record",
-      _m_category_stage_with_date([{"code": LOINC_AJCC_CLINICAL_M,
-                                    "value": _CM1_DISPLAY}]),
+      _od(_m_category_stage_with_date([{"code": LOINC_AJCC_CLINICAL_M,
+                                        "value": _CM1_DISPLAY}])),
       (4, None))
 
 # THE ANSWERING ONE, NOT THE FIRST ONE AND NOT THE NEWEST ONE. Ignored codes and
@@ -406,7 +420,7 @@ _MIXED = [met_obs("cM1", code="44667-4", category="M"),   # wrong LOINC
           met_obs(_CM1_DISPLAY, date="2011-11-11")]
 M_CATEGORY_UNREADABLE.clear()
 check("the date comes off the observation that answered, not the first in the "
-      "list", _m_category_stage_with_date(_MIXED), (4, "2011-11-11"))
+      "list", _od(_m_category_stage_with_date(_MIXED)), (4, "2011-11-11"))
 check("...and the two candidate dates really do differ, or the check above "
       "proves nothing",
       _MIXED[1]["date"] != _MIXED[2]["date"], True)
@@ -418,8 +432,8 @@ M_CATEGORY_UNREADABLE.clear()
 # most recent. What must never happen is a date belonging to an observation
 # that produced NO ordinal, which is what the checks above pin.
 check("with two cM1s, the FIRST in list order answers and its date is reported",
-      _m_category_stage_with_date([met_obs(_CM1_DISPLAY, date="2020-01-01"),
-                                   met_obs(_CM1_DISPLAY, date="2024-01-01")]),
+      _od(_m_category_stage_with_date([met_obs(_CM1_DISPLAY, date="2020-01-01"),
+                                       met_obs(_CM1_DISPLAY, date="2024-01-01")])),
       (4, "2020-01-01"))
 
 # ONE IMPLEMENTATION, TWO READINGS. The ordinal-only delegate must be exactly
@@ -435,7 +449,7 @@ for _label, _obs in (
     _rich = _m_category_stage_with_date(_obs)
     M_CATEGORY_UNREADABLE.clear()
     check(f"[{_label}] the delegate is the richer form's ordinal",
-          _stage_from_m_category(_obs), _rich[0])
+          _stage_from_m_category(_obs), _rich.ordinal)
 M_CATEGORY_UNREADABLE.clear()
 
 
@@ -765,11 +779,13 @@ print("is hashed before and after and asserted byte-identical.")
 # absent" instead of silently planting nothing, and both controls below
 # reported exactly that on each occasion this line went stale.
 _TIER_CALL = (
-    "    m_category_stage, m_category_date = _m_category_stage_with_date(\n"
+    "    (m_category_stage, m_category_date,\n"
+    "     m_category_obs) = _m_category_stage_with_date(\n"
     "        cancer_metastasis_observations)\n"
     "    if m_category_stage is not None:\n"
+    "        _display, _attr = _attribute_observation(m_category_obs, conditions)\n"
     "        return PatientStage(m_category_stage, STAGE_SOURCE_M_CATEGORY,\n"
-    "                            m_category_date)\n")
+    "                            m_category_date, _display, _attr)\n")
 
 _MATCH_LINE = '        if match.group("category") == "1":'
 
@@ -817,16 +833,17 @@ _control("CONTROL: keying on category 'M' instead of the LOINC admits 44667-4",
 #     the return this tier gained: the list's first entry rather than the one
 #     that answered. On _MIXED that is an ignored 44667-4 record with no date;
 #     on a record where it DOES have one, it is a date no tier measured.
-_DATE_RETURN = "            return _STAGE_MAX_ORDINAL, obs.get(\"date\")"
+_DATE_RETURN = ("            return MCategoryStage(_STAGE_MAX_ORDINAL, "
+                "obs.get(\"date\"), obs)")
 _control("CONTROL: taking the date off the first observation instead of the "
          "answering one reports a date no tier measured",
          _STAGE_SRC,
          [(_DATE_RETURN,
-           "            return _STAGE_MAX_ORDINAL, "
-           "(cancer_metastasis_observations or [{}])[0].get(\"date\")")],
+           "            return MCategoryStage(_STAGE_MAX_ORDINAL, "
+           "(cancer_metastasis_observations or [{}])[0].get(\"date\"), obs)")],
          lambda m: m._m_category_stage_with_date(
              [met_obs("no category recorded", date="2026-01-01"),
-              met_obs(_CM1_DISPLAY, date="2011-11-11")])[1],
+              met_obs(_CM1_DISPLAY, date="2011-11-11")]).date,
          "2026-01-01")
 _control("CONTROL: ...and the SHIPPED module reports the answering one, so "
          "that plant is what moves it",

@@ -248,6 +248,116 @@ def pseudonym_for_identity(identity: Optional[str]) -> str:
 
 
 # ===========================================================================
+# THE LINKAGE PSEUDONYM
+# ===========================================================================
+#
+# THE PARSER CARRIES RESOURCE IDS NOW, AND RESOURCE IDS ARE UUIDs. The
+# stage-attribution item made `oncotriage/fhir/parser.py` capture the two FHIR
+# elements that say which Condition a staging Observation is about --
+# `Condition.stage.assessment` and `Observation.focus` -- and both are
+# References, resolved to logical ids. On Synthea, and on most real servers,
+# those ids are UUIDs.
+#
+# SO THEY CANNOT TRAVEL. This module's `uuid` shape rule classes any UUID as
+# IDENTIFIER_RECORD_NUMBER, deliberately and without provenance, and the MCP
+# surface scans the whole de-identified record before returning it. MEASURED:
+# with the raw ids carried through, one ordinary corpus patient's record
+# produced 68 `record_number` matches via `uuid` and
+# `parse_fhir_bundle` refused -- every call, for every patient.
+#
+# AND THEY CANNOT SIMPLY BE DROPPED, which is the other obvious answer. The
+# renderer resolves the attribution FROM the de-identified record: dropping
+# the ids would make "which cancer is this stage" unanswerable for exactly the
+# observation-backed tiers the item exists to serve, silently, on any source
+# that does write those elements.
+#
+# WHAT IS ACTUALLY NEEDED IS THE RELATION, NOT THE IDS. The resolver only ever
+# asks "is this id in that list" -- it never renders one -- and equality is
+# preserved under any injective function. So every linkage id is replaced by
+# the same kind of token this module already emits for the patient: a
+# domain-separated sha256 prefix. The relation survives byte for byte, no UUID
+# does, and the transformation is deterministic and pure, so the rendered
+# prompt stays reproducible across machines and processes.
+
+LINK_TOKEN_PREFIX = "LK-"
+"""What a pseudonymised linkage id starts with. Distinct from
+``PSEUDONYM_PREFIX`` so a reader of a record can tell a patient token from a
+resource one, and so neither can be mistaken for a raw id."""
+
+LINK_TOKEN_DOMAIN = "oncotriage/deid/link/v1"
+"""Domain separation, on ``PSEUDONYM_DOMAIN``'s footing and for its reason:
+the emitted token must not equal the patient token derived from the same
+string, and the ``v1`` versions the derivation so two eras cannot be silently
+compared."""
+
+LINK_TOKEN_HEX_CHARS = 12
+"""Length of the hex tail, matching ``PSEUDONYM_HEX_CHARS``. These tokens are
+compared only with each other and only WITHIN one patient record, where the
+population is a few hundred resources rather than 22,000 patients -- so 48
+bits is far more headroom than the patient token has, and a collision would
+cost an attribution rather than a patient identity."""
+
+LINK_FIELDS_BY_KEY: Dict[str, Tuple[str, ...]] = {
+    "conditions": ("id", "stage_assessment_ids"),
+    "cancer_stage_observations": ("id", "focus_ids"),
+    "cancer_metastasis_observations": ("id", "focus_ids"),
+}
+"""Which sub-fields of which RENDERED_FIELDS entries carry a linkage id.
+
+DECLARED RATHER THAN DISCOVERED. Rewriting every sub-field that merely LOOKS
+like an id would reach `code`, `stage_code` and the `codings` list -- SNOMED
+and LOINC codes, which are not identifiers, are read by the registries and the
+extractor, and would break both. The three entries here are exactly what the
+parser's own linkage capture writes."""
+
+
+def link_token(value: Optional[str]) -> Optional[str]:
+    """The stable, opaque token for one resource id, or None.
+
+    Deterministic and pure, exactly as ``pseudonym_for_identity`` is and for
+    the same reason: the rendered prompt has to be reproducible on any machine,
+    in any process, with no key material.
+
+    None and the empty string pass through UNCHANGED rather than becoming a
+    token. A record with no id is not linked to anything, and minting a token
+    for an absence would make two unlinked resources compare EQUAL -- which is
+    the one thing the resolver must never see, since it would attribute a stage
+    to whichever nameless condition also had no id.
+    """
+    if not value:
+        return value
+    digest = hashlib.sha256(
+        f"{LINK_TOKEN_DOMAIN}|{value}".encode("utf-8")).hexdigest()
+    return LINK_TOKEN_PREFIX + digest[:LINK_TOKEN_HEX_CHARS]
+
+
+def _pseudonymise_links(entries, fields: Tuple[str, ...]) -> List[Any]:
+    """`entries` with every linkage field in `fields` tokenised.
+
+    RETURNS NEW DICTS for the entries it changes and leaves every other key
+    alone, because ``deidentify`` promises the caller's ``patient_data`` is not
+    mutated -- and its own copy of these lists is shallow, so writing through
+    an entry would reach the caller's record.
+    """
+    out: List[Any] = []
+    for entry in entries or []:
+        if not isinstance(entry, dict) or not any(f in entry for f in fields):
+            out.append(entry)
+            continue
+        new = dict(entry)
+        for field in fields:
+            if field not in new:
+                continue
+            value = new[field]
+            if isinstance(value, (list, tuple)):
+                new[field] = [link_token(v) for v in value]
+            else:
+                new[field] = link_token(value)
+        out.append(new)
+    return out
+
+
+# ===========================================================================
 # THE IDENTIFIER VOCABULARY
 # ===========================================================================
 #
@@ -787,6 +897,14 @@ def deidentify(patient_data: Dict,
             fields[key] = dict(value) if isinstance(value, dict) else value
         else:
             fields[key] = list(value) if isinstance(value, list) else (value or [])
+            # THE LINKAGE IDS ARE TOKENISED, NEVER CARRIED AND NEVER DROPPED.
+            # See THE LINKAGE PSEUDONYM above: raw resource UUIDs make this
+            # module's own uuid rule refuse the record, and dropping them makes
+            # the stage line unable to name a cancer. The relation is what the
+            # resolver reads, and a token preserves it exactly.
+            _link_fields = LINK_FIELDS_BY_KEY.get(key)
+            if _link_fields:
+                fields[key] = _pseudonymise_links(fields[key], _link_fields)
 
     inventory = merge_inventories(
         identifiers_from_parsed_record(patient_data),

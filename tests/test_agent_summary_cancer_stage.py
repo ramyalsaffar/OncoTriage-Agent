@@ -113,6 +113,8 @@ from oncotriage import config as _config
 from oncotriage.agent import patient as _patient_module
 from oncotriage.agent.filtering import node_rule_based_filter
 from oncotriage.agent.patient import (
+    STAGE_ATTRIBUTION_CLAUSE_PREFIX,
+    STAGE_ATTRIBUTION_UNKNOWN_CLAUSE,
     STAGE_DATE_CLAUSE_PREFIX,
     STAGE_DATE_UNKNOWN_CLAUSE,
     TEMPORAL_KEY_STAGE_DATE,
@@ -123,6 +125,7 @@ from oncotriage.agent.patient import (
 from oncotriage.agent.prompts import render_system_prompt
 from oncotriage.extraction import stage as _stage_module
 from oncotriage.extraction.stage import (
+    PatientStage,
     STAGE_NUMERALS,
     STAGE_SOURCE_CONDITION_DISPLAY,
     STAGE_SOURCE_M_CATEGORY,
@@ -332,7 +335,7 @@ def stage_line(summary):
     return hits[0]
 
 
-def expected_stage_line(ordinal, source, date_clause=None):
+def expected_stage_line(ordinal, source, date_clause=None, attributed=None):
     """The line the renderer is required to produce, built from the vocabularies.
 
     DERIVED FROM STAGE_NUMERALS AND _STAGE_SOURCE_PHRASES on the same footing
@@ -341,11 +344,25 @@ def expected_stage_line(ordinal, source, date_clause=None):
     covering. The DATE CLAUSE is passed in as a literal by every caller, never
     derived, so nothing here can agree with the renderer by construction --
     section 8a additionally pins two whole lines with no helper at all.
+
+    ``attributed`` IS THE CONDITION DISPLAY THE STAGE BELONGS TO, and its
+    DEFAULT IS None -- meaning "the record did not establish one", which is the
+    shape every fixture in this file produces and the shape every observation
+    of this corpus produces. That default is deliberate rather than
+    convenient: the attribution item's whole finding is that Synthea states no
+    staging linkage anywhere, so a helper defaulting to the ATTRIBUTED shape
+    would describe a record this project has never seen.
     """
-    detail = _STAGE_SOURCE_PHRASES[source]
+    detail = []
+    if attributed is not None:
+        detail.append(f"{STAGE_ATTRIBUTION_CLAUSE_PREFIX} {attributed}")
+    detail.append(_STAGE_SOURCE_PHRASES[source])
     if date_clause is not None:
-        detail = f"{detail}; {date_clause}"
-    return f"Cancer Stage: {STAGE_NUMERALS[ordinal]} ({detail})"
+        detail.append(date_clause)
+    head = STAGE_NUMERALS[ordinal]
+    if attributed is None:
+        head = f"{head} {STAGE_ATTRIBUTION_UNKNOWN_CLAUSE}"
+    return f"Cancer Stage: {head} ({'; '.join(detail)})"
 
 
 def section_index(summary, needle):
@@ -425,7 +442,12 @@ check("a patient with no stage anywhere gets the absence sentence",
 check("...and the extractor genuinely returns None for that patient, so the "
       "sentence is not being produced by some other branch",
       extract_patient_stage_with_source(_NO_STAGE["conditions"]),
-      (None, None, None))
+      # NAMED, not a bare tuple. This read (None, None, None) until the
+      # stage-attribution item widened PatientStage, and the fields it means
+      # are the three that decide the absence branch; the two it does not
+      # mention are None for the same reason and are pinned in the
+      # attribution file.
+      PatientStage(None, None, None, None, None))
 check("a summary with a stage differs from one without",
       _create_patient_summary(_NO_STAGE)
       == _create_patient_summary(_STAGE_ZERO), False)
@@ -471,13 +493,31 @@ for _source in STAGE_SOURCES:
     # observation-backed tiers carry the same clause and the two
     # diagnosis-text tiers carry none. Derived from the closed subset rather
     # than listed, on the same footing as the phrases above.
+    #
+    # AND THE SAME SUBSET DECIDES THE ATTRIBUTION, from the other side. A tier
+    # that read a diagnosis NAME attributes the stage to that very condition
+    # by construction -- the string match that produced the ordinal IS the
+    # attribution -- while an observation-backed tier can only be attributed
+    # through an explicit FHIR link, which none of these fixtures carries and
+    # which no record in this corpus carries. So the two halves of
+    # STAGE_SOURCES_OBSERVATION_BACKED are exactly the two halves of "does
+    # this line name a cancer", which is why the expectation is derived from
+    # it rather than listed per tier. `_st.attributed_condition` is read from
+    # the EXTRACTOR rather than retyped, so this check is about the RENDERER
+    # placing it, and section 5 of the attribution file is what pins the
+    # extractor's own answer.
     check(f"[{_source}] renders the numeral, the provenance and -- for an "
           f"observation-backed tier -- the staging date",
           stage_line(_create_patient_summary(_p)),
           expected_stage_line(
               _ordinal, _source,
               "staged 2024-01-01, 2 years before reference date"
-              if _source in STAGE_SOURCES_OBSERVATION_BACKED else None))
+              if _source in STAGE_SOURCES_OBSERVATION_BACKED else None,
+              attributed=_st.attributed_condition))
+    check(f"[{_source}] names the cancer exactly when the tier read a "
+          f"diagnosis name, and never from an unlinked observation",
+          _st.attributed_condition is not None,
+          _source not in STAGE_SOURCES_OBSERVATION_BACKED)
 
 # The four phrases must DISCRIMINATE. Four identical strings would satisfy
 # every check above and tell the model nothing.
@@ -538,7 +578,13 @@ def rendered_ordinal(patient_data):
     if line == _ABSENCE_LINE:
         return None
     for ordinal, numeral in STAGE_NUMERALS.items():
-        if line.startswith(f"Cancer Stage: {numeral} ("):
+        # The trailing SPACE, not "(" -- the line's head is the numeral alone
+        # when the stage is attributed to a cancer and the numeral followed by
+        # STAGE_ATTRIBUTION_UNKNOWN_CLAUSE when it is not, so anchoring on the
+        # open paren reads every unattributed line as unreadable. The space
+        # still disambiguates the numerals from each other: "Stage I " cannot
+        # match "Stage II (" because the character after "Stage I" is "I".
+        if line.startswith(f"Cancer Stage: {numeral} "):
             return ordinal
     return f"<unreadable: {line}>"
 
@@ -635,11 +681,11 @@ _STAGE_OBS_DATE = "2024-01-01"
 check("[stage group] the whole line, spelled out",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2024-01-01, 2 years before reference date)")
 check("[m category] the whole line, spelled out",
       stage_line(_create_patient_summary(patient(met_obs=[met_obs(_CM1_DISPLAY)]))),
-      "Cancer Stage: Stage IV (from a recorded AJCC clinical M category "
+      "Cancer Stage: Stage IV recorded; associated cancer not established (from a recorded AJCC clinical M category "
       "observation; staged 2024-01-01, 2 years before reference date)")
 
 # THE UNDATED TIERS ARE UNCHANGED, AND THAT IS THE DELIBERATE BRANCH. A
@@ -657,11 +703,12 @@ check("the diagnosis-text fixtures really do carry an onset date, so the two "
       (True, True))
 check("[condition display] renders no date clause at all",
       stage_line(_create_patient_summary(patient([_DATED_CONDITION]))),
-      "Cancer Stage: Stage II (from diagnosis text)")
+      f"Cancer Stage: Stage II (for {_DATED_CONDITION['display']}; "
+      "from diagnosis text)")
 check("[metastatic keyword] likewise",
       stage_line(_create_patient_summary(patient([_DATED_MET_CONDITION]))),
-      "Cancer Stage: Stage IV (from diagnosis text describing metastatic "
-      "disease)")
+      f"Cancer Stage: Stage IV (for {_DATED_MET_CONDITION['display']}; "
+      "from diagnosis text describing metastatic disease)")
 check("...and neither line mentions the onset date it was given",
       ["2026-07-01" in stage_line(_create_patient_summary(patient([_c])))
        for _c in (_DATED_CONDITION, _DATED_MET_CONDITION)], [False, False])
@@ -674,14 +721,14 @@ check("[stage group, undated observation] the absence is stated",
       stage_line(_create_patient_summary(
           patient(stage_obs=[{"stage_display": "Stage IIIA (qualifier value)",
                               "loinc": "21908-9"}]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       f"{STAGE_DATE_UNKNOWN_CLAUSE})")
 check("...and the corpus's own 'unknown' sentinel takes the same branch, "
       "rather than reaching the date parser as a literal string",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="unknown")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       f"{STAGE_DATE_UNKNOWN_CLAUSE})")
 check("...and that clause is DIFFERENT from the dated one, so the two states "
       "are distinguishable by a reader",
@@ -696,13 +743,13 @@ check("[unreadable date] the raw date is stated and no interval is invented",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="not-a-date")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged not-a-date)")
 check("[after the reference date] likewise",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="2030-01-01")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2030-01-01)")
 _delta = {k: TEMPORAL_RENDER_COUNTS[k] - _before.get(k, 0)
           for k in set(TEMPORAL_RENDER_COUNTS) | set(_before)
@@ -736,27 +783,27 @@ check("[year precision] the interval is capped at years",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="2024")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2024, 2 years before reference date)")
 check("[year precision, under a year] it degrades to the coarse floor rather "
       "than counting days it does not have",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="2026")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2026, less than 1 year before reference date)")
 check("[month precision, under a year] months, never days",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="2026-04")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2026-04, 3 months before reference date)")
 check("[day precision, under a year] the exact day count, which is what a "
       "restaging window is written in",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="2026-06-26")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2026-06-26, 38 days before reference date)")
 
 # THE INTERVAL FOLLOWS THE REFERENCE DATE AND NOT THE CLOCK. The one property
@@ -803,7 +850,7 @@ check("the extractor reports the ANSWERING observation's date",
       _restaged.observation_date, "2019-05-26")
 check("...and the summary renders it, not the newer unreadable one",
       stage_line(_create_patient_summary(_RESTAGED)),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2019-05-26, 7 years before reference date)")
 
 # THE SAME TRAP ACROSS TIERS. An unparseable stage-group observation sits above
@@ -823,7 +870,7 @@ check("the date is the M observation's and not the stage-group record's",
       _m_under.observation_date, "2024-01-01")
 check("...and the rendered line says so",
       stage_line(_create_patient_summary(_M_UNDER_JUNK)),
-      "Cancer Stage: Stage IV (from a recorded AJCC clinical M category "
+      "Cancer Stage: Stage IV recorded; associated cancer not established (from a recorded AJCC clinical M category "
       "observation; staged 2024-01-01, 2 years before reference date)")
 
 # THE VOCABULARY, AND THE INVARIANT OVER IT.
@@ -867,7 +914,7 @@ check("a corpus-shaped ISO datetime renders as the day it names",
       stage_line(_create_patient_summary(
           patient(stage_obs=[stage_obs("Stage IIIA (qualifier value)",
                                        date="2019-05-26T11:05:53-07:00")]))),
-      "Cancer Stage: Stage III (from a recorded stage group observation; "
+      "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
       "staged 2019-05-26, 7 years before reference date)")
 
 
@@ -928,7 +975,7 @@ _control("CONTROL: ...and that plant is a REAL regression rather than a broken "
          [(_IS_NOT_NONE, "    if stage.ordinal:")],
          lambda m: stage_line(m._create_patient_summary(
              _TIER_PATIENTS[STAGE_SOURCE_STAGE_GROUP])),
-         "Cancer Stage: Stage III (from a recorded stage group observation; "
+         "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
          "staged 2024-01-01, 2 years before reference date)")
 
 # 2. ABSENCE OMITTED instead of stated -- silence where the model needs a fact.
@@ -961,11 +1008,16 @@ _control("CONTROL: ...and the same plant breaks the M-category patient too, "
 #    gone, so "Stage IV from a clinician's assignment" and "Stage IV because a
 #    diagnosis name contains the word metastatic" become the same sentence.
 _control("CONTROL: rendering without the source phrase loses the evidence class",
-         [("        stage_detail = [_STAGE_SOURCE_PHRASES[stage.source]]",
-           '        stage_detail = ["source withheld"]')],
+         [("        stage_detail.append(_STAGE_SOURCE_PHRASES[stage.source])",
+           '        stage_detail.append("source withheld")')],
          lambda m: stage_line(m._create_patient_summary(
              _TIER_PATIENTS[STAGE_SOURCE_METASTATIC_KEYWORD])),
-         "Cancer Stage: Stage IV (source withheld)")
+         # The attribution survives the plant and the PHRASE does not, which
+         # is what makes this control about the evidence class rather than
+         # about the line as a whole.
+         f"Cancer Stage: Stage IV (for "
+         f"{_TIER_PATIENTS[STAGE_SOURCE_METASTATIC_KEYWORD]['conditions'][0]['display']}; "
+         f"source withheld)")
 
 # 6. THE DEFECT THIS PASS EXISTS TO PREVENT: the newest staging observation's
 #    date, rendered beside an ordinal an OLDER observation produced. It is the
@@ -974,8 +1026,9 @@ _control("CONTROL: rendering without the source phrase loses the evidence class"
 #    restaged patient whose newest record the regex cannot read. Planted in
 #    the EXTRACTOR, which is where the date is decided.
 _WINNER_DATE_RETURN = (
+    "                    _display, _attr = _attribute_observation(obs, conditions)\n"
     "                    return PatientStage(ordinal, STAGE_SOURCE_STAGE_GROUP,\n"
-    "                                        obs.get('date'))")
+    "                                        obs.get('date'), _display, _attr)")
 
 
 def _restaged_date(module):
@@ -993,9 +1046,12 @@ _control_in(_STAGE_SRC,
             "CONTROL: reporting the newest staging observation's date states a "
             "date no tier measured",
             [(_WINNER_DATE_RETURN,
+              "                    _display, _attr = _attribute_observation("
+              "obs, conditions)\n"
               "                    return PatientStage(ordinal, "
               "STAGE_SOURCE_STAGE_GROUP,\n"
-              "                                        sorted_obs[0].get('date'))")],
+              "                                        sorted_obs[0].get('date'), "
+              "_display, _attr)")],
             _restaged_date, "2026-06-26")
 
 
@@ -1021,31 +1077,37 @@ _control_in(_STAGE_SRC,
             "CONTROL: ...and the SUMMARY then states it, which is the sentence "
             "a reader would act on",
             [(_WINNER_DATE_RETURN,
+              "                    _display, _attr = _attribute_observation("
+              "obs, conditions)\n"
               "                    return PatientStage(ordinal, "
               "STAGE_SOURCE_STAGE_GROUP,\n"
-              "                                        sorted_obs[0].get('date'))")],
+              "                                        sorted_obs[0].get('date'), "
+              "_display, _attr)")],
             lambda m: _rendered_under(m, _RESTAGED),
-            "Cancer Stage: Stage III (from a recorded stage group observation; "
+            "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
             "staged 2026-06-26, 38 days before reference date)")
 _control_in(_STAGE_SRC,
             "CONTROL: ...while the unmutated copy driven through the SAME "
             "rebinding renders the answering observation's date",
             [], lambda m: _rendered_under(m, _RESTAGED),
-            "Cancer Stage: Stage III (from a recorded stage group observation; "
+            "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
             "staged 2019-05-26, 7 years before reference date)")
 
 # 7. THE CROSS-TIER LEAK. The M tier answers and the date comes off a
 #    stage-group observation that produced nothing.
 _M_TIER_RETURN = (
+    "        _display, _attr = _attribute_observation(m_category_obs, conditions)\n"
     "        return PatientStage(m_category_stage, STAGE_SOURCE_M_CATEGORY,\n"
-    "                            m_category_date)")
+    "                            m_category_date, _display, _attr)")
 _control_in(_STAGE_SRC,
             "CONTROL: the M tier borrowing a stage-group record's date",
             [(_M_TIER_RETURN,
+              "        _display, _attr = _attribute_observation("
+              "m_category_obs, conditions)\n"
               "        return PatientStage(m_category_stage, "
               "STAGE_SOURCE_M_CATEGORY,\n"
               "                            (cancer_stage_observations or "
-              "[{}])[0].get('date') or m_category_date)")],
+              "[{}])[0].get('date') or m_category_date, _display, _attr)")],
             lambda m: m.extract_patient_stage_with_source(
                 _M_UNDER_JUNK["conditions"],
                 cancer_stage_observations=_M_UNDER_JUNK["cancer_stage_observations"],
@@ -1060,11 +1122,15 @@ _control_in(_STAGE_SRC,
 #    rather than assuming.
 _CONDITION_TIER_RETURN = (
     "                return PatientStage(ordinal, STAGE_SOURCE_CONDITION_DISPLAY,\n"
-    "                                    None)")
+    "                                    None,\n"
+    '                                    (cond.get("display") or "").strip() or None,\n'
+    "                                    STAGE_ATTRIBUTION_DIAGNOSIS_TEXT)")
 _ONSET_LEAK = [(_CONDITION_TIER_RETURN,
                 "                return PatientStage(ordinal, "
                 "STAGE_SOURCE_CONDITION_DISPLAY,\n"
-                "                                    cond.get('onset_date'))")]
+                "                                    cond.get('onset_date'),\n"
+                '                                    (cond.get("display") or "").strip() or None,\n'
+                "                                    STAGE_ATTRIBUTION_DIAGNOSIS_TEXT)")]
 _ONSET_PATIENT = patient([_DATED_CONDITION])
 _control_in(_STAGE_SRC,
             "CONTROL: the condition tier leaking the DIAGNOSIS onset as a "
@@ -1077,7 +1143,8 @@ _control_in(_STAGE_SRC,
             "CONTROL: ...and the rendered line is STILL clean under that leak, "
             "because the renderer branches on the tier and not on the date",
             _ONSET_LEAK, lambda m: _rendered_under(m, _ONSET_PATIENT),
-            "Cancer Stage: Stage II (from diagnosis text)")
+            f"Cancer Stage: Stage II (for {_DATED_CONDITION['display']}; "
+            "from diagnosis text)")
 
 # 9. THE BRANCH MOVED FROM THE TIER TO THE DATE -- the fallback accident. An
 #    observation-backed stage whose Observation carries no date stops saying so
@@ -1090,7 +1157,7 @@ _control("CONTROL: branching on the date instead of the tier loses the "
          [("        if stage.source in STAGE_SOURCES_OBSERVATION_BACKED:",
            "        if stage.observation_date is not None:")],
          lambda m: stage_line(m._create_patient_summary(_UNDATED_OBS_PATIENT)),
-         "Cancer Stage: Stage III (from a recorded stage group observation)")
+         "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation)")
 
 # 10. THE CLAUSE DROPPED ALTOGETHER -- the state before this pass, which is
 #     what says the pinned lines in section 7 discriminate.
@@ -1101,7 +1168,7 @@ _control("CONTROL: dropping the date clause reverts the line to the form that "
            "            pass")],
          lambda m: stage_line(m._create_patient_summary(
              _TIER_PATIENTS[STAGE_SOURCE_STAGE_GROUP])),
-         "Cancer Stage: Stage III (from a recorded stage group observation)")
+         "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation)")
 
 # 11. THE INTERVAL DROPPED, THE DATE KEPT -- a bare date is what every other
 #     section of this summary stopped printing at PROMPT_VERSION 1.8.0.
@@ -1110,7 +1177,7 @@ _control("CONTROL: a staging date with no elapsed interval beside it",
            'TEMPORAL_KEY_STAGE_DATE))', '            + "")')],
          lambda m: stage_line(m._create_patient_summary(
              _TIER_PATIENTS[STAGE_SOURCE_STAGE_GROUP])),
-         "Cancer Stage: Stage III (from a recorded stage group observation; "
+         "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
          "staged 2024-01-01)")
 
 # 12. THE RAW DATE UNSLICED. Every stage-group date in the corpus is a full ISO
@@ -1123,7 +1190,7 @@ _control("CONTROL: without the [:10] slice the line carries a time and a "
              patient(stage_obs=[stage_obs(
                  "Stage IIIA (qualifier value)",
                  date="2019-05-26T11:05:53-07:00")]))),
-         "Cancer Stage: Stage III (from a recorded stage group observation; "
+         "Cancer Stage: Stage III recorded; associated cancer not established (from a recorded stage group observation; "
          "staged 2019-05-26T11:05:53-07:00, 7 years before reference date)")
 
 # 5. THE VOCABULARY GUARD -- a tier added to the extractor with no phrase must

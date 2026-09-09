@@ -1031,6 +1031,24 @@ _STRING_PREFILTER = ("exec", "spec_from_file_location", "SourceFileLoader",
 # any plant and compared at the end against a baseline, with a non-degeneracy
 # probe so that comparison cannot be a tautology.
 #
+# tests/test_extraction_stage_attribution.py (the stage-attribution item)
+# execs a PATCHED COPY of oncotriage/extraction/stage.py in six shapes, each
+# breaking one rule of "which cancer does this stage belong to": the
+# Condition.stage.assessment direction severed, the Observation.focus
+# direction severed, the ambiguity refusal relaxed to "take the first
+# claimant", attribution invented from the record carrying only one cancer,
+# the diagnosis-text tier naming the first condition instead of the matching
+# one, and the M tier resolving against a sibling observation rather than the
+# one that answered. `git show` can supply NONE of them: every one reverts a
+# fix that is AT HEAD, so a git blob would compare the fixed module with
+# itself, and the resolver those six break did not exist in any revision
+# before this item. Nothing execs a file in the working tree: stage.py is
+# hashed before any plant and compared at the end, with a non-degeneracy probe
+# against oncotriage/agent/patient.py so that comparison cannot be a
+# tautology, and each plant asserts its own occurrence count so a plant that
+# matched nothing is a named failure rather than a working check reported as
+# broken.
+#
 # tests/test_extraction_stage_observation_sort.py (the stage-observation sort
 # item) execs a PATCHED COPY of oncotriage/extraction/stage.py in five shapes:
 # the whole Tier-0 sort reverted to the raw-string form it shipped with, the
@@ -1175,6 +1193,7 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    "tests/test_extraction_stage_m_category.py",
                    "tests/test_extraction_stage_non_oncology_guard.py",
                    "tests/test_extraction_stage_observation_sort.py",
+                   "tests/test_extraction_stage_attribution.py",
                    "tests/test_agent_trial_verdict_normalization.py",
                    # SEVENTEEN execs, each an in-memory copy of
                    # oncotriage/agent/evaluation.py with one part of Stage 5's
