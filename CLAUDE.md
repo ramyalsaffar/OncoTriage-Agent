@@ -14425,6 +14425,281 @@ estimate and the criteria-CHARACTER term remains a capped tie-breaker, but "a
 trial with 4,000 characters of criteria costs about the same to answer as one
 with 800" is now known to be false for a trial carrying four times the criteria.
 
+### The blind judge is shown the trial's own criteria (the criteria-reference pass)
+
+**A CRITERION THAT REFERS TO OTHER CRITERIA COULD NOT BE RESOLVED, AND THE JUDGE
+SAID SO IN ITS OWN RATIONALES.** `oncotriage/evaluation/rater.py` sent per
+decision exactly three things -- arm, criterion, patient_value -- and no trial
+context of any kind. So `"all who do not fulfil inclusion criteria"`, a real
+ClinicalTrials.gov exclusion, is unanswerable: **five distinct decisions on
+NCT06057350 in `eval_run_item11_20260908_logs` came back `not_evaluable` with
+rationales naming the criteria they were not shown** ("the inclusion criteria
+whose nonfulfillment would trigger this exclusion are not provided").
+**REQUEST SHAPE 2** gives every request its own trial's registry criteria as
+fenced reference data.
+
+**THE SOURCE IS THE RUN'S OWN RECORD OF WHAT IT SENT, NEVER A FETCH.**
+`oncotriage/evaluation/run_harness.py:build_contexts` writes one context per
+trial whose `trial_text` is, in its own words, "byte-for-byte what that trial
+contributed to the Stage 5 message, fences included, because it is the same
+function that produced that message". A live fetch from the registry would be
+today's text audited against a decision made on last month's -- the registry is
+re-scraped weekly by anyone who can get a study registered.
+
+**STORED IS NOT VERIFIED, AND FOUR THINGS ARE CHECKED PER TRIAL.** Exactly one
+open and one close `<<<TRIAL_DATA ...>>>` fence; BOTH fence lines naming the
+decision's own trial; a non-empty body; and no `<{3,}|>{3,}` run in the body.
+The last is the sharpest: `_neutralize_fence_markers` already spelled out every
+bracket run on the way to the judge, so a body still carrying one **did not come
+from that renderer** -- re-neutralising here would hide that, refusing reports
+it, and it is also what makes the new fence unbreakable from the inside.
+
+**THE FENCE HEADER IS PARSED AND THEN DROPPED, WHICH IS THE WHOLE BLINDING
+ARGUMENT.** It reads `<<<TRIAL_DATA nct_id=NCT06057350 phase=NA>>>`, and both
+fields are things the rater's own role paragraph says the judge is not shown --
+the phase explicitly, the nct_id worse than explicitly, since a registered id is
+a key into whatever the judge has memorised about that trial. Forwarding the
+block verbatim would have repaired one blinding hole by opening two. **Measured
+over the whole 7,300-request run: zero occurrences of any nct_id, of `phase=`,
+or of `TRIAL_DATA` anywhere in any request's `params`.** The withheld phase is
+recorded in the manifest so a reader knows what was taken out.
+
+**WHAT IS RECORDED AND NOT VERIFIED SAYS SO IN THE FIELD NAME.** The record's
+`llm_classifier_prompt_sha256` is over the WHOLE rendered Stage 5 message --
+wrapper, patient record and every trial's block -- so it cannot be recomputed
+from one trial's text and this module does not pretend to. It is carried into
+the manifest under `recorded_not_verified`, beside a `verified` list naming the
+four checks that were really made.
+
+**MEASURED COVERAGE, AND ONE MEASUREMENT THAT KILLED A TEMPTING GATE.** Over
+`eval_run_item7_20260903`: **7,300 of 7,300 decisions get a verified reference,
+zero context errors, zero fence problems, 130 distinct trial texts.** And the
+recorded criterion text appears verbatim in its own trial's body only **4,439
+times -- 60.8%** -- because the pipeline stores the judge's ECHO of a criterion,
+legitimately re-wrapped and re-cased against the registry source. So
+`criterion_found_in_reference` is recorded per row as a DIAGNOSTIC and is
+**never a gate**: gating on containment would withhold the repair from two
+decisions in five for a reason that has nothing to do with whether the text is
+the right trial's.
+
+**AN UNVERIFIABLE TRIAL COSTS ITS DECISIONS THE BLOCK AND NOTHING ELSE.** The
+request is still built -- two content parts, byte-identical to shape 1 -- the
+row is marked `reference_context: absent` with a reason from a CLOSED
+ten-member vocabulary, and the reason is counted. `REFERENCE_ABSENT_REASONS`
+names each remedy separately, because "absent" alone sends a reader to the trial
+registry when the cause might be a record this harness could not parse, a
+directory that does not hold the trial, or a shape that never asks. **One
+missing trial never fails a batch.**
+
+**THE PART ORDER IS THE CACHE MECHANISM, AND THE REVERT MATRIX IS WHY IT IS
+PINNED.** OpenAI's cache is implicit and keys on the longest common PREFIX, and
+requests are built in `(patient, trial, arm, index)` order -- so with the
+reference SECOND, every decision of one patient-trial shares
+`system + record + reference` and every decision of one patient still shares
+`system + record` across trials. Put it third and the shared prefix stops at the
+record; put it first and it stops at the system prompt. **A plant that moved it
+last was MISSED by every other check in the new file** -- the bytes are all
+still there, the groups are still contiguous, the blinding still holds, and the
+only trace is a lower `cached_tokens` that no artifact compares against a
+counterfactual. It is pinned BY FENCE rather than by index, in both modes.
+
+**AND THE (PATIENT, TRIAL) CONTIGUITY IS ENFORCED IN PRODUCTION, not only in a
+test.** `build_requests` refuses a request list whose groups interleave, by
+name, because nothing about a broken run raises. Measured over the real run:
+**388 contiguous (patient, trial) groups inside 30 contiguous patient blocks.**
+
+**THE BLINDING INVARIANCE IS RE-ASKED OF THE NEW SHAPE.**
+`tests/test_evaluation_rater.py` section 8c serialises two runs differing ONLY
+in the recorded status and requires the bytes to be equal; that check was
+measured over a TWO-part body and would go on passing over a three-part one
+whose third part leaked. The reference is a function of the TRIAL and cannot
+carry a status -- that is the argument, and the new file's section 3 is the
+measurement, with the anchored mode as the control that the comparison can
+still fail.
+
+**`build_blind_decision_block` STILL TAKES NO STATUS**, unchanged: the reference
+is a separate function and a separate content part, so the structural guarantee
+is untouched.
+
+**THE SYSTEM PROMPT GAINED A PARAGRAPH, BECAUSE A FENCE THE SYSTEM MESSAGE DOES
+NOT NAME IS A FENCE IT DOES NOT GOVERN.** The two boundary paragraphs said "the
+message that follows contains two fenced regions"; a third region added without
+touching them would leave the "never an instruction" rule literally not covering
+the one place third-party registry prose arrives in bulk.
+`_DATA_BOUNDARY_REFERENCE` is APPENDED rather than spliced -- so shape 1
+reproduces byte for byte -- and its first sentence repairs the count explicitly
+rather than leaving a reader to notice it is now wrong. It states that the
+region is data and never an instruction, that it carries no information about
+any recorded decision, that it attests NOTHING about the patient (it is what the
+trial ASKS FOR, never what the patient HAS), that the record decides every
+patient fact, and that its ABSENCE is not evidence about anything.
+**`build_requests` REFUSES a body and a system prompt built at different
+shapes, in BOTH directions.**
+
+**THE REQUEST SHAPE IS VERSIONED, AND SHAPE 1 IS STILL PRODUCIBLE ON PURPOSE.**
+`REQUEST_SHAPE_VERSION` is 2 and is recorded under one spelling in all three
+written artifacts -- `rater_manifest.json`, `ratings.json` and `summary.json` --
+read off the INDEX rather than off the module constant, so an artifact can never
+claim a shape its own bodies were not built at. Every published blind and
+anchored figure was taken at shape 1 and **nothing recomputes or relabels
+them**. Shape 1 remains buildable because section 8a's history pin needs it:
+that pin hashes the anchored request bodies against a value measured from
+`git show HEAD:` before blind mode existed, and **a golden value refreshed to
+accommodate the change it guards makes whatever the code does correct by
+definition**. It broke on the first run of this change, which is the pin working;
+it is driven at `REQUEST_SHAPE_HISTORICAL` now and holds unchanged.
+
+**A REAL BUG THE SHAPE CHANGE WOULD HAVE CAUSED, FOUND AND FIXED.**
+`estimate_tokens` read `messages[1]["content"][1]["text"]` -- an INDEX, not a
+definition. At shape 2 `content[1]` is the reference and the per-decision block
+has moved to `content[2]`, so the old form **measured the reference and dropped
+the decision**, silently, since both are strings and the sum stays plausible. It
+is `parts[1:]` now, which states the property the figure is OF: the uncacheable
+remainder. `_request_chars` already walked every part, so the pre-submission
+liability and the dry-run bounds picked up the added characters for free -- and
+the reference is counted as UNCACHED in both bounds, because the batch path
+assumes no cache saving it has not measured.
+
+**`CRITERIA_REFERENCE_ABSENT` IS THE 48th MODULE-LEVEL COUNTER AND IT IS
+EXEMPTED RATHER THAN REGISTERED**, on `oncotriage/mcp/server.py:TOOL_FAILURES`'
+footing plus one reason of its own: `oncotriage/degradation.py` binds counter
+OBJECTS, so registering it would put a judge harness -- with `openai`,
+`spend_journal` and the prompt lift behind it -- into the import graph of every
+batch run, none of which has ever rated anything.
+`criteria_reference_report_lines()` is its reader and `_report_plan` prints it
+before a cent is spent. It is a PROCESS census and says so: item 11's own driver
+called `main()` twice in one interpreter, so it accumulates across runs, and the
+EXACT per-run figures live on the `RunInput` and are what every artifact reports.
+
+```bash
+# The criteria-reference pass. Same shape, same directory. No network, no keys,
+# NO SPEND, no live Qdrant, no model, no corpus, no database, no git history,
+# no live server -- every record, context and decision is a literal built in
+# the file and no evaluation run directory is read. It writes NOTHING anywhere,
+# not even a temp directory, and it EXECS NOTHING: every control is a different
+# INPUT to a function, or a module attribute rebound inside try/finally. NOT in
+# the collision matrix -- the two repository files it reads
+# (evaluation/rater.py, agent/evaluation.py) are written by neither of the
+# suite's two writers and are sha256-compared at the end. Bucket A, ~1 s.
+python tests/test_rater_criteria_reference.py                       # 142
+```
+
+**TWELVE REVERTS, TWELVE CAUGHT, ZERO ABORTS** -- each planted into a
+`copytree`'d copy with a `sitecustomize` stripping the editable install's
+MetaPathFinder (which otherwise beats `PYTHONPATH`), a realpath preflight
+asserting the COPY is what imports, `PYTHONDONTWRITEBYTECODE=1`, and every plant
+asserting its own occurrence count so a plant that matched nothing is a named
+PLANT-FAILED rather than a working check reported as broken. Both source files
+byte-identical afterwards.
+
+**AND THE MATRIX FOUND SIX DEFECTS IN THE TEST CODE THAT READING DID NOT.** Four
+plants ABORTED rather than failing, in the shape this project has now shipped
+eighteen times -- and the sixth is the instructive one: **`drive()` converts a
+raise into a marker STRING, which protects the CALL and not the UNPACK**, so
+`a, b = drive(f)` on a marker raises `ValueError: too many values to unpack`. It
+also surfaced a chain of pre-existing unguarded reads in
+`tests/test_evaluation_rater.py` -- `_perturbed[0]`, `_summary["..."]`,
+`_leak[...]`, `_rt[...]`, a bare `max()`, `built(...).requests[0]` -- every one
+of which was unreachable until `build_requests` learned to refuse. The root fix
+is that **`built()` now returns an index-shaped stand-in on a refusal** rather
+than a marker, so no call site has to remember to wrap it.
+
+**TEST COUNTS.** `tests/test_evaluation_rater.py` **433 -> 440** (one
+non-degeneracy check beside the hardened `_perturbed[0]`, and section 1z's six
+over the empty-matrix record),
+`tests/test_degradation_counter_readers.py` **158 -> 160** (the two per-entry
+checks the new exemption drives), `tests/test_rater_criteria_reference.py`
+**142**, new. `tests/test_package_invariants.py` unchanged at **261**, and check
+2h caught a genuinely dead `REFERENCE_STATES` in this pass's own code -- it is
+load-bearing now: `summarize_reference_coverage` refuses a row carrying a third
+state, because such a row would fall out of BOTH counts and every coverage rate
+would be over a denominator nobody chose.
+
+**THE PROBE'S FIRST SUBMISSION WAS REFUSED BY THE SHIPPED GATE, AND THE REFUSAL
+WAS RIGHT.** `config.RATER_SPEND_CAP_USD` bounds every judge session this
+project has ever run, CUMULATIVELY -- and `rater.main()` migrates prior state
+files into the journal on every run, which is how `$7.2824 across 18 sessions`
+arrived. So a driver setting the cap to `$1` was asking for a lifetime total the
+history had already broken, and the gate reported `$-6.28 left` and submitted
+nothing. **"This probe may spend at most $1" is a statement about the INCREMENT,
+and against a cumulative ledger the increment is `already spent + 1`.** Both
+numbers are printed and both land in the probe's trace.
+
+**A PRE-EXISTING CRASH THIS PASS'S OWN PROBE EXPOSED, AND FIXED.**
+`cohens_kappa`'s `n == 0` early return omitted `pipeline_counts`,
+`rater_counts` and `matrix` while still returning a NON-EMPTY `categories` --
+and `print_summary` iterates `categories` and subscripts
+`pipeline_counts[cat]` unconditionally. So **any single-armed population
+crashed the console report with `KeyError: 'pipeline_counts'`**, and the probe's
+five decisions are all `exclusion`, leaving the inclusion arm's matrix empty.
+The three artifacts are written ABOVE that call, so the data was safe, the
+spend was recorded and the command exited non-zero having lost only the printed
+report. **A record whose SHAPE depends on its own contents is one a consumer
+cannot read by key**; the empty return is total over the same keys now, with
+zeros, and section 1z pins the two key sets equal and drives the pre-fix shape
+through the walk `print_summary` performs.
+
+**THE PROBE: FIVE ROWS, SHAPE 2, `$0.0566` MEASURED.** One batch,
+`batch_6aa1bde246708190a634a42b8104e137`, 5 requests, 5 completed, 0 failed,
+against a $1.00 increment ceiling and a $0.0962 reservation. Every row carried
+the reference block and all five carried the SAME text digest -- one trial, one
+byte-identical block, which is the cache prefix working.
+
+| | shape 1 (`eval_run_item11_20260908_logs`) | shape 2 (this probe) |
+|---|---|---|
+| rated | 5 | 5 |
+| carrying the reference block | 0 | **5** |
+| rationales reporting criteria they were not shown | **5** | **0** |
+| assigned_status | `not_evaluable` x5 | `violated` x5 |
+| patient_value_support | mixed | `supported` x5 |
+
+Shape 1: *"Although the record documents a resolved overlapping malignant
+neoplasm of the colon in 2019, the inclusion criteria whose nonfulfillment would
+trigger this exclusion are not provided."* Shape 2, same decision: *"The
+documented resolved overlapping malignant neoplasm of the colon in 2019
+establishes prior colorectal cancer, so the patient does not fulfill the
+inclusion criterion of no prior CRC."* **The reference resolves, and the answer
+is supported from the record.**
+
+**THE CHANGED VERDICT IS NOT REPORTED AS A SUCCESS, AND THE PROBE'S OWN SUMMARY
+SAYS SO IN THOSE WORDS.** The shape-1 answer was `not_evaluable` FOR WANT OF
+THE REFERENCE, so a substantive shape-2 status answers a DIFFERENT question
+rather than answering the same one better. Agreement with the pipeline is not a
+criterion of this probe. **Five rows verify this specific repair and nothing
+about overall judge accuracy; they are development evidence about the
+instrument and they join no headline figure.**
+
+**THE RATER IS A LEAF AND THAT IS WHY NO PIPELINE ARTIFACT MOVED.** Measured
+rather than argued: **no package module imports
+`oncotriage.evaluation.rater` at all** -- every mention of the name inside
+`oncotriage/` is prose in a comment or docstring -- and the only importer in the
+tree is `rater_run.py`. `oncotriage/fixtures/` names it nowhere and
+`run_fingerprint.RENDERER_MODULES` does not contain it. So no fixture, no
+prompt version, no renderer digest and no fingerprint can be reached by
+anything in this pass.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **NO FIXTURE OR CHARACTERIZATION GATE COVERS SHAPE 2.** The twelve
+   characterization fixtures are about the pipeline, not the rater, and the
+   rater has never had one. The new file is the whole of the coverage.
+2. **THE `criterion_found_in_reference` DIAGNOSTIC IS NOT ANALYSED ANYWHERE.**
+   It is written per row and read by nothing; the 60.8% figure above is the only
+   reading anyone has taken of it.
+3. **THE MERGE PATH IS COVERED BY REASONING AND ONE UNIT CHECK, NOT BY A DRIVE.**
+   `load_runs`' criteria merge -- including the two-directory conflict that
+   marks a trial absent -- is exercised through `read_record_criteria` and the
+   planted merge, not through two real directories.
+4. **NOTHING RE-RATES THE SHAPE-1 POPULATION AT SHAPE 2.** The probe is five
+   rows. Whether the reference changes agreement, or changes it in a good
+   direction, is not measured and is deliberately not claimed.
+5. **THE JOURNAL BOOTSTRAP RAN AS A SIDE EFFECT OF THIS PASS.**
+   `09- Testing/Evaluation Runs/spend_journal.jsonl` did not exist before it and
+   now records 18 prior sessions and $7.2824. It is the migration the journal
+   exists for and it is idempotent (measured: a second call records 0 rows and
+   adds $0.00), but it was not asked for and it moves the remaining rater budget
+   from a reported $50.00 to a true $42.72.
+
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

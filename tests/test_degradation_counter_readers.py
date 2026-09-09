@@ -386,6 +386,19 @@ _READER_EXEMPTIONS = {
     "GUARD_FAILURES": ("mcp_server.py", "mcp_server.py",
                        "entry point, and it counts faults from the import "
                        "window itself"),
+
+    # --- the JUDGE HARNESS, on TOOL_FAILURES' footing and with one reason of
+    # its own. A rater session is not a pipeline run and has no run-end report
+    # to attach to -- but the decisive argument is the same one that keeps
+    # FastAPI out of every batch run's import graph: oncotriage/degradation.py
+    # binds counter OBJECTS, so registering this would put the judge harness,
+    # `openai`, `spend_journal` and the prompt lift behind
+    # `import oncotriage.degradation` for every process in the project, none of
+    # which has ever rated anything. criteria_reference_report_lines() is its
+    # reader, and _report_plan prints it before a cent is spent.
+    "CRITERIA_REFERENCE_ABSENT": ("oncotriage/evaluation/rater.py",
+                                  "oncotriage/evaluation/rater.py",
+                                  "judge harness, not a pipeline run"),
 }
 
 # CHECKPOINT_FAULTS is the one name owned by TWO modules -- batch/runner.py

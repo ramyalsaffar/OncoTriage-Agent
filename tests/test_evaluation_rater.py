@@ -167,6 +167,24 @@ def close(label, actual, expected, tol=1e-9):
         _FAILURES[-1] += f"\n          value:    {actual!r}"
 
 
+def walk(value, *keys, default="<absent>"):
+    """Walk into a ``drive`` result without ever raising.
+
+    ``drive`` protects the CALL; a subscript on its marker string, or on a
+    legitimately-absent block, aborts the file just as surely. Every
+    ``drive(...)[k]`` in this file goes through here.
+    """
+    cur = value
+    for k in keys:
+        if isinstance(cur, dict):
+            cur = cur.get(k, default)
+        elif isinstance(cur, (list, tuple)) and isinstance(k, int):
+            cur = cur[k] if -len(cur) <= k < len(cur) else default
+        else:
+            return default
+    return cur
+
+
 def drive(fn, *args, **kwargs):
     """Call into the harness and convert a raise into a value.
 
@@ -353,6 +371,43 @@ check("1k  rater_implied_status: disagree implies the correction",
       drive(R.rater_implied_status, "met",
             {"status_verdict": "disagree", "corrected_status": "not_met"}),
       "not_met")
+
+
+# --- 1z -- THE EMPTY MATRIX RETURNS THE SAME RECORD SHAPE ----------------
+#
+# FOUND BY A REAL PAID RUN, NOT BY READING. The `n == 0` branch omitted three
+# keys the full return carries while still returning a non-empty `categories`,
+# and `print_summary` iterates `categories` and subscripts `pipeline_counts`
+# unconditionally -- so a single-armed population (the criteria-reference
+# probe's five decisions are all exclusions, leaving the inclusion arm empty)
+# crashed the console report AFTER all three artifacts had been written.
+_EMPTY = drive(R.cohens_kappa, [[0, 0], [0, 0]], ("a", "b"))
+_FULL = drive(R.cohens_kappa, [[1, 0], [0, 1]], ("a", "b"))
+check("1z  the empty-matrix record has the SAME key set as a populated one, "
+      "so a consumer can read it by key",
+      sorted(_EMPTY) if isinstance(_EMPTY, dict) else _EMPTY,
+      sorted(_FULL) if isinstance(_FULL, dict) else _FULL)
+check("1z  non-degeneracy: that key set is not empty",
+      len(_FULL) > 8 if isinstance(_FULL, dict) else False, True)
+check("1z  ...and the counts it reports are zeros over the SAME categories, "
+      "never an empty dict a caller would KeyError on",
+      (_EMPTY.get("pipeline_counts"), _EMPTY.get("rater_counts"))
+      if isinstance(_EMPTY, dict) else _EMPTY,
+      ({"a": 0, "b": 0}, {"a": 0, "b": 0}))
+check("1z  ...and every category it names is in those counts, which is the "
+      "exact pairing print_summary walks",
+      all(c in (_EMPTY.get("pipeline_counts") or {})
+          and c in (_EMPTY.get("rater_counts") or {})
+          for c in (_EMPTY.get("categories") or []))
+      if isinstance(_EMPTY, dict) else False, True)
+check("1z  CONTROL: the crash is reproducible from the pre-fix shape -- a "
+      "record missing the key, walked the way print_summary walks it",
+      "KeyError" in str(drive(
+          lambda rec: [rec["pipeline_counts"][c] for c in rec["categories"]],
+          {"categories": ["a"], "pipeline_counts": {}})), True)
+check("1z  ...and the same walk over the SHIPPED empty record does not raise",
+      drive(lambda rec: [rec["pipeline_counts"][c] for c in rec["categories"]],
+            _EMPTY), [0, 0])
 
 
 # ===========================================================================
@@ -1316,19 +1371,70 @@ def planted_run(status_overrides=None):
                       dict(_ORDER))
 
 
-def built(mode, run=None, retest_fraction=0.0, seed=42, rubric=None):
-    """A RequestIndex over the planted run, or a marker string on a raise."""
+def built(mode, run=None, retest_fraction=0.0, seed=42, rubric=None,
+          shape=None):
+    """A RequestIndex over the planted run, or a marker string on a raise.
+
+    ``shape`` defaults to whatever a run built today is, so every check that
+    does not care follows the shipped shape. 8a passes
+    ``REQUEST_SHAPE_HISTORICAL`` explicitly: a pin measured against history can
+    only go on asking its question if history is still producible, and the
+    system prompt and the request bodies must both be built at the shape or the
+    module refuses them as disagreeing.
+    """
     rubric = _FIXED_RUBRIC if rubric is None else rubric
+    shape = R.REQUEST_SHAPE_VERSION if shape is None else shape
     defs = (drive(R.lift_arm_status_definitions, rubric)
             if mode == R.MODE_BLIND else None)
     if isinstance(defs, str):
         return defs
-    return drive(R.build_requests, run or planted_run(),
-                 drive(R.build_system_prompt, rubric, mode=mode),
-                 {"rubric_sha256": "x"}, _MODEL, 300, None,
-                 mode=mode, arm_definitions=defs,
-                 retest_fraction=retest_fraction, retest_seed=seed,
-                 structured_output=False)
+    return idx(drive(R.build_requests, run or planted_run(),
+                     drive(R.build_system_prompt, rubric, mode=mode,
+                           shape_version=shape),
+                     {"rubric_sha256": "x"}, _MODEL, 300, None,
+                     mode=mode, arm_definitions=defs,
+                     retest_fraction=retest_fraction, retest_seed=seed,
+                     structured_output=False, shape_version=shape))
+
+
+class _RefusedIndex(object):
+    """A stand-in for a ``RequestIndex`` that ``build_requests`` refused.
+
+    ``built`` returns a marker STRING on a refusal, and a string has no
+    ``.requests`` -- so a defect that makes the builder refuse aborts this file
+    at module level while a ``check`` argument is being evaluated, reporting one
+    traceback where it owes 434 results. That is the shape this project has
+    shipped eighteen times; the revert matrix for the criteria-reference change
+    found it here, where it became REACHABLE when ``build_requests`` learned to
+    refuse a system prompt and a request shape that disagree.
+
+    Every attribute is the empty answer, so every check below FAILS and names
+    itself instead of vanishing.
+    """
+
+    def __init__(self, marker):
+        self.marker = marker
+        self.requests = []
+        self.by_custom_id = {}
+        self.retest_ids = set()
+        self.primary_ids = set()
+        self.retest_meta = {}
+        self.include_keys_meta = None
+        self.reference_by_custom_id = {}
+        self.reference_meta = {}
+        self.system_prompt = ""
+        self.rubric_meta = {}
+        self.mode = None
+        self.form = None
+        self.shape_version = None
+
+    def __repr__(self):
+        return f"<refused: {self.marker}>"
+
+
+def idx(value):
+    """A built index, or a stand-in that cannot abort the caller."""
+    return value if hasattr(value, "requests") else _RefusedIndex(value)
 
 
 def blob(index):
@@ -1403,7 +1509,7 @@ def _as_anthropic_body(request):
     }
 
 
-_anch = built(R.MODE_ANCHORED)
+_anch = built(R.MODE_ANCHORED, shape=R.REQUEST_SHAPE_HISTORICAL)
 _anch_historical = ([_as_anthropic_body(r) for r in _anch.requests]
                     if hasattr(_anch, "requests") else [])
 check("8a  the anchored requests' CONTENT and ORDER still hash to the value "
@@ -1433,7 +1539,16 @@ check("8a  ...and the ORDER is the run's own order, which is what the first "
 # same list must not hash to it.
 _perturbed = json.loads(
     json.dumps(_anch_historical, sort_keys=True, ensure_ascii=False))
-_perturbed[0]["params"]["max_tokens"] = 301
+# GUARDED, AND THE REASON IS THE DEFECT THIS SHAPE HAS ALWAYS BEEN. A bare
+# `_perturbed[0]` raises IndexError exactly when a defect has made `built()`
+# refuse and return a marker -- which is when this file owes a summary and 433
+# results, not a traceback. It became REACHABLE when `build_requests` learned
+# to refuse a system prompt and a request shape that disagree; the shape was
+# always here.
+check("8a  CONTROL: non-degeneracy -- there is a request to perturb",
+      bool(_perturbed), True)
+if _perturbed:
+    _perturbed[0]["params"]["max_tokens"] = 301
 check("8a  CONTROL: a single changed field breaks the pin",
       sha(json.dumps(_perturbed, sort_keys=True, ensure_ascii=False))
       != _ANCHORED_PIN, True)
@@ -1878,17 +1993,23 @@ check("8n  ...and marked which ratings are retests",
       and sum(1 for r in _collected["rated"].values() if r["is_retest"]),
       len(_bi2.retest_ids))
 
+# A DICT OR AN EMPTY ONE, never a marker string: `summarize` legitimately
+# omits the blind-only keys when the mode is not blind, and a defect that makes
+# `built` refuse produces exactly that -- so `_summary.get("confusion_counts")`
+# raises KeyError and aborts the file. Every read below is `.get`.
 _summary = drive(R.summarize, _bi2, _collected["rated"], {}, planted_run())
+if not isinstance(_summary, dict):
+    _summary = {"<refused>": _summary}
 check("8n  the headline counts PRIMARIES ONLY -- a retested decision must not "
       "vote twice",
-      (_summary["decisions_total"], _summary["decisions_rated"]),
+      (_summary.get("decisions_total"), _summary.get("decisions_rated")),
       (len(_PLANT), len(_PLANT)))
 check("8n  hand-computed agreement: 5 of 7 primaries agree",
-      (_summary["overall_agree"], _summary["overall_disagree"]), (5, 2))
-close("8n  ...so the rate is 5/7", _summary["overall_agreement_rate"], 5 / 7.0)
+      (_summary.get("overall_agree"), _summary.get("overall_disagree")), (5, 2))
+close("8n  ...so the rate is 5/7", _summary.get("overall_agreement_rate"), 5 / 7.0)
 check("8n  hand-computed per-arm, per-status confusion counts, DIAGONAL "
       "INCLUDED",
-      _summary["confusion_counts"],
+      _summary.get("confusion_counts"),
       {"inclusion": {"met": {"met": 1, "not_met": 1},
                      "not_met": {"not_met": 1},
                      "not_evaluable": {"not_evaluable": 1}},
@@ -1897,12 +2018,12 @@ check("8n  hand-computed per-arm, per-status confusion counts, DIAGONAL "
                      "not_evaluable": {"not_evaluable": 1}}})
 check("8n  the summary says which mode produced it, and that a blind verdict "
       "is arithmetic",
-      (_summary["mode"], "BLIND" in _summary["anchoring"]),
+      (_summary.get("mode"), "BLIND" in (_summary.get("anchoring") or "")),
       (R.MODE_BLIND, True))
 check("8n  the residual leaks are stated IN THE OUTPUT, not only in a design "
       "note -- including the patient_value one",
       "patient_value_is_the_judged_model_s_own_extract"
-      in _summary["circularity_limitations"], True)
+      in (_summary.get("circularity_limitations") or {}), True)
 
 # --- the residual leak is MEASURED, not described -------------------------
 # Hand-computed over the plant: 1 extract begins "Not in patient record"
@@ -1913,7 +2034,9 @@ check("8n  the residual leaks are stated IN THE OUTPUT, not only in a design "
 # tied with not_evaluable at 2 -- Counter.most_common breaks the tie by
 # insertion order, which is why the assertion below reads the rate rather than
 # the label.
-_leak = _summary["patient_value_leak_measured"]
+# A DICT OR AN EMPTY ONE, for `_summary`'s reason one level down: the
+# blind-only block is legitimately absent whenever the mode is not blind.
+_leak = _summary.get("patient_value_leak_measured") or {}
 check("8l  the marker classes are bucketed by Stage 5's two documented "
       "conventions, prefix-matched and case-folded",
       (drive(R.patient_value_marker_class, "Not in patient record"),
@@ -1924,25 +2047,25 @@ check("8l  the marker classes are bucketed by Stage 5's two documented "
       ("MARKER: not in patient record", "MARKER: not in patient record",
        "MARKER: not applicable", "quoted data", "quoted data"))
 check("8n  the leak measurement buckets the plant as hand-counted",
-      {k: v["decisions"] for k, v in _leak["marker_classes"].items()},
+      {k: v["decisions"] for k, v in (_leak.get("marker_classes") or {}).items()},
       {"MARKER: not in patient record": 1, "MARKER: not applicable": 1,
        "quoted data": 5})
 close("8n  ...and a guesser seeing ONLY the extract class scores 4/7",
-      _leak["status_predictable_from_marker_class"], 4 / 7.0)
+      _leak.get("status_predictable_from_marker_class"), 4 / 7.0)
 check("8n  the excess over the base rate is reported beside it, so a skewed "
       "corpus cannot make the leak look small by itself",
-      _leak["excess_over_base_rate"] is not None
-      and abs(_leak["status_predictable_from_marker_class"]
-              - _leak["majority_status_base_rate"]
-              - _leak["excess_over_base_rate"]) < 1e-12, True)
+      _leak.get("excess_over_base_rate") is not None
+      and abs(_leak.get("status_predictable_from_marker_class")
+              - _leak.get("majority_status_base_rate")
+              - _leak.get("excess_over_base_rate")) < 1e-12, True)
 check("8n  the limitation prose quotes the measured size rather than only "
       "asserting 'correlates strongly'",
       "patient_value_leak_size_on_this_run"
-      in _summary["circularity_limitations"], True)
+      in (_summary.get("circularity_limitations") or {}), True)
 check("8n  ...and the sentence names the leakiest class AND the excess, "
       "because either alone misleads in a different direction",
-      all(s in _summary["circularity_limitations"][
-          "patient_value_leak_size_on_this_run"]
+      all(s in ((_summary.get("circularity_limitations") or {}).get(
+          "patient_value_leak_size_on_this_run") or "")
           for s in ("100.0%", "not in patient record",
                     "over always answering", "per-class shares")), True)
 # The tie-break is deterministic and meaningful, not dict order. Both marker
@@ -1974,8 +2097,8 @@ check("8n  CONTROL: reverse the sizes and the OTHER class is named, so the "
 # The prose must not assert a SIZE it has not measured. The first version said
 # "the small excess" unconditionally -- false on any corpus where it is large.
 check("8n  the sentence makes no hardcoded claim that the excess is small",
-      "small" in _summary["circularity_limitations"][
-          "patient_value_leak_size_on_this_run"], False)
+      "small" in ((_summary.get("circularity_limitations") or {}).get(
+          "patient_value_leak_size_on_this_run") or ""), False)
 check("8n  an empty decision list is reported as such rather than dividing by "
       "zero",
       drive(R.measure_patient_value_leak, [])["decisions"], 0)
@@ -1998,34 +2121,34 @@ check("8n  CONTROL: the anchored summary carries neither the blind confusion "
       (True, False))
 
 # --- 8o -- INTRA-RATER AGREEMENT -----------------------------------------
-_rt = _summary["retest"]
+_rt = _summary.get("retest") or {}
 check("8o  one pair per retested decision, both copies rated",
-      (_rt["duplicates_submitted"], _rt["pairs"]),
+      (_rt.get("duplicates_submitted"), _rt.get("pairs")),
       (len(_bi2.retest_ids), len(_bi2.retest_ids)))
 check("8o  hand-computed: 6 of 7 pairs identical, 1 changed",
-      (_rt["identical"], _rt["changed"]), (6, 1))
+      (_rt.get("identical"), _rt.get("changed")), (6, 1))
 close("8o  ...so intra-rater agreement is 6/7",
-      _rt["intra_rater_agreement_rate"], 6 / 7.0)
+      _rt.get("intra_rater_agreement_rate"), 6 / 7.0)
 check("8o  the decision that moved is named, with both answers",
       [(c["arm"], c["index"], c["first_assigned"], c["second_assigned"])
-       for c in _rt["changed_decisions"]],
+       for c in (_rt.get("changed_decisions") or [])],
       [("inclusion", 1, "not_met", "met")])
 check("8o  it is reported SEPARATELY: the headline agreement is unchanged by "
       "the retest answers",
-      (_summary["overall_agree"], _summary["overall_disagree"]), (5, 2))
+      (_summary.get("overall_agree"), _summary.get("overall_disagree")), (5, 2))
 check("8o  a pair whose primary failed to parse is NOT counted as unstable",
-      drive(R.retest_report, _bi2,
-            {c: v for c, v in _collected["rated"].items()
-             if c != "pA_NCT00000001_inclusion_1"})["pairs"],
+      walk(drive(R.retest_report, _bi2,
+                  {c: v for c, v in _collected["rated"].items()
+                   if c != "pA_NCT00000001_inclusion_1"}), "pairs"),
       len(_bi2.retest_ids) - 1)
 check("8o  ...and is reported as an incomplete pair instead",
-      drive(R.retest_report, _bi2,
-            {c: v for c, v in _collected["rated"].items()
-             if c != "pA_NCT00000001_inclusion_1"}
-            )["pairs_incomplete"]["only_retest_rated"], 1)
+      walk(drive(R.retest_report, _bi2,
+                 {c: v for c, v in _collected["rated"].items()
+                  if c != "pA_NCT00000001_inclusion_1"}),
+           "pairs_incomplete", "only_retest_rated"), 1)
 check("8o  with no retest requested the block says so rather than reporting a "
       "rate over zero pairs",
-      drive(R.retest_report, _anch, {})["pairs"], 0)
+      walk(drive(R.retest_report, _anch, {}), "pairs"), 0)
 
 # --- 8p -- THE STATE FILE CANNOT BE READ ACROSS MODES --------------------
 check("8p  the two modes name different state files by default",
@@ -2742,12 +2865,12 @@ check("9l  every request for one patient shares an identical (system prompt, "
       {p: 1 for p in _by_patient})
 check("9l  non-degeneracy: there is more than one request per patient, so "
       "the check above is not one prefix compared with itself",
-      max(sum(1 for r in _pref.requests
-              if _pref.by_custom_id[r["custom_id"]].patient_id == p)
-          for p in _by_patient) > 1, True)
+      max([sum(1 for r in _pref.requests
+               if _pref.by_custom_id[r["custom_id"]].patient_id == p)
+           for p in _by_patient] or [0]) > 1, True)
 check("9l  ...and the two patients' prefixes DIFFER, so the check is about "
       "the record rather than about a constant",
-      len({tuple(sorted(v))[0] for v in _by_patient.values()}),
+      len({tuple(sorted(v))[0] for v in _by_patient.values() if v}),
       len(_by_patient))
 check("9l  the per-decision block is the LAST part, after the record: it is "
       "what must differ, and anything after it would be outside the cached "
@@ -2826,7 +2949,8 @@ check("9m  a truncation at the new ceiling is still bucketed loudly rather "
       and "truncated_max_tokens" in R.RETRYABLE_REASONS, True)
 check("9m  ...and it reaches the wire under the field a reasoning model "
       "requires, not the legacy one",
-      sorted(k for k in built(R.MODE_ANCHORED).requests[0]["params"]
+      sorted(k for k in walk(built(R.MODE_ANCHORED).requests, 0, "params",
+                             default={})
              if "token" in k), ["max_completion_tokens"])
 
 # The table is TOTAL over MODES. A mode with no ceiling is a paid request

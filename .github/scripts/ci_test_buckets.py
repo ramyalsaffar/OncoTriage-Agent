@@ -874,6 +874,22 @@ BUCKETS = {
         "NOTHING and loads no module by location: every control is a "
         "different INPUT to a pure function, an injected environ/classifier "
         "argument, or an attribute rebound inside try/finally"),
+    "test_rater_criteria_reference.py": (
+        _A, None,
+        "ran green in 0.8s, 142 checks, against ONLY the directory skeleton: "
+        "the rater's criteria-reference block (request shape 2). Every "
+        "record, context and decision is a literal built in the file, so no "
+        "evaluation run directory is read and `default_run_dir()` is never "
+        "called. No network, no keys, no spend, no live Qdrant, no model, no "
+        "corpus, no database, no git history, no live server. It writes "
+        "NOTHING anywhere -- not even a temp directory -- so it is not in the "
+        "collision matrix; the two repository files it reads "
+        "(oncotriage/evaluation/rater.py, oncotriage/agent/evaluation.py) are "
+        "written by neither of the suite's two writers and are "
+        "sha256-compared at the end. It EXECS NOTHING and loads no module by "
+        "location: every control is a different INPUT to a function, or a "
+        "module attribute rebound inside try/finally with the restore "
+        "asserted"),
     "test_evaluation_rater.py": (
         _A, None,
         "ran green in 1.1s, 311 checks, against ONLY the directory skeleton, "
