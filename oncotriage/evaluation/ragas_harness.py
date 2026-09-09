@@ -1418,11 +1418,26 @@ def _recorder_is_reachable(fn, target, depth=0):
 def build_embeddings(model, tally):
     """The Ragas embedder, wired to OpenAI, with usage recorded.
 
-    THE ONE OPENAI DEPENDENCY IN THIS MODULE, and it is an embedder rather than
-    a judge: ``ResponseRelevancy`` scores cosine similarity between the real
-    question and questions the JUDGE reverse-engineered, so something has to
-    turn both into vectors. It renders no verdict and reads no criterion, so
-    the different-family separation this harness exists to preserve is intact.
+    ONE OF THE MODULE'S TWO OPENAI DEPENDENCIES. This line read "THE ONE
+    OPENAI DEPENDENCY IN THIS MODULE" and was true until the 2026-09-08 judge
+    port; ``build_judge`` builds an ``AsyncOpenAI`` too, and measuring rather
+    than reading is what settled it -- an AST walk over this module finds
+    exactly two ``from openai import`` statements, one here and one there, and
+    two ``resolve_api_key("OPENAI_API_KEY")`` reads beside them.
+
+    WHAT THE STALE LINE WAS FOR, AND WHY THE SEPARATION IS STILL INTACT. Its
+    job was to say that an OpenAI object in this module is not a second judge.
+    That is still the fact and it is now argued from the right axis: the
+    separation this harness preserves is JUDGE vs PIPELINE CLASSIFIER, not
+    OpenAI vs everything. ``oncotriage/evaluation/judge_independence.py`` is
+    what checks it, at import and again before the first billed request, and
+    at the shipped default it compares an OpenAI judge against an Anthropic
+    classifier (``config.MATCHING_PROVIDER`` ships ``"bedrock_anthropic"``).
+
+    An embedder could not breach that separation in either configuration:
+    ``ResponseRelevancy`` scores cosine similarity between the real question
+    and questions the JUDGE reverse-engineered, so something has to turn both
+    into vectors. It renders no verdict and reads no criterion.
     """
     from openai import AsyncOpenAI
     from ragas.embeddings.base import embedding_factory
@@ -3012,8 +3027,10 @@ def _parse_args(argv=None):
                    help="score only these metrics (default: all three). "
                         "Selecting none of the generation metrics skips that "
                         "dataset entirely; selecting no metric that needs an "
-                        "embedder means no OpenAI client is built and "
-                        "OPENAI_API_KEY is never read. Choices: "
+                        "embedder means no EMBEDDER is built -- but the JUDGE "
+                        "is an OpenAI model since the 2026-09-08 port, so an "
+                        "OpenAI client is built and OPENAI_API_KEY is read on "
+                        "every run whatever is selected. Choices: "
                         + ", ".join(ALL_METRICS))
     p.add_argument("--response-field", choices=RESPONSE_FIELDS,
                    default=DEFAULT_RESPONSE_FIELD, metavar="FIELD",
@@ -3248,10 +3265,15 @@ def main(argv=None):
                    else args.reasoning_effort)
         llm = build_judge(args.judge_model, args.temperature, args.max_tokens,
                           tally, args.max_retries, reasoning_effort=_effort)
-        # No embedder is CONSTRUCTED unless a selected metric needs one, so a
+        # No EMBEDDER is CONSTRUCTED unless a selected metric needs one, and
+        # the embedding-call check below turns that from a claim into a
+        # measurement. What this comment used to add -- "so a
         # context-precision-only run reads no OPENAI_API_KEY and builds no
-        # OpenAI client. Asserted after scoring by the embedding-call check
-        # below, which turns "no OpenAI call" from a claim into a measurement.
+        # OpenAI client" -- was true of the Anthropic judge and is FALSE of
+        # this one: build_judge three lines above is unconditional, and it
+        # reads that key and builds an AsyncOpenAI on every run. The
+        # measurement below is about EMBEDDING calls and has never said
+        # anything about the judge's.
         embeddings = (build_embeddings(args.embedding_model, tally)
                       if needs_embeddings else None)
         metrics = build_metrics(llm, embeddings, args.metrics)
