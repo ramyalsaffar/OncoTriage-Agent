@@ -235,3 +235,96 @@ f40048a7d859eab0a54a1202557182c857653757:gitleaks:generic-api-key:685
 # REMOVAL CONDITION: this goes when history is rewritten. Nothing else removes
 # it, because nothing else removes the blob.
 fd805105894372541a44ce1da35b8f385ff67355:gitleaks:generic-api-key:559
+
+# ===========================================================================
+# BLOCK 5 — A DELIBERATE NON-ENTRY. AN UNREACHABLE BLOB GETS NO FINGERPRINT.
+# ===========================================================================
+#
+# THIS BLOCK SUPPRESSES NOTHING. It carries no fingerprint line, on purpose,
+# and it is the record of an inspection rather than an acceptance. It is here
+# because the obvious response to the finding it describes is to add a
+# fingerprint, and adding one was MEASURED to break CI.
+#
+# THE FINDING. One blob, `7348124f0d213da9d03908fd51444194cef0e6d1`, reported
+# by the project scanner's `openai_anthropic_key` detector as a 33-byte content
+# match at offset 209163. The gate names no basename for it, which is the first
+# symptom: no tree names this blob, so there is no path to attribute it to.
+#
+# IT IS DANGLING, NOT HISTORICAL, AND THAT IS THE WHOLE DIFFERENCE FROM BLOCKS
+# 1 TO 4. Every entry above keys a blob that is reachable, immutable and
+# therefore in every clone, which is why every REMOVAL CONDITION above reads
+# "when history is rewritten". This one is reachable from nothing:
+# `git rev-list --objects --all --reflog --indexed-objects` does not list it
+# (3,627 objects listed, and a known-reachable blob found as the control);
+# `git log --all --find-object` names no commit; `git fsck` reports it as an
+# unreachable blob. It is a LOOSE object, mtime 2026-09-09T15:01:46, and
+# `git gc` prunes such an object on its own schedule.
+#
+# WHAT IT IS. An intermediate draft of `tests/test_evaluation_rater.py`: 4,039
+# lines, 212,688 bytes, carrying that file's `check`/`_RESULTS` harness and its
+# `build_blind_decision_block`, `REQUEST_SHAPE_VERSION`, `rubric_sha256` and
+# `cohens_kappa` markers. Its size places it between the committed versions at
+# `a7108a46` (177,456 bytes) and `c4d59c0c` (218,557 bytes) — i.e. a working
+# state that reached the object database (a `git add` or equivalent; which
+# one is not recoverable, since nothing references it) and was superseded
+# before it was committed. Nothing was lost by never committing it: the pass
+# that produced it is at HEAD.
+#
+# WHAT THE MATCH IS, ESTABLISHED WITHOUT EVER PRINTING IT. The blob carries
+# exactly one string beginning `sk-`, at its line 3954, and the statement it
+# sits in is byte-for-byte the section-9q non-degeneracy control that the file
+# at HEAD carries at line 4079 — same comment, same variable names, same
+# `os.environ["OPENAI_API_KEY"]` assignment. HEAD assembles that sentinel at
+# run time and so contains no `sk-` literal at all; this draft still spelled it
+# out. The two were compared by digest and never by eye:
+#
+#     * the candidate splits on `-` into seven parts, and the sha256 of each of
+#       the first six equals the sha256 of the corresponding word in the
+#       assembly at HEAD — the six-word tuple that spells out in English that
+#       the value is not a real key — while the seventh is twelve zeros;
+#     * sha256 of the candidate:
+#           e9556fb8a84f2fe00af3d94eacf6d9bea4abc1bc4730c386a6785560d571901d
+#     * sha256 of the value HEAD assembles:
+#           2b3efbb2b4f9a26bf4a09ea36e83fa43aa9ade5e5b3e78f01b1efdf37047625c
+#       The two differ by one character of length (33 against 32) because the
+#       literal form carried a separator before the zeros where the assembly
+#       concatenates them.
+#
+# It carries no opaque alphanumeric run, and no `T3BlbkFJ` infix, so it matches
+# no gitleaks rule and would be reported by one engine only. It is usable
+# against no service and there is nothing to rotate.
+#
+# WHY NO FINGERPRINT IS ADDED, AND IT WAS RUN RATHER THAN REASONED ABOUT. A
+# fresh `git clone --no-local` of this repository does NOT contain this blob —
+# clone transfers reachable objects, and this one is reachable from nothing —
+# so the gate over that clone reports ZERO unaccepted findings. Adding the
+# fingerprint to a copy of this table and running the gate over that same clone
+# reports it under ACCEPTED TABLE IS STALE and exits 2. So the entry would turn
+# a finding that exists only in one developer's object database into a CI
+# failure that exists for everybody, which is the exact harm the staleness
+# check at the top of this file is for.
+#
+# THE REMEDY IS TO EXPIRE THE OBJECT, which is this gate's own recorded control
+# for a dangling finding. It is local, it touches no history, and it is
+# irreversible for a content that costs nothing to lose:
+#
+#     git prune --expire=now        # or: git gc --prune=now
+#
+# MEASURED, ON A COPY, RATHER THAN ASSERTED. `.git` was copied to a scratch
+# directory, that one loose object removed from the copy, and the gate run
+# against it with `--repo`: blobs 2211 -> 2210 and ZERO unaccepted findings,
+# with all seventeen `oncotriage`-engine entries above still matched. (The
+# copy still exits 2, and so does a fresh clone, because this machine has no
+# gitleaks binary and the seven `gitleaks`-engine entries above cannot be
+# matched without it. All seven of the entries reported stale are gitleaks
+# entries; none is a project-scanner entry. That is an environment artifact
+# of this checkout, not a property of the table.)
+#
+# NOT PERFORMED HERE. Pruning removes every unreachable object in this
+# checkout, not only this one — there are 295 of them, including unreachable
+# commits that are sometimes somebody's only handle on abandoned work — so it
+# is an operator's decision rather than a scanner's.
+#
+# REMOVAL CONDITION: none. This block suppresses nothing, so it cannot go
+# stale, and it is worth more after the object is pruned than before: it is the
+# record of why the finding is not in the table.
