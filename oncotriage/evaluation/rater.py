@@ -4544,6 +4544,18 @@ than no remedy.
 """
 
 
+STATE_MODEL_KEY = "model"
+"""The key a state file records its judge under.
+
+A module constant on ``STATE_SHAPE_KEY``'s and ``RUBRIC_SHA_KEY``'s footing:
+``require_state_model`` quotes it in the refusal it raises, and a remedy naming
+a key that does not exist is worse than no remedy. It is also the name the
+three written artifacts use for the same fact, so an operator comparing a
+refusal against the ``rater_manifest.json`` beside it is comparing one spelling
+rather than two.
+"""
+
+
 def state_input_file_ids(state):
     """{batch_id: input_file_id} for the recorded batches that carry one.
 
@@ -4860,6 +4872,172 @@ def require_state_rubric(state, rubric_meta, state_path):
         f"Resume with the code that submitted them, or use --output-dir to "
         f"keep the two apart.",
         code="state_rubric_mismatch")
+
+
+def require_state_model(state, model, state_path):
+    """Refuse a state file whose batches were submitted to a DIFFERENT judge.
+
+    ``require_state_shape`` guards WHICH INSTRUMENT built the requests and
+    ``require_state_rubric`` guards WHAT THEY WERE JUDGED AGAINST. This guards
+    WHO ANSWERED THEM, and it is the same defect one field over: ``model`` has
+    been written into the state file since this module's first commit
+    (``81203ea``) and was read back by nothing, so a resume across a judge
+    change joined one model's answers onto artifacts recording another.
+
+    **THIS IS NOT A HYPOTHETICAL POPULATION. IT IS THE ARTIFACTS ON DISK.**
+    ``d0f4519`` (2026-09-08 17:05) -- "Port rater and Ragas judge to GPT-5.6
+    Terra on OpenAI Batch" -- moved ``DEFAULT_MODEL`` from
+    ``claude-sonnet-4-6`` to ``gpt-5.6-terra``. Of the nineteen state files
+    under ``09- Testing/Evaluation Runs/``, SIXTEEN were written before that
+    port and record the Anthropic judge, and THREE record the OpenAI one
+    (item 11's two blind sessions and the criteria-reference probe). COUNTED,
+    not estimated: the first draft of this paragraph said seventeen and two,
+    which is wrong in both directions and adds to twenty. Resuming any of the
+    sixteen today with no ``--model`` flag asks this session to attribute
+    Anthropic answers to ``gpt-5.6-terra``.
+
+    **THE COLLECTION-TIME REPORT IS A COMPLEMENT AND NOT A REPLACEMENT, AND
+    THERE ARE THREE REASONS.** ``main()`` already prints "ANSWERING MODEL(S)
+    differ from the requested ..." when the ids read off the responses are not
+    exactly ``{args.model}``. That line is:
+
+      * a ``console.out``, not a refusal -- the artifacts are written anyway,
+        with ``"model": args.model`` at the top of each of the three;
+      * AFTER the poll, the retrieval and the spend, so it costs the session
+        it describes;
+      * and unreachable for a batch that has not finished. ``answering_models``
+        is empty then and the report is guarded on it, so the commonest reason
+        to resume at all -- an interrupted session -- is exactly the case it
+        cannot speak about.
+
+    **AND THE RESUME DESTROYS THE EVIDENCE BEFORE THE FIRST POLL, WHICH IS THE
+    SHARPEST OF THE THREE.** ``main()``'s ``state.update({... "model":
+    args.model ...})`` runs BELOW these guards and is written out by the
+    ``write_state`` on the resume path before any batch is polled. So a resume
+    under a different model overwrites the record of which model was asked,
+    with the wrong one, and a later resume then has nothing left to compare:
+    the mistake erases the only local evidence that it was made.
+
+    **ABSENT REFUSES, AND THAT IS FROM A SURVEY RATHER THAN FROM CAUTION.**
+    ``require_state_mode`` reads an absent ``mode`` as anchored, and
+    ``require_state_shape`` refuses an absent shape while offering an
+    evidence-conditioned adoption; the three differ because their absent
+    POPULATIONS differ, and each is a claim about the artifacts on disk. The
+    claim here was measured the same way and is the rubric's: this field is
+    written unconditionally by the only writer there is, it was in the commit
+    that ADDED this module, and ALL NINETEEN state files carry it, every one as
+    a string. The absent population is EMPTY, so a file without it was not
+    written by this module and establishes nothing about the batches it names.
+
+    **SO THERE IS NO HAND-ADOPTION ESCAPE, AND THE REASON IS NOT THAT THE FACT
+    IS UNKNOWABLE.** It is knowable -- ``batch_jsonl`` writes ``model`` into
+    every uploaded request body, so a batch carrying an ``input_file_id`` can
+    be asked directly. The escape is absent because the shape's reason for
+    having one does not hold here: that one exists so that a real interrupted
+    legacy batch is not stranded, and there is no such batch, because the
+    absent population is empty. The message names the check anyway -- an
+    operator needs to know WHICH judge those batches used before deciding what
+    to do -- but it invites establishing the fact, never writing it into this
+    file, because a value hand-written into this field is adopted as fact by
+    every artifact of every later resume.
+
+    Returns the model the recorded batches were submitted to, which past this
+    point equals ``model`` by construction -- see the call site for why nothing
+    downstream reads it.
+    """
+    if not state:
+        # NOT A DISAGREEMENT. First submit, and -- for as long as
+        # `require_state_for_resume` is what runs above this -- unreachable on
+        # a resume, because a resume with no state file is refused before this
+        # is asked. See the call site.
+        return None
+    found = state.get(STATE_MODEL_KEY)
+    # ── ABSENT, THEN TYPE, THEN VALUE, on `require_state_rubric`'s structure
+    #    and for its reason. A model id is a string, so no bool, int, float,
+    #    list or dict equals one and an `isinstance(found, str) and found ==
+    #    want` guard on the equality would be DEAD CODE -- the finding the
+    #    revert matrix made about the rubric guard, which this one inherits
+    #    rather than repeats. The type decision therefore lives in ONE
+    #    reachable, decisive branch ABOVE the equality, and what it buys is the
+    #    right DIAGNOSIS: a JSON `true` or a nested object is a file that is
+    #    not a record of anything, which is a different remedy from "the judge
+    #    changed".
+    if found is None:
+        _files = state_input_file_ids(state)
+        # THE MIXED CASE IS NAMED, on `require_state_shape`'s footing. A file
+        # can record an input_file_id for SOME of its batches and not others
+        # -- the field arrived with the OpenAI port -- and a message that
+        # listed only the checkable ones would let an operator run the check,
+        # find nothing about the batch they are actually resuming, and not
+        # know why.
+        _ids = [b.get("id") for b in (state.get("batches") or [])
+                if isinstance(b, dict) and b.get("id")]
+        _without = [b for b in _ids if b not in _files]
+        if _files:
+            _how = (
+                "THE CHECK, batch by batch. This file records an uploaded "
+                "input file for "
+                + ", ".join(f"{b} -> {f}" for b, f in sorted(_files.items()))
+                + ". Retrieve that file from the account's storage "
+                "(`client.files.content(<input_file_id>)`; it is a download, "
+                "not a completion, so it bills nothing) and read the `model` "
+                "field of any request body in it -- every line carries it, "
+                "because that is what the request was sent with. That "
+                "establishes which judge answered; it is NOT an invitation to "
+                "write the answer into this file, because a model id "
+                "hand-written here is adopted as fact by every artifact of "
+                "every later resume. Having established it, submit afresh "
+                "with --output-dir, or resume with --model <the id you read>."
+                + (f" {len(_without)} recorded batch(es) carry no "
+                   f"input_file_id and cannot be checked this way: "
+                   + ", ".join(sorted(_without)) + ". If the batch you are "
+                   f"resuming is one of those, nothing establishes which "
+                   f"judge answered it: submit afresh with --output-dir."
+                   if _without else ""))
+        else:
+            _how = (
+                f"None of the {len(_ids)} batch(es) this file records carries "
+                f"an input_file_id, so there is no local or remote handle on "
+                f"what was sent -- that field arrived with the OpenAI port and "
+                f"nothing local records the requests. Submit afresh with "
+                f"--output-dir.")
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records no {STATE_MODEL_KEY}, "
+            f"so which judge its batches were submitted to cannot be "
+            f"established from it. Every state file this module has ever "
+            f"written carries that field -- it was in the commit that added "
+            f"this module -- so its absence means this file was not written "
+            f"by this harness's writer, and nothing about the batches it "
+            f"names is recorded. An absent model is NOT read as the default "
+            f"{model!r}: this project has already changed judges once, and "
+            f"guessing would attribute one model's answers to another. "
+            f"{_how}",
+            code="state_model_absent")
+    if not isinstance(found, str):
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records {STATE_MODEL_KEY} as "
+            f"{found!r}, which is a {type(found).__name__} and not a model "
+            f"id. This file cannot be read as a record of which judge "
+            f"answered its batches. Submit afresh with --output-dir.",
+            code="state_model_malformed")
+    if found == model:
+        return found
+    raise RaterRefusal(
+        f"the state file at {state_path!r} records judge {found!r} and this "
+        f"session is running {model!r}. Resuming across them joins answers "
+        f"produced by {found!r} onto a session whose rater_manifest.json, "
+        f"ratings.json and summary.json all record {model!r} -- and every "
+        f"agreement figure in summary.json is a statement about a judge, so "
+        f"one computed across two is a number about neither. It also "
+        f"overwrites this file's own record of {found!r} with {model!r} "
+        f"before the first poll, which destroys the evidence that it "
+        f"happened. Resume with --model {found!r} if that judge is still "
+        f"reachable with this key -- the artifacts then correctly record the "
+        f"model that answered -- or use --output-dir to keep the two apart. "
+        f"(If {found!r} is not reachable with this key, it is not a judge "
+        f"this configuration can resume: --output-dir is the only way "
+        f"forward.)",
+        code="state_model_mismatch")
 
 
 def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
@@ -6832,7 +7010,25 @@ def main(argv=None):
         # rubric metadata is reporting the rulebook the answers were rated
         # under.
         require_state_rubric(state, index.rubric_meta, state_path)
-        # LAST OF THE FIVE, because it is the only one that reads a file this
+        # ── AND WHO ANSWERED THEM ─────────────────────────────────────
+        #
+        # The third of the provenance trio: shape is what the requests
+        # LOOKED LIKE, rubric is what they were JUDGED AGAINST, and this is
+        # WHO ANSWERED. It is the only one of the three whose remedy is a
+        # flag rather than different code or a different directory, which is
+        # why it runs LAST of them: an operator who met it first could fix
+        # it with `--model` and then discover that the shape or the rubric
+        # had moved too, which are faults no flag repairs. Meeting the
+        # widest fault first is one refusal instead of three.
+        #
+        # ITS RETURN IS NOT READ, for the reason the two above give: past
+        # this line the recorded model and `args.model` are EQUAL, so the
+        # manifest's `"model": args.model` -- and `collect_results`'
+        # `rated_by` fallback, which stamps a rating with the requested id
+        # when a response echoes none -- are reporting the model those
+        # batches were actually submitted to.
+        require_state_model(state, args.model, state_path)
+        # LAST OF THE SIX, because it is the only one that reads a file this
         # session did not write. It was at the resume fork, ~150 lines and one
         # network round trip below here, where it surfaced after the visibility
         # check had already refused for the wrong reason.
@@ -6912,7 +7108,9 @@ def main(argv=None):
     console.out(spend_journal.describe(spend.SPEND_BUDGET_RATER))
 
     state.update({"run_dir": run.run_dir, "run_dirs": list(run.run_dirs),
-                  "model": args.model,
+                  # UNDER THE MODULE'S OWN KEY CONSTANT, so the writer and
+                  # `require_state_model` cannot spell one fact two ways.
+                  STATE_MODEL_KEY: args.model,
                   "mode": index.mode,
                   "custom_id_form": index.form,
                   "retest_requests": len(index.retest_ids),

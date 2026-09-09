@@ -3493,26 +3493,27 @@ check("9n  the source doubles args.max_tokens rather than naming a literal, "
 #
 # THE GAP THIS CLOSES WAS MEASURED BY DRIVING main(), NOT BY READING IT.
 # `--resume batch_x` against an empty --output-dir reached the poll with all
-# FOUR provenance guards having returned without comparing anything: each opens
+# FIVE provenance guards having returned without comparing anything: each opens
 # `if not state: return`, which is correct for a first submit and is the exact
 # opposite of correct on a resume, where the batch exists, was paid for, and
 # this directory records nothing about it. The session then writes three
-# artifacts stamping TODAY'S mode, subset, shape and rubric onto answers it
-# cannot establish anything about.
+# artifacts stamping TODAY'S mode, subset, shape, rubric and JUDGE onto
+# answers it cannot establish anything about.
 #
-# THE FOUR "SILENT ON NO STATE" READINGS ARE PINNED FIRST, because they are the
+# THE FIVE "SILENT ON NO STATE" READINGS ARE PINNED FIRST, because they are the
 # premise: if any of them ever started refusing an empty state on its own, this
 # section's subject would be gone and its checks would pass for the wrong
 # reason.
 _R9o = _fn9k
-check("9o  premise: each of the other four guards is SILENT on an empty state "
+check("9o  premise: each of the other five guards is SILENT on an empty state "
       "-- which is why one guard has to know it is a resume",
       tuple(refusal_code(fn, *args) for fn, args in (
           (_R9o("require_state_mode"), ({}, R.MODE_BLIND, "/s")),
           (_R9o("require_state_subset"), ({}, built(R.MODE_BLIND), "/s")),
           (_R9o("require_state_shape"), ({}, R.REQUEST_SHAPE_VERSION, "/s")),
-          (_R9o("require_state_rubric"), ({}, {R.RUBRIC_SHA_KEY: "x"}, "/s")))),
-      ("<did not raise>",) * 4)
+          (_R9o("require_state_rubric"), ({}, {R.RUBRIC_SHA_KEY: "x"}, "/s")),
+          (_R9o("require_state_model"), ({}, R.DEFAULT_MODEL, "/s")))),
+      ("<did not raise>",) * 5)
 check("9o  a resume with no state file REFUSES, by its own code",
       refusal_code(_R9o("require_state_for_resume"), {}, "batch_x", "/nope"),
       "resume_without_state")
@@ -3520,7 +3521,7 @@ check("9o  ...and a SUBMIT with no state file does not, because that is the "
       "first submit and there is nothing to disagree with",
       refusal_code(_R9o("require_state_for_resume"), {}, None, "/nope"),
       "<did not raise>")
-check("9o  ...and a resume WITH a state file does not either -- the four "
+check("9o  ...and a resume WITH a state file does not either -- the five "
       "guards beside it are what judge its contents",
       refusal_code(_R9o("require_state_for_resume"),
                    {"mode": R.MODE_BLIND}, "batch_x", "/nope"),
@@ -3669,10 +3670,10 @@ check("9o  main() calls it, with the resume flag and the state path",
 check("9o  ...inside a try, exactly as often as the subset guard beside it",
       (_calls_inside_try(_main_fn, "require_state_for_resume"),
        _calls_inside_try(_main_fn, "require_state_subset")), (1, 1))
-check("9o  ...and BEFORE the four it gates, in main()'s own source order",
+check("9o  ...and BEFORE the five it gates, in main()'s own source order",
       [n for n in ("require_state_for_resume", "require_state_mode",
                    "require_state_subset", "require_state_shape",
-                   "require_state_rubric")
+                   "require_state_rubric", "require_state_model")
        if n in _MAIN_TXT][0], "require_state_for_resume")
 
 
@@ -3972,8 +3973,15 @@ try:
         return ["--blind", "--run-dir", _run9q, "--output-dir",
                 _out9q] + list(extra)
 
+    # IT RECORDS A MODEL, and that is not padding. Every one of the nineteen
+    # real state files carries one, `require_state_model` refuses a file that
+    # does not, and the first version of this fixture omitted it -- so the
+    # cross-mode scenario and the non-degeneracy control below both refused at
+    # the model guard instead of reaching what they were written to measure.
+    # A fixture that a shipped guard rejects is not a control.
     _GOOD9q = {"mode": R.MODE_BLIND, "include_keys_sha256": None,
                R.STATE_SHAPE_KEY: R.REQUEST_SHAPE_VERSION,
+               R.STATE_MODEL_KEY: R.DEFAULT_MODEL,
                "batches": [{"id": "batch_9q"}]}
 
     # (a) THE ITEM-1 REFUSAL, at the entry point, offline.
@@ -4016,6 +4024,30 @@ try:
     check("9q  a state file recording a DIFFERENT rubric: 1, zero network",
           (_rc, _n, "records rubric eeeeeeeeeeee" in _txt), (1, 0, True))
 
+    # (e2) THE MODEL GUARD, offline -- a MISMATCH. The live population: of the
+    #      nineteen state files on disk, sixteen record `claude-sonnet-4-6`
+    #      and were written before the 2026-09-08 port moved DEFAULT_MODEL to
+    #      `gpt-5.6-terra`. Resuming one of those today is exactly this.
+    _write_state9q(dict(_GOOD9q, rubric_sha256=_LIVE_SHA,
+                        **{R.STATE_MODEL_KEY: "claude-sonnet-4-6"}))
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file recording a DIFFERENT judge: 1, zero network, and "
+          "the message names both models rather than the key",
+          (_rc, _n, "records judge 'claude-sonnet-4-6'" in _txt,
+           repr(R.DEFAULT_MODEL) in _txt), (1, 0, True, True))
+    check("9q  ...and it offers --model as the remedy, which is the only "
+          "same-invocation fix any of the three provenance guards has",
+          "--model 'claude-sonnet-4-6'" in _txt, True)
+    # (e3) THE MODEL GUARD, offline -- ABSENT.
+    _write_state9q({k: v for k, v in dict(_GOOD9q,
+                                          rubric_sha256=_LIVE_SHA).items()
+                    if k != R.STATE_MODEL_KEY})
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file with no recorded judge: 1, zero network, and it "
+          "is NOT read as the default",
+          (_rc, _n, "records no model" in _txt,
+           "is NOT read as the default" in _txt), (1, 0, True, True))
+
     # (f) THE CROSS-MODE BATCH GUARD, offline. It reads the OTHER mode's state
     #     file, which is the one guard that consults a file this session did
     #     not write -- and it used to sit ~150 lines and one round trip below
@@ -4025,6 +4057,8 @@ try:
     # and this check measure that instead of the cross-mode one.
     _write_state9q(dict(_GOOD9q, rubric_sha256=_LIVE_SHA,
                         batches=[{"id": "batch_mine"}]))
+    # THE MODEL IS THE SHIPPED DEFAULT HERE, from `_GOOD9q`, so the model guard
+    # passes and this check measures the cross-mode guard rather than it.
     with _io9k.open(_os9k.path.join(_out9q, R.state_filename(R.MODE_ANCHORED)),
                     "w", encoding="utf-8") as _fh:
         json.dump({"mode": R.MODE_ANCHORED,
@@ -4068,7 +4102,8 @@ check("9q  the temp directory is gone", _os9k.path.isdir(_tmp9q), False)
 # swallowed, and a drive cannot see a seventh guard added below the network.
 _LOCAL_GUARDS9q = ("require_state_for_resume", "require_state_mode",
                    "require_state_subset", "require_state_shape",
-                   "require_state_rubric", "refuse_batch_from_other_mode")
+                   "require_state_rubric", "require_state_model",
+                   "refuse_batch_from_other_mode")
 
 
 def _first_at9q(needle):
@@ -4101,6 +4136,207 @@ check("9q  the resume ids are parsed exactly once in main(), so the list the "
       "cross-mode guard checked is the list that gets polled",
       _MAIN_TXT.count("args.resume.split(',')")
       + _MAIN_TXT.count('args.resume.split(",")'), 1)
+
+
+# --- 9r -- ...AND WHO ANSWERED THEM --------------------------------------
+#
+# `model` was written into the state file by the commit that ADDED this module
+# and was read back by NOTHING, so a resume across a judge change joined one
+# model's answers onto artifacts recording another. THE POPULATION IS ON DISK:
+# commit d0f4519 moved DEFAULT_MODEL from `claude-sonnet-4-6` to
+# `gpt-5.6-terra`, and SIXTEEN of the nineteen state files under
+# 09- Testing/Evaluation Runs/ were written before it and record the Anthropic
+# judge; the other three are item 11's two blind sessions and the
+# criteria-reference probe. Counted, not estimated.
+_MODEL_A = "gpt-5.6-terra"
+_MODEL_B = "claude-sonnet-4-6"
+_MODEL_STATE = {"mode": R.MODE_BLIND, "include_keys_sha256": None,
+                R.STATE_SHAPE_KEY: R.REQUEST_SHAPE_VERSION,
+                R.RUBRIC_SHA_KEY: "a" * 64,
+                R.STATE_MODEL_KEY: _MODEL_A,
+                "batches": [{"id": "batch_model"}]}
+check("9r  the key constant is the name the artifacts already use, so a "
+      "refusal and the manifest beside it are one spelling",
+      R.STATE_MODEL_KEY, "model")
+check("9r  an EQUAL model proceeds, and the guard hands back the value it "
+      "proved equal",
+      drive(_R9o("require_state_model"), dict(_MODEL_STATE), _MODEL_A, "/s"),
+      _MODEL_A)
+check("9r  a DIFFERENT recorded model refuses, by its own code",
+      refusal_code(_R9o("require_state_model"), dict(_MODEL_STATE),
+                   _MODEL_B, "/s"), "state_model_mismatch")
+# ABSENT REFUSES, AND THE POLICY IS FROM A SURVEY. Like the rubric and unlike
+# the shape, the absent population is EMPTY: all nineteen state files on disk
+# carry `model`, every one as a string, and the field was in the commit that
+# added this module. So absence means the file was not written by this writer,
+# and there is no legacy resume to strand.
+check("9r  an ABSENT model refuses, under a code of its own",
+      refusal_code(_R9o("require_state_model"),
+                   {k: v for k, v in _MODEL_STATE.items()
+                    if k != R.STATE_MODEL_KEY}, _MODEL_A, "/s"),
+      "state_model_absent")
+check("9r  ...and it is NOT read as this session's model, which is the "
+      "guess that would attribute one judge's answers to another",
+      refusal_code(_R9o("require_state_model"),
+                   {"mode": R.MODE_BLIND, "batches": [{"id": "b"}]},
+                   R.DEFAULT_MODEL, "/s"), "state_model_absent")
+check("9r  ...and the three codes are distinct, because the remedies are",
+      len({refusal_code(_R9o("require_state_model"), dict(_MODEL_STATE),
+                        _MODEL_B, "/s"),
+           refusal_code(_R9o("require_state_model"),
+                        {k: v for k, v in _MODEL_STATE.items()
+                         if k != R.STATE_MODEL_KEY}, _MODEL_A, "/s"),
+           refusal_code(_R9o("require_state_model"),
+                        dict(_MODEL_STATE, model=1), _MODEL_A, "/s")}), 3)
+# TYPE CONFUSION, the rubric guard's finding inherited rather than repeated: a
+# model id is a string, so no bool, int, float, list or dict equals one and an
+# `isinstance(...) and found == want` guard on the EQUALITY would be dead code.
+# The type decision is therefore a branch of its own ABOVE the equality, and
+# what it buys is the right DIAGNOSIS -- a file that is not a record of
+# anything, which is a different remedy from "the judge changed".
+check("9r  a non-string model is its own refusal rather than a mismatch: "
+      "true, 1, 1.0, a list and a dict all land in the malformed branch",
+      tuple(refusal_code(_R9o("require_state_model"),
+                         dict(_MODEL_STATE, model=v), _MODEL_A, "/s")
+            for v in (True, 1, 1.0, [_MODEL_A], {"model": _MODEL_A})),
+      ("state_model_malformed",) * 5)
+check("9r  ...and a string that merely differs is a MISMATCH, so the type "
+      "branch has not swallowed the value branch",
+      refusal_code(_R9o("require_state_model"),
+                   dict(_MODEL_STATE, model=_MODEL_B), _MODEL_A, "/s"),
+      "state_model_mismatch")
+# THE ORDER IS PINNED, because it is what makes every branch reachable: absent,
+# then type, then value. Put the equality first and a non-string is a mismatch;
+# put the type check above the absent check and `None` is reported as a
+# malformed id.
+_MODEL_SRC = _ast9k.unparse(next(
+    (n for n in _ast9k.walk(_MAIN_SRC)
+     if isinstance(n, _ast9k.FunctionDef)
+     and n.name == "require_state_model"), _ast9k.parse("def _m(): pass")))
+_MORDER = {c: _MODEL_SRC.find(c)
+           for c in ("state_model_absent", "state_model_malformed",
+                     "state_model_mismatch", "found == model")}
+check("9r  the guard tests absent, then type, then value -- in that order, so "
+      "no branch is unreachable",
+      (all(v >= 0 for v in _MORDER.values()),
+       _MORDER["state_model_absent"] < _MORDER["state_model_malformed"]
+       < _MORDER["found == model"] < _MORDER["state_model_mismatch"]),
+      (True, True))
+check("9r  ...and the equality is BARE, not guarded by an isinstance that "
+      "cannot change an outcome -- the type branch above it is what decides",
+      "isinstance(found, str) and found == model" in _MODEL_SRC, False)
+# WEAKENED-COMPARISON ANALOGUES. A model id is a string with structure -- a
+# family prefix and a version -- so the plausible weakenings are a prefix
+# match, a case-fold and a "family" match. All three would ACCEPT a real judge
+# change: `claude-sonnet-4-6` and `claude-sonnet-4-5` share a prefix and a
+# family, and `GPT-5.6-Terra` differs from `gpt-5.6-terra` only in case while
+# naming the same weights nobody has proved are the same weights.
+check("9r  the comparison is not on a prefix: an id sharing every character "
+      "but the last still refuses",
+      refusal_code(_R9o("require_state_model"),
+                   dict(_MODEL_STATE, model="claude-sonnet-4-5"),
+                   "claude-sonnet-4-6", "/s"), "state_model_mismatch")
+check("9r  ...nor on the family: two ids sharing a vendor prefix and nothing "
+      "else still refuse",
+      refusal_code(_R9o("require_state_model"),
+                   dict(_MODEL_STATE, model="gpt-4o"), _MODEL_A, "/s"),
+      "state_model_mismatch")
+check("9r  ...nor case-folded: an id differing only in case still refuses, "
+      "because nothing establishes that two spellings name one set of weights",
+      refusal_code(_R9o("require_state_model"),
+                   dict(_MODEL_STATE, model=_MODEL_A.upper()), _MODEL_A, "/s"),
+      "state_model_mismatch")
+check("9r  ...and whitespace is not stripped either -- a padded id is a "
+      "different string and this guard does not decide it is not",
+      refusal_code(_R9o("require_state_model"),
+                   dict(_MODEL_STATE, model=" " + _MODEL_A), _MODEL_A, "/s"),
+      "state_model_mismatch")
+_MSG9r = str(drive(lambda: _R9o("require_state_model")(
+    dict(_MODEL_STATE), _MODEL_B, "/s")))
+check("9r  the mismatch message states BOTH models, names what joining them "
+      "corrupts, and offers the two remedies",
+      all(w in _MSG9r for w in (repr(_MODEL_A), repr(_MODEL_B),
+                                "rater_manifest.json", "ratings.json",
+                                "summary.json", "--model", "--output-dir")),
+      True)
+# THE OVERWRITE IS THE SHARPEST CONSEQUENCE AND THE MESSAGE SAYS SO. main()'s
+# state.update runs BELOW these guards and is written out on the resume path
+# before any batch is polled, so a resume under a different model destroys the
+# record of which model was asked -- the mistake erases its own evidence.
+check("9r  ...and it names the overwrite, which is the consequence no later "
+      "check could recover from",
+      ("destroys the evidence" in _MSG9r, "before the first poll" in _MSG9r),
+      (True, True))
+_MSG9r_ABSENT = str(drive(lambda: _R9o("require_state_model")(
+    {"mode": R.MODE_BLIND, "batches": [{"id": "b1"}]}, _MODEL_A, "/s")))
+check("9r  the absent message directs to a fresh directory and offers NO "
+      "paste-able snippet, because the absent population is empty and a "
+      "hand-written id would be adopted as fact",
+      ("--output-dir" in _MSG9r_ABSENT,
+       ('"%s":' % R.STATE_MODEL_KEY) in _MSG9r_ABSENT), (True, False))
+# NON-DEGENERACY FOR THAT SNIPPET TEST: the shape guard's evidenced branch DOES
+# print exactly that shape of snippet, so the absence above is a property of
+# this message rather than of the substring never appearing anywhere.
+check("9r  non-degeneracy: the shape guard's evidenced branch DOES print a "
+      "paste-able snippet, so the absence above is a real difference",
+      ('"%s":' % R.STATE_SHAPE_KEY) in _MSG_EVID, True)
+# WHERE THE EVIDENCE EXISTS THE CHECK IS NAMED, and where it does not the
+# message says so rather than naming a check that cannot be run. Same shape as
+# the shape guard's, and the evidence is the same file: `batch_jsonl` writes
+# `model` into every uploaded request body.
+_MSG9r_EVID = str(drive(lambda: _R9o("require_state_model")(
+    {"mode": R.MODE_BLIND,
+     "batches": [{"id": "b1", "input_file_id": "file-9r"}]}, _MODEL_A, "/s")))
+check("9r  ...and where an input_file_id exists the message names the check "
+      "over it, the batch it belongs to, and that it bills nothing",
+      all(w in _MSG9r_EVID for w in ("b1 -> file-9r", "files.content",
+                                     "bills nothing", "`model` field")), True)
+check("9r  ...while a file recording no input_file_id is told there is no "
+      "handle at all, rather than being told to run a check it cannot",
+      ("input_file_id" in _MSG9r_ABSENT, "files.content" in _MSG9r_ABSENT),
+      (True, False))
+# AND THE EVIDENCE THE MESSAGE NAMES IS REAL: the uploaded request body carries
+# the model. Read off the shipped builder rather than asserted.
+_BODY9r = walk(drive(R.to_batch_line,
+                     {"custom_id": "c", "params": {"model": _MODEL_A}}),
+               "body", "model")
+check("9r  non-degeneracy: the uploaded request line really carries the "
+      "model, so the check the absent message names can actually be run",
+      _BODY9r, _MODEL_A)
+# IT REACHES THE STATE FILE, from args rather than from a retyped string.
+check("9r  main()'s state.update records the judge under the module's own key "
+      "constant, from the parsed argument",
+      [v for k, v in (_UPDATE if isinstance(_UPDATE, list) else [])
+       if k == "STATE_MODEL_KEY"], ["args.model"])
+check("9r  ...and it does so under the constant rather than a literal, so the "
+      "writer and the guard cannot spell one fact two ways",
+      [k for k, _v in (_UPDATE if isinstance(_UPDATE, list) else [])
+       if k == "'model'"], [])
+check("9r  main() calls require_state_model, with the parsed model argument",
+      "require_state_model(state, args.model, state_path)" in _MAIN_TXT, True)
+check("9r  ...inside a try, exactly as often as the rubric guard beside it",
+      (_calls_inside_try(_main_fn, "require_state_model"),
+       _calls_inside_try(_main_fn, "require_state_rubric")), (1, 1))
+# THE PLACEMENT IS PINNED. It is the third of the provenance trio and it runs
+# LAST of them, because its remedy is a flag while shape's and rubric's are
+# different code or a different directory -- so an operator meets the widest
+# fault first. And it runs BEFORE the cross-mode guard, which reads a file this
+# session did not write.
+check("9r  it runs after the shape and rubric guards and before the "
+      "cross-mode one, in main()'s own source order",
+      [g for g in ("require_state_shape", "require_state_rubric",
+                   "require_state_model", "refuse_batch_from_other_mode")
+       if _MAIN_TXT.find(g + "(") >= 0]
+      == sorted(("require_state_shape", "require_state_rubric",
+                 "require_state_model", "refuse_batch_from_other_mode"),
+                key=lambda g: _MAIN_TXT.find(g + "(")), True)
+# AND THE COLLECTION-TIME REPORT IS STILL THERE. This guard is its complement,
+# not its replacement: that one reads the ids off the RESPONSES, after the poll
+# and the spend, and prints rather than refusing.
+check("9r  the collection-time divergence report survives, so the two "
+      "measurements -- what was ASKED and what ANSWERED -- both remain",
+      ("ANSWERING MODEL(S) differ" in _MAIN_TXT,
+       "answering_models" in _MAIN_TXT), (True, True))
 
 
 print()

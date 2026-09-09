@@ -12,14 +12,24 @@ third time as a head test in item 11's ``headwindow.py`` -- three copies in
 three files no test suite read.
 
 THIS FILE PINS WHAT THE MODULE OWNS, WHICH IS THE DIVISION AND NOT THE WINDOW.
-"Does this text state a time window" is RULE 4's vocabulary, owned by item 9's
-``is_window_criterion``, which lives outside this repository; the module takes
-it as a callable and this file supplies a small DECLARED probe of its own for
-the classification checks. That probe is not a copy of item 9's predicate and
+"Does this text state a time window" is RULE 4's vocabulary, owned by
+``oncotriage/evaluation/criterion_windows.py``; the module under test takes it
+as a callable, and sections 1 to 6 supply a small DECLARED probe of its own for
+the classification checks. That probe is not a copy of the real predicate and
 does not try to be -- it is a stand-in whose only job is to make
 ``classify_window_scope``'s three-way branch drivable. The pins that carry the
 real corpus are the HEAD TEXTS in ``_ITEM10_CRITERIA``, which are a fact about
 the division alone and need no window predicate at all.
+
+SECTION 7 IS THE END-TO-END HALF, AND IT IS WHAT THE EXTRACTION BOUGHT. The
+real predicate used to live in ``item9_families.py`` in an evaluation-run log
+directory outside this repository, so no check here had ever driven the shipped
+module with it: the DIVISION was pinned and the CLASSIFICATION was not. Section
+7 drives it over the same 24 real criteria and pins the scope distribution and
+the compound split. THE PROBE STAYS -- measured, the two predicates agree on
+every one of those texts, which is what makes sections 5 and 6 statements about
+the division independently of which predicate divides it, and section 7f pins
+both that agreement and the fact that they are nonetheless different functions.
 
 THE HEADS WERE LIFTED, NOT TRANSCRIBED. Every expected head in that table was
 produced by running the shipped module over item 10's own thirty
@@ -97,6 +107,13 @@ except ImportError:
 import re                                                      # noqa: E402
 
 from oncotriage.evaluation import criterion_clauses as CC      # noqa: E402
+# THE EXTRACTED WINDOW PREDICATE. Section 7 is what it makes possible: before
+# it, the classification this module produces could only be driven through a
+# declared stand-in, because the real predicate lived outside this repository.
+from oncotriage.evaluation import criterion_windows as W        # noqa: E402
+import io as _io7                                              # noqa: E402
+import ast as _ast7                                            # noqa: E402
+import inspect as _inspect7                                    # noqa: E402
 
 
 # ===========================================================================
@@ -137,6 +154,22 @@ def guarded(fn, *a, **kw):
         return fn(*a, **kw)
     except Exception as exc:                                   # noqa: BLE001
         return f"<RAISED {type(exc).__name__}: {exc}>"
+
+
+def guarded_raises(fn, *a, **kw):
+    """The exception TYPE NAME ``fn`` raises, or a named absence.
+
+    ``guarded`` answers what a call RETURNED. Where the assertion is that a
+    call must raise -- section 7g, that omitting a required argument is a
+    TypeError rather than a silent default -- the type is the whole content of
+    the check, and "it returned a marker string" would be satisfied by any
+    raise at all.
+    """
+    try:
+        fn(*a, **kw)
+        return "<did not raise>"
+    except Exception as exc:                                   # noqa: BLE001
+        return type(exc).__name__
 
 
 class rebind(object):
@@ -674,6 +707,278 @@ check("C5-i  ...and every one of them moves in the same direction -- "
       sorted({(CC.is_compound(c, probe_is_window, coordination=True),
                CC.is_compound(c, probe_is_window, coordination=False))
               for c in _moved}), [(True, False)])
+
+
+# ===========================================================================
+# SECTION 7 -- THE WINDOW PREDICATE IS IN THE PACKAGE, SO CLASSIFICATION IS
+#              VERIFIED END TO END
+# ===========================================================================
+#
+# WHAT THIS SECTION EXISTS TO REMOVE. Sections 5 and 6 drive
+# `classify_window_scope` and `is_compound` through `probe_is_window`, a
+# DECLARED stand-in, because the predicate that produced the published numbers
+# lived in `item9_families.py` in an evaluation-run log directory outside this
+# repository. So the DIVISION was pinned and the CLASSIFICATION was not: no
+# check in this file had ever driven the shipped module with the real
+# predicate. `oncotriage/evaluation/criterion_windows.py` is that predicate,
+# extracted, and this section is the end-to-end half.
+#
+# THE EXTRACTION WAS ACCEPTED ON POPULATION IDENTITY, NOT ON READING. Both
+# predicates were driven through this same shipped machinery over the 30 J2
+# `pipeline_missed_gate` cases and the FULL 7,300-decision item-7 population,
+# and the SELECTED KEY LISTS were compared byte for byte: six selections each
+# -- the three window scopes, `is_compound` with and without the coordination
+# cut, and the unwindowed clause TEXTS -- identical on both populations, with a
+# one-alternation perturbation of the extracted predicate shown to move five of
+# the six on the 30 and all six on the 7,300. That was a ONE-TIME acceptance
+# proof over stored populations and it has deliberately NO standing form: a
+# runtime refusal against a historical key list would make this module's
+# correctness a function of artifacts outside the repository. What stands is
+# below, on FIXED examples.
+
+_ITEM9_SELFTEST = (
+    # (text, is a window, is past-tense wording) -- item 9's own four
+    # self-test examples, which are the boundary RULE 4 draws, plus the
+    # vocabulary exclusion its note argues for.
+    ("Any chemotherapy within the last 12 months", True, False),
+    ("Surgery in the preceding 6 months", True, False),
+    ("Histologically confirmed stage II colon cancer", False, False),
+    ("History of myocardial infarction", False, True),
+)
+check("7a  the predicate answers item 9's own four self-test examples exactly "
+      "as item 9's did -- including that BARE PAST-TENSE IS NOT A WINDOW, "
+      "which is the distinction RULE 4 draws and 1.10.0 did not move",
+      tuple(guarded(W.is_window_criterion, t) for t, _w, _p in _ITEM9_SELFTEST),
+      tuple(w for _t, w, _p in _ITEM9_SELFTEST))
+check("7a  ...and the OTHER temporal branch fires on exactly the one of the "
+      "four that is past-tense wording, so the boundary is a measured "
+      "separation rather than an assertion about one string",
+      tuple(bool(W.PAST_TENSE_RE.search(t)) for t, _w, _p in _ITEM9_SELFTEST),
+      tuple(p for _t, _w, p in _ITEM9_SELFTEST))
+# THE DECLARED EXCLUSION, which is the boundary a widening would cross first.
+# item 9's note: "ongoing | current | currently | active" ALONE is not a
+# window -- "currently pregnant" is a present-tense state, not a lookback.
+check("7b  a present-tense state is NOT a window, which is the one widening "
+      "item 9 considered and refused",
+      (guarded(W.is_window_criterion, "Currently pregnant or breastfeeding"),
+       guarded(W.is_window_criterion, "Ongoing grade 2 neuropathy"),
+       guarded(W.is_window_criterion, "Active autoimmune disease")),
+      (False, False, False))
+# THE TWO HALVES ARE SEPARATELY LOAD-BEARING, and that is why they are two
+# patterns rather than one alternation: each answers for strings the other is
+# silent on. Without this, "the base is item 8's verbatim and the extra is
+# this project's widening" would be a claim about provenance with no
+# behavioural content.
+check("7c  the BASE half alone answers for strings the extra is silent on",
+      tuple((bool(W.WINDOW_BASE_RE.search(t)), bool(W.WINDOW_EXTRA_RE.search(t)))
+            for t in ("Relapse since randomization",
+                      "No more than two prior lines of therapy")),
+      ((True, False), (True, False)))
+check("7c  ...and the EXTRA half alone answers for strings the base is silent "
+      "on, so neither is redundant",
+      tuple((bool(W.WINDOW_BASE_RE.search(t)), bool(W.WINDOW_EXTRA_RE.search(t)))
+            for t in ("Any systemic therapy during the past",
+                      "Radiotherapy throughout the previous",
+                      "Treatment over the last")),
+      ((False, True), (False, True), (False, True)))
+# AND THE PREDICATE ITSELF CONSULTS BOTH, which is a different claim from the
+# two patterns being independent. THE REVERT MATRIX IS WHAT SAID SO: dropping
+# `or WINDOW_EXTRA_RE.search(t)` from the disjunction left the two checks above
+# passing -- they search the patterns directly -- and moved no corpus
+# classification, because on these 24 texts the base always fires too. It was
+# caught by ONE check, whose label is about something else entirely. These two
+# are the direct statement.
+check("7c  the PREDICATE answers True for a string only the EXTRA half "
+      "matches, so the disjunction really consults it",
+      tuple(guarded(W.is_window_criterion, t)
+            for t in ("Any systemic therapy during the past",
+                      "Radiotherapy throughout the previous",
+                      "Treatment over the last")),
+      (True, True, True))
+check("7c  ...and True for a string only the BASE half matches, so neither arm "
+      "of the disjunction can be deleted without a check failing",
+      tuple(guarded(W.is_window_criterion, t)
+            for t in ("Relapse since randomization",
+                      "No more than two prior lines of therapy")),
+      (True, True))
+check("7c  ...and window_hits reports WHICH fired, per half, so a census over "
+      "this predicate is auditable per decision rather than one boolean",
+      guarded(W.window_hits, "Surgery in the preceding 6 months"),
+      {"base": ["6 months"], "extra": ["in the preceding 6 months"]})
+check("7c  ...and an unwindowed string reports both halves empty rather than "
+      "raising or returning None",
+      guarded(W.window_hits, "Histologically confirmed carcinoma"),
+      {"base": [], "extra": []})
+# ABSENCE IS FALSE, NOT AN ERROR. A criterion string may legitimately be
+# absent, and a raise would make that a different KIND of event from an
+# unwindowed criterion at every call site.
+check("7d  None and the empty string are unwindowed rather than an error",
+      (guarded(W.is_window_criterion, None),
+       guarded(W.is_window_criterion, ""),
+       guarded(W.window_hits, None)),
+      (False, False, {"base": [], "extra": []}))
+
+# --- 7e -- END TO END, over the real corpus this file already carries -----
+#
+# THE CORPUS IS `_ITEM10_CRITERIA` -- item 10's own thirty pipeline_missed_gate
+# criteria, de-duplicated to 24 distinct texts, all public ClinicalTrials.gov
+# trial text and already in this file. So the end-to-end classification is
+# pinned over REAL criteria without this test reading a stored population or
+# an artifact outside the repository.
+#
+# THE NUMBERS WERE LIFTED BY RUNNING THE SHIPPED MODULE AND PRINTED HERE, never
+# derived by hand -- pass 20f-4's lesson, where a hand-transcribed literal
+# survived an element-for-element comparison because the entry it changed was
+# never rendered.
+_REAL_SCOPES = tuple(guarded(CC.classify_window_scope, c, W.is_window_criterion)
+                     for c, _h, _n, _n0 in _ITEM10_CRITERIA)
+_REAL_COMPOUND = tuple(guarded(CC.is_compound, c, W.is_window_criterion)
+                       for c, _h, _n, _n0 in _ITEM10_CRITERIA)
+check("7e  every one of the 24 distinct corpus criteria classifies into the "
+      "closed scope vocabulary -- no None, no unrecognised value",
+      sorted(set(_REAL_SCOPES)) == sorted(
+          set(_REAL_SCOPES) & set(CC.WINDOW_SCOPES)), True)
+check("7e  the scope distribution under the REAL predicate, pinned",
+      {s: _REAL_SCOPES.count(s) for s in CC.WINDOW_SCOPES},
+      {CC.WINDOW_SCOPE_NONE: 0, CC.WINDOW_SCOPE_HEAD: 20,
+       CC.WINDOW_SCOPE_EXCEPTION_ONLY: 4})
+check("7e  ...and it is non-degenerate: TWO of the three scopes occur, so the "
+      "branch is exercised rather than the table happening to be uniform",
+      len({s for s in _REAL_SCOPES}), 2)
+check("7e  the compound count under the REAL predicate, pinned",
+      (sum(1 for x in _REAL_COMPOUND if x is True), len(_REAL_COMPOUND)),
+      (12, 24))
+check("7e  ...and it is non-degenerate: the predicate divides the corpus "
+      "rather than calling all of it compound or none of it",
+      (any(_REAL_COMPOUND), all(_REAL_COMPOUND)), (True, False))
+# THE ONE CASE THE EXCEPTION-SPAN FIX WAS MEASURED ON, classified END TO END.
+# `headwindow.py:head_of` returned `text[:marker.start()]`, which loses a
+# window sitting AFTER a parenthetical exception and reports the criterion as
+# windowed only inside its exception -- the opposite of what the text says.
+_NCT06225310 = next((c for c, _h, _n, _n0 in _ITEM10_CRITERIA
+                     if "except for non-melanoma skin cancer" in c), None)
+check("7e  probe: the parenthetical-exception case is in the corpus",
+      _NCT06225310 is not None, True)
+check("7e  NCT06225310 exclusion #1 is window_on_head under the REAL "
+      "predicate -- the window after the parenthetical governs the head, "
+      "which is what the restored tail is for",
+      guarded(CC.classify_window_scope, _NCT06225310 or "",
+              W.is_window_criterion), CC.WINDOW_SCOPE_HEAD)
+
+# --- 7f -- THE PROBE AND THE REAL PREDICATE ARE TWO FUNCTIONS ------------
+#
+# AND THEY AGREE ON THIS CORPUS, WHICH IS THE MEASUREMENT RATHER THAN THE
+# HOPE. Every one of the 24 texts gets the same scope and the same compound
+# verdict from both -- so sections 5 and 6, which drive the probe, were not
+# measuring something the real predicate would have disagreed with. That is
+# why the probe STAYS: it keeps those sections' subject the DIVISION, provably
+# independent of which predicate divides it.
+_PROBE_SCOPES = tuple(guarded(CC.classify_window_scope, c, probe_is_window)
+                      for c, _h, _n, _n0 in _ITEM10_CRITERIA)
+_PROBE_COMPOUND = tuple(guarded(CC.is_compound, c, probe_is_window)
+                        for c, _h, _n, _n0 in _ITEM10_CRITERIA)
+check("7f  the probe and the REAL predicate agree on every corpus criterion, "
+      "for both the scope and the compound verdict -- so sections 5 and 6 "
+      "pin the division independently of which predicate divides it",
+      (_PROBE_SCOPES == _REAL_SCOPES, _PROBE_COMPOUND == _REAL_COMPOUND),
+      (True, True))
+# NON-DEGENERACY FOR THAT AGREEMENT: they are genuinely different functions,
+# and the strings where they differ are named. Without this, "they agree" would
+# be equally satisfied by the probe having silently BECOME the real predicate,
+# which is the two-owner drift the extraction exists to remove.
+check("7f  ...and they are nonetheless DIFFERENT predicates: the real one "
+      "answers True on strings the probe is silent on, so the agreement above "
+      "is a property of this corpus rather than of one function twice",
+      tuple((guarded(W.is_window_criterion, t), guarded(probe_is_window, t))
+            for t in ("Relapse since randomization",
+                      "No more than two prior lines of therapy",
+                      "Treatment over the last")),
+      ((True, False), (True, False), (True, False)))
+check("7f  ...and their patterns are not each other's",
+      (W.WINDOW_BASE_RE.pattern == _PROBE_WINDOW_RE.pattern,
+       W.WINDOW_EXTRA_RE.pattern == _PROBE_WINDOW_RE.pattern),
+      (False, False))
+
+# --- 7g -- THE DIVISION MODULE DOES NOT OWN THE WINDOW, STILL ------------
+#
+# The parameter stays REQUIRED. Installing this predicate as a default would
+# make `criterion_clauses` own both questions de facto, and a caller who
+# omitted the argument would silently get RULE 4's window predicate whether or
+# not that is the predicate they meant -- `empty_database(db_path, flag)`'s
+# rule, that a default which makes a claim is not a convenience.
+_CC_IMPORTS = sorted({
+    (n.module or "") if isinstance(n, _ast7.ImportFrom)
+    else ",".join(a.name for a in n.names)
+    for n in _ast7.walk(_ast7.parse(
+        _io7.open(CC.__file__, encoding="utf-8").read()))
+    if isinstance(n, (_ast7.Import, _ast7.ImportFrom))})
+check("7g  probe: the import walk over criterion_clauses found its imports, "
+      "so the emptiness below is a measurement and not an empty walk",
+      len(_CC_IMPORTS) >= 1, True)
+check("7g  criterion_clauses imports nothing from criterion_windows, so the "
+      "division and the window still have two owners -- an AST walk over its "
+      "IMPORTS rather than a substring over its source, because a function "
+      "docstring naming the module is not an import of it",
+      ([m for m in _CC_IMPORTS if "criterion_windows" in m], _CC_IMPORTS),
+      ([], ["re"]))
+def _defaulted_params(fn):
+    """The parameter NAMES of ``fn`` that carry a default.
+
+    `fn.__defaults__ in (None, (True,))` was the first version of this and it
+    is loose in the direction that matters: it would pass a signature that had
+    LOST `coordination` and gained `is_window=True`, because the defaults TUPLE
+    is `(True,)` either way. The property is about the NAME.
+    """
+    spec = _inspect7.signature(fn)
+    return [n for n, prm in spec.parameters.items()
+            if prm.default is not _inspect7.Parameter.empty]
+
+
+check("7g  ...and `is_window` carries no default in any of the three -- the "
+      "parameter NAME, not the defaults tuple, because a tuple of (True,) is "
+      "the same whether it belongs to `coordination` or to `is_window`",
+      tuple((f.__name__, "is_window" in guarded(_defaulted_params, f))
+            for f in (CC.classify_window_scope, CC.unwindowed_clauses,
+                      CC.is_compound)),
+      (("classify_window_scope", False), ("unwindowed_clauses", False),
+       ("is_compound", False)))
+check("7g  ...and the only defaulted parameter any of them has is the "
+      "coordination cut, so this is not passing over a signature that has "
+      "lost a parameter",
+      tuple(guarded(_defaulted_params, f)
+            for f in (CC.classify_window_scope, CC.unwindowed_clauses,
+                      CC.is_compound)),
+      ([], ["coordination"], ["coordination"]))
+check("7g  ...so omitting it is a TypeError rather than a silent default",
+      tuple(guarded_raises(f, "Any therapy within 6 months")
+            for f in (CC.classify_window_scope, CC.unwindowed_clauses,
+                      CC.is_compound)),
+      ("TypeError",) * 3)
+
+# --- 7h -- THE PROVENANCE IS RECORDED IN THE MODULE -----------------------
+#
+# A predicate moved out of a paid artifact whose provenance is not written down
+# beside it is a regular expression nobody can trace. The module's docstring
+# names the source script, its directory, its sha256 and its date; this pins
+# that they are there rather than re-reading the artifact, which would make
+# this file depend on a tree outside the repository.
+_WDOC = W.__doc__ or ""
+check("7h  the module records WHERE the predicate came from -- the script, "
+      "the log directory, the sha256 and the date",
+      (all(s in _WDOC for s in (
+          "item9_families.py",
+          "eval_run_item9_20260904_logs",
+          "c5c2deb04f3cb28be9d15953a73be03fc889aafcf783d42b26a541c2922321b1",
+          "2026-09-04")),
+       "item8_analyse.py" in _WDOC), (True, True))
+check("7h  ...and that the source scripts are NOT edited, which is what makes "
+      "their published numbers checkable against them",
+      ("are not edited" in _WDOC.lower()
+       or "not edited" in _WDOC.lower()), True)
+check("7h  ...and that the item-8 base was re-verified at extraction rather "
+      "than assumed",
+      ("verbatim" in _WDOC and "DRIFTED" in _WDOC), True)
+
 
 
 print()

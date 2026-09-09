@@ -892,7 +892,8 @@ BUCKETS = {
         "asserted"),
     "test_evaluation_rater.py": (
         _A, None,
-        "ran green in 2.4s, 522 checks, against ONLY the directory skeleton, "
+        # RE-MEASURED against a provision_ci_paths.py skeleton (the # resume-provenance and state-model passes). The string it replaces said # "522 checks" and was stale by 42 before the model guard was added: the # file reported 534 at the previous commit, measured by running it.
+        "ran green in ~2.5s, 564 checks, against ONLY the directory skeleton, "
         "identical in a depth-1 clone: the blind rater harness. IT DOES NOT "
         "NEED ragas INSTALLED -- measured, the interpreter that ran it green "
         "has no ragas distribution at all; `09- Testing/ragas-venv/` is a "
@@ -1904,7 +1905,11 @@ BUCKETS = {
         "two writers and is sha256-compared at the end. It EXECS NOTHING."),
     "test_criterion_clause_division.py": (
         _A, None,
-        "ran green in <1s, 67 checks, against ONLY the provisioned CI "
+        # 67 -> 93 WITH SECTION 7, which drives the classification end to end
+        # against the REAL window predicate -- extracted into
+        # oncotriage/evaluation/criterion_windows.py, so it no longer lives
+        # outside this repository. RE-MEASURED against a skeleton root.
+        "ran green in <1s, 93 checks, against ONLY the provisioned CI "
         "skeleton (MEASURED against a provision_ci_paths.py root, not "
         "assumed): oncotriage/evaluation/criterion_clauses.py, the one owner "
         "of how an eligibility criterion is DIVIDED for window-scope "

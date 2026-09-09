@@ -58,11 +58,23 @@ third in the head test built on top of it:
    an exception is a SPAN that is excised, and what follows it is restored.
 
 WHAT THIS MODULE DOES NOT DECIDE. It does not own the WINDOW predicate. "Does
-this text state a time window" is RULE 4's vocabulary, it is owned by item 9's
-``is_window_criterion``, and it is passed in as a callable rather than copied
-here -- a second copy of a regular expression whose provenance is three
-documents long is exactly the drift this module exists to remove. Every
-function that needs it takes it as an argument.
+this text state a time window" is RULE 4's vocabulary, and it is passed in as a
+callable rather than copied here -- a second copy of a regular expression whose
+provenance is three documents long is exactly the drift this module exists to
+remove. Every function that needs it takes it as an argument.
+
+**THAT PREDICATE IS NOW IN THE PACKAGE, AND THE ARGUMENT STILL HAS NO DEFAULT.**
+It was item 9's ``is_window_criterion``, in an evaluation-run log directory
+outside this repository; it is ``oncotriage/evaluation/criterion_windows.py``,
+extracted there with its provenance recorded, which is what let
+``tests/test_criterion_clause_division.py`` section 7 finally drive this
+module's classification end to end against the predicate that produced the
+published numbers. NOTHING HERE IMPORTS IT. The parameter is the statement that
+the division and the window are two questions with two owners, and installing a
+default would make this module own both de facto -- a caller who omitted the
+argument would silently get RULE 4's window predicate whether or not that is
+the predicate they meant. ``empty_database(db_path, flag)``'s rule: a default
+that makes a claim is not a convenience.
 """
 
 import re
