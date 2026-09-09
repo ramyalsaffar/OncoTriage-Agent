@@ -926,7 +926,7 @@ print("=" * 78)
 # it, so it agrees with a careless regeneration by construction; a literal here
 # is a second place a human has to consent to a bump. It is the only line in
 # this file a future bump must edit, and that is the cost being paid on purpose.
-check("PROMPT_VERSION reads 1.10.0", PROMPT_VERSION, "1.10.0")
+check("PROMPT_VERSION reads 1.11.0", PROMPT_VERSION, "1.11.0")
 
 # 1.8.0 IS PINNED HERE TOO, AND ITS ADDITION IS INSIDE A DIFFERENT SECTION.
 # Section 5b's scan below is about the pinned sentences and where they landed;

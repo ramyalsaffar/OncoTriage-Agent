@@ -476,7 +476,210 @@ from oncotriage.utils import get_age_reference_date
 # oncotriage/evaluation/rater.py slices unchanged. The fixture SCHEMA_VERSION is
 # untouched -- this is a prompt edit, not a recording-format edit -- and no model
 # call was made in this pass.
-PROMPT_VERSION = "1.10.0"
+#
+# 1.11.0 CLOSED THE RESOLVED-CONDITION CONTRAVENTION, NAMED THE MEDICATION
+# STATUS TOKEN, AND MADE THE QUOTED STATUS PART OF THE EVIDENCE TRAIL. Three
+# operator-approved changes, no deletion, no reordering, and no timing language
+# touched.
+#
+# THE MEASURED BASIS FOR (a). The A2 family, re-judged blind under an
+# independent judge (`09- Testing/Evaluation Runs/eval_run_item11_20260908_logs`,
+# ITEM11_REPORT.md section 2): on 90 of 137 decisions -- 65.7%, 95% CI
+# 57.4%-73.1%, over 40 distinct criteria and 14 patients -- the pipeline wrote
+# the arm's DISQUALIFIER while quoting evidence the record marks resolved,
+# inactive or in remission, and the judge gave RULE 4's own non-disqualifying
+# answer. That is RULE 4's active/current branch contravened under BYTE-IDENTICAL
+# rule text: the branch already said "Resolved/inactive/in remission: inclusion
+# -> not_evaluable; exclusion -> not_violated", Section 5's ACTIVITY check
+# already restated it at the point of write, and the FINAL REMINDER already
+# restated it again. The same class is what
+# oncotriage/agent/evaluation.py's temporal-conflict detector was built to COUNT
+# rather than rewrite (an AML resolved in 1997 marked "not_met" against a
+# newly-diagnosed-AML criterion; a concussion resolved in 2012 quoted to
+# disqualify on active CNS leukaemia), and that detector only looks because a
+# simulation put the precision of REWRITING these rows at 0.57.
+#
+# SO MORE OF THE SAME SENTENCE WAS NOT THE FIX, AND THAT IS WHY (a) IS NOT ONE.
+# Restating "resolved is not active" a fourth time would be the instruction the
+# model already had three times and did not act on. What (a) ADDS is the two
+# things the shipped text never said:
+#
+#   THE ROUTE. The judge's own rationales say where these rows should have gone
+#   and it is frequently NOT the resolved branch: of the 90, 53 cite BOTH the
+#   resolution and missing data and 8 cite ONLY missing data. The exclusion arm
+#   is the only one that can separate the two routes -- RULE 4 answers
+#   "not_violated" there and RULE 1 answers "not_evaluable" -- and of its 10
+#   cases the judge chose RULE 1's answer 6 times against RULE 4's once. The
+#   report states the consequence in as many words: "a prompt fix written to the
+#   resolved branch would be credited for whichever mechanism actually moves
+#   them". So the new sentence sends the model to the EXISTING missing-evidence
+#   rule when current status cannot be established, rather than asserting a
+#   second outcome of its own. It adds no rule; it names the one that applies.
+#
+#   THE COUNTERWEIGHT. "Do not treat resolved disease as active", pressed
+#   harder and alone, has an obvious failure in the opposite direction: a model
+#   that over-applies it starts answering "not_evaluable" on "history of X" and
+#   "prior X" criteria, where a resolved X is exactly what satisfies them --
+#   turning a fail-safe into a fail-open on every prior-malignancy exclusion.
+#   RULE 4's past-tense branch already rules that ("Any documented occurrence
+#   (past or present) satisfies the criterion") and the new sentence binds the
+#   two branches together so the reinforcement cannot be read as overriding it.
+#
+# WHERE (a) GOES, AND WHY IT GOES TO THREE PLACES. 1.7.0 MEASURED that this
+# model acts on the restatement at the point of writing rather than on the rule
+# at the top, and 1.10.0 records the converse: a reminder that contradicts the
+# rule leaves the contradiction exactly where the model acts. So the paragraph
+# is added to RULE 4 and the two existing restatements are brought into line
+# with it, in the SAME words:
+#
+#   RULE 4          the whole paragraph, as a CLOSING synthesis after the
+#                   past-tense and active/current branches. It closes rather
+#                   than gates -- unlike 1.10.0's ongoing test, which had to be
+#                   FIRST because it decides an answer -- because both of its
+#                   deferrals ("the existing missing-evidence rule", "the
+#                   existing timing rules") are BACKWARD references, and placed
+#                   above the branches they would point at text the model has
+#                   not read yet.
+#   Section 5       the ACTIVITY check gains the route and the counterweight as
+#                   a CONTINUATION of the ACTIVITY item, indented under it. It
+#                   already carried the first sentence's content, and a THIRD
+#                   item would have made "CHECK TWO THINGS" false -- which is a
+#                   reword of a shipped line this edit is not permitted.
+#   FINAL REMINDER  the same two sentences, as a new paragraph under the
+#                   existing resolved line. That line is scoped to criteria
+#                   "requiring an active or current one" and is silent on prior
+#                   disease; silence there is what the counterweight exists to
+#                   close, and the reminder is the last thing the model reads.
+#
+# "Preserve the existing timing rules" IS THE FOURTH SENTENCE AND IT IS LOAD-
+# BEARING, not politeness. All window/timing wording is PARKED by operator
+# ruling and is byte-identical across this bump -- 1.9.0's quote-the-interval
+# branch, 1.10.0's ongoing gate, 1.8.0's stated-interval paragraph and the FINAL
+# REMINDER's time-window line. The sentence says so INSIDE the prompt so a model
+# reading the new paragraph cannot take it as licence to re-decide a window.
+#
+# (b) RULE 2 NAMES THE TOKEN, WHICH 1.10.0 RECORDED AS THE FOLLOW-UP AND
+# DESCRIBED AS "STRICTLY BETTER". That bump made the RECORD stop collapsing an
+# unknown medication status into `active`; a medication whose parsed status is
+# unknown has printed `status: unknown` since. RULE 2's arm list reads
+# "ACTIVE / ON-HOLD / no status documented" and names no token, so the model
+# reaches the right arm by reading `status: unknown` AS "no status documented"
+# -- an inference, on the one field where oncotriage/agent/patient.py's own
+# comment says out loud where the line belongs ("`status: unknown` falls to
+# RULE 4's OTHERWISE line and to RULE 2's 'no status documented' arm"). The
+# sentence is added UNDER that arm, so it reads as a routing instruction into
+# the arm rather than as a fourth arm.
+#
+# ITS FIRST HALF IS NOT IN TENSION WITH "TREAT AS CURRENT THERAPY", and the
+# distinction is the GLOBAL INVARIANT's. "Treat as current therapy" is a
+# TEMPORAL convention -- do not go looking for an end date, do not read the line
+# as historical. "Provides no evidence by itself that the medication is
+# currently used or absent" is an EVIDENTIAL bound -- the line is not a quotable
+# data point for a criterion asking whether the patient is on the drug, in
+# either direction. Absence of data is not evidence of absence, and it is not
+# evidence of presence either.
+#
+# AND IT DOES NOT MOVE RULE 4's ONGOING GATE, which is parked. That gate keys on
+# "a medication whose status is active" -- a literal status word -- and
+# `status: unknown` does not satisfy it, before this edit or after. The routing
+# this sentence makes explicit is the one 1.10.0 already ruled and the renderer
+# already implements; a line with no documented status has ALWAYS reached
+# "current therapy" through RULE 2 and the OTHERWISE branch through RULE 4, so
+# naming the token adds a token to an existing arm and no new interaction.
+#
+# (c) THE EVIDENCE TRAIL. patient_value is specified as "exact data point/s
+# from patient record ... No interpretive statements", and that says what may
+# NOT be added without saying what must be KEPT. A row quoting a resolved
+# condition without its status word is indistinguishable, downstream and to the
+# composed assessment, from a row quoting a current one -- and the composed
+# assessment (1.5.0) is built FROM these rows, so a status dropped here is a
+# status absent from the stored record of the verdict. This is the same
+# quote-before-judge mechanism 1.9.0 applied to intervals, applied to status:
+# the evidence and the verdict cannot come apart if the evidence has to carry
+# the status. "Do not infer or add a status" is the C1/C7 half -- a status the
+# record does not state is fabricated evidence.
+#
+# IT GOES WITH patient_value, NOT INTO THE PRE-WRITE CHECK, and the reason is
+# scope. That check fires only "BEFORE YOU WRITE not_met OR violated"; (c)
+# governs "the evidence used for THIS verdict", which is every row of every
+# verdict including "met", "not_violated" and "not_evaluable". Placing it in the
+# two-item check would have silently NARROWED an operator-approved instruction
+# to the disqualifying arm.
+#
+# MIDDLE NUMBER, and the first change alone would earn it: a disqualifier this
+# template previously produced on a resolved quote is now routed to the
+# non-disqualifying answer or to the missing-evidence rule. Verdicts move.
+#
+# THREE AUDIENCES, on 1.7.0's and 1.9.0's precedent. (a)'s RULE 4 paragraph and
+# the whole of (b) ride INSIDE the `evaluation_rules` span
+# (oncotriage/evaluation/rater.py:_RUBRIC_SPANS, "SECTION 3 -- CRITERION
+# EVALUATION ORDER" to "SECTION 5 -- OUTPUT FORMAT"), so the independent rater
+# judges a resolved quote and an unknown medication status under the
+# classifier's own rules -- required rather than tidy, since the A2 population
+# was measured with a rater and a rater holding the old rule would disagree for
+# rubric mismatch rather than for decision quality. (a)'s Section 5 and FINAL
+# REMINDER restatements and the whole of (c) lie OUTSIDE every lifted span and
+# the rater does not receive them: Section 5 describes the pipeline's output
+# envelope and the rater has its own.
+#
+# THE PACKING COST WAS MEASURED AND CONSENTED TO, per the discipline
+# tests/test_agent_stage5_input_packing.py checks 3i-3k record. The template's
+# own fixed share of MATCHING_INPUT_TOKEN_BUDGET moves 5414 -> 5677 tokens on
+# the confirmed variant and 5534 -> 5796 on the unconfirmed -- +263 and +262,
+# 2.2% of the budget -- and the pinned numbers are updated in this same commit.
+# (MEASURED, not estimated: the first draft of this paragraph guessed +228 from
+# the character count before running the estimator and was wrong by 15%.) That
+# is charged to EVERY chunk of every GROUPED request; the shipped per-trial arm
+# bypasses the packer, so the exposure is the retained comparison arm, which is
+# also the arm the twelve fixtures pin.
+#
+# AND THE REPARTITIONING WAS MEASURED THROUGH THE PRODUCTION PATH, which is
+# stronger than 1.10.0's method and was chosen after the weaker one disagreed
+# with it. `python fixture_replay.py` (pinned to the OpenAI arm, the only arm the
+# harness can hook) was run against HEAD and against this tree, and the packer's
+# own `input_packing` events were read out of both logs -- so the fixed cost is
+# the one the NODE computes, wrapper included, over the real patient record.
+# NINE fixtures reach the packer; the other three abort before Stage 5.
+#
+#   every one of the nine   input estimate +262 or +263 tokens, exactly the
+#                           template delta above and nothing else
+#   TWO of the nine gain    `ablation_no_cross_encoder` 4 chunks -> 5
+#     a whole chunk         `normal_1` 4 -> 5
+#   the replay's differing- `ablation_bm25_only` 163 -> 219,
+#     field counts moved    `ablation_no_cross_encoder` 147 -> 265,
+#     on three             `truncation_split` 200 -> 201
+#
+# 22% of the packed sample gains a request on a 2.2% change, which is 1.10.0's
+# finding again: a trial block is large relative to what is left of the budget
+# once this template and a patient record are paid for. A FIELD COUNT THAT MOVED
+# WITHOUT A CHUNK COUNT MOVING IS THE SAME FINDING, not a smaller one -- the same
+# number of requests carrying different trials is a different set of judgements.
+#
+# WHY THE WEAKER METHOD IS RECORDED AS SUPERSEDED RATHER THAN OMITTED. It was run
+# first: each fixture's own recorded trial blocks, repacked under both templates,
+# charging no user-message wrapper. It reported 3 of 11 moving and named a
+# DIFFERENT three (`normal_1`, `truncation_split`, `mesh_fallback_siteless_code`).
+# It agrees on the shape and not on the membership, because a fixed cost short by
+# the wrapper puts every boundary in the wrong place. The production path is the
+# authority and the approximation is what an approximation is worth.
+#
+# WHAT DID NOT MOVE: the JSON template's field set, field order and example
+# values; the section order; every section heading and marker line; the response
+# schema; Section 2's two variants and the branch that selects them; the fenced
+# patient-record block; the GLOBAL INVARIANT and the disqualification proof
+# requirement; RULE 4's reference date, its 1.8.0 stated-interval paragraph, its
+# 1.9.0 quote-the-interval branch, its 1.10.0 ongoing gate, its past-tense
+# branch and its active/current branch, all byte-identical; RULE 2's three arms
+# and their outcomes; C7 and C8; 1.7.0's ISOLATION check; every FINAL REMINDER
+# line already present, including 1.10.0's time-window line; and every rubric
+# span MARKER, so oncotriage/evaluation/rater.py's five spans still resolve and
+# still resolve to the same boundaries. Read that last one narrowly: the markers
+# did not move, so the SLICING is unchanged -- the rubric TEXT deliberately did
+# move, because (a) and (b) ride inside `evaluation_rules`, which is the whole
+# point of the three-audiences paragraph above. The fixture
+# SCHEMA_VERSION is untouched -- this is a prompt edit, not a recording-format
+# edit -- and NO MODEL CALL WAS MADE IN THIS PASS.
+PROMPT_VERSION = "1.11.0"
 
 
 def prompt_sha256(rendered_text: str) -> str:
@@ -709,6 +912,7 @@ If relevant data is a MEDICATION, check its status:
 
 ACTIVE / ON-HOLD / no status documented:
     Treat as current therapy.
+    A medication line reading `status: unknown` provides no evidence by itself that the medication is currently used or absent. Treat it like a medication line with no documented status.
 
 COMPLETED / STOPPED / CANCELLED:
     Treat as historical therapy. Use end date for temporal reasoning.
@@ -762,6 +966,8 @@ If the criterion requires an active/current condition:
     Resolved/inactive/in remission: inclusion -> "not_evaluable"; exclusion -> "not_violated".
     No resolution documented: inclusion -> "met"; exclusion -> "not_evaluable".
     Explicitly active/recurrence: inclusion -> "met"; exclusion -> "violated".
+
+For a criterion about current disease, do not treat resolved or inactive disease as active. Apply the existing missing-evidence rule when current status cannot be established. For criteria about prior disease or treatment, resolution does not erase documented history. Preserve the existing timing rules.
 
 RULE 5 -- DIRECT CONTRADICTION CHECK
 
@@ -818,9 +1024,11 @@ inclusion_criteria and exclusion_criteria:
 
     BEFORE YOU WRITE "not_met" OR "violated" ON ANY CRITERION, CHECK TWO THINGS:
         ACTIVITY (RULE 4). If the criterion requires an ACTIVE or CURRENT condition, the patient evidence you are about to quote must show that condition active NOW. Evidence marked resolved, inactive, in remission, completed or otherwise not active does NOT support a disqualifying status: inclusion -> "not_evaluable", exclusion -> "not_violated", exactly as RULE 4 states.
+            Apply the existing missing-evidence rule when current status cannot be established. For criteria about prior disease or treatment, resolution does not erase documented history.
         ISOLATION (C4). This status rests ONLY on this trial's own criterion text against the patient record. A disqualification you recorded for another trial in this message is NEVER evidence here, and neither is the reading of the patient you formed while writing it. Derive this status again from the record; trials in one message share the patient and nothing else.
 
 patient_value: exact data point/s from patient record, OR "Not in patient record", OR "Not applicable -- [reason]". No interpretive statements.
+    When the evidence used for this verdict explicitly states a clinical status, preserve that status in `patient_value`, linked to the condition it describes. Do not infer or add a status.
 
 assessment is emitted BEFORE eligible, so you write it first and it determines the verdict. Reason in assessment, then conclude in eligible; do not decide the verdict first and describe it afterwards.
     For "eligible" trials: begin with "No known disqualifiers."
@@ -891,6 +1099,8 @@ FINAL REMINDER
 A trial can ONLY be classified "not_eligible" if you can quote explicit patient evidence that contradicts a trial criterion. If the patient record does not contain that evidence, the criterion status MUST be "not_evaluable".
 
 Evidence that a condition is RESOLVED, inactive or in remission does not contradict a criterion requiring an active or current one. Under RULE 4 that criterion is "not_evaluable" (inclusion) or "not_violated" (exclusion), never a disqualifier.
+
+Apply the existing missing-evidence rule when current status cannot be established. For criteria about prior disease or treatment, resolution does not erase documented history.
 
 For any time-window criterion: an ONGOING condition or medication is inside the window whatever its interval says; otherwise the record's stated interval, quoted verbatim, decides it. Never your own arithmetic.
 

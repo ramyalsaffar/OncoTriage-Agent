@@ -1502,7 +1502,7 @@ check("the hash names none of the rendering machinery",
 
 print("\n12. PROMPT_VERSION and the RULE 4 wording move together")
 
-check("PROMPT_VERSION reads 1.10.0", PROMPT_VERSION, "1.10.0")
+check("PROMPT_VERSION reads 1.11.0", PROMPT_VERSION, "1.11.0")
 
 _RENDERED_PROMPT = drive(render_system_prompt, True, "applied",
                          "<probe: no patient record>")

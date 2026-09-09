@@ -759,12 +759,12 @@ _TEMPLATE_ONLY_TOKENS = {
 }
 check("3i  the template's own fixed cost, per chunk, per variant -- pinned so "
       "a prompt edit's packing cost is consented to rather than discovered",
-      _TEMPLATE_ONLY_TOKENS, {True: 5414, False: 5534})
+      _TEMPLATE_ONLY_TOKENS, {True: 5677, False: 5796})
 check("3j  ...and that is the share of MATCHING_INPUT_TOKEN_BUDGET the "
       "template spends before one byte of patient record or trial text",
       {k: round(100.0 * t / config.MATCHING_INPUT_TOKEN_BUDGET, 1)
        for k, t in _TEMPLATE_ONLY_TOKENS.items()},
-      {True: 45.1, False: 46.1})
+      {True: 47.3, False: 48.3})
 check("3k  non-degeneracy: the unconfirmed variant really is the dearer of the "
       "two, so the pin above is over two different numbers rather than one "
       "measured twice",

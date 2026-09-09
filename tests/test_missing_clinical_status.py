@@ -112,6 +112,7 @@ from oncotriage import degradation as _degradation
 from oncotriage import paths as _paths
 from oncotriage import tracking as _tracking
 from oncotriage.agent import patient as _patient_module
+from oncotriage.agent import prompts as _prompts_mod
 from oncotriage.agent.patient import _create_patient_summary
 from oncotriage.fhir import parser as _parser
 from oncotriage.storage import database_logger as _dl
@@ -789,9 +790,39 @@ check("5f  ...and the two variants are DIFFERENT texts, so 5e is not "
               != _PROMPT_NOW["prompt_template_sha256_site_unconfirmed"]),
       True)
 
-check("5g  PROMPT_VERSION did not move: the template text is unchanged, so "
-      "the middle number has nothing to record",
-      _PROMPT_NOW["prompt_version"], "1.10.0")
+# 5g's ORIGINAL CLAIM IS RETIRED, AND IT IS ARGUED HERE RATHER THAN DELETED
+# QUIETLY. It read: "PROMPT_VERSION did not move: the template text is
+# unchanged, so the middle number has nothing to record", pinned at "1.10.0".
+# That was TRUE of the renderer pass that wrote it and is the right thing for
+# THAT pass to have asserted -- it edited a changelog comment in prompts.py and
+# nothing else, and a template edit smuggled in beside a renderer fix is exactly
+# what it existed to catch.
+#
+# WHAT RETIRED IT IS THE FOLLOW-UP THAT PASS ITSELF RECORDED. The 1.10.0 block
+# in oncotriage/agent/prompts.py named the open item in as many words -- RULE 2
+# lists "ACTIVE / ON-HOLD / no status documented" and does not name the word
+# `unknown`, so the model reaches the right arm by INFERENCE; "naming the token
+# in RULE 2 would be strictly better and is a TEMPLATE edit with its own
+# middle-number bump". PROMPT_VERSION 1.11.0 is that edit. So the literal is not
+# merely stale, its SENTENCE is false: the template text moved, deliberately,
+# for this file's own subject.
+#
+# RE-PINNING THE LITERAL AT "1.11.0" WAS REJECTED. It would re-state a claim
+# that is now false, and it would fail at every future bump for a reason that
+# has nothing to do with medication status -- which is a landmine, not a guard.
+# What replaces it is the property that SURVIVES a bump and is this file's to
+# hold: the tracking seam reports the version prompts.py DECLARES, rather than a
+# copy of its own. That is not a tautology -- it goes through
+# _tracking._prompt_params(), so a tracking layer that hardcoded a version, or
+# cached one taken at its own import, fails here.
+check("5g  the tracking seam reports the version prompts.py declares, so a "
+      "hardcoded or cached copy in the tracking layer cannot survive a bump",
+      _PROMPT_NOW["prompt_version"], _prompts_mod.PROMPT_VERSION)
+
+check("5g-i non-degeneracy: that version is a real non-empty string rather "
+      "than two absences compared with each other",
+      isinstance(_prompts_mod.PROMPT_VERSION, str)
+      and len(_prompts_mod.PROMPT_VERSION) > 0, True)
 
 # THE COMMENT THIS PASS FIXED SAID SOMETHING THAT IS NOW FALSE. Left standing
 # it would tell the next reader the collapse is still there -- which is exactly

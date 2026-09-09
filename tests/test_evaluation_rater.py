@@ -1084,6 +1084,72 @@ check("7d'' ...and so does 1.10.0's gate, in the same span and not a neighbour "
       "that drifted over it",
       _R110_SPANS, ["evaluation_rules"])
 
+# --- 7d''' -- 1.11.0 SPLITS ACROSS THE BOUNDARY THREE WAYS -----------
+#
+# The bump made three operator-approved changes and they reach different
+# audiences, so the boundary is pinned for each of them IN BOTH DIRECTIONS --
+# "the rubric contains X" alone is satisfied by a span widened to swallow the
+# prompt, "the rubric omits Y" alone by a lift that had stopped working.
+#
+# (a) RULE 4's closing paragraph. INSIDE `evaluation_rules`, and required
+#     rather than tidy: the A2 population this bump answers was measured WITH a
+#     rater, and a rater still holding 1.10.0's rule would score the fix's own
+#     non-disqualifying answer as a defect -- disagreeing for rubric mismatch
+#     rather than for decision quality, which is the confound this harness
+#     exists to remove.
+# (b) RULE 2's `status: unknown` routing. INSIDE, for the same reason: the rater
+#     judges medication criteria and must reach the same arm.
+# (c) The patient_value evidence-trail sentence. OUTSIDE, on the standing rule
+#     that Section 5 describes the pipeline's OUTPUT ENVELOPE and the rater has
+#     its own -- the same reason C6 is restated rather than lifted.
+#
+# The Section 5 and FINAL REMINDER restatements of (a) are OUTSIDE too, on
+# 1.7.0's precedent, and their sentence is a SUBSTRING of the RULE 4 paragraph
+# -- so it is pinned by OCCURRENCE COUNT rather than by presence: exactly one,
+# the one inside the rule. A count is what distinguishes "the rubric carries the
+# rule" from "a span drifted over the reminder as well".
+_R111_RULE4 = ("For a criterion about current disease, do not treat resolved or "
+               "inactive disease as active.")
+_R111_TAIL = ("Apply the existing missing-evidence rule when current status "
+              "cannot be established.")
+_R111_RULE2 = ("A medication line reading `status: unknown` provides no "
+               "evidence by itself")
+_R111_OUT = ("When the evidence used for this verdict explicitly states a "
+             "clinical status, preserve that status in `patient_value`")
+check("7d''' non-degeneracy: all four 1.11.0 sentences ARE in the rendered "
+      "prompt, so the checks below are about the span boundary rather than "
+      "about a template that lost them",
+      (_R111_RULE4 in _ONE, _R111_TAIL in _ONE, _R111_RULE2 in _ONE,
+       _R111_OUT in _ONE),
+      (True, True, True, True))
+check("7d''' 1.11.0's RULE 4 paragraph DOES reach the lifted rubric, so "
+      "the rater judges a resolved quote under the classifier's own rule",
+      _R111_RULE4 in _RUBRIC, True)
+check("7d''' ...and so does RULE 2's `status: unknown` routing",
+      _R111_RULE2 in _RUBRIC, True)
+check("7d''' ...while the patient_value evidence-trail sentence does NOT, "
+      "because Section 5 is the pipeline's output envelope and the rater has "
+      "its own",
+      _R111_OUT in _RUBRIC, False)
+check("7d''' ...and the restatement sentence appears in the rubric EXACTLY "
+      "ONCE -- the one inside RULE 4. The Section 5 and FINAL REMINDER copies "
+      "are outside every span, so a second occurrence means a boundary drifted "
+      "over one of them",
+      _RUBRIC.count(_R111_TAIL), 1)
+check("7d''' ...and it really occurs three times in the RENDERED prompt, "
+      "so that count of one is a boundary measurement rather than a template "
+      "that only ever had one copy",
+      _ONE.count(_R111_TAIL), 3)
+_R111_SPANS = [n for n, (s, e) in _SPAN_BY_NAME.items()
+               if _R111_RULE4 in str(drive(R._slice_span, _ONE, s, e, n))]
+check("7d''' ...and the paragraph lands in `evaluation_rules` specifically, "
+      "not in a neighbour that drifted over it",
+      _R111_SPANS, ["evaluation_rules"])
+_R111_R2_SPANS = [n for n, (s, e) in _SPAN_BY_NAME.items()
+                  if _R111_RULE2 in str(drive(R._slice_span, _ONE, s, e, n))]
+check("7d''' ...and so does RULE 2's routing sentence",
+      _R111_R2_SPANS, ["evaluation_rules"])
+
 check("7e  the meta digests one sha per span, keyed by the span names",
       sorted(_META.get("span_sha256") or {}),
       sorted(n for n, _, _ in R._RUBRIC_SPANS))
