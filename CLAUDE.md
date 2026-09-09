@@ -14700,6 +14700,202 @@ anything in this pass.
    adds $0.00), but it was not asked for and it moves the remaining rater budget
    from a reported $50.00 to a true $42.72.
 
+### Five guards, and none of them behind a network call (the resume-provenance pass)
+
+**FOUR ITEMS, ALL IN THE BLIND RATER'S RESUME PATH.** No billed call, no AWS
+call, no schema change, no migration: nothing outside the repository was
+written, and the nineteen `rater_state*.json` files under
+`09- Testing/Evaluation Runs/` were read as survey evidence and never edited.
+
+**1. `--resume <id>` WITH NO STATE FILE BYPASSED EVERY GUARD, AND THE REASON IS
+STRUCTURAL RATHER THAN AN OVERSIGHT.** `require_state_mode`,
+`require_state_subset`, `require_state_shape` and the new
+`require_state_rubric` each open `if not state: return` -- correct for a FIRST
+SUBMIT, where nothing is recorded and nothing can disagree. On a resume the same
+absence means the opposite: the batch exists, it was paid for, and this
+directory records no mode, no subset, no shape and no rubric for it. **So all
+four fell silent on exactly the invocation that needs them**, and the session
+polled, parsed and wrote three artifacts stamping TODAY'S four values onto
+answers it could establish nothing about. `require_state_for_resume` is the one
+guard that can tell a resume from a first submit, it runs first, and it gates
+the other four. **There is deliberately no override flag**: an unverified resume
+is indistinguishable on disk from a verified one, and a refusal needs no second
+evidence source where an admission would need four. An UNREADABLE state file
+lands there too -- `read_state` reports a decode failure as `None` -- and the
+message asks the filesystem so the two remedies (wrong directory / broken file)
+are named apart.
+
+**2. THE LOCAL GUARDS RAN AFTER THE NETWORK, AND THE COST WAS A MISDIAGNOSIS
+RATHER THAN A ROUND TRIP.** Measured by driving `main()` with
+`socket.socket.connect`, `connect_ex`, `socket.create_connection` and
+`getaddrinfo` trapped: a state file from the other mode, a state file with no
+recorded shape, and `--resume` against an empty directory **all three reported
+`REFUSED: this key cannot see the judge model 'gpt-5.6-terra'
+(APIConnectionError)` after three attempts on api.openai.com** -- three because
+the SDK retries. Every provenance refusal this module has was masked by a
+message naming the key and the model, which sends an operator to their
+credentials when the fault is a forgotten flag or a wrong directory.
+
+The whole block moves above `model_is_visible`, and **nothing in it needs a
+network answer**: four guards read this session's own state file,
+`refuse_batch_from_other_mode` reads the other mode's at two known paths, and
+the batch ids a resume names are `args.resume.split(",")`. It also moves above
+`require_client` -- local, so never the problem -- because a state file this
+module refuses is fatal whatever the credentials are, and being told to export a
+key in order to be told the directory is wrong is one step of a two-step
+diagnosis that did not need the first. **`os.makedirs(out_dir)` moves DOWN**: it
+used to precede the state read, so a refused invocation left an empty output
+directory behind, which is itself the trap the next `--resume` trips on. After:
+**all six refusals fire with ZERO outbound attempts, each naming its own
+fault**, and the non-degeneracy control -- a state file in order -- reaches the
+wire and refuses at the visibility check, which is the one thing below that
+genuinely needs it.
+
+**3. THE ADOPTION INSTRUCTION INVITED A RECOLLECTION, AND THE BRIEF'S PREMISE
+FOR FIXING IT WAS FACTUALLY WRONG.** `state_shape_absent` offered "if you can
+establish which code submitted those batches, record it yourself", which a
+recollection satisfies -- and a recollection in that field is adopted as fact by
+every artifact of every later resume. The brief said to condition it on "THAT
+batch's persisted request file (the submitted JSONL this module persists)".
+**This module persists no such file.** Measured: it has exactly three local
+writers -- `write_state`, `persist_raw_replies` and `write_json` --
+`submit_batches` builds the JSONL in memory and uploads it, and the raw OUTPUT
+file does not echo the request (checked against the real 5-request probe output,
+where `TRIAL_CRITERIA_REFERENCE` appears nowhere).
+
+**THE EVIDENCE THAT DOES EXIST IS THE UPLOADED INPUT FILE**, addressed by the
+`input_file_id` `submit_batches` records beside each batch id. So the invitation
+is now the NAME OF A CHECK: retrieve that file (`client.files.content`, a
+download and not a completion, so it bills nothing) and read the **SYSTEM**
+message of any request in it.
+
+**THE SYSTEM MESSAGE AND NOT THE USER PARTS, AND THAT IS THE HALF THE BRIEF GOT
+WRONG.** Shape 2 OMITS the reference block for any decision whose trial criteria
+could not be verified -- `reference_context: absent`, a real and counted state
+-- so **a batch every one of whose references was absent carries user parts
+BYTE-IDENTICAL to shape 1**. Checking there is a false negative in the direction
+that matters: the operator reads "no fence", writes a 1, and a shape-2 batch is
+relabelled by somebody who followed the instructions exactly. The boundary
+paragraph is appended to the system prompt unconditionally at shape 2, so the
+marker `<<<TRIAL_CRITERIA_REFERENCE>>>` is the only difference the two shapes
+carry on EVERY row -- verified in all four (mode, shape) combinations, and pinned
+against the shipped builder so the instruction cannot name a marker that is not
+the discriminator.
+
+**AND WHERE THE CHECK CANNOT BE RUN THE INVITATION IS WITHDRAWN RATHER THAN
+SOFTENED.** `input_file_id` arrived with the OpenAI port, so **3 of the 19 state
+files on disk carry it**; the message names the (batch, file) pairs it found,
+names the batches it cannot check, and where there are none it offers no key to
+hand-write at all and directs to `--output-dir`.
+
+**4. `rubric_sha256` WAS WRITTEN AND READ BACK BY NOTHING.** Same defect one
+field over, and it is the one that corrupts a measurement rather than a label:
+the rules are lifted VERBATIM out of `oncotriage/agent/prompts.py` precisely so
+the pipeline and its auditor are judged against ONE text, so an agreement rate
+computed across two rulebooks is a number about neither. Nothing else catches
+it -- the rubric is not in the custom_id, so the join succeeds and every rating
+parses. `require_state_rubric` refuses on mismatch, naming both digests, the
+prompt version, what joining them corrupts and the remedy.
+
+**ABSENT REFUSES, AND THE POLICY IS FROM A SURVEY.** `require_state_mode` reads
+an absent mode as anchored and `require_state_shape` refuses an absent shape;
+the two differ because their absent POPULATIONS differ. This field was in the
+commit that ADDED the module (`81203ea`, 2026-08-11 -- earlier than `mode`,
+`include_keys_sha256` and `input_file_id`) and **all nineteen state files on disk
+carry it**, so the absent population is EMPTY: a file without it was not written
+by this writer, there is no legacy resume to strand, and nothing weighs against
+refusing. **And there is no hand-adoption escape here, unlike the shape**: the
+digest is a function of ~8,800 characters of prompt text at a past commit, so an
+operator cannot establish it by inspection the way they can establish a shape
+from one marker, and inviting a hand-written digest would invite a guess.
+
+**THE REVERT MATRIX CORRECTED THIS PASS'S OWN CODE, and it is the finding worth
+reading.** The rubric guard shipped as
+`if isinstance(found, str) and found == want:` by analogy with the shape guard's
+bool/float exclusion -- and **deleting that isinstance changed nothing any check
+could see**, because no bool, int, float, list or dict equals a hex string. The
+shape guard's exclusion IS live (`True == 1` would be adopted as shape 1); this
+one was dead code, described in a comment as a live branch. This project's own
+rule from the de-identification pass applies: *a guard that cannot change an
+outcome must not be described as one.* Restructured to **absent, then type, then
+value** -- three reachable, decisive branches, with the order pinned, because
+any other order makes one of them dead.
+
+**TWO STATE KEYS BECAME CONSTANTS** (`INCLUDE_KEYS_STATE_KEY`, `RUBRIC_SHA_KEY`)
+on `STATE_SHAPE_KEY`'s footing: the item-1 refusal names all four provenance
+fields, and a remedy naming a key that does not exist is worse than no remedy.
+`RUBRIC_SHA_KEY` keys TWO dicts -- `rubric_meta`, which lands in the manifest,
+and the state file -- deliberately under one spelling, so a refusal and the
+manifest beside it are compared as one name rather than two.
+
+**THE TEST FILE'S OWN CLAIMS WERE NARROWED RATHER THAN LEFT.** Its docstring
+said "NO NETWORK, NO KEYS ... the evaluation run directories are never read".
+Section 9q drives `main()`, so it fabricates a minimal run directory under
+`tempfile.mkdtemp` and its non-degeneracy control puts a FABRICATED
+`OPENAI_API_KEY` in `os.environ` for one drive inside a `try`/`finally` that
+restores what was there -- it has to, because the property being measured is
+that the guards run above `require_client`. "No network" is now MEASURED with a
+firing control rather than claimed. The bucket-A justification in
+`ci_test_buckets.py` moved with it; the file stays bucket A.
+
+```bash
+# The resume-provenance pass. Same file, four new sections (9o, 9p, 9q, plus
+# 9k split per branch). NO NETWORK -- and section 9q measures it rather than
+# claiming it, with a firing control. No live judge, NO SPEND, no corpus
+# (default_run_dir() is never called), no database, no git history. It writes
+# only inside three tempfile.mkdtemp trees, each removed in a finally with the
+# removal ASSERTED. Bucket A, ~2.4 s.
+python tests/test_evaluation_rater.py                               # 524 (was 467)
+```
+
+**VERIFIED BY RUNNING.** `tests/test_evaluation_rater.py` **467 -> 534**;
+`tests/test_package_invariants.py` **261/0/0**, unchanged, so no never-read name
+was introduced; `static_checks.py` compiles 289; `ci_test_buckets.py --check`
+consistent at 129 files; the staged secret gate reports **0 unaccepted
+findings**. **EIGHTEEN REVERTS, EIGHTEEN CAUGHT, NONE ABORTING**, each into a
+`copytree`'d copy with a `sitecustomize` stripping the editable install's
+MetaPathFinder (which otherwise beats `PYTHONPATH`), a realpath preflight
+asserting the COPY is what imports, `PYTHONDONTWRITEBYTECODE=1`, and every plant
+asserting its own occurrence count -- clean control 534/0. **No money was spent,
+no AWS call was made, no schema changed, no migration was run, and nothing
+outside the repository was written**: the nineteen state files were read as
+survey evidence and are byte-unchanged.
+
+**BUCKET A REPORTS 2 FAILURES AND BOTH REPRODUCE AT HEAD, which is stated
+rather than glossed.** `test_runner_stop_switch.py` and
+`test_runner_sigterm_shutdown.py` fail in the pool and are **green alone at
+their documented counts (140 and 87)**; a `git worktree` at HEAD with none of
+this pass's changes reports the same two (plus
+`test_ablation_stop_and_lock.py`, a third). None of the three touches the
+rater, and none of their modules was edited here. **The pre-migration pass's
+note that they "run green in CI bucket A's pool" is stale on this machine** --
+it is left as written, per the rule that a past-tense account keeps its
+wording, and the current reading is recorded here instead.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE MODULE DOES NOT RUN THE SHAPE CHECK ITSELF.** It names it. Running it
+   is a provider round trip, which item 2 has just moved every guard above, and
+   the adoption is deliberately the operator's claim rather than this module's
+   inference. A `--verify-shape-from-input-file` flag that made the call
+   explicitly is the arguable end state and is a spending-and-ordering decision.
+2. **`input_file_id` IS NOT BACKFILLABLE**, so the 16 older state files can
+   never gain the evidence. Their remedy is `--output-dir` and always will be.
+3. **NO GUARD COVERS THE MODEL.** `state["model"]` is written and read back by
+   nothing -- the same shape as `rubric_sha256` was, one field over. A resume
+   across a judge change joins answers from one model onto artifacts recording
+   another. It was out of this pass's four items and is the obvious fifth.
+4. **THE RETRY PASS RE-SUBMITS UNDER TODAY'S CODE WITHOUT ASKING.** The guards
+   run once, at the top; the retry batch built ~150 lines below is built at
+   today's shape and rubric by construction, which is correct -- but nothing
+   records that a session's primary and retry batches were built at the same
+   shape, because there is one shape field per state file rather than one per
+   batch.
+5. **THE `--dry-run` PATH IS UNGUARDED AND DOES NOT NEED TO BE**: it returns
+   before the state file is read and cannot resume. Stated so the asymmetry is
+   not read as an omission.
+
+
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

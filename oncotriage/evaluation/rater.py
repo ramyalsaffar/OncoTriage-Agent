@@ -354,6 +354,19 @@ def _slice_span(rendered, start_marker, end_marker, name):
     return span
 
 
+RUBRIC_SHA_KEY = "rubric_sha256"
+"""The one spelling of the lifted rubric's digest.
+
+It keys TWO dicts and that is deliberate rather than a collision: the
+``rubric_meta`` this function returns (which lands in ``rater_manifest.json``)
+and the state file ``require_state_rubric`` reads. They are the same fact, so
+they carry the same name -- ``STATE_SHAPE_KEY``'s argument, which is that an
+operator comparing a refusal against the manifest beside it should be comparing
+one spelling rather than two. A constant is what makes that true by
+construction instead of by two literals agreeing today.
+"""
+
+
 def lift_rubric():
     """Slice the decision rules verbatim out of the shipped Stage 5 prompt.
 
@@ -408,7 +421,7 @@ def lift_rubric():
         "span_order": list(spans.keys()),
         "span_sha256": {k: _sha256(v) for k, v in spans.items()},
         "span_chars": {k: len(v) for k, v in spans.items()},
-        "rubric_sha256": _sha256(rubric),
+        RUBRIC_SHA_KEY: _sha256(rubric),
         "rubric_chars": len(rubric),
         "render_probes": list(_RENDER_PROBES),
         "reference_date_in_rules": reference_date,
@@ -4363,6 +4376,93 @@ def state_filename(mode):
     return STATE_FILENAME_BLIND if mode == MODE_BLIND else STATE_FILENAME
 
 
+def require_state_for_resume(state, resume, state_path):
+    """Refuse ``--resume <id>`` against a directory that records nothing.
+
+    **A BATCH ID WITH NO STATE FILE BYPASSES EVERY GUARD BELOW, BY
+    CONSTRUCTION RATHER THAN BY OVERSIGHT.** ``require_state_mode``,
+    ``require_state_subset``, ``require_state_shape`` and
+    ``require_state_rubric`` each open with ``if not state: return`` -- which
+    is correct for a FIRST SUBMIT, where there is nothing recorded yet and
+    nothing to disagree with. On a resume the same absence means the opposite
+    thing: the batch exists, it was paid for, and this directory holds no
+    record of what mode, what decision subset, what request shape or what
+    rubric produced it. So all four guards fall silent on exactly the
+    invocation that needs them most, and the session proceeds to poll, parse
+    and write three artifacts whose recorded mode, subset, shape and rubric are
+    TODAY'S -- attributed to answers this module cannot establish anything
+    about.
+
+    Measured before it was closed: ``--resume batch_x`` against an empty
+    ``--output-dir`` reached the poll with every one of those guards having
+    returned without comparing anything.
+
+    **THE REMEDY IS THE DIRECTORY, AND THERE IS DELIBERATELY NO OVERRIDE.**
+    ``submit_batches`` writes the state file BEFORE the first batch is polled
+    and re-writes it after every one, so a batch this harness created has a
+    state file somewhere -- naming it, naming its mode, its subset, its shape
+    and its rubric. Resuming from that directory is the whole remedy. A flag
+    admitting an unverified resume was considered and rejected: it would put
+    artifacts on disk whose four provenance fields are unbacked while looking
+    exactly like artifacts whose fields were checked, which is the one outcome
+    this family of guards exists to make impossible. A refusal needs no second
+    evidence source; an admission would need four.
+
+    An UNREADABLE state file lands here too, because ``read_state`` reports a
+    decode failure as ``None``, and so does one that parses to an empty or
+    non-object value. Absent and present-but-empty are different operator
+    errors -- the wrong directory, versus a file that is there and records
+    nothing -- so the message asks the filesystem and words the second to cover
+    both, because they arrive here indistinguishable: the caller's
+    ``read_state(...) or {}`` maps a decode failure and a literal ``{}`` onto
+    the same value, and re-reading the file to tell them apart would be a
+    second read of something another process may have replaced.
+
+    **AND A RESUME THAT NAMES NO PARSEABLE ID IS REFUSED TOO, under its own
+    code.** ``--resume ,`` and ``--resume " "`` are truthy, so they clear
+    main()'s "nothing to do" check, and ``[b.strip() for b in
+    resume.split(",") if b.strip()]`` is then EMPTY -- the poll loop runs zero
+    times, every decision in the rebuilt index comes back ``no_result``, and the
+    run exits 3 with a summary whose coverage is nil. That reads as a broken
+    rater rather than as a mistyped flag. It is a separate code from the missing
+    state file because the remedy is different: name a batch, versus resume from
+    the right directory.
+    """
+    if not resume:
+        return
+    if not [b.strip() for b in str(resume).split(",") if b.strip()]:
+        raise RaterRefusal(
+            f"--resume was given {resume!r}, which names no batch id. Nothing "
+            f"would be polled, every decision would come back 'no_result', and "
+            f"the run would exit 3 reporting nil coverage -- which reads as a "
+            f"broken rater rather than as a mistyped flag. Pass one or more "
+            f"batch ids, comma separated; they are printed as each batch is "
+            f"created and recorded in the state file.",
+            code="resume_names_no_batch")
+    if state:
+        return
+    exists = os.path.isfile(state_path)
+    why = ("exists and records nothing this module can read as state -- either "
+           "it could not be decoded (logged as rater.state_unreadable above) "
+           "or it parses to an empty or non-object value" if exists
+           else "does not exist")
+    raise RaterRefusal(
+        f"--resume names batch(es) {resume!r} but the state file at "
+        f"{state_path!r} {why}, so nothing about those batches is recorded "
+        f"here. Every provenance guard this module has reads that file: "
+        f"without it the mode, the {INCLUDE_KEYS_STATE_KEY} subset, the "
+        f"{STATE_SHAPE_KEY} and the {RUBRIC_SHA_KEY} of the batches being "
+        f"joined are all unknown, and this session would write a "
+        f"rater_manifest.json, a ratings.json and a summary.json recording "
+        f"TODAY'S values over answers produced by something else. Resume from "
+        f"the output directory the batches were submitted from -- "
+        f"submit_batches writes that file before the first batch is polled, so "
+        f"one exists -- or submit afresh. There is no flag that admits this: "
+        f"an unverified resume is indistinguishable on disk from a verified "
+        f"one.",
+        code="resume_without_state")
+
+
 def require_state_mode(state, mode, state_path):
     """Refuse a state file written by the other mode, by name.
 
@@ -4407,7 +4507,7 @@ def require_state_subset(state, index, state_path):
     """
     if not state:
         return
-    found = state.get("include_keys_sha256")
+    found = state.get(INCLUDE_KEYS_STATE_KEY)
     want = include_keys_fingerprint(index)
     if found == want:
         return
@@ -4424,6 +4524,15 @@ def require_state_subset(state, index, state_path):
         code="state_subset_mismatch")
 
 
+INCLUDE_KEYS_STATE_KEY = "include_keys_sha256"
+"""The key a state file records its decision subset under.
+
+A module constant on ``STATE_SHAPE_KEY``'s footing: ``require_state_for_resume``
+names all four provenance keys in the remedy it offers, and a remedy naming a
+key that does not exist is worse than no remedy.
+"""
+
+
 STATE_SHAPE_KEY = "request_shape_version"
 """The key a state file records its submission shape under.
 
@@ -4433,6 +4542,39 @@ rather than two. It is a module constant because the refusal below quotes it in
 the remedy it offers, and a remedy naming a key that does not exist is worse
 than no remedy.
 """
+
+
+def state_input_file_ids(state):
+    """{batch_id: input_file_id} for the recorded batches that carry one.
+
+    **THIS IS THE ONLY EVIDENCE OF A BATCH'S REQUEST SHAPE THAT EXISTS
+    ANYWHERE, AND IT IS NOT LOCAL.** Measured before the refusal below was
+    worded: this module has exactly three local writers -- ``write_state``,
+    ``persist_raw_replies`` and ``write_json`` -- and NONE of them writes the
+    submitted requests. ``submit_batches`` builds the JSONL in memory
+    (``batch_jsonl(chunk).encode("utf-8")``) and uploads it; the only thing that
+    survives locally is the ``input_file_id`` the provider echoes back, which
+    that function records per batch here. And the RESPONSE file is no help
+    either: an OpenAI batch output row carries ``custom_id``, ``response.body``
+    and ``error`` and does not echo the request -- checked against the real
+    5-request probe output, where the string ``TRIAL_CRITERIA_REFERENCE``
+    appears nowhere.
+
+    So a shape can be established for a batch whose entry carries an
+    ``input_file_id`` (retrieve that file from the account's storage and read
+    it) and for no other. ``input_file_id`` arrived with the OpenAI port, so of
+    the nineteen state files on disk exactly three carry it -- which is why the
+    refusal names the pairs it found rather than promising a check that may not
+    be runnable.
+    """
+    out = {}
+    for entry in state.get("batches") or []:
+        if not isinstance(entry, dict):
+            continue
+        bid, fid = entry.get("id"), entry.get("input_file_id")
+        if bid and fid:
+            out[bid] = fid
+    return out
 
 
 def require_state_shape(state, shape_version, state_path):
@@ -4463,13 +4605,42 @@ def require_state_shape(state, shape_version, state_path):
     population contains at least one shape-2 member, "absent means 1" would
     relabel it, and the only honest answer is to refuse and say so.
 
-    **THE REMEDY IS EXPLICIT ADOPTION, NOT A FLAG.** A refusal with no way
-    forward would strand money already spent: a legitimately interrupted
-    legacy batch is retrievable and would become unresumable. So the message
-    offers the operator the one thing this module cannot do for them -- write
-    the shape into the file themselves, having established it. That makes the
-    claim theirs, auditable in the file, and impossible to make by accident,
-    which is exactly what distinguishes it from this module guessing.
+    **THE REMEDY IS EXPLICIT ADOPTION, NOT A FLAG -- AND IT IS CONDITIONED ON
+    EVIDENCE THAT EXISTS.** A refusal with no way forward would strand money
+    already spent: a legitimately interrupted legacy batch is retrievable and
+    would become unresumable. So the message offers the operator the one thing
+    this module cannot do for them -- write the shape into the file themselves,
+    having established it. That makes the claim theirs, auditable in the file,
+    and impossible to make by accident, which is what distinguishes it from
+    this module guessing.
+
+    What it must NOT be is an invitation to recall. The message used to read
+    "if you can establish which code submitted those batches, record it
+    yourself", which a recollection satisfies -- and a recollection written
+    into this field is adopted as fact by every artifact of every later resume,
+    which is the one thing this guard exists to prevent. So the invitation is
+    now the NAME OF A CHECK: retrieve the batch's uploaded input file (the
+    ``input_file_id`` ``submit_batches`` records beside each batch id here) and
+    read the SYSTEM message of any request in it -- a shape-2 request's
+    contains ``FENCE_TRIAL_CRITERIA_OPEN`` and a shape-1 request's does not.
+
+    **THE CHECK IS ON THE SYSTEM MESSAGE AND NOT ON THE USER PARTS, AND THAT IS
+    THE HALF THAT IS EASY TO GET WRONG.** Shape 2 OMITS the reference block for
+    any decision whose trial criteria could not be verified -- ``reference_
+    context: absent``, a real and counted state -- so a batch every one of
+    whose references was absent carries user parts BYTE-IDENTICAL to shape 1.
+    Checking there is a false negative in the direction that matters: the
+    operator reads "no fence", writes a 1, and a shape-2 batch is relabelled by
+    somebody who followed the instructions exactly. The boundary paragraph is
+    appended to the system prompt unconditionally at shape 2, so it is the only
+    difference the two shapes carry on EVERY row.
+
+    **AND WHERE THE CHECK CANNOT BE RUN, THE INVITATION IS WITHDRAWN RATHER
+    THAN SOFTENED.** ``input_file_id`` arrived with the OpenAI port, so of the
+    nineteen state files on disk exactly three carry it; nothing local records
+    the requests at all (see ``state_input_file_ids``). A state file with no
+    ``input_file_id`` therefore has no evidence behind it, and the message says
+    so and directs to ``--output-dir`` instead of quoting a key to hand-write.
 
     Returns the shape the recorded batches were submitted at, which past this
     point is equal to ``shape_version`` by construction -- see the call site
@@ -4495,6 +4666,61 @@ def require_state_shape(state, shape_version, state_path):
     if matched:
         return found
     if found is None:
+        # ── THE ADOPTION INSTRUCTION IS CONDITIONED ON EVIDENCE THAT
+        #    EXISTS, AND THE ONLY EVIDENCE IS THE UPLOADED INPUT FILE ────
+        #
+        # The instruction used to read "if you can establish which code
+        # submitted those batches, record it yourself", which invites a
+        # recollection. A recollection written into this field is adopted as
+        # fact by every artifact of every later resume, which is the one thing
+        # this guard exists to prevent -- so the invitation is now the NAME OF A
+        # CHECK, and where that check cannot be run it is withdrawn rather than
+        # softened. See `state_input_file_ids` for why the check is a provider
+        # round trip and not a local file: nothing local records the requests.
+        _files = state_input_file_ids(state)
+        _ids = [b.get("id") for b in (state.get("batches") or [])
+                if isinstance(b, dict) and b.get("id")]
+        _without = [b for b in _ids if b not in _files]
+        if _files:
+            _how = (
+                f"THE CHECK, batch by batch. This file records an uploaded "
+                f"input file for "
+                + ", ".join(f"{b} -> {f}" for b, f in sorted(_files.items()))
+                + f". Retrieve that file from the account's storage "
+                f"(`client.files.content(<input_file_id>)`; it is a download, "
+                f"not a completion, so it bills nothing) and look at the "
+                f"SYSTEM message of any request in it. A shape-"
+                f"{REQUEST_SHAPE_CRITERIA_REFERENCE} request's system message "
+                f"contains the marker {FENCE_TRIAL_CRITERIA_OPEN!r}; a shape-"
+                f"{REQUEST_SHAPE_HISTORICAL} request's does not, and that "
+                f"marker is the only difference the two shapes carry on EVERY "
+                f"row. "
+                f"DO NOT CHECK THE USER PARTS: shape "
+                f"{REQUEST_SHAPE_CRITERIA_REFERENCE} omits the reference block "
+                f"for any decision whose trial criteria could not be verified, "
+                f"so a batch every one of whose references was absent carries "
+                f"user parts identical to shape "
+                f"{REQUEST_SHAPE_HISTORICAL} and would be read as shape "
+                f"{REQUEST_SHAPE_HISTORICAL}. Having read the marker, record "
+                f"it by adding \"{STATE_SHAPE_KEY}\": <one of "
+                f"{REQUEST_SHAPES}> to that file. The rater_manifest.json "
+                f"beside this file is corroboration and not a substitute for "
+                f"that check: it records the shape of the session that wrote "
+                f"it and no batch ids."
+                + (f" {len(_without)} recorded batch(es) carry no "
+                   f"input_file_id and cannot be checked this way: "
+                   + ", ".join(sorted(_without)) + ". If the batch you are "
+                   f"resuming is one of those, submit afresh with "
+                   f"--output-dir instead." if _without else ""))
+        else:
+            _how = (
+                f"THERE IS NO EVIDENCE TO ADOPT FROM, so this refusal offers "
+                f"no way to record the shape by hand. None of the "
+                f"{len(_ids)} batch(es) this file records carries an "
+                f"input_file_id -- that field arrived with the OpenAI port, "
+                f"and it is the only handle on the requests that were actually "
+                f"sent, because nothing local records them. Submit afresh with "
+                f"--output-dir.")
         raise RaterRefusal(
             f"the state file at {state_path!r} records no request shape, so "
             f"what its batches were submitted at cannot be established from "
@@ -4503,14 +4729,8 @@ def require_state_shape(state, shape_version, state_path):
             f"{REQUEST_SHAPE_CRITERIA_REFERENCE} batch was submitted before "
             f"this field existed, so guessing would attribute real answers to "
             f"an instrument that did not produce them -- which is the one "
-            f"thing versioning the shape exists to make impossible. Submit "
-            f"afresh with --output-dir, or, if you can establish which code "
-            f"submitted those batches, record it yourself by adding "
-            f"\"{STATE_SHAPE_KEY}\": <one of {REQUEST_SHAPES}> to that file. "
-            f"The rater_manifest.json written beside a state file records "
-            f"the shape of the session that wrote it, where one exists -- "
-            f"it records no batch ids, so it is evidence rather than "
-            f"proof for any particular batch.",
+            f"thing versioning the shape exists to make impossible. "
+            f"{_how}",
             code="state_shape_absent")
     describe = (lambda v: REQUEST_SHAPE_NOTES.get(
         v, "a shape this module does not know how to build"))
@@ -4525,6 +4745,121 @@ def require_state_shape(state, shape_version, state_path):
         f"did not produce it. Resume with the code that submitted them, or "
         f"use --output-dir to keep the two apart.",
         code="state_shape_mismatch")
+
+
+def require_state_rubric(state, rubric_meta, state_path):
+    """Refuse a state file whose batches were rated under a DIFFERENT rubric.
+
+    ``require_state_shape`` guards WHICH INSTRUMENT produced the answers being
+    joined. This guards WHAT THEY WERE JUDGED AGAINST, and it is the same
+    defect one field over: ``rubric_sha256`` has been written into the state
+    file since this module's first commit and was read back by nothing, so a
+    resume across a rubric edit joined answers rated under rubric A onto
+    artifacts recording rubric B.
+
+    **NOTHING ELSE CATCHES IT, AND THE REASON IS THAT THE RUBRIC IS NOT IN THE
+    CUSTOM_ID.** Primary custom_ids are a function of (patient, trial, arm,
+    index) alone, so every returned id is in the rebuilt index, the join
+    succeeds, every rating parses under the same output contract, and the
+    session is complete and clean-looking. The rubric is lifted VERBATIM out of
+    ``oncotriage/agent/prompts.py`` by ``lift_rubric``, so a one-word edit to
+    the shipped Stage 5 prompt inside any lifted span moves this digest -- and
+    the whole reason the rules are lifted rather than retyped is that both
+    models must be judged against ONE text. An artifact recording today's
+    rubric over yesterday's answers breaks exactly that, permanently, and a
+    later reader comparing two summaries by ``rubric_sha256`` is comparing a
+    label to a lie.
+
+    **ABSENT REFUSES, AND THAT IS FROM A SURVEY RATHER THAN FROM CAUTION.**
+    ``require_state_mode`` reads an absent ``mode`` as anchored, and
+    ``require_state_shape`` refuses an absent shape; the two differ because the
+    absent populations differ, and each argument is a claim about the artifacts
+    on disk. The claim here was measured the same way: this field is written
+    unconditionally by the only writer there is, it was in the commit that
+    ADDED this module (``81203ea``, 2026-08-11 -- earlier than ``mode``,
+    earlier than ``include_keys_sha256``, earlier than ``input_file_id``), and
+    ALL NINETEEN state files under ``09- Testing/Evaluation Runs/`` carry it.
+    So the absent population is EMPTY: no version of this writer has ever
+    omitted it, and a state file without it was not written by this module --
+    which establishes nothing about what its batches were rated against. There
+    is no legacy resume to strand, so there is nothing to weigh against
+    refusing.
+
+    **AND THERE IS NO HAND-ADOPTION ESCAPE HERE, unlike the shape.** That
+    escape exists because a legacy shape is unrecoverable from anywhere and a
+    real interrupted batch would otherwise be unresumable. Neither half holds
+    for the rubric: the absent population is empty, so no real batch needs it;
+    and the digest is a function of ~8,800 characters of prompt text at a past
+    commit, so an operator cannot establish it by inspection the way they can
+    establish a shape from one marker. Inviting a hand-written digest would
+    invite a guess, and a guess here is silently adopted as fact.
+    """
+    if not state:
+        # NOT A DISAGREEMENT. First submit, and -- for as long as
+        # `require_state_for_resume` is what runs above this -- unreachable on
+        # a resume, because a resume with no state file is refused before this
+        # is asked. See the call site.
+        return None
+    found = state.get(RUBRIC_SHA_KEY)
+    want = rubric_meta[RUBRIC_SHA_KEY]
+    # ── ABSENT, THEN TYPE, THEN VALUE, AND THE ORDER IS THE WHOLE STRUCTURE ──
+    #
+    # `require_state_shape` guards its comparison with
+    # `isinstance(found, int) and not isinstance(found, bool)` because there
+    # the type check IS the decision: `True == 1` and `1.0 == 1` are both True
+    # in Python, so without it a JSON `true` would be ADOPTED as shape 1.
+    #
+    # THE SAME GUARD ON THIS COMPARISON WAS DEAD CODE, AND THE REVERT MATRIX IS
+    # WHAT SAID SO. A digest is a string, and no bool, int, float, list or dict
+    # equals one -- so `isinstance(found, str) and found == want` and a bare
+    # `found == want` answer identically for every value, and deleting the
+    # isinstance changed nothing any check could see. This project's own rule,
+    # from the de-identification pass's bool-exclusion finding: a guard that
+    # cannot change an outcome must not be described as one.
+    #
+    # So the type decision lives in ONE place, reachable and decisive, and the
+    # branches are ordered so that each is the only thing that can answer for
+    # its case. A hand-editable file is exactly where a JSON `true`, a number
+    # or a nested object turns up, and reporting one as "records rubric True"
+    # under the mismatch branch would name the wrong fault: the file is not a
+    # record of anything, which is a different remedy from "the prompt moved".
+    if found is None:
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records no {RUBRIC_SHA_KEY}, so "
+            f"what rubric its batches were rated against cannot be "
+            f"established from it. Every state file this module has ever "
+            f"written carries that field -- it was in the commit that added "
+            f"this module -- so its absence means this file was not written by "
+            f"this harness's writer, and nothing about the batches it names is "
+            f"recorded. Submit afresh with --output-dir. The digest is a "
+            f"function of the whole lifted rulebook, so unlike "
+            f"{STATE_SHAPE_KEY} there is no field to establish by inspection "
+            f"and none to add by hand.",
+            code="state_rubric_absent")
+    if not isinstance(found, str):
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records {RUBRIC_SHA_KEY} as "
+            f"{found!r}, which is a {type(found).__name__} and not a digest. "
+            f"A rubric digest is the sha256 hex of the lifted rulebook; this "
+            f"file cannot be read as a record of what its batches were rated "
+            f"against. Submit afresh with --output-dir.",
+            code="state_rubric_malformed")
+    if found == want:
+        return found
+    raise RaterRefusal(
+        f"the state file at {state_path!r} records rubric {found[:12]}... and "
+        f"the rulebook this code lifts is {want[:12]}.... The rules are sliced "
+        f"verbatim out of oncotriage/agent/prompts.py (PROMPT_VERSION "
+        f"{rubric_meta.get('source_prompt_version')!r}), so that prompt has "
+        f"been edited inside a lifted span since those batches were submitted. "
+        f"Resuming across it joins answers judged against one rulebook onto a "
+        f"session whose rater_manifest.json, ratings.json and summary.json all "
+        f"record the other -- and the whole point of lifting the rules is that "
+        f"the pipeline and its auditor are judged against ONE text, so an "
+        f"agreement rate computed across two is a number about neither. "
+        f"Resume with the code that submitted them, or use --output-dir to "
+        f"keep the two apart.",
+        code="state_rubric_mismatch")
 
 
 def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
@@ -4584,14 +4919,43 @@ def write_state(path, state):
 
 
 def read_state(path):
+    """The state file as a MAPPING, or None -- never a bare decoded value.
+
+    **A PAYLOAD THAT DECODES TO A NON-OBJECT USED TO REACH THE GUARDS AND
+    ESCAPE main() AS A TRACEBACK.** A file holding ``[1]``, ``3`` or ``"x"``
+    is valid JSON, so ``json.load`` returned it, ``or {}`` in the caller left it
+    alone because it is truthy, and the first guard then did ``state.get("mode")``
+    -- an ``AttributeError``, which ``except RaterRefusal`` does not catch. So an
+    operator with a corrupt state file got a traceback instead of the "REFUSED:
+    ..." line and the exit 1 every other state fault produces, and
+    ``refuse_batch_from_other_mode`` had the same hole against the OTHER mode's
+    file.
+
+    Refused HERE rather than in each of the five guards, because this is the one
+    place the file is read and the alternative is five copies of one test. It
+    returns ``None`` -- the value the four "no state" branches are already
+    written for -- so nothing downstream changed, and ``main()``'s
+    ``read_state(...) or {}`` then makes ``require_state_for_resume`` refuse a
+    resume against it by the same branch that covers a decode failure. That is
+    also what makes that refusal's wording ("records nothing this module can
+    read as state") true rather than approximate.
+
+    The degradation is logged either way and the two are distinguishable by
+    ``error_type``: a real decode failure carries the exception's name, and a
+    decoded non-object carries ``NotAMapping``.
+    """
     if not os.path.isfile(path):
         return None
     try:
         with io.open(path, "r", encoding="utf-8") as fh:
-            return json.load(fh)
+            payload = json.load(fh)
     except (OSError, ValueError) as exc:
         log.warning("rater.state_unreadable", error_type=type(exc).__name__)
         return None
+    if not isinstance(payload, dict):
+        log.warning("rater.state_unreadable", error_type="NotAMapping")
+        return None
+    return payload
 
 
 #------------------------------------------------------------------------------
@@ -6393,6 +6757,93 @@ def main(argv=None):
         return 0
 
     # ---- everything below spends money ---------------------------------
+    #
+    # ══ THE LOCAL PROVENANCE GUARDS RUN FIRST, AND THAT ORDER IS THE
+    #    DIFFERENCE BETWEEN A DIAGNOSIS AND A MISDIAGNOSIS ══════════════
+    #
+    # They used to sit BELOW the free visibility check, and the cost was not
+    # the round trip. MEASURED, by driving this function with every socket
+    # entry point trapped: a state file from the other mode, a state file with
+    # no recorded shape, and `--resume` against a directory with no state file
+    # ALL THREE reported `REFUSED: this key cannot see the judge model
+    # 'gpt-5.6-terra' (APIConnectionError)` after three attempts to reach
+    # api.openai.com -- because the SDK retries. So every provenance refusal
+    # this module has was masked, on a machine with no network, by a message
+    # naming the key and the model instead of the file and the field. An
+    # operator following that message checks their credentials; the fault is a
+    # forgotten flag or a wrong directory.
+    #
+    # NOTHING HERE NEEDS A NETWORK ANSWER, and that is why the whole block
+    # moves rather than some of it. Each guard reads this session's own state
+    # file, `refuse_batch_from_other_mode` reads the other mode's at two known
+    # paths, and all of them are `os.path.isfile` + `json.load`. The batch ids
+    # a resume names are `args.resume.split(",")` -- argument parsing. The one
+    # thing below that genuinely needs the wire is the visibility check itself,
+    # and it stays where it is, immediately above the first upload.
+    #
+    # IT IS ALSO ABOVE `require_client`, which is local (an import and a key
+    # lookup) and so was never the problem. It moves anyway, because a state
+    # file this module refuses is fatal whatever the credentials are, and being
+    # told to export a key in order to be told the directory is wrong is one
+    # step of a two-step diagnosis that did not need the first step.
+    #
+    # AND NOTHING IS CREATED BEFORE THEY RUN. `os.makedirs(out_dir)` used to
+    # precede the state read, so a refused invocation left an empty output
+    # directory behind -- which is itself a trap, because the next `--resume`
+    # against it finds a directory with no state file. The state read needs
+    # only a PATH, so the read moves up and the mkdir stays down.
+    state_path = os.path.join(out_dir, state_filename(index.mode))
+    state = read_state(state_path) or {}
+    # PARSED HERE RATHER THAN AT THE FORK BELOW, so the guard that consults the
+    # other mode's state can run with the rest of them. On a submit this is
+    # empty and every guard that reads it is a no-op.
+    resume_ids = ([b.strip() for b in args.resume.split(",") if b.strip()]
+                  if args.resume else [])
+    try:
+        # FIRST, AND IT GATES THE OTHER FOUR. A resume with no state file makes
+        # every guard below return without comparing anything, because "no
+        # state" is indistinguishable from "first submit" to each of them
+        # individually. Only this one knows which of the two it is.
+        require_state_for_resume(state, args.resume, state_path)
+        require_state_mode(state, index.mode, state_path)
+        require_state_subset(state, index, state_path)
+        # ── WHICH INSTRUMENT PRODUCED THE ANSWERS BEING JOINED ────────
+        #
+        # The two above guard which POPULATION a resume joins onto. This
+        # guards which REQUEST SHAPE produced it, and it is the only thing
+        # that can: primary custom_ids are identical across shapes, so the
+        # join succeeds, every rating parses, and the session looks clean
+        # while its three artifacts name an instrument that did not run.
+        #
+        # ITS RETURN IS DELIBERATELY NOT READ, AND THAT IS THE ARGUMENT FOR
+        # THE ARTIFACTS BELOW. Past this line the recorded shape and
+        # `index.shape_version` are EQUAL -- a mismatch and an absence both
+        # raised -- so the manifest, ratings.json and summary.json reading
+        # `index.shape_version` ARE reporting the shape the requests were
+        # built with. Reading the state's copy instead would be a second
+        # source for a value just proved identical, and would have to invent
+        # an answer for the first submit, where there is no state to read.
+        require_state_shape(state, index.shape_version, state_path)
+        # ── AND WHAT THEY WERE JUDGED AGAINST ─────────────────────────
+        #
+        # Same shape of defect one field over, and the same argument for why
+        # its return is not read: past this line the recorded rubric digest
+        # and `index.rubric_meta`'s are equal, so the manifest's copy of the
+        # rubric metadata is reporting the rulebook the answers were rated
+        # under.
+        require_state_rubric(state, index.rubric_meta, state_path)
+        # LAST OF THE FIVE, because it is the only one that reads a file this
+        # session did not write. It was at the resume fork, ~150 lines and one
+        # network round trip below here, where it surfaced after the visibility
+        # check had already refused for the wrong reason.
+        if resume_ids:
+            refuse_batch_from_other_mode(resume_ids, index.mode, out_dir,
+                                         run.run_dir)
+    except RaterRefusal as exc:
+        console.out(f"REFUSED: {exc}")
+        log.error("rater.refused", stage="state", reason=exc.code)
+        return 1
+
     try:
         client, key_source = require_client()
     except RaterRefusal as exc:
@@ -6429,41 +6880,6 @@ def main(argv=None):
                 f"(free check; the API echoes {_detail!r})")
 
     os.makedirs(out_dir, exist_ok=True)
-    state_path = os.path.join(out_dir, state_filename(index.mode))
-    state = read_state(state_path) or {}
-    try:
-        require_state_mode(state, index.mode, state_path)
-        require_state_subset(state, index, state_path)
-        # ── WHICH INSTRUMENT PRODUCED THE ANSWERS BEING JOINED ────────
-        #
-        # The two above guard which POPULATION a resume joins onto. This
-        # guards which REQUEST SHAPE produced it, and it is the only thing
-        # that can: primary custom_ids are identical across shapes, so the
-        # join succeeds, every rating parses, and the session looks clean
-        # while its three artifacts name an instrument that did not run.
-        #
-        # ITS RETURN IS DELIBERATELY NOT READ, AND THAT IS THE ARGUMENT FOR
-        # THE ARTIFACTS BELOW. Past this line the recorded shape and
-        # `index.shape_version` are EQUAL -- a mismatch and an absence both
-        # raised -- so the manifest, ratings.json and summary.json reading
-        # `index.shape_version` ARE reporting the shape the requests were
-        # built with. Reading the state's copy instead would be a second
-        # source for a value just proved identical, and would have to invent
-        # an answer for the first submit, where there is no state to read.
-        #
-        # THE RESIDUAL, NAMED: `--resume <id>` against a directory with NO
-        # state file records nothing, so nothing is compared and the
-        # artifacts carry today's shape. That is the workflow
-        # `refuse_batch_from_other_mode` exists for -- it consults the other
-        # mode's state files at two known paths -- and there is no
-        # equivalent evidence for a shape, because the state file is the
-        # only place a shape is ever written. Refusing it would refuse a
-        # legitimate resume.
-        require_state_shape(state, index.shape_version, state_path)
-    except RaterRefusal as exc:
-        console.out(f"REFUSED: {exc}")
-        log.error("rater.refused", stage="state", reason=exc.code)
-        return 1
     # ── THE SPEND GATE ────────────────────────────────────────────────────
     #
     # SEEDED FROM THIS SESSION'S OWN STATE FILE, so `--resume` continues under
@@ -6501,7 +6917,8 @@ def main(argv=None):
                   "custom_id_form": index.form,
                   "retest_requests": len(index.retest_ids),
                   "requests": len(index.requests),
-                  "include_keys_sha256": include_keys_fingerprint(index),
+                  INCLUDE_KEYS_STATE_KEY:
+                      include_keys_fingerprint(index),
                   # THE SHAPE, RECORDED AT SUBMISSION TIME. This dict is
                   # applied before the first `write_state` -- which happens
                   # inside `submit_batches`, after the first batch id exists
@@ -6510,7 +6927,8 @@ def main(argv=None):
                   # value `require_state_shape` has just proved equal, so it
                   # is a no-op there rather than a silent adoption.
                   STATE_SHAPE_KEY: index.shape_version,
-                  "rubric_sha256": index.rubric_meta["rubric_sha256"]})
+                  RUBRIC_SHA_KEY:
+                      index.rubric_meta[RUBRIC_SHA_KEY]})
 
     plan = None
     batch_ids = []
@@ -6622,13 +7040,11 @@ def main(argv=None):
             batch_ids = submit_batches(client, chunks, state, state_path,
                                        "primary", out_dir=out_dir)
         else:
-            batch_ids = [b.strip() for b in args.resume.split(",")
-                         if b.strip()]
-            # Before polling: is this batch the other mode's? Checked here
-            # rather than at the parse, where it surfaces as every response
-            # failing for a reason that names the rater instead of the flag.
-            refuse_batch_from_other_mode(batch_ids, index.mode, out_dir,
-                                         run.run_dir)
+            # PARSED ABOVE, WITH THE GUARDS. `refuse_batch_from_other_mode`
+            # used to be called here, which is after the visibility check and
+            # so unreachable on a machine with no network; it now runs in the
+            # local guard block with the other four, against this same list.
+            batch_ids = resume_ids
             console.out(f"  RESUMING {len(batch_ids)} batch(es); nothing new "
                         f"is submitted.")
             state.setdefault("batches", [])

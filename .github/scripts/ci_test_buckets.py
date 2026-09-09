@@ -892,7 +892,7 @@ BUCKETS = {
         "asserted"),
     "test_evaluation_rater.py": (
         _A, None,
-        "ran green in 0.9s, 463 checks, against ONLY the directory skeleton, "
+        "ran green in 2.4s, 522 checks, against ONLY the directory skeleton, "
         "identical in a depth-1 clone: the blind rater harness. IT DOES NOT "
         "NEED ragas INSTALLED -- measured, the interpreter that ran it green "
         "has no ragas distribution at all; `09- Testing/ragas-venv/` is a "
@@ -900,13 +900,25 @@ BUCKETS = {
         "cannot be input-based and says so: section 7j rebinds "
         "rater.render_system_prompt inside try/finally and asserts the "
         "restore BY IDENTITY, which is an attribute rebind rather than a "
-        "patched source, so it execs nothing. All it writes is two fresh "
-        "tempfile.mkdtemp trees -- two state files in one, and the state "
-        "file the real submit_batches writes in the other -- each removed "
+        "patched source, so it execs nothing. It writes three fresh "
+        "tempfile.mkdtemp trees -- two state files in one, the state file the "
+        "real submit_batches writes in the second, and a fabricated minimal "
+        "evaluation run plus its output directory in the third -- each removed "
         "in a finally with the removal then ASSERTED. Nothing in the "
-        "repository, so it "
-        "is not in the collision matrix. No network, no keys, no spend, no "
-        "corpus"),
+        "repository, so it is not in the collision matrix. "
+        "NO NETWORK, AND SECTION 9q MEASURES IT RATHER THAN CLAIMING IT: it "
+        "drives the real main() with socket.connect / connect_ex / "
+        "create_connection / getaddrinfo replaced by a recorder that RAISES, "
+        "requires six provenance refusals to fire with ZERO outbound "
+        "attempts, and carries a firing control that makes a real call and is "
+        "named in the record. Its one non-degeneracy control puts a "
+        "FABRICATED OPENAI_API_KEY in os.environ for a single drive, inside a "
+        "try/finally that restores what was there -- it has to, because the "
+        "property is that the local guards run above require_client, and an "
+        "invocation with no key cannot tell a guard's refusal from a missing "
+        "credential. NO SPEND (the drives it reaches the wire with are "
+        "blocked by the trap), no live judge, no corpus -- "
+        "default_run_dir() is never called"),
     "test_evaluation_ragas_manifest.py": (
         _A, None,
         "ran green in 1.5s, 69 checks, against ONLY the directory skeleton "

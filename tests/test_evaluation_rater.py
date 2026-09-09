@@ -95,17 +95,47 @@ make the renderer answer differently for one probe. Section 7j rebinds
 restore BY IDENTITY. That is an attribute rebind, not a patched source: nothing
 is exec'd, nothing on disk is touched, and the claim above is unaffected.
 
-NO NETWORK, NO KEYS, NO SPEND, NO DATABASE, NO CORPUS, NO GIT HISTORY. Every
-decision, response and usage object in here is a literal built in this file.
-The evaluation run directories are never read -- the harness's own
-``default_run_dir()`` is never called -- so this file is unaffected by whether
-a run exists on disk.
+  9  THE RESUME PATH'S PROVENANCE GUARDS. Five of them, and each answers a
+     different "what produced the answers this resume is about to join":
+     ``require_state_for_resume`` (9o -- a batch id with no state file records
+     nothing, and made the other four fall silent), ``require_state_mode``,
+     ``require_state_subset`` (9k), ``require_state_shape`` (9k) and
+     ``require_state_rubric`` (9p -- a field written since this module's first
+     commit and read back by nothing). 9q is the one section in this file that
+     drives ``main()``, and it exists because a guard that is never REACHED
+     passes every check written about the guard: it requires each refusal to
+     fire with ZERO outbound network attempts, which they did not before the
+     block was moved above the visibility check.
 
-IT WRITES NOTHING IN THE REPOSITORY, and section 8p2 is the one place it writes
-anything at all: a fresh ``tempfile.mkdtemp`` holding two state files, removed
-in a ``finally`` with the removal then ASSERTED. That block cannot be
-in-memory -- ``refuse_batch_from_other_mode`` exists to read a state file off
-disk, and a control that faked one would be exercising a different function.
+NO NETWORK, AND IT IS MEASURED RATHER THAN CLAIMED. Section 9q replaces
+``socket.socket.connect``, ``connect_ex``, ``socket.create_connection`` and
+``socket.getaddrinfo`` with a recorder that RAISES, arms it around each
+``main()`` drive, disarms it in a ``finally``, and asserts the disarm. A firing
+CONTROL runs first -- a real outbound call, blocked and recorded -- so a zero
+attempt count is a measurement rather than an absence of instrumentation. Every
+other section in this file touches no socket at all.
+
+NO SPEND, NO DATABASE, NO GIT HISTORY. Every decision, response and usage
+object outside section 9q is a literal built in this file.
+
+TWO CLAIMS THIS FILE USED TO MAKE ARE NARROWER THAN THEY READ, and both are
+section 9q's doing. "NO KEYS": 9q's non-degeneracy control puts a FABRICATED
+``OPENAI_API_KEY`` in ``os.environ`` for one drive, inside a ``try``/``finally``
+that restores whatever was there -- it has to, because the property being
+measured is that the local guards run ABOVE ``require_client``, and an
+invocation with no key at all cannot distinguish "refused by a guard" from
+"refused for want of a credential". "THE EVALUATION RUN DIRECTORIES ARE NEVER
+READ" is still true of the PROJECT's -- ``default_run_dir()`` is never called --
+but 9q fabricates its own minimal run directory under ``tempfile.mkdtemp`` and
+points ``--run-dir`` at it, because ``main()`` cannot be driven without one.
+
+IT WRITES NOTHING IN THE REPOSITORY, and three sections write anything at all:
+8p2 (two state files), 9o (one deliberately unreadable state file) and 9q (a
+fabricated run directory, an output directory and several state files). All
+three use a fresh ``tempfile.mkdtemp``, remove it in a ``finally``, and then
+ASSERT the removal. None can be in-memory: ``refuse_batch_from_other_mode``
+exists to read a state file off disk, ``read_state``'s decode-failure branch
+needs a real malformed file, and ``main()`` resolves paths.
 This file is still NOT in ``tests/run_serial_tests.py``'s collision matrix:
 nothing it writes is in the repository, and the only repository file it reads
 is the module under test, which neither of the suite's two writers writes.
@@ -2912,12 +2942,85 @@ check("9k  the absent refusal is a DIFFERENT code from the mismatch, because "
       != refusal_code(_fn9k("require_state_shape"),
                       dict(_SHAPE_STATE, request_shape_version=1),
                       R.REQUEST_SHAPE_CRITERIA_REFERENCE, "/s"), True)
-check("9k  the absent message refuses to guess out loud, and offers the one "
-      "remedy this module cannot apply for the operator",
-      all(w in str(drive(lambda: _fn9k("require_state_shape")(
-          dict(_SHAPE_STATE), R.REQUEST_SHAPE_VERSION, "/s")))
-          for w in ("records no request shape", "NOT read as",
-                    _SHAPE_KEY, "--output-dir")), True)
+# THE ADOPTION INSTRUCTION IS CONDITIONED ON EVIDENCE, AND THIS CHECK WAS
+# SPLIT WHEN IT BECAME SO. It used to require the message to quote
+# STATE_SHAPE_KEY unconditionally, which was right while adoption was always
+# offered. It no longer is: the ONLY evidence of a batch's shape is the
+# uploaded input file, addressed by the `input_file_id` `submit_batches`
+# records per batch, and 16 of the 19 state files on disk carry none -- so a
+# message that quotes the key an operator must NOT write by hand, on a file
+# where nothing can establish the value, is the invitation this pass removed.
+# Both branches are pinned, in both directions, so neither can acquire the
+# other's wording.
+_SHAPE_STATE_EVIDENCED = dict(
+    _SHAPE_STATE,
+    batches=[{"id": "batch_shape", "tag": "primary",
+              "input_file_id": "file-evidence"},
+             {"id": "batch_other", "tag": "primary"}])
+
+
+def _absent_msg(state):
+    return str(drive(lambda: _fn9k("require_state_shape")(
+        dict(state), R.REQUEST_SHAPE_VERSION, "/s")))
+
+
+_MSG_BARE = _absent_msg(_SHAPE_STATE)
+_MSG_EVID = _absent_msg(_SHAPE_STATE_EVIDENCED)
+check("9k  the absent message refuses to guess out loud, whichever branch it "
+      "takes", all(w in m for m in (_MSG_BARE, _MSG_EVID)
+                   for w in ("records no request shape", "NOT read as",
+                             "--output-dir")), True)
+check("9k  with NO input_file_id recorded there is nothing to adopt from, so "
+      "the message does NOT quote the key an operator would hand-write, and "
+      "says why", (_SHAPE_KEY in _MSG_BARE,
+                   "THERE IS NO EVIDENCE TO ADOPT FROM" in _MSG_BARE,
+                   "carries an input_file_id" in _MSG_BARE),
+      (False, True, True))
+check("9k  with an input_file_id recorded it names THE CHECK -- the file to "
+      "retrieve, the SYSTEM message, the exact marker, and only then the key "
+      "to write",
+      all(w in _MSG_EVID for w in ("file-evidence", "files.content", "SYSTEM",
+                                   R.FENCE_TRIAL_CRITERIA_OPEN, _SHAPE_KEY)),
+      True)
+# THE USER-PART WARNING IS THE HALF THE BRIEF FOR THIS PASS GOT WRONG, and it
+# is pinned because getting it wrong is a FALSE NEGATIVE: shape 2 omits the
+# reference block for any decision whose criteria could not be verified, so a
+# batch every one of whose references was absent carries user parts identical
+# to shape 1. Checking the user parts would read such a batch as shape 1 and
+# the operator would then write a 1 into the file as established fact.
+check("9k  ...and it warns off the user parts by name, because a shape-2 "
+      "batch with every reference absent carries shape-1 user parts",
+      "DO NOT CHECK THE USER PARTS" in _MSG_EVID, True)
+check("9k  ...and it names the batches the check CANNOT be run for, rather "
+      "than promising a check for all of them",
+      "batch_other" in _MSG_EVID, True)
+# THE MARKER CLAIM THE MESSAGE MAKES IS TRUE OF THE SHIPPED BUILDER, in all
+# four (mode, shape) combinations. Without this the instruction could name a
+# marker that is not actually the discriminator -- which is how an operator
+# comes to record a wrong shape having followed the instructions exactly.
+_MARKER_TRUTH = tuple(
+    (m, s, R.FENCE_TRIAL_CRITERIA_OPEN in str(drive(
+        R.build_system_prompt, "RUBRIC", mode=m, shape_version=s)))
+    for m in (R.MODE_ANCHORED, R.MODE_BLIND) for s in R.REQUEST_SHAPES)
+check("9k  the marker the instruction names IS the discriminator: present in "
+      "every shape-2 system prompt and absent from every shape-1 one, both "
+      "modes",
+      _MARKER_TRUTH,
+      ((R.MODE_ANCHORED, 1, False), (R.MODE_ANCHORED, 2, True),
+       (R.MODE_BLIND, 1, False), (R.MODE_BLIND, 2, True)))
+# AND THE LOCAL ARTIFACTS REALLY DO NOT CARRY IT, which is why the check is a
+# provider round trip the OPERATOR makes rather than one this module makes.
+# `submit_batches` builds the JSONL in memory and uploads it; the three local
+# writers are the state file, the raw RESPONSE JSONL and the three JSON
+# reports. A future edit that started persisting the requests would make a
+# local check possible and should move the instruction -- this check is what
+# would notice.
+check("9k  nothing local records the submitted requests: submit_batches "
+      "uploads the JSONL it builds and no writer in the module writes it",
+      ("batch_jsonl(chunk).encode" in _inspect.getsource(R.submit_batches),
+       any("batch_jsonl" in _inspect.getsource(f)
+           for f in (R.write_state, R.persist_raw_replies, R.write_json))),
+      (True, False))
 check("9k  the mismatch message names both shapes, what joining them would "
       "corrupt, and the fix",
       all(w in str(drive(lambda: _fn9k("require_state_shape")(
@@ -2946,6 +3049,11 @@ _main_fn = next((n for n in _ast9k.walk(_MAIN_SRC)
                 None)
 check("9k  main() was located (probe, so the scans below cannot pass over an "
       "empty walk)", _main_fn is not None, True)
+# BOUND ONCE, HERE, AND EMPTY WHEN main() COULD NOT BE FOUND. Sections 9o and
+# 9q both read it; the first version defined it inside 9o BELOW its first
+# reader and the file aborted on a NameError, which is the shape a `check`
+# cannot report.
+_MAIN_TXT = _ast9k.unparse(_main_fn) if _main_fn is not None else ""
 
 
 def _state_update_pairs(fn):
@@ -3379,6 +3487,620 @@ check("9n  ...which still clears the measured blind maximum with room, so "
 check("9n  the source doubles args.max_tokens rather than naming a literal, "
       "which is what makes the two above facts about the same number",
       "args.max_tokens * 2" in _inspect.getsource(R.main), True)
+
+
+# --- 9o -- A RESUME WITH NO STATE FILE IS REFUSED -------------------------
+#
+# THE GAP THIS CLOSES WAS MEASURED BY DRIVING main(), NOT BY READING IT.
+# `--resume batch_x` against an empty --output-dir reached the poll with all
+# FOUR provenance guards having returned without comparing anything: each opens
+# `if not state: return`, which is correct for a first submit and is the exact
+# opposite of correct on a resume, where the batch exists, was paid for, and
+# this directory records nothing about it. The session then writes three
+# artifacts stamping TODAY'S mode, subset, shape and rubric onto answers it
+# cannot establish anything about.
+#
+# THE FOUR "SILENT ON NO STATE" READINGS ARE PINNED FIRST, because they are the
+# premise: if any of them ever started refusing an empty state on its own, this
+# section's subject would be gone and its checks would pass for the wrong
+# reason.
+_R9o = _fn9k
+check("9o  premise: each of the other four guards is SILENT on an empty state "
+      "-- which is why one guard has to know it is a resume",
+      tuple(refusal_code(fn, *args) for fn, args in (
+          (_R9o("require_state_mode"), ({}, R.MODE_BLIND, "/s")),
+          (_R9o("require_state_subset"), ({}, built(R.MODE_BLIND), "/s")),
+          (_R9o("require_state_shape"), ({}, R.REQUEST_SHAPE_VERSION, "/s")),
+          (_R9o("require_state_rubric"), ({}, {R.RUBRIC_SHA_KEY: "x"}, "/s")))),
+      ("<did not raise>",) * 4)
+check("9o  a resume with no state file REFUSES, by its own code",
+      refusal_code(_R9o("require_state_for_resume"), {}, "batch_x", "/nope"),
+      "resume_without_state")
+check("9o  ...and a SUBMIT with no state file does not, because that is the "
+      "first submit and there is nothing to disagree with",
+      refusal_code(_R9o("require_state_for_resume"), {}, None, "/nope"),
+      "<did not raise>")
+check("9o  ...and a resume WITH a state file does not either -- the four "
+      "guards beside it are what judge its contents",
+      refusal_code(_R9o("require_state_for_resume"),
+                   {"mode": R.MODE_BLIND}, "batch_x", "/nope"),
+      "<did not raise>")
+# TYPE CONFUSION, the bool/float analogue. `read_state` returns None or a
+# parsed value, and a file holding `[]`, `0`, `false` or `"x"` parses. All of
+# them are recorded-nothing, so all of them must refuse rather than being read
+# as "a state file exists".
+check("9o  a state file that parses to something falsy-or-not-a-record still "
+      "refuses a resume: [] , 0, false, \"\" and {} are all recorded-nothing",
+      tuple(refusal_code(_R9o("require_state_for_resume"), v, "batch_x", "/n")
+            for v in ([], 0, False, "", {})),
+      ("resume_without_state",) * 5)
+# THE MESSAGE MUST NAME ALL FOUR FIELDS, because the operator's question is
+# "what exactly is unknown". Naming them from the module's own constants is
+# what stops the message going stale when a fifth is added.
+_MSG9o = str(drive(lambda: _R9o("require_state_for_resume")(
+    {}, "batch_x,batch_y", "/tmp/nope/rater_state_blind.json")))
+check("9o  the message names the batches, the file, all four provenance "
+      "fields from the module's own constants, and the three artifacts that "
+      "would carry unbacked values",
+      all(w in _MSG9o for w in ("batch_x,batch_y", "/tmp/nope",
+                                R.INCLUDE_KEYS_STATE_KEY, R.STATE_SHAPE_KEY,
+                                R.RUBRIC_SHA_KEY, "rater_manifest.json",
+                                "ratings.json", "summary.json")), True)
+check("9o  ...and states that there is no flag which admits it, so a reader "
+      "does not go looking for one",
+      "no flag that admits this" in _MSG9o, True)
+# ABSENT AND UNREADABLE ARE DIFFERENT OPERATOR ERRORS. `read_state` reports a
+# decode failure as None, so the guard cannot tell them apart from its argument
+# -- it asks the filesystem, and the two remedies (wrong directory / broken
+# file) are distinguished in the text.
+_tmp9o = _tempfile9k.mkdtemp(prefix="oncotriage-rater-9o-")
+try:
+    _bad = _os9k.path.join(_tmp9o, R.state_filename(R.MODE_BLIND))
+    with _io9k.open(_bad, "w", encoding="utf-8") as _fh:
+        _fh.write("{not json")
+    check("9o  read_state reports an unreadable file as None (probe)",
+          drive(R.read_state, _bad), None)
+    _msg_bad = str(drive(lambda: _R9o("require_state_for_resume")(
+        drive(R.read_state, _bad) or {}, "batch_x", _bad)))
+    _empty_obj = _os9k.path.join(_tmp9o, "empty_" + R.STATE_FILENAME_BLIND)
+    with _io9k.open(_empty_obj, "w", encoding="utf-8") as _fh:
+        _fh.write("{}")
+    check("9o  a state file holding a literal {} is READABLE and records "
+          "nothing (probe: it is not a decode failure)",
+          drive(R.read_state, _empty_obj), {})
+    _msg_empty = str(drive(lambda: _R9o("require_state_for_resume")(
+        drive(R.read_state, _empty_obj) or {}, "batch_x", _empty_obj)))
+    check("9o  a PRESENT state file that records nothing refuses and says the "
+          "file is there, rather than saying it does not exist -- the remedies "
+          "differ (wrong directory versus a file that records nothing)",
+          ("records nothing this module can read as state" in _msg_bad,
+           "does not exist" in _msg_bad,
+           "records nothing this module can read as state" in _msg_empty,
+           "does not exist" in _msg_empty), (True, False, True, False))
+    check("9o  ...and an ABSENT one says THAT, on the same call",
+          "does not exist" in str(drive(lambda: _R9o(
+              "require_state_for_resume")({}, "batch_x",
+                                          _bad + ".missing"))), True)
+    # A DECODED NON-OBJECT IS NOT A STATE FILE, and the alternative to refusing
+    # it here was five copies of one isinstance test. `[1]`, `3` and `"x"` are
+    # valid JSON, so json.load returned them, `or {}` in main() left them alone
+    # because they are truthy, and the first guard's `state.get("mode")` was an
+    # AttributeError -- which `except RaterRefusal` does not catch, so an
+    # operator with a corrupt file got a traceback instead of the REFUSED line
+    # and exit 1 that every other state fault produces.
+    _nonobj = {}
+    for _i, _payload in enumerate(("[1]", "3", '"x"', "null", "true")):
+        _q = _os9k.path.join(_tmp9o, "nonobj%d.json" % _i)
+        with _io9k.open(_q, "w", encoding="utf-8") as _fh:
+            _fh.write(_payload)
+        _nonobj[_payload] = drive(R.read_state, _q)
+    check("9o  read_state returns None for a payload that decodes to a "
+          "NON-OBJECT, so the four guards' 'no state' branch covers it and "
+          "nothing calls .get on a list",
+          _nonobj, {"[1]": None, "3": None, '"x"': None, "null": None,
+                    "true": None})
+    # NON-DEGENERACY: it still returns a real mapping for a real state file, so
+    # the readings above are about the payload's TYPE rather than about
+    # read_state having stopped working.
+    _okp = _os9k.path.join(_tmp9o, "ok.json")
+    with _io9k.open(_okp, "w", encoding="utf-8") as _fh:
+        _fh.write('{"mode": "blind"}')
+    check("9o  non-degeneracy: a real object still round-trips",
+          drive(R.read_state, _okp), {"mode": "blind"})
+    # AND THE WHOLE CHAIN: a non-object on disk, through read_state, through
+    # main()'s `or {}`, reaches the resume guard's REFUSAL rather than a
+    # traceback. This is the property; the readings above are the mechanism.
+    _q0 = _os9k.path.join(_tmp9o, "nonobj0.json")
+    check("9o  ...so a resume against a state file holding [1] refuses by "
+          "name instead of escaping main() as an AttributeError",
+          refusal_code(_R9o("require_state_for_resume"),
+                       drive(R.read_state, _q0) or {}, "batch_x", _q0),
+          "resume_without_state")
+    # AND refuse_batch_from_other_mode HAD THE SAME HOLE against the OTHER
+    # mode's file, which is why the fix is in read_state rather than in the
+    # five guards: this call reads a file this session did not write.
+    _other = _os9k.path.join(_tmp9o, R.state_filename(R.MODE_ANCHORED))
+    with _io9k.open(_other, "w", encoding="utf-8") as _fh:
+        _fh.write("[1]")
+    check("9o  ...and the cross-mode guard survives a non-object in the OTHER "
+          "mode's state file, which it reads through the same function",
+          refusal_code(R.refuse_batch_from_other_mode, ["batch_x"],
+                       R.MODE_BLIND, _tmp9o, None), "<did not raise>")
+finally:
+    _shutil9k.rmtree(_tmp9o, ignore_errors=True)
+check("9o  the temp directory is gone", _os9k.path.isdir(_tmp9o), False)
+# A RESUME THAT NAMES NO PARSEABLE ID IS ITS OWN REFUSAL. `--resume ,` is
+# truthy, so it clears main()'s "nothing to do" check, and the id list it
+# produces is EMPTY -- the poll loop runs zero times, every decision comes back
+# no_result, and the run exits 3 reporting nil coverage. Pre-existing, adjacent
+# to this guard's subject, and closed here under a separate code because the
+# remedy differs: name a batch, versus resume from the right directory.
+check("9o  a resume naming NO parseable batch id refuses under its own code",
+      tuple(refusal_code(_R9o("require_state_for_resume"),
+                         {"mode": R.MODE_BLIND}, v, "/s")
+            for v in (",", " ", ",,", " , ")),
+      ("resume_names_no_batch",) * 4)
+check("9o  ...and it fires even when the state file is in perfect order, "
+      "because a flag naming nothing is a defect whatever the file records",
+      refusal_code(_R9o("require_state_for_resume"),
+                   {"mode": R.MODE_BLIND, "batches": [{"id": "b"}]},
+                   ",", "/s"), "resume_names_no_batch")
+check("9o  ...and it is a DIFFERENT code from the missing-state refusal",
+      refusal_code(_R9o("require_state_for_resume"), {}, ",", "/s")
+      != refusal_code(_R9o("require_state_for_resume"), {}, "batch_x", "/s"),
+      True)
+check("9o  ...and a resume naming ONE id among empties proceeds, so the check "
+      "is about naming nothing rather than about punctuation",
+      refusal_code(_R9o("require_state_for_resume"), {"mode": R.MODE_BLIND},
+                   ",batch_x,", "/s"), "<did not raise>")
+# AND THE LIST THE GUARD PARSES IS THE LIST main() POLLS -- one expression, in
+# main(), so a flag the guard accepted cannot become an empty poll list.
+check("9o  main() builds its resume id list with the same filter the guard "
+      "applies, so the two cannot disagree about what names a batch",
+      ("if b.strip()" in _MAIN_TXT,
+       _MAIN_TXT.count("args.resume.split(',')")
+       + _MAIN_TXT.count('args.resume.split(",")')), (True, 1))
+# CALLED, FIRST, AND FROM THE SAME try AS THE OTHERS. It has to be first: it is
+# the only one that can tell a resume from a first submit, and every guard
+# after it is a no-op on the state it refuses.
+check("9o  main() calls it, with the resume flag and the state path",
+      "require_state_for_resume(state, args.resume, state_path)" in _MAIN_TXT,
+      True)
+check("9o  ...inside a try, exactly as often as the subset guard beside it",
+      (_calls_inside_try(_main_fn, "require_state_for_resume"),
+       _calls_inside_try(_main_fn, "require_state_subset")), (1, 1))
+check("9o  ...and BEFORE the four it gates, in main()'s own source order",
+      [n for n in ("require_state_for_resume", "require_state_mode",
+                   "require_state_subset", "require_state_shape",
+                   "require_state_rubric")
+       if n in _MAIN_TXT][0], "require_state_for_resume")
+
+
+# --- 9p -- ...AND THE RUBRIC THE ANSWERS WERE JUDGED AGAINST --------------
+#
+# `rubric_sha256` was written into the state file by the commit that ADDED this
+# module and was read back by NOTHING, so a resume across an edit to the
+# shipped Stage 5 prompt joined answers judged against one rulebook onto
+# artifacts recording the other. Nothing else catches it: the rubric is not in
+# the custom_id, so the join succeeds and every rating parses.
+_RUBRIC_STATE = {"mode": R.MODE_BLIND, "include_keys_sha256": None,
+                 R.STATE_SHAPE_KEY: R.REQUEST_SHAPE_VERSION,
+                 R.RUBRIC_SHA_KEY: "a" * 64,
+                 "batches": [{"id": "batch_rubric"}]}
+_META_A = {R.RUBRIC_SHA_KEY: "a" * 64, "source_prompt_version": "9.9.9"}
+_META_B = {R.RUBRIC_SHA_KEY: "b" * 64, "source_prompt_version": "9.9.9"}
+check("9p  an EQUAL rubric digest proceeds, and the guard hands back the "
+      "value it proved equal",
+      drive(_R9o("require_state_rubric"), dict(_RUBRIC_STATE), _META_A, "/s"),
+      "a" * 64)
+check("9p  a DIFFERENT recorded digest refuses, by its own code",
+      refusal_code(_R9o("require_state_rubric"), dict(_RUBRIC_STATE),
+                   _META_B, "/s"), "state_rubric_mismatch")
+# ABSENT REFUSES, AND THE POLICY IS FROM A SURVEY. Unlike the shape, the absent
+# population here is EMPTY: the field predates `mode`, predates
+# `include_keys_sha256`, predates `input_file_id`, and all nineteen state files
+# under 09- Testing/Evaluation Runs/ carry it. So absence means the file was not
+# written by this writer, and there is no legacy resume to strand.
+check("9p  an ABSENT rubric digest refuses, under a code of its own",
+      refusal_code(_R9o("require_state_rubric"),
+                   {k: v for k, v in _RUBRIC_STATE.items()
+                    if k != R.RUBRIC_SHA_KEY}, _META_A, "/s"),
+      "state_rubric_absent")
+check("9p  ...and the three codes are distinct, because the remedies are",
+      len({refusal_code(_R9o("require_state_rubric"), dict(_RUBRIC_STATE),
+                        _META_B, "/s"),
+           refusal_code(_R9o("require_state_rubric"),
+                        {k: v for k, v in _RUBRIC_STATE.items()
+                         if k != R.RUBRIC_SHA_KEY}, _META_A, "/s"),
+           refusal_code(_R9o("require_state_rubric"),
+                        dict(_RUBRIC_STATE, rubric_sha256=1), _META_A, "/s")}),
+      3)
+# TYPE CONFUSION, AND THE REVERT MATRIX CORRECTED THIS BLOCK'S OWN PREMISE. The
+# first version guarded the equality with `isinstance(found, str) and found ==
+# want` by analogy with the shape guard's bool/float exclusion -- and deleting
+# that isinstance changed NOTHING any check could see, because no bool, int,
+# float, list or dict equals a hex string. The shape guard's exclusion IS live
+# (`True == 1`); this one was dead code. So the type decision is now a branch of
+# its own, ABOVE the equality, and what these checks pin is that a non-digest
+# is reported as a file that records nothing rather than as a prompt that moved
+# -- two different remedies.
+check("9p  a non-string digest is its own refusal rather than a mismatch: "
+      "true, 1, 1.0, a list and a dict all land in the malformed branch",
+      tuple(refusal_code(_R9o("require_state_rubric"),
+                         dict(_RUBRIC_STATE, rubric_sha256=v), _META_A, "/s")
+            for v in (True, 1, 1.0, ["a" * 64], {"sha": "a" * 64})),
+      ("state_rubric_malformed",) * 5)
+check("9p  ...and a string that merely differs is a MISMATCH, so the type "
+      "branch has not swallowed the value branch",
+      refusal_code(_R9o("require_state_rubric"),
+                   dict(_RUBRIC_STATE, rubric_sha256="b" * 64),
+                   _META_A, "/s"), "state_rubric_mismatch")
+# THE ORDER IS PINNED, because it is what makes every branch reachable: absent,
+# then type, then value. Reordered any other way one branch becomes dead -- put
+# the equality first and a non-digest is a mismatch; put the type check above
+# the absent check and `None` is reported as a malformed digest.
+_RUBRIC_SRC = _ast9k.unparse(next(
+    (n for n in _ast9k.walk(_MAIN_SRC)
+     if isinstance(n, _ast9k.FunctionDef)
+     and n.name == "require_state_rubric"), _ast9k.parse("def _m(): pass")))
+_ORDER_AT = {c: _RUBRIC_SRC.find(c)
+             for c in ("state_rubric_absent", "state_rubric_malformed",
+                       "state_rubric_mismatch", "found == want")}
+check("9p  the guard tests absent, then type, then value -- in that order, so "
+      "no branch is unreachable",
+      (all(v >= 0 for v in _ORDER_AT.values()),
+       _ORDER_AT["state_rubric_absent"] < _ORDER_AT["state_rubric_malformed"]
+       < _ORDER_AT["found == want"] < _ORDER_AT["state_rubric_mismatch"]),
+      (True, True))
+check("9p  ...and the equality is BARE, not guarded by an isinstance that "
+      "cannot change an outcome -- the type branch above it is what decides",
+      "isinstance(found, str) and found == want" in _RUBRIC_SRC, False)
+# WEAKENED-COMPARISON ANALOGUE: a prefix comparison would accept a digest that
+# shares its first twelve characters -- which is exactly what the message
+# PRINTS, so it is the plausible mistake.
+check("9p  the comparison is not on the printed prefix: a digest agreeing for "
+      "12 characters and differing after still refuses",
+      refusal_code(_R9o("require_state_rubric"),
+                   dict(_RUBRIC_STATE, rubric_sha256="a" * 12 + "c" * 52),
+                   _META_A, "/s"), "state_rubric_mismatch")
+_MSG9p = str(drive(lambda: _R9o("require_state_rubric")(
+    dict(_RUBRIC_STATE), _META_B, "/s")))
+check("9p  the mismatch message states BOTH digests, what joining them "
+      "corrupts, where the rules come from, and the remedy",
+      all(w in _MSG9p for w in ("a" * 12, "b" * 12, "prompts.py", "9.9.9",
+                                "rater_manifest.json", "ratings.json",
+                                "summary.json", "--output-dir")), True)
+_MSG9p_ABSENT = str(drive(lambda: _R9o("require_state_rubric")(
+    {"mode": R.MODE_BLIND}, _META_A, "/s")))
+check("9p  ...and the absent message directs to a fresh directory, offers NO "
+      "JSON snippet to paste, and says why an operator cannot establish this "
+      "field by inspection the way they can a shape",
+      ("--output-dir" in _MSG9p_ABSENT,
+       ('"%s":' % R.RUBRIC_SHA_KEY) in _MSG9p_ABSENT,
+       "none to add by hand" in _MSG9p_ABSENT,
+       R.STATE_SHAPE_KEY in _MSG9p_ABSENT),
+      (True, False, True, True))
+# NON-DEGENERACY FOR THAT SNIPPET TEST: the shape's own evidence branch DOES
+# print exactly that shape of snippet, so the absence above is a property of
+# this message rather than of the substring never appearing anywhere.
+check("9p  non-degeneracy: the shape guard's evidenced branch DOES print a "
+      "paste-able snippet, so the absence above is a real difference",
+      ('"%s":' % R.STATE_SHAPE_KEY) in _MSG_EVID, True)
+# IT REACHES THE STATE FILE, and from the index rather than from a retyped
+# string -- the round trip the shape guard already carries, one field over.
+check("9p  main()'s state.update records the rubric digest under the module's "
+      "own key constant, read from the index's rubric metadata",
+      [v for k, v in (_UPDATE if isinstance(_UPDATE, list) else [])
+       if k == "RUBRIC_SHA_KEY"], ["index.rubric_meta[RUBRIC_SHA_KEY]"])
+check("9p  ...and lift_rubric writes the digest under that same constant, so "
+      "the manifest and the state file cannot spell it two ways",
+      (R.RUBRIC_SHA_KEY, R.RUBRIC_SHA_KEY in (drive(R.lift_rubric) or ("", {}))[1]),
+      ("rubric_sha256", True))
+check("9p  main() calls require_state_rubric, with the index's metadata",
+      "require_state_rubric(state, index.rubric_meta, state_path)"
+      in _MAIN_TXT, True)
+check("9p  ...inside a try, exactly as often as the shape guard beside it",
+      (_calls_inside_try(_main_fn, "require_state_rubric"),
+       _calls_inside_try(_main_fn, "require_state_shape")), (1, 1))
+# A LIVE ROUND TRIP AGAINST THE REAL RULEBOOK, and it is `lift_rubric()`
+# rather than `built()`'s metadata for a reason found by running: `built`
+# passes the PLANTED ``{"rubric_sha256": "x"}``, so a round trip over it
+# compares "x" with "x" and an `isinstance(..., str)` probe passes on "x". The
+# real digest is what `main()` compares, so it is what has to be exercised, and
+# the non-degeneracy check is now that it is a 64-character hex digest.
+_LIVE_META = (drive(R.lift_rubric) or ("", {}))[1]
+_LIVE_SHA = walk(_LIVE_META, R.RUBRIC_SHA_KEY)
+check("9p  non-degeneracy: lift_rubric really produced a 64-character hex "
+      "digest, so the round trip below is over a real value and not over a "
+      "placeholder",
+      (isinstance(_LIVE_SHA, str), len(_LIVE_SHA) if isinstance(_LIVE_SHA, str)
+       else -1,
+       all(c in "0123456789abcdef" for c in _LIVE_SHA)
+       if isinstance(_LIVE_SHA, str) else False), (True, 64, True))
+check("9p  a resume of a state file recording the LIVE rubric proceeds",
+      refusal_code(_R9o("require_state_rubric"),
+                   {"mode": R.MODE_BLIND, R.RUBRIC_SHA_KEY: _LIVE_SHA},
+                   _LIVE_META, "/s"), "<did not raise>")
+check("9p  ...and one recording anything else does not",
+      refusal_code(_R9o("require_state_rubric"),
+                   {"mode": R.MODE_BLIND, R.RUBRIC_SHA_KEY: "z" * 64},
+                   _LIVE_META, "/s"), "state_rubric_mismatch")
+# AND THE PLANTED DIGEST built() USES IS NOT THE LIVE ONE, which is the fact
+# that made the first version of the two checks above vacuous. Pinned so the
+# next reader is not tempted to reach for `built()` here.
+check("9p  ...and built()'s planted rubric metadata is NOT the live digest, "
+      "which is why this section does not use it",
+      walk(getattr(built(R.MODE_BLIND), "rubric_meta", {}),
+           R.RUBRIC_SHA_KEY) == _LIVE_SHA, False)
+
+
+# --- 9q -- EVERY LOCAL GUARD FIRES BEFORE THE FIRST NETWORK TOUCH ---------
+#
+# THE COST OF THE OLD ORDER WAS NOT THE ROUND TRIP, AND THAT WAS MEASURED
+# RATHER THAN ARGUED. The five local guards sat BELOW the free
+# `models.retrieve` visibility check, so on a machine that cannot reach the API
+# every one of them was unreachable: a state file from the other mode, a state
+# file with no recorded shape, and `--resume` against a directory with no state
+# file ALL THREE reported
+#
+#     REFUSED: this key cannot see the judge model 'gpt-5.6-terra'
+#              (APIConnectionError: Connection error.)
+#
+# after three attempts on api.openai.com -- three because the SDK retries. That
+# is a MISDIAGNOSIS, not a wasted round trip: it sends an operator to their
+# credentials when the fault is a forgotten flag or a wrong directory.
+#
+# THIS SECTION DRIVES THE REAL main() WITH EVERY SOCKET ENTRY POINT TRAPPED and
+# requires each refusal to fire with ZERO outbound attempts. It is the only
+# check in this file that goes through the entry point; the ones above are about
+# the guards, and a guard that is never reached passes all of them.
+#
+# NO KEY, NO SPEND, NO NETWORK: the guards now run above `require_client`, so
+# these invocations do not even resolve a credential -- which is itself the
+# property being pinned, and check 9q's last two lines are what say so.
+import socket as _socket9q                                       # noqa: E402
+import traceback as _tb9q                                        # noqa: E402
+
+_NET9q = []
+_REAL9q = {"connect": _socket9q.socket.connect,
+           "connect_ex": _socket9q.socket.connect_ex,
+           "create_connection": _socket9q.create_connection,
+           "getaddrinfo": _socket9q.getaddrinfo}
+
+
+class _NetworkTouched9q(Exception):
+    """Raised by the trap. Named so a recorded attempt is attributable."""
+
+
+def _trap9q(name):
+    def _f(*a, **_k):
+        frames = [fr for fr in _tb9q.extract_stack()[:-1]
+                  if "_trap9q" not in fr.name]
+        where = ("%s:%d" % (_os9k.path.basename(frames[-1].filename),
+                            frames[-1].lineno)) if frames else "?"
+        _NET9q.append((name, where))
+        raise _NetworkTouched9q("%s from %s" % (name, where))
+    return _f
+
+
+def _arm9q():
+    _socket9q.socket.connect = _trap9q("connect")
+    _socket9q.socket.connect_ex = _trap9q("connect_ex")
+    _socket9q.create_connection = _trap9q("create_connection")
+    _socket9q.getaddrinfo = _trap9q("getaddrinfo")
+
+
+def _disarm9q():
+    _socket9q.socket.connect = _REAL9q["connect"]
+    _socket9q.socket.connect_ex = _REAL9q["connect_ex"]
+    _socket9q.create_connection = _REAL9q["create_connection"]
+    _socket9q.getaddrinfo = _REAL9q["getaddrinfo"]
+
+
+# THE FIRING CONTROL, FIRST. A trap that does not fire would make every reading
+# below "0 attempts" for the wrong reason, which is the shape this project
+# reserves a control for.
+_NET9q[:] = []
+_arm9q()
+try:
+    _ctl = drive(_socket9q.create_connection, ("api.openai.com", 443), 1)
+finally:
+    _disarm9q()
+check("9q  CONTROL: the trap fires on a real outbound call and records it, so "
+      "a zero below is a measurement rather than an absence of instrumentation",
+      (str(_ctl).startswith("<RAISED _NetworkTouched9q"), len(_NET9q)),
+      (True, 1))
+check("9q  ...and it is disarmed afterwards, so nothing later in this file "
+      "runs under it", (_socket9q.create_connection is
+                        _REAL9q["create_connection"],
+                        _socket9q.socket.connect is _REAL9q["connect"]),
+      (True, True))
+
+
+def _run_main9q(argv):
+    """(rc, network_attempts, console_text) from the REAL main(), trapped."""
+    _NET9q[:] = []
+    _buf = []
+    _real_out = R.console.out
+    R.console.out = lambda *a, **_k: _buf.append(
+        " ".join(str(x) for x in a))
+    _arm9q()
+    try:
+        rc = R.main(argv)
+    except BaseException as exc:                                # noqa: BLE001
+        rc = "<RAISED %s: %s>" % (type(exc).__name__, str(exc)[:120])
+    finally:
+        _disarm9q()
+        R.console.out = _real_out
+    return rc, len(_NET9q), "\n".join(_buf)
+
+
+# A REAL, MINIMAL EVALUATION RUN DIRECTORY. Written here rather than borrowed
+# from disk: this file may not read the project's own evaluation runs, and a
+# fabricated one is what makes the drive a statement about main() rather than
+# about a corpus.
+_tmp9q = _tempfile9k.mkdtemp(prefix="oncotriage-rater-9q-")
+try:
+    _run9q = _os9k.path.join(_tmp9q, "eval_run_9q")
+    _os9k.makedirs(_run9q)
+    with _io9k.open(_os9k.path.join(_run9q, "p0.json"), "w",
+                    encoding="utf-8") as _fh:
+        json.dump({"patient_summary": {"text": "Patient: PT-9q\nAge: 61 years\n"},
+                   "verdicts": [{"nct_id": "NCT09000001",
+                                 "verdict_group": "matches",
+                                 "inclusion_criteria": [
+                                     {"criterion": "Confirmed carcinoma",
+                                      "status": "met",
+                                      "patient_value": "adenocarcinoma"}],
+                                 "exclusion_criteria": [
+                                     {"criterion": "Prior therapy",
+                                      "status": "absent",
+                                      "patient_value": "none"}]}]}, _fh)
+    with _io9k.open(_os9k.path.join(_run9q, "manifest.json"), "w",
+                    encoding="utf-8") as _fh:
+        json.dump({"runs": {"pat-9q": {"file": "p0.json"}}}, _fh)
+    _out9q = _os9k.path.join(_tmp9q, "out")
+    _sp9q = _os9k.path.join(_out9q, R.state_filename(R.MODE_BLIND))
+
+    def _write_state9q(payload):
+        if not _os9k.path.isdir(_out9q):
+            _os9k.makedirs(_out9q)
+        with _io9k.open(_sp9q, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh)
+
+    def _argv9q(*extra):
+        return ["--blind", "--run-dir", _run9q, "--output-dir",
+                _out9q] + list(extra)
+
+    _GOOD9q = {"mode": R.MODE_BLIND, "include_keys_sha256": None,
+               R.STATE_SHAPE_KEY: R.REQUEST_SHAPE_VERSION,
+               "batches": [{"id": "batch_9q"}]}
+
+    # (a) THE ITEM-1 REFUSAL, at the entry point, offline.
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  --resume with no state file: main() returns 1, refuses by name, "
+          "and touches the network ZERO times",
+          (_rc, _n, "REFUSED" in _txt, "state file" in _txt), (1, 0, True, True))
+    # AND THE OUTPUT DIRECTORY IS NOT CREATED. `os.makedirs(out_dir)` used to
+    # precede the state read, so a refused invocation left an empty directory
+    # behind -- and the next `--resume` against it then finds a directory with
+    # no state file, which is this very refusal one step later.
+    check("9q  ...and it creates no output directory, so a refused invocation "
+          "leaves nothing behind for the next one to trip on",
+          _os9k.path.isdir(_out9q), False)
+
+    # (b) THE MODE GUARD, offline.
+    _write_state9q({"mode": R.MODE_ANCHORED, "batches": [{"id": "batch_9q"}]})
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file from the OTHER mode: 1, zero network, and the "
+          "message names the two modes rather than the key",
+          (_rc, _n, "written by a 'anchored' run" in _txt), (1, 0, True))
+
+    # (c) THE SHAPE GUARD, offline.
+    _write_state9q({k: v for k, v in _GOOD9q.items()
+                    if k != R.STATE_SHAPE_KEY})
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file with no recorded shape: 1, zero network",
+          (_rc, _n, "records no request shape" in _txt), (1, 0, True))
+
+    # (d) THE SUBSET GUARD, offline. A state written against an include list
+    #     resumed with the flag forgotten.
+    _write_state9q(dict(_GOOD9q, include_keys_sha256="f" * 64))
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file written against a DIFFERENT subset: 1, zero "
+          "network", (_rc, _n, "include list sha256" in _txt), (1, 0, True))
+
+    # (e) THE RUBRIC GUARD, offline.
+    _write_state9q(dict(_GOOD9q, rubric_sha256="e" * 64))
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file recording a DIFFERENT rubric: 1, zero network",
+          (_rc, _n, "records rubric eeeeeeeeeeee" in _txt), (1, 0, True))
+
+    # (f) THE CROSS-MODE BATCH GUARD, offline. It reads the OTHER mode's state
+    #     file, which is the one guard that consults a file this session did
+    #     not write -- and it used to sit ~150 lines and one round trip below
+    #     the visibility check, at the resume fork.
+    # THE LIVE DIGEST, not built()'s planted one: main() lifts the real
+    # rulebook, so a planted digest here makes the rubric guard refuse first
+    # and this check measure that instead of the cross-mode one.
+    _write_state9q(dict(_GOOD9q, rubric_sha256=_LIVE_SHA,
+                        batches=[{"id": "batch_mine"}]))
+    with _io9k.open(_os9k.path.join(_out9q, R.state_filename(R.MODE_ANCHORED)),
+                    "w", encoding="utf-8") as _fh:
+        json.dump({"mode": R.MODE_ANCHORED,
+                   "batches": [{"id": "batch_theirs"}]}, _fh)
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_theirs"))
+    check("9q  a batch the ANCHORED state file claims, resumed blind: 1, zero "
+          "network, and the message names the flag rather than the rater",
+          (_rc, _n, "was submitted by a 'anchored' run" in _txt),
+          (1, 0, True))
+
+    # THE NON-DEGENERACY CONTROL FOR ALL SIX. An invocation whose state file is
+    # entirely in order must get PAST every local guard and only then touch the
+    # network -- otherwise "zero attempts" above would be satisfied by a main()
+    # that refuses everything for some unrelated reason.
+    _os9k.remove(_os9k.path.join(_out9q, R.state_filename(R.MODE_ANCHORED)))
+    _write_state9q(dict(_GOOD9q, rubric_sha256=_LIVE_SHA))
+    _prev_key = _os9k.environ.get("OPENAI_API_KEY")
+    _os9k.environ["OPENAI_API_KEY"] = (
+        "-".join(("sk", "9q", "not", "a", "real", "key")) + "0" * 12)
+    try:
+        _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    finally:
+        if _prev_key is None:
+            _os9k.environ.pop("OPENAI_API_KEY", None)
+        else:
+            _os9k.environ["OPENAI_API_KEY"] = _prev_key
+    check("9q  CONTROL: a state file in order gets PAST every local guard and "
+          "reaches the network -- so the six zeros above are the guards "
+          "firing, not main() refusing for something else",
+          (_n > 0, "REFUSED" in _txt), (True, True))
+    check("9q  ...and what it reaches the network FOR is the visibility check, "
+          "which is the one thing below that genuinely needs the wire",
+          "cannot see the judge model" in _txt, True)
+finally:
+    _shutil9k.rmtree(_tmp9q, ignore_errors=True)
+check("9q  the temp directory is gone", _os9k.path.isdir(_tmp9q), False)
+
+# THE ORDER IS PINNED STRUCTURALLY TOO, because the drive above proves it for
+# the invocations it drives and an AST pin proves it for every one. Both are
+# needed: a scan cannot see a guard that is called and whose refusal is
+# swallowed, and a drive cannot see a seventh guard added below the network.
+_LOCAL_GUARDS9q = ("require_state_for_resume", "require_state_mode",
+                   "require_state_subset", "require_state_shape",
+                   "require_state_rubric", "refuse_batch_from_other_mode")
+
+
+def _first_at9q(needle):
+    """Where ``needle`` first appears in main()'s unparsed source, or -1."""
+    return _MAIN_TXT.find(needle)
+
+
+_NET_CALL9q = _first_at9q("model_is_visible(")
+check("9q  main() calls model_is_visible (probe, so the ordering pins below "
+      "cannot pass over an absent needle)", _NET_CALL9q >= 0, True)
+check("9q  EVERY local provenance guard is called before it, in main()'s own "
+      "source order",
+      [g for g in _LOCAL_GUARDS9q
+       if not (0 <= _first_at9q(g + "(") < _NET_CALL9q)], [])
+check("9q  ...and require_client, which is local but was above them, is now "
+      "below -- so a refused state file needs no credential at all",
+      0 <= _first_at9q("require_client()") and
+      all(_first_at9q(g + "(") < _first_at9q("require_client()")
+          for g in _LOCAL_GUARDS9q), True)
+check("9q  ...and the output directory is created only after the guards, so a "
+      "refusal leaves nothing on disk",
+      0 <= _first_at9q("makedirs(out_dir") and
+      all(_first_at9q(g + "(") < _first_at9q("makedirs(out_dir")
+          for g in _LOCAL_GUARDS9q), True)
+# THE RESUME IDS ARE PARSED ONCE. `refuse_batch_from_other_mode` had to move
+# above the fork that used to build them, so the list is built early and the
+# fork reads it -- and a second `args.resume.split` would be a second list that
+# could disagree with the one the guard checked.
+check("9q  the resume ids are parsed exactly once in main(), so the list the "
+      "cross-mode guard checked is the list that gets polled",
+      _MAIN_TXT.count("args.resume.split(',')")
+      + _MAIN_TXT.count('args.resume.split(",")'), 1)
 
 
 print()
