@@ -497,12 +497,35 @@ check("1i-i non-degeneracy: there are three of them, so 1i is not comparing "
 # state file after each batch is collected -- different store, different
 # arithmetic, different price table. The pin stays EXACT, which is what makes
 # a fourth member added without an argument fail here.
+# FIVE MEMBERS, AND THE TWO ADDED ARE THE CUMULATIVE READINGS.
+# `spend_journal_rater` / `spend_journal_campaign` name the CROSS-PROCESS
+# store: before it, `rater.rater_spend_before` seeded a judge session from its
+# OWN state file, so a fresh --output-dir started at the full cap and two
+# invocations were two independent $50 budgets. They are TWO members rather
+# than one `spend_journal` because `BUDGET_FOR_SEED_SOURCE` is a total map
+# from seed source to budget and the journal records both -- see that table.
+# `rater_state` is RETAINED beside them: it is what the rater still produces
+# when the journal cannot be read, which is the pre-journal behaviour, and
+# `describe_seed` names which of the two answered.
+#
+# THE PIN STAYS EXACT. That is what makes a sixth member added without an
+# argument fail HERE rather than nowhere.
 check("1j  SEED_SOURCES is closed and `fresh` is a VALUE rather than an "
       "absence: 'this campaign has no prior spend' and 'nobody asked' are "
       "different statements",
       spend.SEED_SOURCES,
       (spend.SEED_SOURCE_NONE, spend.SEED_SOURCE_CAMPAIGN,
-       spend.SEED_SOURCE_RATER_STATE))
+       spend.SEED_SOURCE_RATER_STATE,
+       spend.SEED_SOURCE_JOURNAL_RATER, spend.SEED_SOURCE_JOURNAL_CAMPAIGN))
+check("1j-ii ...and every one of them except `fresh` is assigned a budget, "
+      "so a resumed baseline can never be added to the wrong program's spend",
+      sorted(set(spend.SEED_SOURCES) - {spend.SEED_SOURCE_NONE}
+             - set(spend.BUDGET_FOR_SEED_SOURCE)), [])
+check("1j-iii ...and the two journal readings land in DIFFERENT budgets, "
+      "which is the whole reason they are two members",
+      (spend.BUDGET_FOR_SEED_SOURCE[spend.SEED_SOURCE_JOURNAL_RATER],
+       spend.BUDGET_FOR_SEED_SOURCE[spend.SEED_SOURCE_JOURNAL_CAMPAIGN]),
+      (spend.SPEND_BUDGET_RATER, spend.SPEND_BUDGET_CAMPAIGN))
 check("1j-i ...and every member is a distinct non-empty string, so the tuple "
       "cannot grow a member that reads as one already there",
       (len(set(spend.SEED_SOURCES)), all(spend.SEED_SOURCES)),

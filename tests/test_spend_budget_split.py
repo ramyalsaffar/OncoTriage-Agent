@@ -58,6 +58,8 @@ import ast
 import hashlib
 import os
 import sys
+import os as _os_journal
+import tempfile as _tempfile_journal
 import types
 
 # ABOVE THE IMPORTS, for oncotriage/fixtures/replay.py's reason.
@@ -650,9 +652,27 @@ with budgets(cap=300.0, rater_cap=50.0) as ledger:
            raised(spend.require_budget, spend.SPEND_SOURCE_RATER, "probe")),
           (False, 50.0, None))
 
+# ── THE JOURNAL IS EXPLICITLY EMPTY IN THIS FILE, AND SAYING SO IS THE POINT ──
+#
+# `rater_spend_before` reads the CROSS-PROCESS spend journal first and falls
+# back to the session's own state file only when the journal has nothing for
+# the rater budget. Calling it with no `journal=` would read the REAL journal,
+# so every seed figure below would pass today (that file does not exist yet)
+# and start failing the day a judge session created it -- a test that breaks
+# because production data appeared, which is the silent-pass shape this
+# project removes. `_NO_JOURNAL` names a path inside a temp directory that is
+# never written, so these checks measure the FALLBACK deliberately.
+# A PATH THAT IS NEVER CREATED, not a temp DIRECTORY: `read_entries` answers
+# an absent file with an empty list, so nothing has to exist and nothing has to
+# be cleaned up. The pid keeps two concurrent runs from naming one path.
+_NO_JOURNAL = _os_journal.path.join(
+    _tempfile_journal.gettempdir(),
+    f"oncotriage-absent-journal-{_os_journal.getpid()}.jsonl")
+
 # THE SEED IS ATTRIBUTED, WHICH IS THE HALF A CAP-ONLY SPLIT LEAVES BROKEN.
 with budgets(cap=300.0, rater_cap=50.0) as ledger:
-    ledger.seed(_rater.rater_spend_before({_rater.STATE_SPEND_KEY: 45.0}))
+    ledger.seed(_rater.rater_spend_before(
+        {_rater.STATE_SPEND_KEY: 45.0}, journal=_NO_JOURNAL))
     check("4f  *** a resumed judge session's baseline lands in the RATER "
           "budget and in NO other ***",
           (round(spend.active_spend(spend.SPEND_SOURCE_RATER), 4),
@@ -858,7 +878,7 @@ with budgets(cap=300.0, rater_cap=50.0) as ledger:
 
 with budgets(cap=300.0, rater_cap=50.0) as ledger:
     ledger.seed(_rater.rater_spend_before(
-        {_rater.STATE_SPEND_KEY: 9.0, "batches": [1, 2]}))
+        {_rater.STATE_SPEND_KEY: 9.0, "batches": [1, 2]}, journal=_NO_JOURNAL))
     check("6d  the resumed-baseline banner names the budget the baseline "
           "lands in, so a judge resuming $9 does not read as a campaign that "
           "has already spent it",

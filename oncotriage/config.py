@@ -5788,7 +5788,33 @@ unstated edge is a promise nobody can rely on.
 """
 
 RATER_SPEND_CAP_USD = 50.00
-"""The most one JUDGE SESSION may spend, in US dollars. Its OWN budget.
+"""The most the JUDGE may spend IN TOTAL, in US dollars. Its OWN budget.
+
+**CUMULATIVE ACROSS EVERY SESSION AND EVERY PROCESS, WHICH THIS SENTENCE USED
+TO SAY THE OPPOSITE OF.** It read "the most one JUDGE SESSION may spend", and
+that was mechanically true: `rater.rater_spend_before` seeded a session's
+ledger from THAT SESSION'S OWN `rater_state.json`, so a fresh `--output-dir`
+started at the full cap and two invocations were two independent $50 budgets
+with nothing anywhere saying so. Item 11 ran two populations that lived in two
+run directories; what kept them under ONE ledger was that its driver called
+`main()` twice inside one interpreter -- a property of a hand-written script,
+not of this project.
+
+THE OPERATOR RULING IS THAT THE CAP IS CUMULATIVE FOR THE CAMPAIGN, and the
+store that makes that enforceable is `oncotriage/spend_journal.py`: one
+append-only file, one exclusive `flock` across each read-then-append, one entry
+per collected batch keyed idempotently so a `--resume` cannot charge the same
+money twice, and a one-time migration that SUMS the existing state files from
+the artifacts on disk rather than taking a total from any note. Every judge
+session seeds from it and the reservation gate is compared against ITS
+remainder.
+
+MEASURED at the migration, 2026-09-08: **$7.2825 across 18 state files**, of
+which 6 carry a non-zero amount. Ten of the remaining twelve record batches
+and no `spend_usd` because they predate that key -- those are recorded as a
+FLOOR, not as zero, and `spend.describe_seed` prints "A FLOOR, NOT A TOTAL"
+whenever one is in the sum. The port probe's $0.0596 left no state file and is
+in no reading, under this cap or any other.
 
 THE VALUE IS AN OPERATOR RULING AND SO IS THE SPLIT ITSELF. Budgets are per
 billed PROGRAM, not one number for all: `SPEND_CAP_USD` bounds the campaign and
@@ -5812,16 +5838,16 @@ argument is about what the two bound rather than about tidiness:
     claude-sonnet-4-6's $3.00/$15.00 with the flat 50% batch discount. One
     number over two tables is a number whose meaning depends on which of them
     moved.
-  * THEY ALREADY RESUME FROM DIFFERENT STORES. A campaign seeds its ledger
-    from the `runs` chain (`database_logger.campaign_spend_before`); a rater
-    session seeds from its own `rater_state.json`
-    (`rater.rater_spend_before`). Two chains were already being compared
+  * THEY RESUME FROM DIFFERENT STORES. A campaign seeds its ledger from the
+    `runs` chain (`database_logger.campaign_spend_before`); the judge seeds
+    from `oncotriage/spend_journal.py`. Two chains were already being compared
     against one cap, which is the conflation `spend.SPEND_BUDGETS` removes.
 
 WHAT THE SPLIT DOES **NOT** BUY, stated so nobody reads more into it than is
-there: it does not net the judge's spend against the campaign's either. It
-never did -- the two are separate processes with no shared store -- and the
-split makes that honest instead of accidental. See `spend.SPEND_BUDGETS`.
+there: it does not net the judge's spend against the campaign's either, and
+the journal does not change that. Stage 5's spend goes to the `runs` table and
+the judge's to the journal; the two are disjoint populations under two caps,
+which is the design rather than an omission. See `spend.SPEND_BUDGETS`.
 
 WHAT THE OVERSHOOT IS HERE, and it is COARSER than Stage 5's. The Batches API
 puts the gate and the charge further apart: one `batches.create` commits up to

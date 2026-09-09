@@ -82,7 +82,7 @@ except ImportError:
         raise
     del _candidate, _how
 
-from oncotriage import config, paths
+from oncotriage import config, paths, settings, spend_journal
 from oncotriage.fixtures import capture as cap
 from oncotriage.evaluation import ragas_harness as rh
 
@@ -1484,6 +1484,13 @@ class _DrivenMetric(object):
         return types.SimpleNamespace(value=self.value)
 
 
+DRIVE_JOURNAL_DIR = tempfile.mkdtemp(prefix="resume_drive_journal_")
+_PROD_JOURNAL = spend_journal.journal_path()
+_PROD_JOURNAL_BEFORE = (
+    hashlib.sha256(io.open(_PROD_JOURNAL, "rb").read()).hexdigest()
+    if os.path.isfile(_PROD_JOURNAL) else "<absent>")
+
+
 def drive_ragas_main(argv, run_dir, suffix=""):
     """Run the real main() with the judge, the embedder and the plan replaced."""
     _TOTAL_SCORED["n"] = 0
@@ -1521,6 +1528,24 @@ def drive_ragas_main(argv, run_dir, suffix=""):
     _env_before = os.environ.get(_env_key)
     os.environ[_env_key] = "1"
 
+    # ── AND THE SPEND JOURNAL IS REDIRECTED, FOR THE SAME KIND OF REASON ──
+    #
+    # `ragas_harness.main()` records this invocation's spend to the
+    # CROSS-PROCESS journal, whose default path it resolves for itself -- so
+    # driving `main()` ten times wrote ten entries into the REAL journal the
+    # first time this was tried. It is measured rather than predicted: the
+    # entries were $0.00 and named this file's own temp output directory, and
+    # they would have seeded the campaign budget of every later ragas run.
+    #
+    # `ONCOTRIAGE_SPEND_JOURNAL` is what a caller who did not choose that
+    # store uses to redirect it -- `ONCOTRIAGE_INFERENCES_DB`'s own argument,
+    # one store over -- and it is set around each drive and restored in the
+    # `finally` beside the independence override, never at module scope.
+    _journal_key = settings.ENV_SPEND_JOURNAL
+    _journal_before = os.environ.get(_journal_key)
+    os.environ[_journal_key] = os.path.join(DRIVE_JOURNAL_DIR,
+                                            "spend_journal.jsonl")
+
     rh.load_run = lambda d, f=None: _make_run(
         response_field=f or rh.DEFAULT_RESPONSE_FIELD, response_suffix=suffix)
     rh.price_plan = lambda *a, **k: {"judge_calls_total": 10,
@@ -1543,6 +1568,10 @@ def drive_ragas_main(argv, run_dir, suffix=""):
             os.environ.pop(_env_key, None)
         else:
             os.environ[_env_key] = _env_before
+        if _journal_before is None:
+            os.environ.pop(_journal_key, None)
+        else:
+            os.environ[_journal_key] = _journal_before
         for k, v in saved.items():
             setattr(rh, k, v)
         if saved_ragas is None:
@@ -1700,6 +1729,30 @@ check("9g  ...and the operator is told why it was kept",
       "was KEPT at" in txt and "without re-judging anything" in txt,
       txt[-500:])
 shutil.rmtree(EMPTY_RUN, ignore_errors=True)
+
+# --- 9h  the PRODUCTION spend journal was not written -----------------------
+#
+# `ragas_harness.main()` records this invocation's spend to the cross-process
+# journal, and it resolves that path for itself -- so the ten drives above
+# wrote ten entries into the REAL journal until `ONCOTRIAGE_SPEND_JOURNAL` was
+# set around each one. MEASURED, not predicted: the entries were $0.00, named
+# this file's own temp directory, and would have seeded the campaign budget of
+# every later ragas run.
+_journal_after = (
+    hashlib.sha256(io.open(_PROD_JOURNAL, "rb").read()).hexdigest()
+    if os.path.isfile(_PROD_JOURNAL) else "<absent>")
+check("9h  the PRODUCTION spend journal is byte-unchanged by ten driven "
+      "ragas runs", _journal_after == _PROD_JOURNAL_BEFORE,
+      (_journal_after, _PROD_JOURNAL_BEFORE))
+_redirected = os.path.join(DRIVE_JOURNAL_DIR, "spend_journal.jsonl")
+check("9h  ...because they went to the redirected one instead, which is what "
+      "says the override REACHED the harness rather than that nothing was "
+      "recorded at all", os.path.isfile(_redirected), True)
+check("9h  ...and every entry there is a ragas run under the campaign budget",
+      sorted({(e["budget"], e["kind"]) for e in
+              spend_journal.read_entries(_redirected)}),
+      [("campaign", "run")])
+shutil.rmtree(DRIVE_JOURNAL_DIR, ignore_errors=True)
 
 shutil.rmtree(DRIVE_RUN, ignore_errors=True)
 

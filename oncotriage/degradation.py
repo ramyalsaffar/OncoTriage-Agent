@@ -130,6 +130,7 @@ from oncotriage.storage import database_logger as _database_logger
 from oncotriage import environment as _environment
 from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage import spend as _spend
+from oncotriage import spend_journal as _spend_journal
 from oncotriage import tracking as _tracking
 
 
@@ -476,6 +477,19 @@ _REGISTRY_SPEC = (
      "key is a model absent from PRICING_CONFIG and is the same configuration "
      "defect that aborts the row write one layer down; a `bad_usage:` key is a "
      "response whose usage block could not be read"),
+    ("JOURNAL_FAULTS", _spend_journal.JOURNAL_FAULTS,
+     "the CROSS-PROCESS spend journal could not be read, written or "
+     "understood. EVERY KEY HERE IS MONEY THE NEXT JUDGE SESSION'S CAP WILL "
+     "NOT SEE -- an `append:` key is a collected batch whose cost was not "
+     "persisted, a `read:` or `parse:` key is history the seed silently "
+     "started without, and a `schema:from_the_future:` key is an entry written "
+     "by a build that knew more fields than this one. It sits beside "
+     "SPEND_LEDGER_FAULTS because it fails in the same direction for the same "
+     "reason: the cap is then enforced against a number LOWER than the truth, "
+     "which is the one direction a budget must not fail in silently. A "
+     "`duplicate_entry_id` key means the file has been hand-edited or "
+     "concatenated -- the money is counted once, correctly, and the fact that "
+     "it happened is not swallowed"),
     ("SPEND_CEILING_TRIPS", _spend.SPEND_CEILING_TRIPS,
      "a Stage 5 invocation asked for more billed calls than its configuration "
      "can legitimately produce, and the request was declined. NOT A BUDGET "

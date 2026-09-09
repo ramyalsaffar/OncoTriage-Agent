@@ -248,8 +248,26 @@ table -- and an operator reading a resumed judge's banner is entitled to know
 which of the two answered.
 """
 
+SEED_SOURCE_JOURNAL_RATER = "spend_journal_rater"
+SEED_SOURCE_JOURNAL_CAMPAIGN = "spend_journal_campaign"
+"""The CUMULATIVE readings, out of ``oncotriage/spend_journal.py``.
+
+**TWO MEMBERS AND NOT ONE, BECAUSE ``BUDGET_FOR_SEED_SOURCE`` IS A TOTAL MAP
+FROM SEED SOURCE TO BUDGET.** One ``spend_journal`` member could not be
+assigned a budget: the journal records both, and which budget an entry belongs
+to is a property of the ENTRY. Naming the budget in the seed source is what
+keeps that table total and therefore checkable at import, which is worth more
+than the small redundancy in the two names.
+
+``rater_state`` IS RETAINED BESIDE THEM and is not dead: it is what
+``rater.rater_spend_before`` still produces when the journal cannot be read at
+all, which is the pre-journal behaviour and the under-enforcing direction, and
+the banner then says which of the two answered.
+"""
+
 SEED_SOURCES = (SEED_SOURCE_NONE, SEED_SOURCE_CAMPAIGN,
-                SEED_SOURCE_RATER_STATE)
+                SEED_SOURCE_RATER_STATE,
+                SEED_SOURCE_JOURNAL_RATER, SEED_SOURCE_JOURNAL_CAMPAIGN)
 """Where a ledger's starting balance came from. CLOSED.
 
 ``fresh`` is a run that is resuming nothing, and it is a VALUE rather than an
@@ -373,6 +391,8 @@ which is a gate that declines the wrong program and never says so.
 BUDGET_FOR_SEED_SOURCE = {
     SEED_SOURCE_CAMPAIGN: SPEND_BUDGET_CAMPAIGN,
     SEED_SOURCE_RATER_STATE: SPEND_BUDGET_RATER,
+    SEED_SOURCE_JOURNAL_RATER: SPEND_BUDGET_RATER,
+    SEED_SOURCE_JOURNAL_CAMPAIGN: SPEND_BUDGET_CAMPAIGN,
 }
 """Which budget a resumed baseline belongs to. TOTAL over ``SEED_SOURCES``
 except ``fresh``, which belongs to none by construction -- it is a zero.

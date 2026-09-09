@@ -1784,6 +1784,56 @@ BUCKETS = {
         "and are sha256-compared at the end. It DOES exec: six in-memory "
         "copies of agent/evaluation.py, one plant each, argued at "
         "_EXEC_ALLOWLIST."),
+    "test_spend_journal.py": (
+        _A, None,
+        "ran green in 6.4s, 63 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED against a provision_ci_paths.py root, not "
+        "assumed): the CROSS-PROCESS spend journal that makes "
+        "RATER_SPEND_CAP_USD cumulative. No network, no keys, NO SPEND -- no "
+        "provider client of any kind is built and no request is issued; every "
+        "amount is a literal. NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS is "
+        "set above the imports), no live Qdrant, no corpus, no database, no "
+        "git history, no live server. It DOES spawn subprocesses -- three in "
+        "sequence for the two-invocation control and eight at once for the "
+        "lock, because the defect it exists for is a PROCESS boundary and a "
+        "same-process check would be satisfied by the module-global ledger it "
+        "replaces. NOT in the collision matrix: every journal it touches is "
+        "inside a tempfile.mkdtemp it removes and asserts gone, the "
+        "PRODUCTION journal is sha256-compared at the end, and the two "
+        "repository files it reads are written by neither of the suite's two "
+        "writers. It EXECS NOTHING and loads no module by location."),
+    "test_rater_multi_run_selection.py": (
+        _A, None,
+        "ran green in 0.8s, 44 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED against a provision_ci_paths.py root, not "
+        "assumed): --run-dir is repeatable, so one judge session can rate a "
+        "population drawn from several evaluation run directories. No "
+        "network, no keys, NO SPEND -- no client is built and nothing is "
+        "submitted; the one end-to-end drive is _prepare, which is everything "
+        "that must hold BEFORE a cent is spent. NO MODEL LOAD "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports), no live Qdrant, "
+        "no corpus, no database, no git history, no live server. Every run "
+        "directory is FABRICATED inside a tempfile.mkdtemp it removes and "
+        "asserts gone and the production evaluation-runs tree is never read. "
+        "NOT in the collision matrix: the one repository file it reads, "
+        "oncotriage/evaluation/rater.py, is written by neither of the suite's "
+        "two writers and is sha256-compared at the end. It EXECS NOTHING."),
+    "test_criterion_clause_division.py": (
+        _A, None,
+        "ran green in <1s, 67 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED against a provision_ci_paths.py root, not "
+        "assumed): oncotriage/evaluation/criterion_clauses.py, the one owner "
+        "of how an eligibility criterion is DIVIDED for window-scope "
+        "analysis. ANALYSIS-SIDE ONLY -- nothing here reaches a model or a "
+        "rendered prompt. No network, no keys, NO SPEND, no live Qdrant, NO "
+        "MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports), no "
+        "corpus, no database, no git history, no live server; every criterion "
+        "is a literal and every one is public ClinicalTrials.gov trial text "
+        "with no patient material of any kind. It writes NOTHING anywhere, "
+        "not even a temp directory, and EXECS NOTHING: every control is a "
+        "module-attribute rebind inside try/finally with the restore asserted "
+        "BY IDENTITY, or a different INPUT to a pure function. NOT in the "
+        "collision matrix."),
     "test_spend_budget_split.py": (
         _A, None,
         "ran green in ~2s, 79 checks, against ONLY the directory skeleton: the "

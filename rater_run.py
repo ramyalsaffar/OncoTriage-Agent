@@ -80,10 +80,25 @@ USAGE
     # a named subset: one patient_id|nct_id|arm|index per line
     python rater_run.py --dry-run --blind --include-keys keys.txt --run-dir <run>
 
+    # a population that SPANS TWO RUN DIRECTORIES, in ONE session and under
+    # ONE budget. --run-dir is repeatable; the include list names decisions
+    # from either. Two invocations would be two processes, and before
+    # oncotriage/spend_journal.py existed they were two independent $50 caps.
+    python rater_run.py --dry-run --blind --include-keys keys.txt \
+        --run-dir <run A> --run-dir <run B>
+
+**THE CAP IS CUMULATIVE ACROSS EVERY SESSION AND EVERY PROCESS.** Each
+invocation seeds its ledger from ``oncotriage/spend_journal.py`` -- one
+append-only file under ``09- Testing/Evaluation Runs/``, one exclusive lock per
+write, one entry per collected batch keyed so that ``--resume`` cannot charge
+the same money twice -- and prints what the judge has spent in total and what
+remains of ``config.RATER_SPEND_CAP_USD`` before it submits anything. The
+reservation gate is compared against THAT remainder.
+
 ``--resume`` REBUILDS THE REQUEST INDEX FROM THE RUN DIRECTORY, so a resumed
 session must repeat every flag that shaped it -- ``--blind``,
-``--retest-fraction``, ``--retest-seed``, ``--limit``, ``--include-keys``,
-``--run-dir``. Forgetting one does not mis-join silently. Widening the index
+``--retest-fraction``, ``--retest-seed``, ``--limit``, ``--include-keys``, and
+EVERY ``--run-dir``. Forgetting one does not mis-join silently. Widening the index
 (resuming a subset batch WITHOUT the flag) is caught by the state file's
 recorded include-list sha256; narrowing it is caught by the join, because the
 returned custom_ids would not be in the rebuilt index.

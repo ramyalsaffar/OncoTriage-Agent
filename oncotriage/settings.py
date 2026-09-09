@@ -88,6 +88,7 @@ ENV_DATA_TRIAL_PATH = "ONCOTRIAGE_DATA_TRIAL_PATH"
 """Directory the trial scrape writes into. 23- Airflow DAG.py's DAG only."""
 
 ENV_INFERENCES_DB = "ONCOTRIAGE_INFERENCES_DB"
+ENV_SPEND_JOURNAL = "ONCOTRIAGE_SPEND_JOURNAL"
 """Full path to the SQLite inference log, overriding ``paths.inferences_path``.
 
 NOT A DIRECTORY, which is why it is resolved by its own function below rather
@@ -568,6 +569,52 @@ def resolve_inferences_db():
             f"    export {ENV_INFERENCES_DB}='/tmp/oncotriage-test.db'"
         )
     return path, ENV_INFERENCES_DB
+
+
+def resolve_spend_journal():
+    """Resolve the cross-process spend journal override from the environment.
+
+    **THIS EXISTS BECAUSE A TEST WROTE INTO A PRODUCTION ARTIFACT AND THAT WAS
+    MEASURED RATHER THAN PREDICTED.** ``oncotriage/spend_journal.py`` resolves
+    its own default path, so any process that drives a harness which records
+    spend writes there -- including ``tests/test_resume_capture_and_ragas.py``,
+    which drives the real ragas ``main()`` ten times and put ten entries into
+    the real journal the first time this was run. A store the code resolves
+    for itself needs a way for a caller who did not choose that store to
+    redirect it, which is exactly what ENV_INFERENCES_DB is for one layer over.
+
+    DELIBERATELY NOT ``_from_env``, for the reason written at
+    ENV_INFERENCES_DB: that helper appends a trailing separator, and a journal
+    FILE path ending in one is a path ``io.open`` refuses -- refused in the one
+    way ``spend_journal.append`` swallows, so the failure would be a counted
+    degradation naming an OSError rather than the variable.
+
+    Returns:
+        (path, source) where source is ENV_SPEND_JOURNAL when the variable was
+        set to a non-empty value, or (None, None) when it was not. It invents
+        no fallback: "not set" means the caller uses its own default, and only
+        the caller knows what that is.
+
+    Raises:
+        RuntimeError: the parent directory does not exist. ENV_INFERENCES_DB's
+            argument exactly -- the FILE not existing is the normal case,
+            because the journal is created on first append, and a missing
+            PARENT is a configuration defect that must reach the operator
+            rather than being counted as a write fault once per batch.
+    """
+    raw = os.environ.get(ENV_SPEND_JOURNAL)
+    if raw is None or raw.strip() == "":
+        return None, None
+    path = os.path.expanduser(raw.strip())
+    parent = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(parent):
+        raise RuntimeError(
+            f"{ENV_SPEND_JOURNAL} points into a directory that does not "
+            f"exist: {parent!r}. The journal FILE is created on first append; "
+            f"its parent is not. Create the directory, or set "
+            f"{ENV_SPEND_JOURNAL} to a path inside one that exists:\n"
+            f"    export {ENV_SPEND_JOURNAL}='/tmp/oncotriage-journal.jsonl'")
+    return path, ENV_SPEND_JOURNAL
 
 
 def resolve_qdrant_url():

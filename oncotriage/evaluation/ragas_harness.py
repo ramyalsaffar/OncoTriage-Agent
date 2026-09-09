@@ -58,7 +58,7 @@ import statistics
 import sys
 import time
 
-from oncotriage import config, paths, spend
+from oncotriage import config, paths, spend, spend_journal
 from oncotriage.evaluation import judge_independence
 from oncotriage.observability import console, get_logger
 
@@ -3234,16 +3234,38 @@ def main(argv=None):
         # what it must NOT do is inherit a total from an earlier main() in the
         # same interpreter.
         #
-        # THERE IS NO SEED. Unlike the rater, `--resume` here re-scores from a
-        # partial journal rather than resuming a submitted batch, and the
-        # journal records SCORES rather than spend -- so there is no persisted
-        # total to inherit, and inventing one from the journal's row count
-        # would be an estimate deciding a budget. The consequence is stated:
-        # `config.SPEND_CAP_USD` binds within one ragas invocation and not
-        # across a resumed pair of them.
+        # ** AND THERE IS A SEED NOW. The block that stood here said there was
+        # ** none, and it was right about the SCORE journal and wrong to stop
+        # ** there.
+        #
+        # The old reasoning: `--resume` re-scores from a partial journal that
+        # records SCORES rather than spend, so there is no persisted total to
+        # inherit and inventing one from a row count would be an estimate
+        # deciding a budget. Every word of that is still true OF THAT FILE. It
+        # simply is not the only store any more.
+        #
+        # `oncotriage/spend_journal.py` records one entry per INVOCATION of
+        # this harness, under the CAMPAIGN budget, which is where
+        # `spend.BUDGET_FOR_SOURCE` puts both ragas paths. So a second
+        # invocation -- a resume, a re-run, a second dataset -- starts under
+        # the remainder of what ragas has already spent instead of at the full
+        # cap. Two invocations were two independent budgets before this and
+        # nothing said so, which is the rater's defect one program over.
+        #
+        # WHAT IT STILL DOES NOT DO: it does not net against Stage 5's spend.
+        # A campaign seeds the same budget from the `runs` table
+        # (`database_logger.campaign_spend_before`); ragas seeds it from the
+        # journal. The two populations are DISJOINT -- Stage 5 writes no
+        # journal entry and ragas writes no `inferences` row -- so neither
+        # double-counts the other, and neither sees it either. That was true
+        # before this change and is unchanged by it.
         spend.SPEND_LEDGER.reset()
         spend.SPEND_STOP.reset()
+        spend.SPEND_LEDGER.seed(
+            spend_journal.total(spend.SPEND_BUDGET_CAMPAIGN))
         console.out(spend.describe_cap())
+        console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
+        console.out(spend_journal.describe(spend.SPEND_BUDGET_CAMPAIGN))
         # ── LAYER 2 OF THE INDEPENDENCE GUARD ─────────────────────────
         #
         # ON THE EFFECTIVE MODEL, AFTER `--judge-model`, AND BEFORE THE CLIENT
@@ -3306,8 +3328,27 @@ def main(argv=None):
     tree_before = snapshot_tree(run_dir, exclude_dir=out_dir)
 
     started = time.monotonic()
-    scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
-                                   journal=journal, reuse=reuse))
+    # ── RECORDED TO THE CROSS-PROCESS JOURNAL, IN A `finally` ─────────────
+    #
+    # ONE ENTRY PER INVOCATION AND NOT ONE PER RESPONSE. This harness charges
+    # the ledger per response and would otherwise write thousands of lines and
+    # take thousands of exclusive locks for a number that is only ever read as
+    # a total. `spend_journal.record_run` is that shape and argues it there.
+    #
+    # THE `finally` IS WHY AN INTERRUPTED RUN STILL CONTRIBUTES: `score_all`
+    # raises on a spend stop and on a KeyboardInterrupt, and both are runs that
+    # have already spent money. The entry is keyed on `(out_dir, run stamp)`,
+    # so a re-run into the SAME output directory under the same stamp appends
+    # nothing and a genuinely new invocation appends its own.
+    _journal_unit = _utc_now()
+    try:
+        scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
+                                       journal=journal, reuse=reuse))
+    finally:
+        spend_journal.record_run(
+            spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
+            out_dir, _journal_unit,
+            spend.SPEND_LEDGER.measured, args.judge_model)
     wall_seconds = time.monotonic() - started
 
     summary = summarize(scores, run, active)

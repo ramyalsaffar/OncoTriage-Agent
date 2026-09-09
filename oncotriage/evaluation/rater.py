@@ -124,7 +124,7 @@ import re
 import time
 from collections import Counter, OrderedDict
 
-from oncotriage import config, paths, spend
+from oncotriage import config, paths, spend, spend_journal
 from oncotriage.agent.prompts import PROMPT_VERSION, render_system_prompt
 from oncotriage.evaluation import judge_independence
 from oncotriage.observability import console, get_logger
@@ -909,14 +909,31 @@ class Decision(object):
 
 
 class RunInput(object):
-    """Everything read out of an evaluation run directory."""
+    """Everything read out of one or more evaluation run directories.
 
-    def __init__(self, run_dir, manifest, summaries, decisions, patient_order):
+    ``run_dir`` IS THE FIRST OF ``run_dirs`` AND STAYS A SINGLE STRING. Six
+    sites read it -- the plan banner, the state file, the cross-mode batch
+    refusal, the rater manifest, ``ratings.json`` and the output-directory
+    default -- and every one of them wants ONE directory: a list there would
+    change the shape of two written artifacts and the default output path for
+    every single-directory invocation, which is the byte-compatibility this
+    change promises. ``run_dirs`` is the honest full answer and is recorded
+    beside it wherever the record matters.
+    """
+
+    def __init__(self, run_dir, manifest, summaries, decisions, patient_order,
+                 run_dirs=None, manifests=None):
         self.run_dir = run_dir
         self.manifest = manifest
         self.summaries = summaries          # patient_id -> summary text
         self.decisions = decisions          # deterministic order
         self.patient_order = patient_order  # patient_id -> ordinal
+        # A TUPLE, AND IT DEFAULTS TO THE ONE DIRECTORY rather than to empty:
+        # a consumer that reads `run_dirs` must never have to ask whether the
+        # single-directory case populated it.
+        self.run_dirs = tuple(run_dirs) if run_dirs else (run_dir,)
+        self.manifests = (tuple(manifests) if manifests
+                          else ((run_dir, manifest),))
 
 
 def load_run(run_dir):
@@ -1026,6 +1043,131 @@ def load_run(run_dir):
     run = RunInput(run_dir, manifest, summaries, decisions, patient_order)
     run.problems = problems
     return run
+
+
+def load_runs(run_dirs):
+    """One ``RunInput`` over SEVERAL evaluation run directories.
+
+    **WHY THIS EXISTS.** ``--include-keys`` names decisions by
+    ``patient_id|nct_id|arm|index`` and ``select_included_decisions`` resolves
+    them against ONE run's decisions, so a population drawn from two runs could
+    not be rated in one session -- which is what item 11 had to work around by
+    calling ``main()`` twice inside one interpreter, and what put two sessions
+    under one process-global ledger by hand rather than by mechanism.
+
+    **A SINGLE DIRECTORY IS BYTE-COMPATIBLE, BY CONSTRUCTION AND NOT BY
+    INSPECTION.** With one entry this delegates to ``load_run`` and returns the
+    object it built, ``problems`` list and all; there is no merge path for a
+    single run to differ on. ``tests/test_evaluation_rater.py`` drives both and
+    compares them field by field anyway, because "by construction" is a claim
+    about code that can be edited.
+
+    THREE REFUSALS, and each is a state in which the merged population would be
+    wrong rather than merely surprising:
+
+      * **the same directory named twice.** Every decision in it would be
+        requested twice, the second copy would collide on its own key, and the
+        include list's line count would disagree with the number of decisions
+        rated. It is a defect in the invocation and it is named as one.
+      * **one patient in two directories with DIFFERENT summaries.** The
+        summary is what the judge audits the decision AGAINST; two records
+        under one id is two different patients as far as every rating is
+        concerned, and picking either would silently rate half the decisions
+        against the wrong record.
+      * **the same decision key in two directories.** The include key would
+        name two decisions, ``select_included_decisions`` would refuse with
+        ``include_key_ambiguous`` on a message about a run, and
+        ``encode_custom_id`` would mint one id for two requests. Caught here,
+        where the message can say WHICH directories.
+
+    ORDINALS ARE RECOMPUTED OVER THE UNION, never inherited: they are the
+    compact ``custom_id`` form's patient index, and two directories' ordinals
+    both start at zero. Recomputing over the sorted union is what
+    ``load_run`` already does within one directory, applied to the merge.
+    """
+    dirs = list(run_dirs or [])
+    if not dirs:
+        raise RaterRefusal("no run directory was named.",
+                           code="run_dir_invalid")
+    seen = {}
+    for d in dirs:
+        if d in seen:
+            raise RaterRefusal(
+                f"--run-dir names {d!r} more than once. Every decision in it "
+                f"would be requested twice, collide on its own join key, and "
+                f"make the include list's line count disagree with the number "
+                f"of decisions rated.",
+                code="run_dir_duplicate")
+        seen[d] = True
+    if len(dirs) == 1:
+        return load_run(dirs[0])
+
+    loaded = [(d, load_run(d)) for d in dirs]
+
+    summaries = {}
+    summary_from = {}
+    for d, run in loaded:
+        for pid, text in run.summaries.items():
+            if pid in summaries and summaries[pid] != text:
+                raise RaterRefusal(
+                    f"patient {pid!r} appears in {summary_from[pid]!r} and in "
+                    f"{d!r} with DIFFERENT patient_summary text. The summary "
+                    f"is what every rating is audited against, so one id "
+                    f"carrying two records cannot be merged: rating them "
+                    f"together would judge half the decisions against the "
+                    f"wrong patient. Rate the directories separately, or "
+                    f"narrow the include list to one of them.",
+                    code="run_merge_summary_conflict")
+            summaries[pid] = text
+            summary_from.setdefault(pid, d)
+
+    key_from = {}
+    clashes = []
+    for d, run in loaded:
+        for decision in run.decisions:
+            if decision.key in key_from and key_from[decision.key] != d:
+                clashes.append((decision.key, key_from[decision.key], d))
+            else:
+                key_from.setdefault(decision.key, d)
+    if clashes:
+        raise RaterRefusal(
+            f"{len(clashes)} decision key(s) appear in more than one "
+            f"--run-dir, so an include key would name two decisions. First "
+            f"{min(len(clashes), _INCLUDE_REPORT_LIMIT)}: "
+            + "; ".join(
+                f"{INCLUDE_KEY_SEPARATOR.join((p, n, a, str(i)))} in {x!r} "
+                f"and {y!r}"
+                for (p, n, a, i), x, y in clashes[:_INCLUDE_REPORT_LIMIT]),
+            code="run_merge_key_conflict")
+
+    patient_order = {pid: ordinal
+                     for ordinal, pid in enumerate(sorted(summaries))}
+    decisions = []
+    for _d, run in loaded:
+        for decision in run.decisions:
+            decisions.append(Decision(
+                patient_id=decision.patient_id,
+                patient_index=patient_order[decision.patient_id],
+                nct_id=decision.nct_id, arm=decision.arm,
+                index=decision.index, criterion=decision.criterion,
+                patient_value=decision.patient_value, status=decision.status,
+                verdict_group=decision.verdict_group))
+    # THE SAME KEY `load_run` SORTS BY, applied to the union. Request order is
+    # then a property of the merged population rather than of the order the
+    # directories were named in -- so two invocations naming the same two
+    # directories the other way round build the identical batch.
+    decisions.sort(key=lambda d: (d.patient_index, d.nct_id, d.arm, d.index))
+
+    first_dir, first_run = loaded[0]
+    merged = RunInput(first_dir, first_run.manifest, summaries, decisions,
+                      patient_order,
+                      run_dirs=[d for d, _r in loaded],
+                      manifests=[(d, r.manifest) for d, r in loaded])
+    problems = []
+    for d, run in loaded:
+        problems.extend(f"{d}: {p}" for p in getattr(run, "problems", []))
+    merged.problems = problems
+    return merged
 
 
 #------------------------------------------------------------------------------
@@ -2224,6 +2366,29 @@ def charge_batch_to_ledger(model, usage_totals):
     return spend.SPEND_LEDGER.charge_usd(usd, spend.SPEND_SOURCE_RATER)
 
 
+def record_batch_spend(state_path, batch_id, usd, model, journal=None):
+    """Persist one collected batch's cost to the CROSS-PROCESS journal.
+
+    Called at both collection sites, immediately after
+    ``charge_batch_to_ledger`` and ``write_state``, so the three records of one
+    batch -- this process's ledger, this session's state file and every future
+    session's cap -- are written together or not at all.
+
+    IDEMPOTENT ON ``(state file, batch id)``, which is what makes ``--resume``
+    safe: re-collecting a batch that was already collected recomputes the same
+    ``entry_id`` and appends nothing. Without that the resume gesture would
+    charge the campaign twice for money spent once.
+
+    NEVER RAISES, on ``charge_batch_to_ledger``'s footing: it runs after a
+    batch has been collected, and a record that could not be written must not
+    discard results already paid for. The failure is counted into
+    ``spend_journal.JOURNAL_FAULTS`` and reaches the run-end degradation block.
+    """
+    return spend_journal.record_batch(
+        spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER,
+        state_path, batch_id, usd, model, path=journal)
+
+
 STATE_SPEND_KEY = "spend_usd"
 """Where a rater session records what it has spent, inside its state file.
 
@@ -2256,16 +2421,39 @@ added to the rater budget and to no other.
 """
 
 
-def rater_spend_before(state):
-    """What this rater session already spent, as a ``spend.LedgerSeed``.
+def rater_spend_before(state, journal=None):
+    """What the JUDGE has already spent, cumulatively, as a ``LedgerSeed``.
+
+    **THIS USED TO BE ONE SESSION'S OWN STATE FILE AND THAT WAS THE DEFECT.**
+    ``config.RATER_SPEND_CAP_USD``'s docstring said "the most one JUDGE SESSION
+    may spend", and it meant it: a fresh ``--output-dir`` started at the full
+    cap, so two invocations were two independent $50 budgets and nothing in the
+    project said so. Item 11's two populations lived in two run directories,
+    ``--include-keys`` could not span them, and what kept those two sessions
+    under ONE ledger was that its driver called ``main()`` twice inside one
+    interpreter -- a property of a hand-written script.
+
+    THE OPERATOR RULING IS THAT THE CAP IS CUMULATIVE, so the reading is
+    ``oncotriage/spend_journal.py``'s: every judge session ever recorded,
+    across processes, under an exclusive lock.
+
+    **THE STATE FILE IS THE FALLBACK AND NOT AN ADDEND.** Adding both would
+    double-count every batch the journal already holds. When the journal has
+    nothing for this budget -- an unreadable file, a machine where the
+    migration has not run -- this returns the session reading, which is exactly
+    the pre-journal behaviour: under-enforcing, in the same direction
+    ``LedgerSeed``'s floor already fails in, and NAMED, because
+    ``spend.describe_seed`` prints the seed's source and the two sources are
+    different members.
 
     NEVER RAISES. It runs before the first billed call of a session, where an
     absent key, a hand-edited file and a fresh state are all ordinary -- and a
     judge refusing to start because its own history could not be read would be
-    a brake stopping a run it has nothing to say about. An unreadable history
-    yields a FRESH seed, which is the over-spending direction, and that is the
-    same direction ``LedgerSeed``'s floor already fails in.
+    a brake stopping a run it has nothing to say about.
     """
+    cumulative = spend_journal.total(spend.SPEND_BUDGET_RATER, path=journal)
+    if cumulative.rows:
+        return cumulative
     if not isinstance(state, dict):
         return spend.LedgerSeed()
     usd = state.get(STATE_SPEND_KEY)
@@ -4631,7 +4819,95 @@ harness's own request shape.
 # a thinking budget). The table stays so that a measured per-mode figure has
 # somewhere to go.
 DEFAULT_MAX_TOKENS = 4096
-DEFAULT_MAX_TOKENS_BLIND = 4096
+
+# ══ AND THE BLIND CEILING IS 1536, BECAUSE THE CONTRACT ABOVE WAS MEASURED.
+#
+# 4096 was BORROWED -- ragas' own docstring, a floor somebody else measured on
+# a different task -- and the block above says in as many words that
+# `usage.completion_tokens_details.reasoning_tokens` is recorded per response
+# "precisely so the next pass can set this from data". This is that pass, and
+# the number below is that data.
+#
+# MEASURED, item 11 (`eval_run_item11_20260908_logs/step3_analysis.json`, a
+# retrieval of results already paid for -- no completion request was issued for
+# the measurement), over 191 BLIND responses from `gpt-5.6-terra` at
+# `reasoning_effort=medium`:
+#
+#     completion (total, billed)   min 55   p50 166   p90 361   p95 426
+#                                  p99 580  MAX 863  mean 195.7
+#     of which reasoning           min  0   p50  93   p90 274   p95 349
+#                                  p99 512  max 775  mean 125.8
+#     visible object               min 52   p50  69   p90  82   p95  87
+#                                  p99  90  max 101  mean  69.9
+#
+#     0 unrated, 0 requests bucketed `truncated_max_tokens`, 0 retry batches.
+#
+# REASONING IS THE LARGER HALF AND IT IS THE VARIABLE HALF. The visible object
+# is tight (52-101); reasoning ranges 0-775. That is why the ceiling is sized
+# against the TOTAL and not against the object, and it is the same fact the
+# block above raised 300 to 4096 for.
+#
+# 1536 = max(observed_max x 1.5, p99 x 2.0) rounded UP to a 256 multiple
+#      = max(863 x 1.5, 580 x 2.0) = max(1294.5, 1160) -> 1536.
+#
+# WHY A MULTIPLIER AND NOT THE MAX. The max of 191 blind replies on one judge
+# on one day is not the max of the distribution, and a ceiling set AT an
+# observed max truncates the first reply that exceeds it -- which on a
+# reasoning model happens BEFORE THE FIRST CHARACTER OF JSON, so the decision
+# is lost rather than shortened. 1536 is 1.78x the observed maximum and 2.65x
+# p99.
+#
+# WHAT IT BUYS, AND IT IS A BUDGET ARGUMENT RATHER THAN A SAFETY ONE. Output
+# bills on tokens GENERATED, so this cannot cost or save a cent at run time and
+# a reply that fits is byte-identical whatever the ceiling was. The
+# RESERVATION is where it is not free: `reserve_batch_liability` prices every
+# reply at the full ceiling, so 4096 -> 1536 cuts a session's reserved
+# liability by 62.5% at identical run-time cost. At 2,212 requests and
+# $6.00/Mtok that is $54.35 reserved at 4096 -- ABOVE the $50
+# `RATER_SPEND_CAP_USD`, so a full-run submission was refused outright -- and
+# $20.38 at 1536, which fits.
+#
+# **PROVISIONAL, AND EVERY QUALIFIER BELONGS TO THE NUMBER RATHER THAN TO THE
+# PROSE.** One development run, one judge, one day, n = 191, on three
+# populations SELECTED FOR BEING HARD. Future outputs are not guaranteed to sit
+# inside this envelope: a longer contract, a different `reasoning_effort`, a
+# different judge or a model revision moves the distribution and none of them
+# would announce it. **RAISE IT IF TRUNCATION APPEARS** -- the signal is
+# `unrated_reason = truncated_max_tokens` in `ratings.json` and the
+# `stop_reasons` census `print_summary` prints, both of which count a
+# truncation loudly and neither of which this change touches; the harness's own
+# one retry pass then resubmits at 2x, and a decision still cut off after that
+# is UNRATED and reported as such.
+#
+# ANCHORED IS UNMEASURED ON THIS JUDGE AND STAYS AT 4096. Item 11 rated no
+# anchored decision, so there is no anchored distribution to size against, and
+# `tests/test_evaluation_rater.py` 8a hashes the anchored request body as
+# comparable history. Moving it is a separate item with its own measurement.
+DEFAULT_MAX_TOKENS_BLIND = 1536
+
+MAX_TOKENS_BLIND_MEASURED = {
+    "n": 191,
+    "judge_model": "gpt-5.6-terra",
+    "reasoning_effort": "medium",
+    "completion_max": 863,
+    "completion_p99": 580,
+    "reasoning_p99": 512,
+    "truncated": 0,
+    "source": "eval_run_item11_20260908_logs/step3_analysis.json",
+    "measured_on": "2026-09-08",
+}
+"""The measurement ``DEFAULT_MAX_TOKENS_BLIND`` was derived from. PROVISIONAL.
+
+A dict rather than prose because the derivation is arithmetic over these
+numbers and a test can then re-run it -- ``max(completion_max x 1.5,
+completion_p99 x 2.0)`` rounded up to a 256 multiple -- instead of retyping
+1536 beside a comment that says where it came from. A ceiling and a claim about
+where it came from that can disagree is the shape this project removes.
+
+``truncated`` is 0 and is recorded BECAUSE it is 0: a distribution measured on
+a run that was itself truncating would be censored, and its maximum would be
+the old ceiling rather than the model's.
+"""
 
 # TOTAL over ``MODES``, guarded at import rather than by an ``assert``, which
 # ``python -O`` deletes. A mode with no ceiling would fall through to whatever
@@ -4807,9 +5083,22 @@ def _parse_args(argv=None):
         description="Have an independent LLM rate every criterion decision in "
                     "an evaluation run. SPENDS MONEY on the OpenAI Batch API "
                     "unless --dry-run is given.")
-    p.add_argument("--run-dir", default=None,
+    # REPEATABLE. `action="append"` with `default=None` is what keeps a
+    # single `--run-dir X` byte-compatible: argparse yields `["X"]`, which
+    # `load_runs` delegates straight to `load_run`, and an invocation naming
+    # none still yields None and takes `default_run_dir()`. A `nargs="+"`
+    # would have been the other shape and is worse here -- it swallows the
+    # next flag-less token, so `--run-dir A B --dry-run` and
+    # `--run-dir A --include-keys B` differ by a space.
+    p.add_argument("--run-dir", action="append", default=None,
+                   metavar="DIR",
                    help="the evaluation run to rate (default: the 10-patient "
-                        "run under 09- Testing/Evaluation Runs/)")
+                        "run under 09- Testing/Evaluation Runs/). REPEATABLE: "
+                        "pass it once per directory to rate a population that "
+                        "spans several runs in ONE session, under one budget. "
+                        "The directories must not share a patient with two "
+                        "different summaries, or a decision key -- either is "
+                        "a refusal, not a merge.")
     p.add_argument("--output-dir", default=None,
                    help="where to write ratings/manifest/summary "
                         "(default: <run-dir>/rater/)")
@@ -4927,9 +5216,15 @@ def _prepare(args):
     include_keys, include_meta = (load_include_keys_file(include_path)
                                   if include_path else (None, None))
 
-    run_dir = args.run_dir or default_run_dir()
-    run_dir = os.path.abspath(os.path.expanduser(run_dir))
-    run = load_run(run_dir)
+    # NORMALISED HERE AND WRITTEN BACK, on `args.max_tokens`'s precedent: the
+    # plan banner, the state file and the manifest all read `args.run_dir`
+    # downstream, and leaving argparse's raw list beside a resolved one would
+    # make them report paths the loader never opened.
+    raw_dirs = args.run_dir or [default_run_dir()]
+    run_dirs = [os.path.abspath(os.path.expanduser(d)) for d in raw_dirs]
+    args.run_dir = run_dirs
+    run = load_runs(run_dirs)
+    run_dir = run.run_dir
 
     rubric, rubric_meta = lift_rubric()
     arm_definitions = (lift_arm_status_definitions(rubric)
@@ -4940,15 +5235,22 @@ def _prepare(args):
     # run under audit used a different one, RULE 4's temporal reasoning differs
     # between the decision and its audit -- which is rubric mismatch, the one
     # thing lifting the rules exists to prevent.
-    run_ref = (run.manifest.get("environment") or {}).get("age_reference_date")
+    # CHECKED FOR EVERY DIRECTORY, not only the first. A merged population
+    # whose second run used a different reference date carries the mismatch
+    # this refusal exists to catch, and reading only `run.manifest` would let
+    # it through on exactly the invocations the merge made possible.
     rubric_ref = rubric_meta.get("reference_date_in_rules")
-    if run_ref and rubric_ref and run_ref != rubric_ref:
-        raise RaterRefusal(
-            f"the run under audit used age_reference_date {run_ref!r} but the "
-            f"lifted rules render RULE 4's reference date as {rubric_ref!r}. "
-            f"config.DATA_SNAPSHOT_DATE has moved since the run. Rating now "
-            f"would measure a temporal-rule mismatch as disagreement.",
-            code="reference_date_mismatch")
+    for _dir, _manifest in run.manifests:
+        run_ref = (_manifest.get("environment") or {}).get(
+            "age_reference_date")
+        if run_ref and rubric_ref and run_ref != rubric_ref:
+            raise RaterRefusal(
+                f"the run under audit used age_reference_date {run_ref!r} but "
+                f"the lifted rules render RULE 4's reference date as "
+                f"{rubric_ref!r}. config.DATA_SNAPSHOT_DATE has moved since "
+                f"the run. Rating now would measure a temporal-rule mismatch "
+                f"as disagreement. (run directory: {_dir!r})",
+                code="reference_date_mismatch")
 
     # ── LAYER 2 OF THE INDEPENDENCE GUARD ─────────────────────────────
     #
@@ -5018,6 +5320,12 @@ def _report_plan(run, index, out_dir, args, calibration=None,
 
     console.banner("RATER DRY RUN" if args.dry_run else "RATER PLAN")
     console.out(f"  run dir            {run.run_dir}")
+    # PRINTED ONLY WHEN THERE IS MORE THAN ONE, so a single-directory plan
+    # banner is byte-identical to the one that shipped. A line reading "and 0
+    # more" on every ordinary invocation is noise that trains an operator to
+    # skip the block the spend figures are in.
+    for _extra in run.run_dirs[1:]:
+        console.out(f"  ...and             {_extra}")
     console.out(f"  output dir         {out_dir}")
     console.out(f"  mode               {index.mode}"
                 + ("   (the recorded status is NOT sent; agreement is "
@@ -5254,11 +5562,22 @@ def main(argv=None):
     # session announced a bound it does not run under and named a constant that
     # would not move its own limit. `describe_serving_cap()`'s argument, one
     # budget over.
+    # ** AND IT IS THE CUMULATIVE READING NOW, NOT THIS SESSION'S OWN.
+    #
+    # The migration runs FIRST and is idempotent: it records every
+    # pre-journal `rater_state.json` on disk as one entry apiece, summed from
+    # the artifacts and never from a number in a report. It is cheap (a walk
+    # of the evaluation-runs tree and one small JSON per state file) and it
+    # has to be here rather than in a separate command, because the invocation
+    # that would forget to run it is the one whose cap then reads zero.
+    spend_journal.bootstrap_from_state_files()
     spend.SPEND_LEDGER.seed(rater_spend_before(state))
     console.out(spend.describe_rater_cap())
     console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
+    console.out(spend_journal.describe(spend.SPEND_BUDGET_RATER))
 
-    state.update({"run_dir": run.run_dir, "model": args.model,
+    state.update({"run_dir": run.run_dir, "run_dirs": list(run.run_dirs),
+                  "model": args.model,
                   "mode": index.mode,
                   "custom_id_form": index.form,
                   "retest_requests": len(index.retest_ids),
@@ -5420,6 +5739,7 @@ def main(argv=None):
             state[STATE_SPEND_KEY] = round(
                 float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
             write_state(state_path, state)
+            record_batch_spend(state_path, bid, _spent, args.model)
 
         for cid in set(index.by_custom_id) - set(rated) - set(unrated):
             unrated[cid] = {"reason": "no_result",
@@ -5469,6 +5789,7 @@ def main(argv=None):
                 state[STATE_SPEND_KEY] = round(
                     float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
                 write_state(state_path, state)
+                record_batch_spend(state_path, bid, _spent, args.model)
         elif retryable:
             console.out(f"  {len(retryable)} retryable failure(s) left "
                         f"unrated (--no-retry).")
@@ -5520,6 +5841,11 @@ def main(argv=None):
         "schema_version": 1,
         "created_at_utc": _utc_now(),
         "run_dir_consumed": run.run_dir,
+        # BOTH, because `run_dir_consumed` is a pinned field of a written
+        # artifact and narrowing it to "the first of several" without saying
+        # so would make every historical manifest read as a claim it no longer
+        # makes. The list is additive and is the honest answer.
+        "run_dirs_consumed": list(run.run_dirs),
         "run_manifest_created_at_utc": run.manifest.get("created_at_utc"),
         "run_environment": run.manifest.get("environment"),
         "output_dir": out_dir,
@@ -5627,6 +5953,7 @@ def main(argv=None):
 
     write_json(os.path.join(out_dir, "ratings.json"),
                {"schema_version": 1, "run_dir": run.run_dir,
+                "run_dirs": list(run.run_dirs),
                 "model": args.model, "ratings": rows})
     write_json(os.path.join(out_dir, "rater_manifest.json"), manifest)
     write_json(os.path.join(out_dir, "summary.json"), summary)

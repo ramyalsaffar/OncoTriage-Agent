@@ -57,6 +57,8 @@ import os
 import shutil
 import sqlite3
 import sys
+import os as _os_journal
+import tempfile as _tempfile_journal
 import tempfile
 import threading
 import types
@@ -1157,27 +1159,46 @@ check("6f  *** the gate is PER CHUNK: a session that crosses its cap on the "
       "first batch does not submit the other two ***",
       drive_submit_crossing(), ("SpendLimitReached", [1]))
 
+# ── THE JOURNAL IS EXPLICITLY EMPTY IN THIS FILE, AND SAYING SO IS THE POINT ──
+#
+# `rater_spend_before` reads the CROSS-PROCESS spend journal first and falls
+# back to the session's own state file only when the journal has nothing for
+# the rater budget. Calling it with no `journal=` would read the REAL journal,
+# so every seed figure below would pass today (that file does not exist yet)
+# and start failing the day a judge session created it -- a test that breaks
+# because production data appeared, which is the silent-pass shape this
+# project removes. `_NO_JOURNAL` names a path inside a temp directory that is
+# never written, so these checks measure the FALLBACK deliberately.
+# A PATH THAT IS NEVER CREATED, not a temp DIRECTORY: `read_entries` answers
+# an absent file with an empty list, so nothing has to exist and nothing has to
+# be cleaned up. The pid keeps two concurrent runs from naming one path.
+_NO_JOURNAL = _os_journal.path.join(
+    _tempfile_journal.gettempdir(),
+    f"oncotriage-absent-journal-{_os_journal.getpid()}.jsonl")
+
 # THE STATE SEED: a resumed session continues under the remaining budget.
 check("6g  a session with a recorded spend seeds from it",
       _rater.rater_spend_before({_rater.STATE_SPEND_KEY: 12.5,
-                                 "batches": [1, 2]}),
+                                 "batches": [1, 2]}, journal=_NO_JOURNAL),
       spend.LedgerSeed(usd=12.5, rows=0, unpriced=0, runs=2,
                        source=spend.SEED_SOURCE_RATER_STATE))
 check("6g-i a fresh state seeds nothing, which is a VALUE and not an absence",
-      _rater.rater_spend_before({}).source, spend.SEED_SOURCE_NONE)
+      _rater.rater_spend_before({}, journal=_NO_JOURNAL).source,
+      spend.SEED_SOURCE_NONE)
 for _bad in ({"spend_usd": "x"}, {"spend_usd": float("nan")},
              {"spend_usd": -1}, None, {"spend_usd": True}):
     check(f"6g-ii a malformed recorded spend ({_bad!r}) seeds FRESH rather "
           f"than raising -- a judge must not refuse to start because its own "
           f"history is unreadable",
-          _rater.rater_spend_before(_bad).usd, 0.0)
+          _rater.rater_spend_before(_bad, journal=_NO_JOURNAL).usd, 0.0)
 
 # THE SEED IS ATTRIBUTED TO THE RATER BUDGET AND TO NO OTHER, which is what
 # `spend.BUDGET_FOR_SEED_SOURCE` decides. Asked about the CAMPAIGN the same
 # ledger reports a full budget, and that pairing is the measurement: a seed
 # that leaked across budgets would make both answers the same.
 with clean_ledger(cap=20.0, rater_cap=20.0) as ledger:
-    ledger.seed(_rater.rater_spend_before({_rater.STATE_SPEND_KEY: 18.0}))
+    ledger.seed(_rater.rater_spend_before(
+        {_rater.STATE_SPEND_KEY: 18.0}, journal=_NO_JOURNAL))
     check("6h  *** a RESUMED session runs under the REMAINDER of its OWN "
           "budget, not a fresh cap ***",
           round(spend.remaining(spend.SPEND_SOURCE_RATER), 6), 2.0)

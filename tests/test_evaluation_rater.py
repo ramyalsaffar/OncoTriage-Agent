@@ -2722,10 +2722,42 @@ check("9l  the per-decision block is the LAST part, after the record: it is "
 # nowhere near enough.
 check("9m  both ceilings leave room for reasoning, which is generated BEFORE "
       "the answer and counted against this same budget",
-      (R.DEFAULT_MAX_TOKENS, R.DEFAULT_MAX_TOKENS_BLIND), (4096, 4096))
-check("9m  non-degeneracy: the new ceiling is far above the pre-port one, "
-      "which is what the reasoning budget costs",
+      (R.DEFAULT_MAX_TOKENS, R.DEFAULT_MAX_TOKENS_BLIND), (4096, 1536))
+check("9m  non-degeneracy: the anchored ceiling is far above the pre-port "
+      "one, which is what the reasoning budget costs",
       R.DEFAULT_MAX_TOKENS >= 4 * 300, True)
+
+# ** AND THE BLIND CEILING IS NO LONGER BORROWED. It is DERIVED, so the check
+# ** re-runs the derivation rather than retyping the answer: a constant and a
+# ** comment claiming where it came from can disagree, and only one of the two
+# ** governs a paid request.
+_M = R.MAX_TOKENS_BLIND_MEASURED
+import math as _math                                            # noqa: E402
+_RAW = max(_M["completion_max"] * 1.5, _M["completion_p99"] * 2.0)
+_DERIVED = int(_math.ceil(_RAW / 256.0)) * 256
+check("9m  the blind ceiling IS max(observed max x 1.5, p99 x 2.0) rounded "
+      "up to a 256 multiple, recomputed from the recorded measurement",
+      R.DEFAULT_MAX_TOKENS_BLIND, _DERIVED)
+check("9m  ...and it clears the observed maximum with real headroom, which "
+      "is what a multiplier is FOR -- 191 replies on one judge on one day "
+      "is not the maximum of the distribution",
+      R.DEFAULT_MAX_TOKENS_BLIND >= int(1.5 * _M["completion_max"]), True)
+check("9m  ...and it is still far above the visible object alone, because "
+      "reasoning is generated FIRST and truncation lands before the first "
+      "character of JSON",
+      R.DEFAULT_MAX_TOKENS_BLIND > _M["reasoning_p99"], True)
+check("9m  the measurement records that NOTHING truncated, without which "
+      "the maximum it reports is the old ceiling rather than the model's",
+      _M["truncated"], 0)
+check("9m  ...and it names its own n, judge and effort, so a reader can see "
+      "what the number is provisional ON",
+      sorted(k for k in ("n", "judge_model", "reasoning_effort", "source",
+                         "measured_on") if _M.get(k)),
+      ["judge_model", "measured_on", "n", "reasoning_effort", "source"])
+check("9m  a truncation at the new ceiling is still bucketed loudly rather "
+      "than absorbed",
+      "truncated_max_tokens" in R.UNRATED_REASONS
+      and "truncated_max_tokens" in R.RETRYABLE_REASONS, True)
 check("9m  ...and it reaches the wire under the field a reasoning model "
       "requires, not the legacy one",
       sorted(k for k in built(R.MODE_ANCHORED).requests[0]["params"]
@@ -2845,6 +2877,33 @@ check("9m  CONTROL: the same invocation with a legal ceiling gets PAST the "
                                      ["--dry-run", "--blind",
                                       "--max-tokens", "1"]))
       != "bad_max_tokens", True)
+
+# --- 9n -- TRUNCATION IS STILL ACCOUNTED FOR AT THE LOWER CEILING -----------
+#
+# Lowering a reply ceiling is only safe while a reply that hits it is still a
+# LOUD, COUNTED, RETRIED event rather than a short answer nobody notices. 5a
+# above drives that through the real `collect_results` and is ceiling-
+# independent by construction -- it keys on `finish_reason`, not on a number.
+# What is pinned HERE is the retry, which is the ONE place the ceiling itself
+# reaches the recovery path: the harness resubmits a truncated decision at
+# TWICE `args.max_tokens`, so the retry ceiling moves with the default and a
+# decision still cut off after it is UNRATED and reported as such.
+_RETRY_MULTIPLIER = 2
+_blind_ceiling = drive(R.resolve_max_tokens, R.MODE_BLIND)
+check("9n  a truncation is a REPORTED unrated reason and a RETRYABLE one, "
+      "which is what makes a lower ceiling safe rather than quiet",
+      ("truncated_max_tokens" in R.UNRATED_REASONS,
+       "truncated_max_tokens" in R.RETRYABLE_REASONS), (True, True))
+check("9n  ...and the retry's ceiling is DERIVED from the resolved one, so it "
+      "moved with this pass rather than staying at the old default",
+      _blind_ceiling * _RETRY_MULTIPLIER, 3072)
+check("9n  ...which still clears the measured blind maximum with room, so "
+      "the recovery path was not narrowed past what the data supports",
+      _blind_ceiling * _RETRY_MULTIPLIER
+      >= 3 * _M["completion_max"], True)
+check("9n  the source doubles args.max_tokens rather than naming a literal, "
+      "which is what makes the two above facts about the same number",
+      "args.max_tokens * 2" in _inspect.getsource(R.main), True)
 
 
 print()
