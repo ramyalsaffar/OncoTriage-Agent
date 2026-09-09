@@ -234,6 +234,21 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 15: `runs.tunables`, added with RUN_COLUMN_ADDITIONS and its migration
+#        loop. It records the EFFECTIVE value of every constant in
+#        `config.TUNABLE_NAMES` at the moment the row was opened, as JSON with
+#        sorted keys -- the same dict, from the same owner function, that every
+#        characterization fixture records in its environment block. Before it, a
+#        run's knob settings were recoverable only for as long as nobody edited
+#        `oncotriage/config.py`: the stamp columns carry the nine facts a resume
+#        gates on and say nothing about the retrieval pools, the fusion weights,
+#        the Stage 4 gate or the packing budget, so "what was RRF_K when this
+#        campaign ran" had no answer in the schema at all.
+#        IT IS PROVENANCE AND NOT A STAMP. It is deliberately NOT in
+#        RUN_FINGERPRINT_COLUMNS and nothing gates, branches or refuses on it --
+#        a resume across a tunable change is exactly as permitted as it was
+#        before this column existed. Additive TEXT, NULL on every existing row,
+#        never backfilled.
 # ERA 14: FIVE `inferences` COLUMNS IN ONE COMMIT -- one era, two changes,
 #        on era 5's precedent that the number counts schema CHANGES and that a
 #        commit is the unit. They are listed as two groups because they answer
@@ -391,7 +406,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 14
+SCHEMA_USER_VERSION = 15
 
 
 #------------------------------------------------------------------------------
@@ -2033,6 +2048,50 @@ RUN_COLUMN_ADDITIONS = {
     # RUN_FINGERPRINT_INTEGER_COLUMNS too, which is what NULLs an unresolvable
     # value instead of letting the string "unknown" sort above every number.
     "matching_per_trial_parallel_bound": "INTEGER",
+    # -- ERA 15 ------------------------------------------------------------
+    #
+    # WHAT EVERY KNOB WAS SET TO WHEN THIS RUN OPENED, as JSON with sorted
+    # keys. The dict is `config.effective_tunables()` -- the SAME owner
+    # function, over the SAME closed `config.TUNABLE_NAMES`, that every
+    # characterization fixture records in its environment block -- so a run row
+    # and a fixture taken in one session cannot disagree about what the
+    # pipeline was configured to do.
+    #
+    # PROVENANCE, NOT A STAMP, AND THAT IS THE WHOLE DESIGN. It is NOT in
+    # RUN_FINGERPRINT_COLUMNS, nothing in this module or any reader gates,
+    # branches or refuses on it, and `run_fingerprint.compare()` has never
+    # heard of it: a resume across a tunable change is exactly as permitted as
+    # it was before this column existed. Gating it would be a large behaviour
+    # change wearing a provenance edit's costume -- twenty-nine constants any
+    # one of which would then refuse a resume, several of which (the MeSH boost
+    # floors, MAX_VARIANT_TERMS) move no verdict on most patients. The nine
+    # facts a resume DOES gate on are the stamp columns and they are unmoved.
+    #
+    # ONE TEXT COLUMN AND NOT TWENTY-NINE, unlike the eight cohort columns and
+    # the eight provenance ones next door, and the difference is what a reader
+    # ASKS. Those are scalars a query filters and orders on -- "which campaigns
+    # ran at a parallel bound above 2" is a numeric question about one column.
+    # This is a SET whose membership is expected to grow every pass, and a
+    # column per member would be a schema era per tunable; JSON in one column
+    # is what `llm_classifier_call_details` and `criterion_details` already do
+    # for the same reason. The cost is stated: SQLite cannot index into it, so a
+    # query that groups on one tunable extracts it with `json_extract` rather
+    # than reading a column, and a reader that wants a tunable indexed should
+    # promote THAT ONE to its own column rather than un-JSONing this.
+    #
+    # SORTED KEYS. The fixture serializes the same dict in DECLARED order,
+    # because a fixture is diffed and its literal order is what a reviewer
+    # reads; this artifact is QUERIED, and two rows written by two eras of
+    # TUNABLE_NAMES must compare as strings without a key reordering making
+    # them look different. `_run_tunables_json` is the one place that decides
+    # it.
+    #
+    # NULL MEANS ONE THING: this row predates the column. `_run_tunables_json`
+    # never returns None for a dict it could build, and the one case it cannot
+    # -- a member whose value will not serialize -- is COUNTED and stored as a
+    # JSON object naming the failure rather than dropped, so a reader never has
+    # to distinguish "old row" from "new row whose serialization failed".
+    "tunables": "TEXT",
 }
 
 
@@ -4405,6 +4464,131 @@ fact worth carrying, and the snapshot table simply has no row for it.
 """
 
 
+RUN_TUNABLES_FAULTS = Counter()
+"""Run rows whose ``tunables`` column could not be built from live config.
+
+Module-level, following ``RUN_RECORD_FAILURES`` immediately above and
+registered in ``oncotriage/degradation.py``'s run-end block beside it -- but a
+SEPARATE counter, not a ``start:`` key on that one, because that counter's own
+docstring states in as many words that it has no start-side key "because
+start_run_record RAISES rather than counting". That statement is true of every
+other thing that can go wrong at open, and it must stay true; folding a
+non-raising fault into it would make the sentence false for one key and there
+would be nothing to say which.
+
+Keys are ``serialize:{ExceptionType}``. A non-zero total means at least one run
+row of this campaign carries a marker object in ``runs.tunables`` instead of the
+knob settings -- see ``_run_tunables_json`` for why that is stored rather than
+NULL, and why this is counted rather than raised.
+"""
+
+
+def _run_tunables_json():
+    """The live tunables as JSON with sorted keys. NEVER RAISES, never ``None``.
+
+    ONE OWNER, TWO ARTIFACTS. The dict is ``config.effective_tunables()`` --
+    the same function, over the same closed ``config.TUNABLE_NAMES``, that
+    ``oncotriage/fixtures/capture.py`` records in every fixture's environment
+    block. That is the whole point of the extraction: a run row and a fixture
+    taken in one session cannot record different sets or different values.
+
+    RESOLVED HERE AND NOT TAKEN AS AN ARGUMENT, which is the opposite of what
+    ``fingerprint``, ``cohort`` and ``environment`` do one function down, and
+    the difference is what those three arguments are FOR. Each of them exists
+    because this module may not import the layer that produces it, and because
+    the caller has already resolved it once -- the fingerprint over the wire,
+    where a second reading could straddle an alias swap and disagree with the
+    first. Neither applies here: ``oncotriage.config`` is already imported at
+    the top of this file, and reading a module attribute is free, local and
+    cannot disagree with itself. Resolving it here is also what makes the
+    column's promise -- "the settings in force at the moment the row was
+    opened" -- true by construction rather than by every caller remembering to
+    pass a fresh dict, and it is what puts the column on EVERY run row rather
+    than only on the rows written by callers that were updated.
+
+    SORTED KEYS, WHERE THE FIXTURE USES DECLARED ORDER. This artifact is
+    QUERIED and compared as text; a fixture is DIFFED by a human, and its
+    literal order is what that reader follows. Sorting here means two rows
+    written under two eras of ``TUNABLE_NAMES`` differ only where the tunables
+    differ, rather than wherever the tuple was reordered.
+
+    ``separators`` IS PINNED for the same reason: the column's bytes are a
+    function of the values and of nothing else, so two identically-configured
+    runs produce byte-identical strings and ``GROUP BY tunables`` is a real
+    grouping rather than a whitespace lottery.
+
+    A VALUE THAT WILL NOT SERIALIZE IS COUNTED AND MARKED, NOT RAISED AND NOT
+    DROPPED. Three decisions, each with its own reason:
+
+      * NOT RAISED, unlike everything else ``start_run_record`` refuses on.
+        Those refusals are about the run being unattributable; this column is
+        PROVENANCE, and killing a campaign because a provenance field could not
+        be built inverts the value of the two. The deterministic case -- a
+        member of ``TUNABLE_NAMES`` whose declared value is not serializable --
+        cannot reach here at all: ``config._assert_tunable_names_resolve()``
+        refuses it at import, in the commit that adds it, naming the offender.
+        What is left is a caller that REBOUND a constant on the config module
+        to something unserializable, which is a test harness rather than a
+        campaign.
+      * NOT DROPPED TO NULL, because NULL in this column has exactly one
+        meaning -- this row predates era 15 -- and a second meaning would make
+        every query that separates the two eras wrong. A reader must never have
+        to distinguish "old row" from "new row whose serialization failed".
+      * MARKED, so the row says what happened. The marker is a JSON object, so
+        every reader that parses this column keeps working and gets a mapping
+        whose keys are not tunable names.
+    """
+    try:
+        # `allow_nan=False` MATCHES THE OWNER'S IMPORT-TIME GUARD, and both
+        # are about the same fact: Python's json writes `Infinity` and `NaN`,
+        # which are not valid JSON, and this column is meant to be QUERIED --
+        # SQLite's json_extract and every non-Python reader reject them. The
+        # declared set cannot contain one (the guard refuses it at import), so
+        # this can only fire on a runtime rebinding, and then it takes the
+        # counted-and-marked path below exactly as an unserializable value
+        # does. Setting it here and not there would let the two disagree about
+        # what "serializable" means.
+        return json.dumps(_config.effective_tunables(),
+                          sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=False, allow_nan=False)
+    except Exception as exc:                       # noqa: BLE001 -- counted
+        # THE NAME IS SANITIZED BEFORE IT GOES IN THE MARKER. An exception
+        # class name is a Python identifier in every case anyone will meet, and
+        # `type("a\"b", (Exception,), {})` is legal -- so an unsanitized name
+        # could put a bare quote inside the literal below and make the ONE
+        # value this function promises is always valid JSON invalid. Keeping
+        # only identifier characters costs nothing and makes the promise true
+        # rather than probable.
+        _name = "".join(c for c in type(exc).__name__ if c.isalnum() or c == "_")
+        RUN_TUNABLES_FAULTS[f"serialize:{_name or 'Unknown'}"] += 1
+        # THE TWO EMISSIONS ARE GUARDED, WHICH IS WHY THIS FUNCTION'S "NEVER
+        # RAISES" IS A PROPERTY RATHER THAN AN INHERITANCE. `console.out` and
+        # `log.warning` both funnel through `observability._emit_line`, which
+        # counts a broken stream into EMIT_FAILURES rather than raising -- so
+        # in practice neither can escape. In practice is not the same as by
+        # construction, and this function runs at the top of every campaign,
+        # before the first patient: a raise here would stop a run over a
+        # provenance field, which is the exact outcome the fault path exists to
+        # avoid. The counter is already incremented above, so a lost line still
+        # leaves the fault on the run-end report.
+        try:
+            console.out(f"[Run] WARNING: the tunables record could not be "
+                        f"serialized ({_name}: {exc}). The run row carries a "
+                        f"marker instead of the knob settings; the run itself "
+                        f"is unaffected.")
+            log.warning("run tunables record unavailable",
+                        event="run_tunables_unavailable",
+                        reason=f"serialize:{_name}")
+        except Exception:                          # noqa: BLE001 -- see above
+            pass
+        # A LITERAL, NOT ANOTHER json.dumps CALL. The one thing that has just
+        # been shown not to work in this process is json.dumps over this data;
+        # building the marker with it would be the same call in the handler for
+        # its own failure. With `_name` sanitized this string is valid JSON by
+        # inspection and cannot fail.
+        return '{"__tunables_error__":"%s"}' % (_name or "Unknown")
+
+
 def start_run_record(invocation_source, db_path=None, fingerprint=None,
                      resumed=None, cohort=None, environment=None):
     """Open a run row at db_path and return its ``runs.id``.
@@ -4533,6 +4717,19 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     # ``stop_reason IS NULL`` mean "this run was not stopped" on every row of
     # every era rather than only on the ones written before era 7.
     values["stop_reason"] = None
+
+    # WHAT EVERY KNOB WAS SET TO AT THIS MOMENT. Resolved here rather than
+    # taken as an argument -- see `_run_tunables_json` for why that is the
+    # opposite call from `fingerprint`, `cohort` and `environment` above, and
+    # for what it buys. RECORDED, NEVER GATED: nothing reads this column to
+    # decide anything, and it is deliberately absent from
+    # RUN_FINGERPRINT_COLUMNS, so a resume across a tunable change is exactly
+    # as permitted as it was before era 15.
+    #
+    # EVERY ROW GETS IT, INCLUDING A TEST'S. There is no argument a caller can
+    # forget and no None branch, so `tunables IS NULL` keeps its single meaning
+    # -- this row predates the column.
+    values["tunables"] = _run_tunables_json()
 
     # WHICH PATIENTS THIS CAMPAIGN COVERED. `cohort` is None for every caller
     # that runs no cohort, and all eight columns are then NULL -- see

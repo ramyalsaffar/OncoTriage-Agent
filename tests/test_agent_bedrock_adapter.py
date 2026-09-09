@@ -1477,11 +1477,24 @@ check("...and it is the ONLY one, so the signal is not buried",
 check("NON-DEGENERACY: two identical stamps disagree about nothing",
       run_fingerprint.disagreements(_stamp("x"), _stamp("x")), [])
 
-check("MATCHING_PROVIDER is recorded in the fixture tunables dict",
-      "\"MATCHING_PROVIDER\": config.MATCHING_PROVIDER," in
-      open(os.path.join(os.path.dirname(os.path.dirname(_ADAPTER_PATH)),
-                        "fixtures", "capture.py"), encoding="utf-8").read(),
-      True)
+# THIS WAS A SUBSTRING TEST OVER capture.py's SOURCE and it is a membership
+# test over the owner now. The tunables dict moved to
+# `config.TUNABLE_NAMES` / `config.effective_tunables()` when `runs.tunables`
+# (schema era 15) became its second consumer, so the literal it searched for no
+# longer exists -- and the property this check actually wants was never about
+# that text. Membership in the owner's tuple is what says the provider is
+# recorded, by both artifacts, whichever expression each writes.
+check("MATCHING_PROVIDER is recorded in the tunables dict every fixture and "
+      "every run row carries",
+      "MATCHING_PROVIDER" in config.TUNABLE_NAMES, True)
+check("...and its recorded VALUE is the live module attribute, so a probe that "
+      "moves the provider for its own run is recorded as the arm that SERVED "
+      "the call rather than the one the file was imported with",
+      config.effective_tunables()["MATCHING_PROVIDER"] is
+      config.MATCHING_PROVIDER, True)
+check("...non-degeneracy: a name that is NOT a member is reported as absent, "
+      "so the membership test can fail",
+      "MATCHING_CALL_MODE" in config.TUNABLE_NAMES, False)
 
 check("the credential has its own project-prefixed variable",
       settings.ENV_BEDROCK_API_KEY, "ONCOTRIAGE_BEDROCK_API_KEY")

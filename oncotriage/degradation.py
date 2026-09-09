@@ -567,6 +567,13 @@ _REGISTRY_SPEC = (
      "RUNNING with a NULL finished_at -- the rows it produced are fine and "
      "the record of the run that produced them is not. There is no start-side "
      "key here because start_run_record RAISES rather than counting"),
+    ("RUN_TUNABLES_FAULTS", _database_logger.RUN_TUNABLES_FAULTS,
+     "a run row's `tunables` column carries a MARKER rather than the knob "
+     "settings, because a value on the config module would not serialize. The "
+     "run and its rows are unaffected -- what is lost is the provenance that "
+     "says what this campaign was configured to do. Keyed by exception type. "
+     "It is separate from RUN_RECORD_FAILURES above because that counter has "
+     "no start-side key by design, and this fault happens at open"),
     ("RUN_METRICS_FLUSH_FAILURES", _database_logger.RUN_METRICS_FLUSH_FAILURES,
      "a run's HEALTH RECORD could not be written to `run_metrics`, so the "
      "persisted copy of this block is stale by at least one flush and a "

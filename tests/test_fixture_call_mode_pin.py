@@ -976,20 +976,40 @@ check("6a  ...non-degeneracy: the same reader finds a neighbouring key, so an "
       "MATCHING_SEED")
 
 
-def _tunable_keys(tree):
-    """The string keys of the `"tunables"` dict literal, by AST."""
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Dict):
-            for key, value in zip(node.keys, node.values):
-                if isinstance(key, ast.Constant) and key.value == "tunables" \
-                        and isinstance(value, ast.Dict):
-                    return [k.value for k in value.keys
-                            if isinstance(k, ast.Constant)]
-    return []
+# THE TUNABLES DICT HAS ONE OWNER AND THIS SECTION READS BOTH HALVES OF THE
+# LINK. It used to walk `capture.py` for a `"tunables"` dict LITERAL and take
+# its keys; the literal is gone, moved to `config.TUNABLE_NAMES` with
+# `config.effective_tunables()` building it, because `runs.tunables` (schema
+# era 15) records the same dict on every run row and two copies of a
+# twenty-nine-member literal are two copies to keep in step by hand.
+#
+# READING THE OWNER ALONE WOULD BE A CHECK ABOUT CONFIG, NOT ABOUT A FIXTURE.
+# So 6b-i pins that the fixture's `"tunables"` value IS the owner's call --
+# by AST, through the same `_env_key_source` reader 6a uses -- and everything
+# below then holds the doctrine over the owner's key set. Without 6b-i, a
+# `capture.py` that had gone back to a literal, or to a different function,
+# would satisfy every remaining check in this section while recording something
+# else entirely.
+check("6b-i the fixture records the OWNER's dict rather than a literal of its "
+      "own, so the run row and the fixture cannot record different tunables",
+      _env_key_source(_env_fn[0] if _env_fn else None, "tunables"),
+      "config.effective_tunables()")
+check("6b-i ...non-degeneracy: the same reader finds a neighbouring key, so an "
+      "absence above would be a finding rather than a reader that matched "
+      "nothing",
+      _env_key_source(_env_fn[0] if _env_fn else None, "sparse_model"),
+      "BM25_SPARSE_MODEL_NAME")
 
-
-_TUNABLES = _tunable_keys(_CAPTURE_TREE)
+_TUNABLES = list(config.TUNABLE_NAMES)
 check("6b  the tunables dict is non-degenerate", len(_TUNABLES) >= 25, True)
+check("6b  ...and the owner's function returns exactly the declared set, in "
+      "the declared order -- a fixture's dict is what the tuple says it is",
+      list(config.effective_tunables()), _TUNABLES)
+check("6b  ...and every value is the module attribute of the same name, which "
+      "is the read `diff_tunables()` makes, so the two cannot answer "
+      "differently for one key",
+      [k for k, v in config.effective_tunables().items()
+       if v is not getattr(config, k)], [])
 
 # EVERY RECORDED TUNABLE MUST BE THE NAME OF A CONFIG ATTRIBUTE. File 46's
 # diff_tunables() resolves each recorded key with getattr(config, name) and

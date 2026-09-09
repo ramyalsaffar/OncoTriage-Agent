@@ -204,38 +204,15 @@ from oncotriage.agent.state import (
     RETRIEVAL_CHANNELS,
 )
 from oncotriage.config import (
-    BM25_RETRIEVAL_SIZE,
-    CHARS_PER_TOKEN,
     COLLECTION_NAME,
-    CROSS_ENCODER_MAX_LENGTH,
     CROSS_ENCODER_MODEL,
     DATA_SNAPSHOT_DATE,
     EMBEDDING_MODEL,
     MATCHING_MAX_TOKENS,
     MATCHING_MODEL,
-    MATCHING_OUTPUT_SPLIT_FRACTION,
-    MATCHING_OUTPUT_TOKENS_PER_TRIAL,
     MATCHING_REASONING_EFFORT,
     MATCHING_SEED,
-    MAX_LLM_CLASSIFIER_RETRIES,
-    MAX_TRIALS_FOR_EVALUATION,
-    MAX_TRUNCATION_SPLITS,
-    MAX_VARIANT_TERMS,
-    MEDCPT_SCORE_FLOOR,
-    MESH_BOOST_DIRECT_FLOOR,
-    MESH_BOOST_DIRECT_FRACTION,
-    MESH_BOOST_PAN_FLOOR,
-    MESH_BOOST_PAN_FRACTION,
     Project_Name,
-    QUALITY_THRESHOLD_PERCENTILE,
-    RRF_K,
-    RRF_POOL_SIZE,
-    RRF_WEIGHT_CONDITIONS,
-    RRF_WEIGHT_CRITERIA,
-    RRF_WEIGHT_DENSE,
-    RRF_WEIGHT_TITLE,
-    TOP_K_CANDIDATES,
-    VECTOR_RETRIEVAL_SIZE,
 )
 from oncotriage.embedding import BM25_SPARSE_MODEL_NAME
 from oncotriage.extraction.stage import extract_patient_stage
@@ -2440,158 +2417,40 @@ def build_environment_block() -> Dict:
         # a fixture whose hash matches a run row's is a fixture whose
         # environment is fully recoverable from the database.
         "sparse_model": BM25_SPARSE_MODEL_NAME,
-        # The File 03 constants the prefix is a function of. A diff caused by
+        # THE CONFIG CONSTANTS THE PREFIX IS A FUNCTION OF. A diff caused by
         # editing one of these is a configuration change, not a refactor
         # regression, and without them recorded the two are indistinguishable.
-        "tunables": {
-            "BM25_RETRIEVAL_SIZE": BM25_RETRIEVAL_SIZE,
-            "VECTOR_RETRIEVAL_SIZE": VECTOR_RETRIEVAL_SIZE,
-            "RRF_POOL_SIZE": RRF_POOL_SIZE,
-            # The RRF fusion constants themselves, per this dict's own
-            # doctrine: only what is recorded HERE is compared by File 46's
-            # diff_tunables(), so a fusion-weight edit would otherwise move
-            # every Stage 2 pool and be reported as a prefix difference with no
-            # cause attached -- an afternoon spent hunting a refactor bug for a
-            # one-line config change. RRF_K is one entry, not two, because both
-            # fusion sites read the one constant.
-            #
-            # FUTURE CAPTURES ONLY. diff_tunables() iterates the keys the
-            # FIXTURE recorded, not the keys this dict declares, so adding
-            # these cannot move, invalidate or re-report any of the twelve
-            # fixtures already on disk -- they replay clean, unchanged and
-            # without recapture. The five entries begin describing captures
-            # taken after this change.
-            "RRF_K": RRF_K,
-            "RRF_WEIGHT_TITLE": RRF_WEIGHT_TITLE,
-            "RRF_WEIGHT_CONDITIONS": RRF_WEIGHT_CONDITIONS,
-            "RRF_WEIGHT_CRITERIA": RRF_WEIGHT_CRITERIA,
-            "RRF_WEIGHT_DENSE": RRF_WEIGHT_DENSE,
-            # The cross-encoder's sequence limit, on this dict's own doctrine
-            # and for the same reason the five RRF entries above are here: it
-            # decides how much of every trial text Stage 3 actually reads, so
-            # editing it changes every ranking -- and every tokenizer call
-            # passes truncation=True, so nothing anywhere would raise. Without
-            # it recorded, that edit reaches a replay as an unexplained
-            # cross_encoder difference with no cause attached.
-            #
-            # FUTURE CAPTURES ONLY, exactly as the RRF block above records:
-            # diff_tunables() iterates the keys the FIXTURE recorded, not the
-            # keys this dict declares, so adding this cannot move, invalidate
-            # or re-report any fixture already on disk.
-            "CROSS_ENCODER_MAX_LENGTH": CROSS_ENCODER_MAX_LENGTH,
-            "TOP_K_CANDIDATES": TOP_K_CANDIDATES,
-            "MAX_TRIALS_FOR_EVALUATION": MAX_TRIALS_FOR_EVALUATION,
-            # Was RERANK_SCORE_THRESHOLD, a floor on the fused RRF score that
-            # could never fire. A fixture captured before this change records
-            # the old name, and File 46's diff_tunables() will report it as
-            # "<no longer defined>" -- which is the correct finding, not a
-            # harness fault: the tunable that shaped that capture is gone.
-            "MEDCPT_SCORE_FLOOR": MEDCPT_SCORE_FLOOR,
-            "QUALITY_THRESHOLD_PERCENTILE": QUALITY_THRESHOLD_PERCENTILE,
-            "MESH_BOOST_DIRECT_FRACTION": MESH_BOOST_DIRECT_FRACTION,
-            "MESH_BOOST_PAN_FRACTION": MESH_BOOST_PAN_FRACTION,
-            "MESH_BOOST_DIRECT_FLOOR": MESH_BOOST_DIRECT_FLOOR,
-            "MESH_BOOST_PAN_FLOOR": MESH_BOOST_PAN_FLOOR,
-            "MAX_LLM_CLASSIFIER_RETRIES": MAX_LLM_CLASSIFIER_RETRIES,
-            "MAX_TRUNCATION_SPLITS": MAX_TRUNCATION_SPLITS,
-            "MATCHING_OUTPUT_TOKENS_PER_TRIAL": MATCHING_OUTPUT_TOKENS_PER_TRIAL,
-            "MATCHING_OUTPUT_SPLIT_FRACTION": MATCHING_OUTPUT_SPLIT_FRACTION,
-            # Both shape the Stage 5 request and therefore the verdicts. They
-            # are duplicated from the environment block above ON PURPOSE: only
-            # what is in "tunables" is compared by File 46's diff_tunables(),
-            # so a reasoning-effort change would otherwise be recorded and
-            # never reported, and a reader would hunt a refactor for a verdict
-            # difference that a one-line config edit caused.
-            "MATCHING_REASONING_EFFORT": MATCHING_REASONING_EFFORT,
-            # THE SAMPLING TEMPERATURE, on the identical argument to the two
-            # around it: it shapes the Stage 5 request and therefore the
-            # verdicts, and only what is in "tunables" is compared by File 46's
-            # diff_tunables(). Without it, moving the constant reaches a replay
-            # as an unexplained Stage 5 difference with no cause attached --
-            # which for THIS constant is the worst case of that failure, since
-            # a temperature change is precisely the thing that makes a
-            # recording and a fresh call disagree for a reason that is not a
-            # bug.
-            #
-            # THE RAW CONSTANT, NOT `matching_temperature_sent()`, AND THAT IS
-            # THIS DICT'S OWN RULE RATHER THAN A PREFERENCE. diff_tunables()
-            # resolves every recorded key with getattr(config, name), so a key
-            # must be the NAME OF A MODULE ATTRIBUTE; "MATCHING_TEMPERATURE_SENT"
-            # is not one -- the owner is a function -- and would be reported
-            # "<no longer defined>" on every future fixture, forever. That is
-            # the `MATCHING_CALL_MODE` trap recorded in the environment block
-            # above, and the resolution is the same: the EFFECTIVE value is
-            # recorded in `matching_temperature_sent` beside it, which nothing
-            # diffs, and the CONSTANT is what this dict compares.
-            #
-            # FUTURE CAPTURES ONLY, on this block's standing doctrine:
-            # diff_tunables() iterates the keys the FIXTURE recorded, not the
-            # keys this dict declares, so nothing on disk moves.
-            "MATCHING_TEMPERATURE": config.MATCHING_TEMPERATURE,
-            "MATCHING_MAX_TOKENS": MATCHING_MAX_TOKENS,
-            # THE INPUT GUARD'S BUDGET, ON EXACTLY THE ARGUMENT ABOVE. Both of
-            # the OUTPUT guard's denominators are already here -- MATCHING_MAX_
-            # TOKENS and MATCHING_OUTPUT_SPLIT_FRACTION -- and the input side's
-            # was not, which is the same asymmetry era 6 closed in the stored
-            # row. It decides the PARTITION: move it and a batch that shipped
-            # as one request ships as three, which changes what the judge is
-            # shown per call and therefore the verdicts, and a replay would
-            # report that as an unexplained cross_encoder-and-Stage-5
-            # difference with no cause attached.
-            #
-            # FUTURE CAPTURES ONLY, on this block's standing doctrine: File
-            # 46's diff_tunables() iterates the keys the FIXTURE recorded, not
-            # the keys this dict declares, so the twelve fixtures on disk are
-            # unmoved and replay clean without recapture. Verified by running.
-            "MATCHING_INPUT_TOKEN_BUDGET": config.MATCHING_INPUT_TOKEN_BUDGET,
-            # WHETHER AN EMPTY VERDICT IS ASKED AGAIN, on this dict's own
-            # doctrine. It decides which trials leave Stage 5 with a verdict at
-            # all, so a fixture whose replay reported a trial as
-            # `omitted_from_model_response` where the recording has a verdict
-            # would otherwise be an unexplained Stage 5 difference with no
-            # cause attached -- which is the exact failure the two constants
-            # above it were added for.
-            #
-            # INERT FOR EVERY FIXTURE THIS HARNESS CAN PRODUCE TODAY, AND
-            # RECORDED ANYWAY. `pin_call_mode_for_fixture_process` pins Stage 5
-            # to the GROUPED arm for both entry points, and the mechanism is
-            # per-trial only -- so it cannot move a capture made now. It is
-            # here for the per-trial capture the migration item owes, where it
-            # is the difference between a diff that names its cause and one
-            # that does not.
-            #
-            # FUTURE CAPTURES ONLY, on this block's standing doctrine: File
-            # 46's diff_tunables() iterates the keys the FIXTURE recorded, not
-            # the keys this dict declares, so nothing on disk moves.
-            "MATCHING_PER_TRIAL_EMPTY_RETRIES":
-                config.MATCHING_PER_TRIAL_EMPTY_RETRIES,
-            # WHICH PROVIDER SERVED STAGE 5. On this dict's own doctrine: a
-            # provider flip changes the endpoint, the request FORM (Responses
-            # rather than Chat Completions), the wire model id and -- because
-            # `seed` is not expressible on the Responses API -- the
-            # determinism of the answer. Without it recorded, that reaches a
-            # replay as an unexplained Stage 5 difference with no cause
-            # attached, which is the afternoon this dict exists to save.
-            #
-            # FUTURE CAPTURES ONLY, exactly as the RRF and
-            # CROSS_ENCODER_MAX_LENGTH blocks above record: diff_tunables()
-            # iterates the keys the FIXTURE recorded, not the keys this dict
-            # declares, so adding this cannot move, invalidate or re-report any
-            # of the twelve fixtures already on disk. They replay clean,
-            # unchanged and without recapture.
-            # READ OFF THE MODULE rather than from the name imported at the
-            # top of this file, and it is the ONLY entry here that is. Every
-            # other tunable in this dict is fixed for the life of a process;
-            # this one is not -- `bedrock_probe.py` sets it on the config
-            # module for its own run, and a test may -- so a bound copy would
-            # record the value this file was IMPORTED with rather than the one
-            # that served the capture. A fixture whose environment block
-            # disagrees with the run it describes is worse than one that omits
-            # the field.
-            "MATCHING_PROVIDER": config.MATCHING_PROVIDER,
-            "MAX_VARIANT_TERMS": MAX_VARIANT_TERMS,
-            "CHARS_PER_TOKEN": CHARS_PER_TOKEN,
-        },
+        #
+        # THE DICT HAS ONE OWNER AND IT IS NOT HERE. It was a dict literal in
+        # this function; `oncotriage/config.py:effective_tunables()` is that
+        # literal, and `config.TUNABLE_NAMES` is its key set, with the whole of
+        # the documentation that used to sit here -- both doctrines, what
+        # decides membership, and the per-entry arguments -- moved with it.
+        # THE REASON IS THE SECOND CONSUMER: `runs.tunables` (schema era 15)
+        # records the same dict on every run row, and a second copy of a
+        # twenty-nine-member literal is a second copy to keep in step by hand.
+        # It could not live in THIS file: a normal batch run would then have to
+        # import the fixture harness, which drags the agent, the graph, the
+        # parser and four proxies into every campaign's import graph.
+        #
+        # IT IS RESOLVED AT CALL TIME, off the config MODULE, which is what the
+        # entry for `MATCHING_PROVIDER` used to say of itself alone and is now
+        # true of all twenty-nine -- see the doctrine block at TUNABLE_NAMES.
+        # A capture taken under `bedrock_probe.py`'s provider override or
+        # `tests/_provider_pin.py`'s pin therefore records the arm that SERVED
+        # it rather than the one this file was imported with.
+        #
+        # THE ORDER IS THE LITERAL'S ORDER, so a capture taken after the
+        # extraction serializes to the identical bytes one taken before it
+        # would have: `write_fixture` uses `json.dumps` without `sort_keys`, so
+        # insertion order is in the file. Proved by equality against the lifted
+        # literal before it was deleted, not by inspection.
+        #
+        # ADDING A MEMBER IS FUTURE CAPTURES ONLY, and that has not changed:
+        # `diff_tunables()` iterates the keys the FIXTURE recorded, not the
+        # keys the owner declares, so a new member cannot move, invalidate or
+        # re-report any fixture already on disk.
+        "tunables": config.effective_tunables(),
     }
 
 

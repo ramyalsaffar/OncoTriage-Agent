@@ -77,6 +77,7 @@ deferred import, and it is stated here rather than discovered from a stray
 "[Paths] Project root" line in a log.
 """
 
+import json
 import sys
 
 import httpx
@@ -6598,6 +6599,308 @@ S3_PRICING = {
     "standard_usd_per_gb_month": 0.023,
     "put_usd_per_1000": 0.005,
 }
+
+
+#------------------------------------------------------------------------------
+# THE EFFECTIVE TUNABLES: ONE OWNER FOR THE DICT TWO ARTIFACTS RECORD
+#------------------------------------------------------------------------------
+#
+# THE CONSTANTS THAT SHAPE WHAT THE PIPELINE PRODUCES, AS A NAMED SET AND AS A
+# FUNCTION THAT READS THEM. Two artifacts record it and they must not be able to
+# disagree:
+#
+#   * every characterization fixture, in `environment["tunables"]`, which
+#     `oncotriage/fixtures/replay.py:diff_tunables()` compares against the live
+#     config so that a prefix difference caused by a one-line config edit is
+#     REPORTED as a config edit rather than hunted as a refactor bug;
+#   * every `runs` row, in the `tunables` column, so that a campaign's knob
+#     settings are recoverable from the artifact months later instead of only
+#     for as long as nobody edits this file.
+#
+# IT WAS A DICT LITERAL INSIDE `oncotriage/fixtures/capture.py`, AND THAT IS WHY
+# IT IS HERE NOW. A second copy in the run-row writer would be a second copy to
+# keep in step by hand -- the shape this project has had to remove for the
+# MedCPT checkpoint (pass 20f-2), the BM25 sparse model (pass 20c-3a) and the
+# per-model cost arithmetic (item 38), each time after the two copies had
+# already drifted. The owner is HERE and not there because a normal run must not
+# depend on fixture-capture machinery: `oncotriage/storage/database_logger.py`
+# already imports this module and importing `oncotriage.fixtures.capture` would
+# put the agent, the graph, the parser and four proxies into every batch run's
+# import graph.
+#
+# ---------------------------------------------------------------------------
+# TWO DOCTRINES, AND BOTH ARE NOW MECHANICAL RATHER THAN CONVENTIONAL
+# ---------------------------------------------------------------------------
+#
+# (1) EVERY KEY IS THE NAME OF AN ATTRIBUTE OF THIS MODULE. `diff_tunables()`
+#     resolves each recorded key with `getattr(config, name)` and reports
+#     "<no longer defined>" when it misses -- so a key that is not an attribute
+#     is reported as MOVED on every future fixture, forever, and the harness
+#     that exists to explain a diff becomes the thing manufacturing one. As a
+#     dict literal that rule was a convention a reviewer had to hold: the key
+#     and the value expression were written separately, so
+#     `"MATCHING_CALL_MODE": config.matching_call_mode()` was one keystroke away
+#     and would have looked right. Here the key IS the expression -- the value
+#     is `globals()[name]` -- so a key that is not an attribute cannot be
+#     recorded at all, and `_assert_tunable_names_resolve()` below turns it into
+#     an import-time failure that names the offender rather than a phantom diff
+#     nobody can explain.
+#
+#     THAT IS WHY `MATCHING_CALL_MODE` AND `MATCHING_TEMPERATURE_SENT` ARE NOT
+#     MEMBERS and the fixture records both as top-level environment fields
+#     instead: the owner of each is a FUNCTION, so neither is an attribute name,
+#     and `MATCHING_PER_TRIAL_CALLS_ENABLED` is one but is the wrong fact --
+#     under `pin_matching_call_mode` it can read True on a run that was grouped.
+#     `_assert_tunable_names_resolve()` would refuse the first two and only a
+#     reader can refuse the third; the comment is what keeps it out.
+#
+# (2) EVERY VALUE IS READ OFF THE MODULE AT CALL TIME. `globals()` inside this
+#     module IS `sys.modules[__name__].__dict__`, and this module defines no
+#     PEP 562 `__getattr__`, so `globals()[name]` and the consumer's
+#     `getattr(config, name)` are the same read of the same dict -- which is
+#     what makes the doctrine one mechanism rather than two that agree today.
+#
+#     THE FIXTURE DICT USED TO BE A MIXTURE AND ITS OWN COMMENT SAID SO WRONGLY.
+#     Twenty-five entries were the names imported at the top of `capture.py`,
+#     bound at import; four (`MATCHING_TEMPERATURE`, `MATCHING_INPUT_TOKEN_
+#     BUDGET`, `MATCHING_PER_TRIAL_EMPTY_RETRIES`, `MATCHING_PROVIDER`) read
+#     `config.X`, and the comment on the last of them claimed it was "the ONLY
+#     entry here that is" and that "every other tunable in this dict is fixed
+#     for the life of a process". Both halves had stopped being true: the other
+#     three read the module, and `bedrock_probe.py`, `tests/_provider_pin.py`
+#     and this file's own `provider()` helpers all move constants on the module
+#     for the duration of a run. A bound copy records the value this FILE was
+#     imported with rather than the value that SERVED the call, and an artifact
+#     that disagrees with the run it describes is worse than one that omits the
+#     field.
+#
+#     THE COST IS STATED: a caller that rebinds one of these on the module gets
+#     the rebound value recorded, which is the point, and a caller that rebinds
+#     a name this tuple does NOT list still gets no record of having done so --
+#     this set is closed, and widening it is a deliberate edit.
+#
+# ---------------------------------------------------------------------------
+# WHAT IS IN THE SET, AND WHAT DECIDES IT
+# ---------------------------------------------------------------------------
+# A constant is a member when moving it moves what the pipeline PRODUCES -- the
+# retrieval pools and their fusion, the rerank budget, the Stage 4 gate, and the
+# Stage 5 request's shape, arm and retry policy. It is NOT a member when it
+# moves only what the pipeline COSTS, how long it takes, or where it writes:
+# `MAX_WORKERS`, `SPEND_CAP_USD`, the SQLite knobs and the cohort seeds are all
+# recorded elsewhere (`runs` carries the cohort columns and the spend gate its
+# own counters) and putting them here would make every fixture report a diff for
+# an operator decision that changed no verdict.
+#
+# THE ORDER IS THE ORDER THE FIXTURE LITERAL HAD, so a capture taken after this
+# extraction serializes its `tunables` dict to the identical byte sequence a
+# capture taken before it would have -- `write_fixture` uses `json.dumps`
+# without `sort_keys`, so insertion order is in the file. The run-row column
+# sorts its keys instead, because that artifact is queried rather than diffed
+# and a stable serialization is what makes two rows comparable as strings.
+# THE VALUE TYPES A MEMBER MAY HAVE. Read only by the guard below, as the
+# diagnosis it prints when a round trip fails -- the round trip is the rule and
+# this is what turns "something in here will not serialize" into a name. It is
+# the JSON-native scalar set on purpose: every one of them round-trips to
+# itself, which is exactly the property the guard enforces.
+_TUNABLE_VALUE_TYPES = (str, int, float, bool, type(None))
+
+
+TUNABLE_NAMES = (
+    # ── STAGE 2: what is retrieved, and how the two channels are fused ──────
+    "BM25_RETRIEVAL_SIZE",
+    "VECTOR_RETRIEVAL_SIZE",
+    "RRF_POOL_SIZE",
+    # RRF_K is one entry and not two: both fusion sites read the one constant,
+    # which is what pass 20f-1 made true by construction when it deleted
+    # `RERANK_RRF_K`.
+    "RRF_K",
+    "RRF_WEIGHT_TITLE",
+    "RRF_WEIGHT_CONDITIONS",
+    "RRF_WEIGHT_CRITERIA",
+    "RRF_WEIGHT_DENSE",
+    # ── STAGE 3: how much of each trial the cross-encoder actually reads ─────
+    # Every tokenizer call passes truncation=True, so moving this changes every
+    # ranking and NOTHING RAISES. Without it recorded, that edit reaches a
+    # replay as an unexplained cross_encoder difference with no cause attached.
+    "CROSS_ENCODER_MAX_LENGTH",
+    "TOP_K_CANDIDATES",
+    # ── STAGE 4: the gate, its two knobs, and the cost cap ──────────────────
+    "MAX_TRIALS_FOR_EVALUATION",
+    # Was RERANK_SCORE_THRESHOLD. A fixture captured before that rename records
+    # the old name and `diff_tunables()` reports it "<no longer defined>", which
+    # is the correct finding rather than a harness fault: the tunable that
+    # shaped that capture is gone.
+    "MEDCPT_SCORE_FLOOR",
+    "QUALITY_THRESHOLD_PERCENTILE",
+    "MESH_BOOST_DIRECT_FRACTION",
+    "MESH_BOOST_PAN_FRACTION",
+    "MESH_BOOST_DIRECT_FLOOR",
+    "MESH_BOOST_PAN_FLOOR",
+    # ── STAGE 5: the request, the arm, the budgets and the retry policy ─────
+    "MAX_LLM_CLASSIFIER_RETRIES",
+    "MAX_TRUNCATION_SPLITS",
+    "MATCHING_OUTPUT_TOKENS_PER_TRIAL",
+    "MATCHING_OUTPUT_SPLIT_FRACTION",
+    "MATCHING_REASONING_EFFORT",
+    # THE CONSTANT, NOT `matching_temperature_record()`. The effective wire fact
+    # has a function for an owner and therefore no attribute name, so it is
+    # recorded beside this dict as `matching_temperature_sent` (in the fixture)
+    # and in its own column (in the run row) rather than smuggled in here under
+    # a key `getattr` would miss.
+    "MATCHING_TEMPERATURE",
+    "MATCHING_MAX_TOKENS",
+    # The INPUT guard's budget. It decides the PARTITION: move it and a batch
+    # that shipped as one request ships as three, which changes what the judge
+    # is shown per call and therefore the verdicts.
+    "MATCHING_INPUT_TOKEN_BUDGET",
+    # Whether an empty verdict is asked again -- which decides which trials
+    # leave Stage 5 with a verdict at all.
+    "MATCHING_PER_TRIAL_EMPTY_RETRIES",
+    # WHICH PROVIDER SERVED STAGE 5. A flip changes the endpoint, the request
+    # form, the wire model id and -- because `seed` is not expressible on the
+    # Responses API -- the determinism of the answer.
+    "MATCHING_PROVIDER",
+    # ── STAGE 1 and the shared token arithmetic ─────────────────────────────
+    "MAX_VARIANT_TERMS",
+    "CHARS_PER_TOKEN",
+)
+"""The config constants recorded as `tunables` by every fixture and every run row.
+
+Closed, ordered, and every member is the name of an attribute of this module --
+see the block above for both doctrines and for what decides membership.
+"""
+
+
+def _assert_tunable_names_resolve():
+    """Refuse at import if a name in ``TUNABLE_NAMES`` is not an attribute here.
+
+    A ``RuntimeError`` and not an ``assert``: ``python -O`` deletes asserts, and
+    this is a schema-consistency guard rather than a debugging aid -- the same
+    reason ``start_run_record``'s unset-column guard is one.
+
+    IT IS AN IMPORT-TIME REFUSAL BECAUSE THE ALTERNATIVE IS SILENT AND
+    PERMANENT. A name that is not an attribute is not a crash at capture time;
+    it is a fixture that records a key ``diff_tunables()`` will report as
+    "<no longer defined>" on every replay for the life of that fixture, and a
+    run row carrying a key nothing can resolve. Both look like findings.
+    Failing here names the offending string in the commit that added it.
+    """
+    _missing = [name for name in TUNABLE_NAMES if name not in globals()]
+    if _missing:
+        raise RuntimeError(
+            f"TUNABLE_NAMES lists {', '.join(_missing)}, which "
+            f"oncotriage/config.py does not define. Every member must be the "
+            f"name of a module attribute -- see the block above TUNABLE_NAMES "
+            f"for why a key that is not one becomes a permanent phantom diff.")
+    _duplicates = sorted({n for n in TUNABLE_NAMES
+                          if TUNABLE_NAMES.count(n) > 1})
+    if _duplicates:
+        raise RuntimeError(
+            f"TUNABLE_NAMES lists {', '.join(_duplicates)} more than once. The "
+            f"dict it builds would be shorter than the tuple, so a reader "
+            f"counting members would disagree with a reader reading them.")
+    # AND EVERY DECLARED VALUE SERIALIZES, checked here rather than at the two
+    # writers. Both artifacts this dict feeds are JSON: a fixture is a gzipped
+    # JSON document and `runs.tunables` is a JSON string, so a member whose
+    # value will not serialize breaks BOTH of them -- deterministically, on
+    # every capture and every run of the era that introduced it. Catching it
+    # here turns a whole era of broken artifacts into one refusal in the commit
+    # that adds the offender, which names it.
+    #
+    # THE FAILURE THIS DOES *NOT* COVER is a caller REBINDING one of these
+    # names on this module to something unserializable at run time -- a test
+    # harness, not a campaign. `database_logger._run_tunables_json` counts and
+    # marks that one rather than raising, and its docstring says why.
+    #
+    # AND EVERY DECLARED VALUE SURVIVES A JSON ROUND TRIP -- which is STRICTLY
+    # MORE than "serializes", and the difference is a real trap rather than
+    # fastidiousness. A tuple SERIALIZES fine and comes back a LIST, so a
+    # fixture would record `[1, 2]`, `diff_tunables()` would compare it against
+    # the live `(1, 2)`, find them unequal, and report that member as MOVED on
+    # every replay of every fixture, forever -- the exact permanent phantom
+    # diff the resolvability rule above exists to prevent, reached through the
+    # value instead of through the key. `config.ABLATION_OUTCOME_METRICS` is a
+    # list and `MATCHING_CALL_MODES` is a tuple, so this is one plausible edit
+    # away rather than hypothetical. A set does not serialize at all and is
+    # caught by the same call.
+    #
+    # `allow_nan=False` IS THE HALF THE ROUND TRIP CANNOT DO ON ITS OWN.
+    # Python's json writes `Infinity` and `NaN` by default, which are NOT valid
+    # JSON -- and `json.loads` reads them back, so `float("inf")` survives a
+    # Python round trip and would sail through the equality below while putting
+    # a token no other reader accepts into a column meant to be queried
+    # (`jq`, SQLite's `json_extract`, any non-Python consumer). `nan` is caught
+    # by the equality (nan != nan) and `inf` is not, which is exactly the kind
+    # of half-coverage that reads as coverage. A "no cap" tunable expressed as
+    # `float("inf")` is one plausible edit away.
+    _live = {n: globals()[n] for n in TUNABLE_NAMES}
+    try:
+        _round_tripped = json.loads(
+            json.dumps(_live, sort_keys=True, allow_nan=False))
+    except (TypeError, ValueError) as exc:
+        _bad = sorted(n for n in TUNABLE_NAMES
+                      if not isinstance(_live[n], _TUNABLE_VALUE_TYPES))
+        raise RuntimeError(
+            f"TUNABLE_NAMES declares a value that will not serialize to JSON "
+            f"({type(exc).__name__}: {exc}). Both artifacts that record this "
+            f"dict are JSON documents, so the offender breaks every fixture "
+            f"and every run row of its era. Suspect members, by type: "
+            f"{', '.join(_bad) if _bad else '(none by type -- read the error)'}"
+        ) from exc
+    _unstable = sorted(n for n in TUNABLE_NAMES
+                       if _round_tripped[n] != _live[n]
+                       or type(_round_tripped[n]) is not type(_live[n]))
+    if _unstable:
+        raise RuntimeError(
+            f"TUNABLE_NAMES declares {', '.join(_unstable)}, whose value does "
+            f"not survive a JSON round trip -- it serializes and comes back a "
+            f"DIFFERENT value or a different type (a tuple comes back a list). "
+            f"diff_tunables() compares a fixture's recorded value against the "
+            f"live one, so such a member is reported MOVED on every replay of "
+            f"every fixture, forever. Store a JSON-native type, or record the "
+            f"fact somewhere that is not compared.")
+
+
+_assert_tunable_names_resolve()
+
+
+def effective_tunables():
+    """The tunables in force RIGHT NOW, as ``{name: value}`` in declared order.
+
+    THE ONE OWNER. ``oncotriage/fixtures/capture.py`` calls it for a fixture's
+    ``environment["tunables"]`` and ``oncotriage/storage/database_logger.py``
+    calls it for the ``runs.tunables`` column, so the two artifacts cannot
+    record different sets or different values of one set.
+
+    EVERY VALUE IS READ HERE, AT CALL TIME, off this module's own namespace.
+    ``globals()`` is ``sys.modules[__name__].__dict__`` and this module defines
+    no PEP 562 ``__getattr__``, so this is the identical read a consumer makes
+    with ``getattr(config, name)`` -- measured in
+    ``tests/test_run_tunables_record.py`` rather than argued, because "the same
+    dict" is exactly the kind of claim that stops being true when somebody adds
+    a module ``__getattr__``.
+
+    A FRESH DICT PER CALL, never a cached one. Two callers may hold it across a
+    config change -- a probe pinning a provider, a test rebinding a constant --
+    and a shared mapping would let one caller's later read be another caller's
+    earlier value. The MAPPING is therefore the caller's to mutate; the VALUES
+    are shared references to the module's own, which is safe only because every
+    member is an immutable scalar. That is not a coincidence to rely on
+    silently: ``_assert_tunable_names_resolve()`` requires every declared value
+    to survive a JSON round trip unchanged and in the same type, and no mutable
+    container does (a list comes back a list but is a shared reference; a tuple
+    comes back a list and fails the type test outright). If that rule is ever
+    relaxed, this function has to copy.
+
+    Returns:
+        ``dict``: JSON-serializable by construction today -- every member is an
+        int, float or str -- and NOT asserted to be here. The run-row writer
+        serializes it and is the one place that has to survive a member whose
+        value is not; see ``_run_tunables_json`` there for what it does then.
+    """
+    _module = globals()
+    return {name: _module[name] for name in TUNABLE_NAMES}
+
 
 
 #------------------------------------------------------------------------------
