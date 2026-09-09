@@ -124,6 +124,11 @@ import subprocess
 import sys
 import tempfile
 import time
+# STDLIB SINCE 3.11, WHICH IS THE INTERPRETER BOTH THE IMAGE AND THIS JOB PIN.
+# It is what lets --print-requirements read the project's own pins BEFORE
+# anything is installed, which is the whole point of that flag: the CI step
+# that installs from it cannot depend on a package it is about to install.
+import tomllib
 
 
 _SCRIPTS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -197,12 +202,107 @@ _OID_RE = re.compile(r"^[0-9a-f]{40}$")
 # new module-scope import appears in that chain. A list that rots silently is
 # the failure mode; this one rots loudly.
 SCANNER_IMPORT_REQUIREMENTS = {
-    # import name    pip requirement
+    # import name    distribution name
     "dotenv":        "python-dotenv",
     "httpx":         "httpx",
     "openai":        "openai",
     "qdrant_client": "qdrant-client",
 }
+
+PYPROJECT_PATH = os.path.join(_REPO_ROOT, "pyproject.toml")
+
+
+class RequirementsUnavailable(RuntimeError):
+    """The pinned requirements could not be derived, so nothing was printed.
+
+    A RuntimeError subclass on the same precedent as ScanUnavailable below: a
+    broad ``except ValueError`` must not be able to turn "I could not read the
+    dependency list" into "here is the dependency list".
+    """
+
+
+def _declared_pins(pyproject_path=None):
+    """{distribution name: the exact requirement string pyproject.toml declares}.
+
+    Keys are normalised the way PEP 503 normalises them, so `python_dotenv`,
+    `python-dotenv` and `Python-Dotenv` are one key.
+    """
+    path = PYPROJECT_PATH if pyproject_path is None else pyproject_path
+    try:
+        with open(path, "rb") as handle:
+            data = tomllib.load(handle)
+    except Exception as exc:
+        raise RequirementsUnavailable(
+            f"could not read the project's dependency list at {path}: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+
+    declared = data.get("project", {}).get("dependencies")
+    if not declared:
+        raise RequirementsUnavailable(
+            f"{path} declares no project.dependencies, so there is nothing to "
+            f"pin against. The gate will not fall back to unpinned names: an "
+            f"unpinned install that looks pinned is the state this derivation "
+            f"exists to remove."
+        )
+
+    pins = {}
+    for requirement in declared:
+        # The distribution name is everything before the first character that
+        # can begin a version specifier, an extra or an environment marker.
+        # No packaging.requirements here: this function must work BEFORE
+        # anything is installed, so it is stdlib only.
+        name = re.split(r"[<>=!~\[;\s]", requirement.strip(), maxsplit=1)[0]
+        if name:
+            pins[re.sub(r"[-_.]+", "-", name).lower()] = requirement.strip()
+    return pins
+
+
+def scanner_requirements(pyproject_path=None):
+    """The pip arguments the CI step installs from, PINNED to this project's own.
+
+    WHY THE PINS ARE HERE AT ALL, AND WHAT CHANGED. Until 2026-09-08 this
+    returned the four bare distribution names, under an argument that is half
+    right and was half wrong: nothing from any of the four is CALLED on this
+    code path -- they are satisfied so that an ``import`` statement succeeds,
+    and the detectors are ``re`` over ``bytes`` -- so the VERSIONS are
+    immaterial to what the gate DECIDES. What that argument missed is what the
+    versions decide about whether the gate RUNS. An unpinned install resolves
+    whatever is newest on the day, so an upstream release that fails to import
+    on the container's Python, or that moves a module-scope symbol
+    ``oncotriage/config.py`` reads, turns this gate into exit 3 -- "the scan
+    could not run" -- with NOTHING IN THIS REPOSITORY HAVING CHANGED, and the
+    only remedy is an emergency edit to a security gate.
+
+    IT IS STILL NOT A SECOND DEPENDENCY LIST, which is the thing the old
+    argument was protecting and is right to protect. The pins are READ from
+    ``pyproject.toml`` -- the one owner this project already declares, and the
+    one it deleted ``requirements/requirements.txt`` to establish. Nothing is
+    retyped, so nothing can drift; a pin bumped there moves this install with
+    no edit here.
+
+    ``httpx`` IS DELIBERATELY EMITTED BARE, and that is the correct answer
+    rather than a gap. It is NOT a declared dependency of this project -- it
+    arrives transitively, and ``oncotriage/config.py`` imports it at module
+    scope on the strength of that. ``openai==1.99.9`` declares
+    ``httpx<1,>=0.23.0``, so pinning it here would be inventing a constraint
+    the project does not make, and would be WEAKER than what the resolver
+    already does: openai's own declared range is the one openai was tested
+    against. A name pyproject declares nothing for is emitted as the bare
+    distribution name and the resolver honours whatever depends on it.
+
+    Raises:
+        RequirementsUnavailable: the dependency list could not be read, or
+            declares nothing. It refuses rather than falling back to the four
+            bare names, because an unpinned install that LOOKS pinned is
+            invisible, and invisible is the whole failure mode being removed.
+    """
+    pins = _declared_pins(pyproject_path)
+    out = []
+    for distribution in sorted(SCANNER_IMPORT_REQUIREMENTS.values()):
+        key = re.sub(r"[-_.]+", "-", distribution).lower()
+        out.append(pins.get(key, distribution))
+    return out
 
 
 class ScanUnavailable(RuntimeError):
@@ -723,15 +823,33 @@ def main(argv=None):
     parser.add_argument("--print-requirements", action="store_true",
                         help="print the pip requirements this gate needs in "
                              "order to import the project's scanner, space "
-                             "separated, and exit 0. The CI step installs from "
-                             "this rather than repeating the list in YAML.")
+                             "separated, and exit 0. PINNED to pyproject.toml's "
+                             "own declarations, read at run time -- a name it "
+                             "declares nothing for (httpx, which arrives "
+                             "transitively through openai) is printed bare. The "
+                             "CI step installs from this rather than repeating "
+                             "the list in YAML. Exits 3 if the dependency list "
+                             "cannot be read, rather than falling back to "
+                             "unpinned names.")
     parser.add_argument("--require-gitleaks", action="store_true",
                         help="exit 3 when gitleaks is not on PATH, instead of "
                              "running the project scanner alone and saying so.")
     args = parser.parse_args(argv)
 
     if args.print_requirements:
-        print(" ".join(sorted(SCANNER_IMPORT_REQUIREMENTS.values())))
+        # EXIT 3, the same code every other "the scan could not run" path uses.
+        # The CI step is `pip install $(... --print-requirements)`: a refusal
+        # here prints nothing on stdout, so pip is invoked with no arguments
+        # and fails loudly on its own -- and the step carries `set -euo
+        # pipefail` so the substitution's own non-zero exit is what fails
+        # first. Either way the operator sees this message rather than a gate
+        # that quietly installed nothing and then exited 3 about the scanner.
+        try:
+            print(" ".join(scanner_requirements()))
+        except RequirementsUnavailable as exc:
+            print(f"COULD NOT DERIVE THE INSTALL REQUIREMENTS: {exc}",
+                  file=sys.stderr)
+            return 3
         return 0
 
     binary = gitleaks_binary()

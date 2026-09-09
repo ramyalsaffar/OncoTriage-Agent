@@ -203,6 +203,41 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
+    env:
+      # NO TELEMETRY LEAVES THIS JOB, DECLARED RATHER THAN INHERITED FROM A
+      # THIRD PARTY'S HEURISTIC.
+      #
+      # WHAT IS AND IS NOT BEING FIXED, because the honest reading matters:
+      # this closes NO live leak. Measured 2026-09-08 against the installed
+      # mlflow-skinny 3.15.1, running tests/test_tracking_mlflow_index.py with
+      # every outbound call trapped -- a bare developer machine resolves
+      # config.mlflow-telemetry.io once, and `CI=true` alone brings that to
+      # zero. mlflow's own `_is_ci_env_or_testing()` checks a set that includes
+      # CI and GITHUB_ACTIONS, both of which Actions sets on every step, so
+      # there is nothing escaping this job today.
+      #
+      # It is set anyway because that no-egress property is a THIRD-PARTY
+      # HEURISTIC that can change in any release, and this project's standing
+      # rule is that a property nothing here enforces is a property that rots.
+      # MLFLOW_DISABLE_TELEMETRY is mlflow's DECLARED opt-out (a
+      # _BooleanEnvironmentVariable in mlflow/environment_variables.py), read
+      # first in is_telemetry_disabled(); DO_NOT_TRACK works identically and is
+      # not set as well, because two mechanisms for one fact is the shape this
+      # project keeps removing.
+      #
+      # IT IS JOB env RATHER THAN A CODE SEAM IN oncotriage/tracking.py, AND
+      # THAT IS FORCED. `mlflow/__init__.py` calls `set_telemetry_client()` at
+      # line 450 -- AT IMPORT -- and that is where `is_telemetry_disabled()` is
+      # consulted. Measured both orders: setting the variable BEFORE
+      # `import mlflow` gives `get_telemetry_client() is None`, and setting it
+      # AFTER leaves a live TelemetryClient. `tracking._configure_store` runs
+      # after `_import_mlflow()`, so the seam that already writes
+      # MLFLOW_ALLOW_FILE_STORE only-when-unset is TOO LATE for this one, and a
+      # seam that reached far enough would still only cover callers that go
+      # through oncotriage.tracking. Job env is set before the interpreter
+      # starts, which is before every import, for every step.
+      MLFLOW_DISABLE_TELEMETRY: 'true'
+
     defaults:
       run:
         working-directory: '03- Code'
@@ -744,10 +779,50 @@ jobs:
         # owner, and section 10 of tests/test_secret_scan_gate.py re-derives the
         # closure by AST and fails when a new module-scope import appears in
         # that chain — so this step cannot silently start installing too little.
+        #
+        # AND IT IS PINNED, AS OF 2026-09-08. That flag now reads
+        # pyproject.toml — the one dependency list this project declares, the
+        # one it deleted requirements/requirements.txt to establish — and emits
+        # each name with the project's own pin. Nothing is retyped here, so
+        # nothing can drift, and a pin bumped there moves this install with no
+        # edit to this file. Before that the four resolved to whatever was
+        # newest on the day, so an upstream release that failed to import on
+        # 3.11 turned a SECURITY GATE into exit 3 with nothing in this
+        # repository having changed. One name is emitted bare on purpose:
+        # httpx is not a declared dependency, it arrives through openai's own
+        # range, and inventing a constraint here would be weaker than the range
+        # openai was tested against.
+        #
+        # THE DERIVATION IS ASSIGNED TO A VARIABLE FIRST, AND THAT IS NOT
+        # STYLE. Under `set -e`, a command substitution that exits non-zero IN
+        # AN ARGUMENT POSITION does not fail the command -- `pip install
+        # $(refusing-script)` leaves the shell looking at pip's status, so a
+        # step written that way exits 0 when the derivation REFUSED, which is
+        # exactly the shape it was written to be loud in. MEASURED 2026-09-08
+        # on bash 3.2.57 (this machine's): rc=0 for the argument form and rc=3
+        # for the assignment form, same refusing script.
+        #
+        # THE RUNNER IS bash 5.x AND THAT WAS NOT MEASURED HERE -- no bash 5 was
+        # available -- so the emptiness guard below carries the guarantee rather
+        # than the `set -e` behaviour. It is version-independent by
+        # construction: a refusal prints nothing on stdout, so `$reqs` is empty,
+        # so the step fails with a message naming the derivation. `set -e` is
+        # kept because where it does fire it fails one line EARLIER, with
+        # --print-requirements' own stderr still the last thing printed.
+        #
+        # `$reqs` is deliberately UNQUOTED at the call: the flag emits one
+        # space-separated requirement per name and pip takes them as separate
+        # arguments.
         run: |
+          set -euo pipefail
           python -m pip install --quiet --upgrade pip
-          python -m pip install --quiet \
-            $(python .github/scripts/secret_scan_gate.py --print-requirements)
+          reqs=$(python .github/scripts/secret_scan_gate.py --print-requirements)
+          if [ -z "$reqs" ]; then
+            echo "::error title=Install requirements not derived::secret_scan_gate.py --print-requirements produced nothing; see its message above." >&2
+            exit 1
+          fi
+          echo "pinned from pyproject.toml: $reqs"
+          python -m pip install --quiet $reqs
 
       - name: THE GATE — both engines over the whole object database
         # `--require-gitleaks` so a missing binary is EXIT 3 and a red build,

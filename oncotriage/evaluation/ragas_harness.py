@@ -402,12 +402,23 @@ RESPONSE_FIELD_MISSING_NOTE = (
 ENVIRONMENT_PACKAGES = ("ragas", "anthropic", "openai", "langchain-core")
 """The distributions whose version decides what a score means.
 
-``ragas`` owns the metric prompts and the decomposition; ``anthropic`` and
-``openai`` are the two SDKs that carry the judge and the embedder;
-``langchain-core`` is ragas' own wrapper layer, whose message and callback
-shapes ragas builds its prompts on top of. Recorded whether or not it is
-installed -- "``langchain-core`` if present" is a statement about the
-environment, and ``absent`` states it.
+``ragas`` owns the metric prompts and the decomposition; ``openai`` is the SDK
+that carries BOTH the judge and the embedder (``build_judge`` and
+``build_embeddings`` each construct an ``AsyncOpenAI``); ``langchain-core`` is
+ragas' own wrapper layer, whose message and callback shapes ragas builds its
+prompts on top of. Recorded whether or not it is installed --
+"``langchain-core`` if present" is a statement about the environment, and
+``absent`` states it.
+
+``anthropic`` IS STILL IN THE TUPLE AND NO LONGER CARRIES ANYTHING, WHICH IS
+THE POINT RATHER THAN AN OVERSIGHT. It did carry the judge until the port to
+GPT-5.6 Terra; this tuple is written into every manifest, and manifests already
+on disk recorded a version for it, so removing the name would make an old
+manifest and a new one disagree about which fields exist rather than about what
+they hold. ``PACKAGE_ABSENT`` is a SUPPORTED value here -- it is the honest
+record for an environment that no longer installs it -- so the name costs one
+field and buys a comparable series. That is the same reasoning ``langchain-core``
+carries one sentence up, arrived at from the other direction.
 """
 
 PACKAGE_ABSENT = "absent"

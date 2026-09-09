@@ -302,7 +302,22 @@ BUCKETS = {
         "tests/run_serial_tests.py, is written by neither of the suite's two "
         "writers and is sha256-compared at the end"),
     "test_agent_ablation_flag_passthrough.py": (
-        _A, None, "ran green in 8.3s; registries and clients replaced through deps"),
+        _A, None,
+        "ran green in 1.3s, 52 checks; registries, clients AND THE MedCPT "
+        "CROSS-ENCODER SCORER all replaced through oncotriage/agent/deps.py, "
+        "so no network, no keys, no spend and NO MODEL LOAD. The last claim is "
+        "measured rather than asserted -- its section 4b proves the reranking "
+        "body ran (the stub scorer's call counter moved) and that neither "
+        "MEDCPT key resolved and neither torch nor transformers entered "
+        "sys.modules. Until 2026-09-08 this file was THE LARGEST DOWNLOAD IN "
+        "BUCKET A: one drive runs node_cross_encoder_rerank with the "
+        "cross-encoder active, which fetched the ~837 MB "
+        "`ncbi/MedCPT-Cross-Encoder` checkpoint on a runner's cold cache. "
+        "Measured both ways with every outbound call trapped: the pre-seam "
+        "file makes 15 attempts to huggingface.co:443 on a cold cache and "
+        "CRASHES with no summary when they fail, and 4 attempts on a warm one "
+        "(swallowed, so it passed while emitting them); the shipped file makes "
+        "ZERO in both, and runs in a fifth of the time"),
     "test_agent_bedrock_anthropic_per_trial.py": (
         _A, None,
         "ran green in 6s, 196 checks, against ONLY the directory skeleton: "

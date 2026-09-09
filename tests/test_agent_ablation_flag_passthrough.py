@@ -27,27 +27,37 @@ Covers:
        both are recomputed locally inside Stage 4 and read no Stage 3 state
     6. retrieval_mode — node_hybrid_retrieval has one return, so no path forks
 
-No network and no LLM: the MeSH filter and the cancer registry are replaced with
-stubs through oncotriage/agent/deps.py, and no flag exercised here reaches Qdrant
-or an OpenAI endpoint.
+NO NETWORK, NO LLM AND NO MODEL LOAD. The MeSH filter, the cancer registry and
+the MedCPT cross-encoder scorer are all replaced with stubs through
+oncotriage/agent/deps.py, and no flag exercised here reaches Qdrant or an
+OpenAI endpoint. Test 4b measures the model half rather than asserting it:
+neither MEDCPT key resolves, and neither torch nor transformers enters
+sys.modules.
 
-THE MedCPT CROSS-ENCODER IS LOADED, AND IT IS RUN. Measured, 2026-08-06, by
-inspecting deps.cached_keys() after a full run: `medcpt_tokenizer` and
-`medcpt_model` are both built. Test 2 calls node_cross_encoder_rerank, which
-reaches models.score_pairs -> medcpt_score_pairs -> deps.get_medcpt_tokenizer(),
-so the ~110 MB model is resolved on first use and really scores the pairs. That
-is local work against the HuggingFace cache -- no network once the cache is
-warm, no LLM, nothing billed -- but it is neither free nor instant, and this
-file's docstring claimed the opposite in both directions before: it said the
-cross-encoder was "loaded by file 13 at import but never run", of which the
-second half was already false and the first half stopped being true when item
-20c pass 2c made the load lazy.
+THE THIRD SEAM IS RECENT AND THE TWO PARAGRAPHS IT REPLACES SAID THE OPPOSITE,
+which is worth keeping as the record of what changed. Until 2026-09-08 this
+file DID load and run the real cross-encoder: measured by inspecting
+deps.cached_keys() after a full run, `medcpt_tokenizer` and `medcpt_model` were
+both built, because Test 4's last drive runs node_cross_encoder_rerank with the
+cross-encoder active and that reaches models.score_pairs ->
+medcpt_score_pairs -> deps.get_medcpt_tokenizer(). The old note called that
+"local work against the HuggingFace cache -- no network once the cache is warm",
+and BOTH HALVES WERE WRONG ON A CI RUNNER. Measured 2026-09-08, warm cache,
+every outbound call trapped: FOUR attempts to huggingface.co:443, swallowed by
+huggingface_hub, which fell back to the cache -- so the file passed while
+emitting them. A runner's cache is COLD, so those four are the ~837 MB
+checkpoint fetch, and this file was the single largest download in bucket A.
 
-The FastEmbed BM25 model is NOT built (measured the same way:
-oncotriage.embedding._MODEL stays None). The `fastembed` LIBRARY does arrive in
-sys.modules regardless, because qdrant_client.fastembed_common imports it; that
-is a library import, not a model construction, and it was equally true under the
-old exec chain.
+Nothing measured was lost, and that is checkable rather than asserted: no
+assertion in this file reads a MedCPT score, a rerank order or a rerank_score.
+The subject is which state keys a node's return declares, and a cross-encoder
+returning real floats and one returning fabricated floats declare the same keys.
+
+The FastEmbed BM25 model is NOT built either (oncotriage.embedding._MODEL stays
+None, checked in 4b). The `fastembed` LIBRARY does arrive in sys.modules
+regardless, because qdrant_client.fastembed_common imports it; that is a
+library import, not a model construction, and it was equally true under the old
+exec chain.
 
 Run from terminal (or F5 in Spyder):
     python tests/test_agent_ablation_flag_passthrough.py
@@ -92,7 +102,8 @@ except ImportError:
         raise
     del _candidate, _how
 
-from oncotriage.agent import deps, filtering, retrieval
+from oncotriage import embedding as _embedding
+from oncotriage.agent import deps, filtering, models, retrieval
 from oncotriage.agent.filtering import node_rule_based_filter
 from oncotriage.agent.retrieval import node_cross_encoder_rerank
 
@@ -103,6 +114,13 @@ from oncotriage.agent.retrieval import node_cross_encoder_rerank
 import ast
 import textwrap
 
+# numpy is already in sys.modules by this line -- the oncotriage import chain
+# above pulls it in -- so this costs no new dependency. It is needed because
+# StubCrossEncoderScorer must return what models.score_pairs' contract says:
+# a 1-D float ARRAY, which node_cross_encoder_rerank calls .min()/.max()/
+# .mean() and np.argsort on.
+import numpy as np
+
 
 # ===========================================================================
 # MINIMAL ASSERTION HARNESS
@@ -110,6 +128,19 @@ import textwrap
 
 _RESULTS = {"passed": 0, "failed": 0}
 _FAILURES = []
+
+
+def last(seq, what: str):
+    """``seq[-1]``, or a NAMED ABSENCE when it is empty.
+
+    A bare ``seq[-1]`` raises IndexError while ``check()``'s argument is being
+    evaluated, and it does so in EXACTLY the state the check exists to catch --
+    so the run reports one traceback where it owes a summary and every result
+    below it. Measured on 2026-09-08: reverting the MEDCPT_SCORER override made
+    _SCORER.queries empty and took the file down at Test 4b. This project has
+    shipped that shape seventeen times; it is a recorded failure here instead.
+    """
+    return seq[-1] if seq else f"<{what}: nothing recorded>"
 
 
 def check(label: str, actual, expected) -> None:
@@ -185,6 +216,51 @@ class StubMeshFilter:
 class StubCancerRegistry:
     """Only the attribute resolve_patient_mesh() reads."""
     exclude_verification = {"refuted", "entered-in-error"}
+
+
+class StubCrossEncoderScorer:
+    """Stands in for the MedCPT cross-encoder, through deps.MEDCPT_SCORER.
+
+    WHY THIS SEAM EXISTS AT ALL. Test 4's last drive runs
+    node_cross_encoder_rerank with the cross-encoder ACTIVE (its only flag is
+    skip_mesh_filter), so the node reaches models.score_pairs ->
+    medcpt_score_pairs -> deps.get_medcpt_tokenizer(), and the real
+    ``ncbi/MedCPT-Cross-Encoder`` checkpoint is resolved. Measured on a cold
+    HuggingFace cache that is ~837 MB fetched over the network; measured on a
+    WARM cache, with every outbound call trapped, it is still FOUR attempts to
+    huggingface.co:443 -- huggingface_hub swallows the failure and falls back to
+    the cache, so the file passed while emitting them. On a CI runner the cache
+    is cold and the network is the only source, which makes this file the single
+    largest download in bucket A.
+
+    NOTHING MEASURED IS LOST, AND THAT IS THE ARGUMENT RATHER THAN A HOPE. The
+    check behind that drive reads _MESH_FILTER.resolve_calls and nothing else;
+    no assertion anywhere in this file reads a MedCPT score, a rerank order or a
+    rerank_score. The subject of the file is ABLATION STATE PASSTHROUGH -- which
+    keys a node's return declares -- and a cross-encoder that returns real
+    floats and one that returns fabricated floats declare the same keys.
+
+    THE CONTRACT IS models.score_pairs': the same two arguments, and a 1-D float
+    array with one score per trial text IN INPUT ORDER. It is a numpy array
+    rather than a list because node_cross_encoder_rerank calls .min(), .max(),
+    .mean() and np.argsort on it.
+
+    The scores DESCEND with input position and are never tied. Ties would leave
+    the ranking entirely to np.argsort's stable tiebreak, which is a weaker
+    exercise of the node than a definite order; descending keeps the reranked
+    pool in the hybrid pool's order, which is the least surprising thing for a
+    reader comparing this drive against the skip_cross_encoder ones.
+    """
+
+    def __init__(self):
+        self.calls = 0
+        self.queries = []
+
+    def __call__(self, query, trial_texts):
+        self.calls += 1
+        self.queries.append(query)
+        return np.array([1.0 - 0.1 * i for i in range(len(trial_texts))],
+                        dtype=float)
 
 
 def make_trial(nct_id: str) -> dict:
@@ -274,9 +350,25 @@ def make_stage4_state(stage3_out: dict, ablation_flags=None) -> dict:
 # what it gets.
 _MESH_FILTER = StubMeshFilter()
 _CANCER_REGISTRY = StubCancerRegistry()
+_SCORER = StubCrossEncoderScorer()
 
 deps.set_override(deps.MESH_FILTER, _MESH_FILTER)
 deps.set_override(deps.CANCER_REGISTRY, _CANCER_REGISTRY)
+deps.set_override(deps.MEDCPT_SCORER, _SCORER)
+
+# THE SCORER OVERRIDE IS FILE-SCOPE RATHER THAN WRAPPED AROUND THE ONE DRIVE
+# THAT NEEDS IT, and that is a decision. Exactly one drive in this file runs
+# with the cross-encoder active today (Test 4's last one), so a narrowly scoped
+# override would be sufficient TODAY -- and it would make "this file loads no
+# model" a property of one call site rather than of the file. A flag dropped
+# from either of the other two drives, or a drive added by a later pass,
+# silently reinstates the download and nothing here would fail. File scope
+# makes the property structural, and it is what lets this file's bucket
+# rationale in .github/scripts/ci_test_buckets.py state it unconditionally.
+#
+# It costs nothing: no assertion in this file reads a score, a rerank order or
+# a rerank_score, and section 4b below proves the model is never built rather
+# than asserting it.
 
 
 # --- THE OVERRIDE IS SHOWN TO BE THE OBJECT THE AGENT ACTUALLY REACHES ------
@@ -304,6 +396,55 @@ check("...and with the override REMOVED it is something else, so the check "
 deps.set_override(deps.MESH_FILTER, _saved_mesh)
 check("...and reinstalling it restores the stub",
       deps.get_mesh_filter() is _MESH_FILTER, True)
+
+# THE SCORER SEAM IS PROVED THE SAME WAY, AND IT NEEDS A DIFFERENT INSTRUMENT.
+# MEDCPT_SCORER has no accessor in deps: its default lives in
+# oncotriage.agent.models, because deps must not import models (models imports
+# deps, and the reverse edge is a cycle). So there is no get_medcpt_scorer() to
+# compare against, and what is asserted instead is the DISPATCH -- that
+# models.score_pairs, which is what every caller inside the agent uses, returns
+# THIS stub's answer. That is strictly stronger than an identity check on the
+# override slot, because it is the path the node actually takes.
+#
+# The negative control is the override slot going back to UNSET, which is what
+# models.score_pairs tests before falling through to the real medcpt_score_pairs.
+# It is deliberately NOT "clear the override and call score_pairs again": that
+# call would load the 837 MB checkpoint, which is the thing this seam exists to
+# avoid, so the control would defeat its own subject.
+_probe_before = _SCORER.calls
+try:
+    # GUARDED, AND NOT FOR TIDINESS. With the override missing this call falls
+    # through to the real medcpt_score_pairs, which on a CI runner's COLD cache
+    # cannot reach huggingface.co and RAISES -- inside a check() argument list,
+    # which would take the file down with a traceback in exactly the state
+    # these three checks exist to catch. It is a recorded failure instead.
+    _probe_scores = models.score_pairs("probe", ["a", "b", "c"])
+except Exception as _exc:                                  # noqa: BLE001
+    _probe_scores = f"<score_pairs raised {type(_exc).__name__}: {_exc}>"
+
+check("models.score_pairs dispatches to THIS stub scorer",
+      _SCORER.calls, _probe_before + 1)
+check("...and returns what it produced, in input order",
+      list(_probe_scores) if hasattr(_probe_scores, "__iter__")
+      and not isinstance(_probe_scores, str) else _probe_scores,
+      [1.0, 0.9, 0.8])
+# THE SHAPE IS PART OF THE CONTRACT, AND CHECKING IT HERE IS WHERE IT IS CHEAP.
+# models.score_pairs' docstring says "a 1-D float array", and
+# node_cross_encoder_rerank calls .min()/.max()/.mean() and np.argsort on the
+# result -- so a stub returning a plain list raises INSIDE the node, thirty
+# frames down, at a bare drive that is not inside a check(). Asserting the shape
+# here turns that into a named failure before any node is driven. Measured: with
+# the stub returning a list, this is the check that names it.
+check("...and it is the ARRAY shape node_cross_encoder_rerank consumes, not a "
+      "list", isinstance(_probe_scores, np.ndarray), True)
+
+_saved_scorer = deps.clear_override(deps.MEDCPT_SCORER)
+check("...and with the override REMOVED the slot models.score_pairs reads is "
+      "UNSET, so the dispatch above can fall through (negative control)",
+      deps.get_override(deps.MEDCPT_SCORER) is deps.UNSET, True)
+deps.set_override(deps.MEDCPT_SCORER, _saved_scorer)
+check("...and reinstalling it restores the stub",
+      deps.get_override(deps.MEDCPT_SCORER) is _SCORER, True)
 
 
 print("\n" + "=" * 70)
@@ -487,10 +628,60 @@ check("Stage 4 rule pass keeps both trials under skip_mesh_filter",
       s4_mesh["candidates_after_rule_filter"], 2)
 
 # skip_mesh_filter alone (cross-encoder active) must also skip resolution.
+# THIS IS THE ONE DRIVE IN THE FILE THAT RUNS THE RERANKING BODY, and it is
+# what makes the MEDCPT_SCORER seam above load-bearing rather than decorative.
 _MESH_FILTER.resolve_calls = 0
+_scorer_calls_before = _SCORER.calls
 _ = node_cross_encoder_rerank(make_stage3_state({"skip_mesh_filter": True}))
 check("skip_mesh_filter skips resolution on the reranking path too",
       _MESH_FILTER.resolve_calls, 0)
+
+
+# ===========================================================================
+# TEST 4b: THE RERANKING BODY RAN, AND IT BUILT NO MODEL
+# ===========================================================================
+# Two halves, and neither is worth anything without the other. "No model was
+# built" is also true of a drive that never reached the reranking body at all
+# -- the two skip_cross_encoder drives above satisfy it for free -- so the
+# non-degeneracy half comes first: the node really called the scorer.
+
+print("\n" + "=" * 70)
+print("Test 4b: the reranking body ran, and it built no cross-encoder")
+print("=" * 70)
+
+check("the drive above really entered the reranking body (non-degeneracy: "
+      "without this, everything below is satisfied by a node that returned "
+      "early)",
+      _SCORER.calls > _scorer_calls_before, True)
+check("...once per rerank query, which is one here",
+      _SCORER.calls - _scorer_calls_before, 1)
+check("...and it was handed the expanded query, so the stub stood in for the "
+      "real call rather than for nothing",
+      last(_SCORER.queries, "scorer query"), "lung neoplasms")
+
+# THE PROPERTY THE BUCKET RATIONALE CLAIMS, MEASURED RATHER THAN ASSERTED.
+# Before this seam these four read: medcpt_tokenizer and medcpt_model both
+# cached, torch and transformers both in sys.modules -- measured 2026-09-08 by
+# running the pre-seam file under a probe. The tokenizer and the weights are
+# ~837 MB of checkpoint, fetched from huggingface.co on a cold cache, which is
+# every CI runner.
+check("no MedCPT tokenizer was built",
+      deps.is_resolved(deps.MEDCPT_TOKENIZER), False)
+check("no MedCPT model was built",
+      deps.is_resolved(deps.MEDCPT_MODEL), False)
+check("torch never entered sys.modules", "torch" in sys.modules, False)
+check("transformers never entered sys.modules",
+      "transformers" in sys.modules, False)
+
+# fastembed IS deliberately absent from that list, and its own absence would be
+# the surprising reading. qdrant_client.fastembed_common imports the LIBRARY at
+# module scope, so it arrives with the agent's import chain whatever this file
+# does; what would be a model load is oncotriage.embedding building the sparse
+# model, and that is what is checked instead.
+check("fastembed the LIBRARY is present, which is not a model load",
+      "fastembed" in sys.modules, True)
+check("...and no BM25 sparse model was constructed",
+      _embedding._MODEL, None)
 
 
 # ===========================================================================

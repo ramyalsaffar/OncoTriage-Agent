@@ -546,7 +546,7 @@ python tests/test_extraction_histology.py                          # 133 (was 10
 python tests/test_agent_mesh_boost_and_quality_gate.py             #  89 (was 54; the two-knob quality gate added Test 7)
 python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
 python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
-python tests/test_agent_ablation_flag_passthrough.py               #  39
+python tests/test_agent_ablation_flag_passthrough.py               #  53 (was 39; the MedCPT seam pass added Test 4b and the scorer half of Test 0. It is also 5x faster -- 6.4s to 1.3s -- and makes ZERO outbound calls, where it made 4 to huggingface.co on a warm cache and 15 on a cold one)
 python tests/test_storage_inference_logging_contract.py            # 101 (was 79 when this line was written, then 98; the token-persistence pass added Test 2's three scoping/spread checks)
 python tests/test_agent_retrieval_observability.py                 # 104
 python tests/test_fhir_birth_date_and_demographics.py              # 172
@@ -595,7 +595,7 @@ python tests/test_ablation_db_isolation.py                         #  72 (was 43
 # (paths.py, fixtures/capture.py, evaluation/run_harness.py, agent/deps.py,
 # embedding.py) are written by neither of the suite's two writers. It EXECS
 # NOTHING. Bucket A, ~2.6 s.
-python tests/test_paths_portability_roots.py                       # 102 passed / 1 FAILED, and the failure is PRE-EXISTING rather than this line going stale: check 8j ('the control plant matched something') fails at HEAD, which the 6b probe pass already recorded as one of bucket A's two standing failures. 103 is the count when it is green; MEASURED 2026-09-03
+python tests/test_paths_portability_roots.py                       # 105 passed / 0 failed; MEASURED 2026-09-08. This line said '102 passed / 1 FAILED' and recorded 8j ('the control plant matched something') as a STANDING failure at HEAD, which it was for two passes and is not any more: commit 8104397 replanted 8j as an AST edit rather than a text substitution, with a non-degeneracy control. The 103 that line named as 'the count when it is green' was itself superseded by the replant
 
 # The render-snapshot test (pass 20f-5, extended by 20f-6). Same shape, same
 # directory, no keys, no spend, and "no network" is now MEASURED rather than
@@ -1180,7 +1180,7 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 # and printed when the binary is absent -- which is the state of the `tests` job
 # on a hosted runner. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~22 s with gitleaks / ~16 s without.
-python tests/test_secret_scan_gate.py                               #  92 with gitleaks; 86 passed / 0 failed / 3 SKIPPED without it
+python tests/test_secret_scan_gate.py                               # 108 with gitleaks (DERIVED as 102 + the 6 gitleaks checks, not measured -- this machine has no gitleaks binary); 102 passed / 0 failed / 3 SKIPPED without it, MEASURED 2026-09-08. Was 92 / 86; the pinned-requirements pass replaced 10f with eleven checks over the pyproject-derived pins and added six more that scope the install step -- its run block located, the flag's output captured in one substitution, that substitution an assignment, never a pip argument, the empty result refused explicitly, and `set -euo pipefail` present IN THAT STEP rather than anywhere in the file
 #   (was 87/81; the CI-green pass added 2a-0 and 2c-b..2c-e over the oid
 #   validation parse_fingerprint gained. Check 4f used to fail on a hosted
 #   x86_64 runner ONLY: it harvests --emit-accepted through that parser from
@@ -11077,6 +11077,15 @@ failures reproduce identically at HEAD** (`test_cancer_grouping_single_owner`
 7c, `test_paths_portability_roots` 8j) -- pre-existing, not this pass's.
 `static_checks.py` compiles 275; `ci_test_buckets --check` consistent at 118
 files. Every other suite at its documented count.
+
+> **CURRENT STATE, 2026-09-08 -- BOTH STANDING FAILURES ARE RESOLVED. The two
+> sentences above are kept as this pass's own measurement, per the rule that a
+> past-tense account keeps its wording.** Commit 8104397 closed both:
+> `test_cancer_grouping_single_owner` 7c now DERIVES its control revision by
+> AST era selection rather than by substring, and `test_paths_portability_roots`
+> 8j is replanted as an AST edit rather than a text substitution, each with a
+> non-degeneracy control. MEASURED 2026-09-08: **105/0** and **94/0**, and CI
+> bucket A is green.
 
 **WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
 

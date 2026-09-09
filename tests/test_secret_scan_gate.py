@@ -902,9 +902,97 @@ check("10d ...and the table names nothing the closure does not reach",
 _printed = subprocess.run([sys.executable, _GATE, "--print-requirements"],
                           capture_output=True, text=True)
 check("10e --print-requirements exits 0", _printed.returncode, 0)
-check("10f ...and prints the pip names the table maps to",
-      sorted(_printed.stdout.split()),
+# WHAT 10f USED TO BE, AND WHY IT IS FOUR CHECKS NOW. It read
+#
+#     sorted(_printed.stdout.split()) == sorted(TABLE.values())
+#
+# which was exact while the flag emitted four BARE distribution names. Since
+# 2026-09-08 it emits each name carried at THIS PROJECT'S OWN PIN, read out of
+# pyproject.toml at run time -- so an upstream release cannot turn a security
+# gate into "the scan could not run" with nothing in this repository having
+# changed. The property 10f protected (nothing lost, nothing invented) is kept
+# below as a comparison over the DISTRIBUTION NAMES; the pins are checked
+# separately, in both directions, with a control that the file is really read.
+def _distribution_of(token):
+    """The distribution name in a `name==version` / `name` requirement token."""
+    import re as _re
+    return _re.split(r"[<>=!~\[;]", token, maxsplit=1)[0].strip()
+
+
+_printed_tokens = _printed.stdout.split()
+check("10f the printed set is exactly the table's distributions -- nothing "
+      "lost and nothing invented",
+      sorted(_distribution_of(t) for t in _printed_tokens),
       sorted(_gate_module.SCANNER_IMPORT_REQUIREMENTS.values()))
+
+_declared = _gate_module._declared_pins()
+_pinned = [t for t in _printed_tokens if t != _distribution_of(t)]
+_bare = [t for t in _printed_tokens if t == _distribution_of(t)]
+
+# NON-DEGENERACY FIRST, BOTH WAYS. Everything below is satisfied for free by an
+# all-bare output (which is the pre-2026-09-08 behaviour and the thing being
+# removed) or by an all-pinned one, so the two halves are asserted to be
+# non-empty before either is trusted.
+check("10f-i some names come back PINNED (non-degeneracy: an all-bare output "
+      "is what this replaced)", len(_pinned) > 0, True)
+check("10f-ii ...and at least one comes back BARE, so 10f-iv is not vacuous "
+      "either", len(_bare) > 0, True)
+check("10f-iii every pinned token is byte-identical to what pyproject.toml "
+      "declares -- the pin is READ, never restated",
+      sorted(_pinned),
+      sorted(_declared[_gate_module.re.sub(r"[-_.]+", "-",
+                                           _distribution_of(t)).lower()]
+             for t in _pinned))
+check("10f-iv ...and every BARE token is one pyproject.toml declares nothing "
+      "for, rather than a pin that was dropped",
+      [t for t in _bare
+       if _gate_module.re.sub(r"[-_.]+", "-", t).lower() in _declared], [])
+check("10f-v httpx is exactly that case, and naming it is the point: it is "
+      "not a declared dependency, it arrives through openai's own range, and "
+      "pinning it here would invent a constraint the project does not make",
+      "httpx" in _bare, True)
+
+# CONTROL: the pins are read from the FILE. Without this, 10f-iii is satisfied
+# by a derivation that agrees with itself -- both sides would come from the
+# same in-memory table.
+_pp_dir = os.path.join(_TMP, "pinned-pyproject-control")
+os.makedirs(_pp_dir, exist_ok=True)
+_pp_moved = os.path.join(_pp_dir, "moved.toml")
+with open(_pp_moved, "w", encoding="utf-8") as _h:
+    _h.write('[project]\nname = "x"\nversion = "0"\n'
+             'dependencies = ["openai==0.0.1-control", "qdrant-client==0.0.2-control"]\n')
+_moved = _gate_module.scanner_requirements(_pp_moved)
+check("10f-vi CONTROL: a pyproject declaring different pins moves the output, "
+      "so the derivation really reads the file",
+      sorted(t for t in _moved if "0.0." in t),
+      ["openai==0.0.1-control", "qdrant-client==0.0.2-control"])
+check("10f-vii ...and the names it declares nothing for are still bare there",
+      sorted(t for t in _moved if "0.0." not in t),
+      ["httpx", "python-dotenv"])
+
+# CONTROL: it REFUSES rather than falling back to bare names. An unpinned
+# install that looks pinned is invisible, which is the whole failure mode.
+_pp_empty = os.path.join(_pp_dir, "nodeps.toml")
+with open(_pp_empty, "w", encoding="utf-8") as _h:
+    _h.write('[project]\nname = "x"\nversion = "0"\n')
+try:
+    _gate_module.scanner_requirements(_pp_empty)
+    _refusal = "fell back silently"
+except _gate_module.RequirementsUnavailable:
+    _refusal = "RequirementsUnavailable"
+check("10f-viii CONTROL: a pyproject with no dependencies REFUSES rather than "
+      "falling back to the bare names", _refusal, "RequirementsUnavailable")
+try:
+    _gate_module.scanner_requirements(os.path.join(_pp_dir, "absent.toml"))
+    _refusal_missing = "fell back silently"
+except _gate_module.RequirementsUnavailable:
+    _refusal_missing = "RequirementsUnavailable"
+check("10f-ix ...and so does an unreadable one",
+      _refusal_missing, "RequirementsUnavailable")
+check("10f-x RequirementsUnavailable is a RuntimeError, so a broad "
+      "`except ValueError` cannot turn it into a silent fallback",
+      issubclass(_gate_module.RequirementsUnavailable, RuntimeError) and
+      not issubclass(_gate_module.RequirementsUnavailable, ValueError), True)
 # IT MUST WORK BEFORE THE REQUIREMENTS ARE INSTALLED, or the CI step that
 # installs from it cannot run. That means returning above load_project_scanner.
 check("10g ...without importing the project's scanner, which is what makes it "
@@ -925,6 +1013,83 @@ check("10i ...and does not name any of the four itself",
 check("10j the workflow runs the gate with --require-gitleaks, so a missing "
       "binary is a red build and not a one-engine pass",
       "--require-gitleaks" in _wf_settings, True)
+
+# THE STEP MUST ASSIGN BEFORE IT INSTALLS, AND THAT IS A MEASURED SHELL FACT
+# RATHER THAN A PREFERENCE. Under `set -e`, a command substitution that exits
+# non-zero IN AN ARGUMENT POSITION does not fail the command: measured on
+# 2026-09-08, `pip install $(refusing-script)` exits 0 while
+# `reqs=$(refusing-script)` exits 3. So the obvious one-liner would swallow a
+# refusal from --print-requirements in exactly the shape it was written to be
+# loud in. The two checks below are the structural half; 10f-viii and 10f-ix
+# are the behavioural half that there is a refusal to swallow at all.
+def _run_block_containing(text, needle):
+    """The `run: |` script block of the step whose body contains `needle`.
+
+    SCOPED, AND THE SCOPING IS LOAD-BEARING. A whole-file search for
+    `set -euo pipefail` is satisfied by the gitleaks step, which carries it for
+    its own reasons -- measured: a revert that dropped it from THIS step was
+    reported as caught by nothing. Returns "" when the block cannot be located,
+    so a check written against it fails rather than passing on an empty string.
+    """
+    lines = text.splitlines()
+    hits = [i for i, ln in enumerate(lines)
+            if needle in ln and not ln.lstrip().startswith("#")]
+    if len(hits) != 1:
+        return ""
+    start = None
+    for i in range(hits[0], -1, -1):
+        if lines[i].rstrip().endswith("run: |"):
+            start = i
+            break
+    if start is None:
+        return ""
+    body_indent = len(lines[start]) - len(lines[start].lstrip())
+    out = []
+    for ln in lines[start + 1:]:
+        if ln.strip() and (len(ln) - len(ln.lstrip())) <= body_indent:
+            break
+        out.append(ln)
+    return "\n".join(out)
+
+
+# LOCATED BY THE ASSIGNMENT, NOT BY THE FLAG NAME. The step's own failure
+# message names --print-requirements too, so a locator keyed on the flag alone
+# sees two hits and gives up -- measured: it returned "", 10l then passed
+# VACUOUSLY against an empty block while 10k and 10m failed. The assignment is
+# what identifies the step, and 10k below is what caught the first version.
+_install_block = _run_block_containing(_wf, "reqs=$(python")
+check("10k the install step's run block was located, so 10l and 10m are not "
+      "checks against an empty string", bool(_install_block.strip()), True)
+# 10l IS TWO CHECKS AND KEYED ON THE SUBSTITUTION, NOT ON THE FLAG NAME. The
+# step's own failure message names the flag, so "every line mentioning it must
+# assign" is false of a correct step -- measured, it failed against the shipped
+# one. The property is about where the flag's OUTPUT goes.
+_subs = [ln.strip() for ln in _install_block.splitlines()
+         if "$(" in ln and "--print-requirements" in ln]
+check("10l the flag's output is captured in exactly one command substitution",
+      len(_subs), 1)
+check("10l-i ...and it is an ASSIGNMENT rather than an argument to pip, "
+      "because `set -e` does not see a substitution that fails in an argument "
+      "position",
+      [ln for ln in _subs if not ln.startswith("reqs=$(")], [])
+check("10l-ii ...and no line expands it into a `pip install` argument list",
+      [ln.strip() for ln in _install_block.splitlines()
+       if "pip install" in ln and "--print-requirements" in ln], [])
+# THE EMPTINESS GUARD IS WHAT CARRIES THE GUARANTEE ON THE RUNNER'S bash 5.x.
+# `set -e`'s behaviour for a failing assignment was measured on bash 3.2 only
+# (no bash 5 was available), so the step ALSO refuses an empty `$reqs`
+# explicitly, which needs no version claim: a refusal prints nothing, so the
+# variable is empty, so the step fails naming the derivation. Measured
+# 2026-09-08 against the exact step body: a derivation that exits 0 and prints
+# nothing gives rc=1 with the guard and rc=0 without it.
+check("10l-iii ...and the step refuses an EMPTY result explicitly, which is "
+      "the half that does not depend on a `set -e` subtlety",
+      '[ -z "$reqs" ]' in _install_block, True)
+check("10m ...and THAT STEP carries `set -euo pipefail`, without which the "
+      "assignment's own non-zero exit is not fatal either. Scoped to the step: "
+      "a whole-file search is satisfied by the gitleaks step, which carries it "
+      "for its own reasons",
+      "set -euo pipefail" in _install_block, True)
 
 # ===========================================================================
 section("SUMMARY")
