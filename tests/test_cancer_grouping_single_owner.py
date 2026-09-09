@@ -657,24 +657,105 @@ check("7f-i. ...and the shipped allocator overshoots at none of them",
 #
 # A CONTROL THE AUTHOR ALSO WROTE THE ASSERTION FOR IS A CONTROL THAT TESTS THE
 # TRANSCRIPTION. This lifts the pre-convergence `stratified_sample` out of
-# `git show HEAD:` and compares its body with the local copy's, tolerating
-# exactly the one substitution the docstring declares. A tree with no `.git`
-# RECORDS that it could not check rather than failing or aborting -- this file
-# is bucket A and must not acquire a git dependency.
+# `git show` and compares its body with the local copy's, tolerating exactly the
+# one substitution the docstring declares. A tree with no `.git` RECORDS that it
+# could not check rather than failing or aborting -- this file is bucket A and
+# must not acquire a git dependency.
+#
+# THE REVISION IS DERIVED, NEVER THE LITERAL `HEAD`, AND THAT IS THE WHOLE
+# CORRECTNESS OF THIS SECTION. It was written as `HEAD:` and was green for
+# exactly as long as the convergence sat uncommitted in the working tree: the
+# instant `e4fbc5a` landed, `HEAD:` started resolving to the CONVERGED body --
+# the one built on `allocate_proportional` -- while the local control below is
+# a transcription of the RETIRED one. The check then compared two different
+# ERAS of the same function and reported the difference between them as a
+# transcription error, naming nothing about what had actually moved.
+#
+# That is the failure mode this repository has already paid for once, recorded
+# at the alias-ownership pass: pinning against whatever `HEAD` happens to be
+# has both failure modes at once -- it cannot fail once the change is committed
+# when the pin is of generated output, and it cannot PASS once the change is
+# committed when the pin is of superseded input. This is the second kind.
+#
+# WHY THE SELECTOR IS NOT CIRCULAR, which is the objection to answer before
+# trusting any derived revision. The predicate asks ONE structural question --
+# does this revision's `stratified_sample` call `allocate_proportional` -- and
+# it is answered by an AST walk over that function alone, never by a substring
+# over the file (the converged body QUOTES the retired rule verbatim in its own
+# docstring, so a substring selector would pick the convergence commit and every
+# control would then test the fix against itself: the exact defect
+# tests/test_storage_query_layer.py had to fix in its own revision selector).
+# The COMPARISON below is over the entire allocation statement sequence -- the
+# early return, the rng seeding, the grouping, the per-group share arithmetic,
+# the trim and the sort. So the derivation picks the ERA and the comparison
+# still checks every statement in it.
 
-def _git_body(rev_path):
-    import subprocess
+_STUDY_REL = "oncotriage/ablation/study.py"
+
+
+def _stratified_sample_node(blob):
+    """The `stratified_sample` FunctionDef in `blob`, or None."""
     try:
-        out = subprocess.run(["git", "show", rev_path], cwd=_CODE_DIR,
-                             capture_output=True, text=True, timeout=30)
-    except Exception as exc:                    # noqa: BLE001
-        return f"<NO GIT: {type(exc).__name__}>"
-    if out.returncode != 0:
-        return "<NO GIT: git show failed>"
-    for node in ast.walk(ast.parse(out.stdout)):
+        tree = ast.parse(blob)
+    except SyntaxError:
+        return None
+    for node in ast.walk(tree):
         if isinstance(node, ast.FunctionDef) and node.name == "stratified_sample":
             return node
-    return "<NOT FOUND at that revision>"
+    return None
+
+
+def _calls_allocator(fn_node):
+    """True when this body reaches `allocate_proportional` as a CALL.
+
+    A NAME LOAD IS NOT ENOUGH AND A SUBSTRING IS FAR TOO MUCH. The converged
+    body names the retired rule in its docstring and the retired body names
+    nothing; asking for a Call node is the question that separates the two eras
+    by what the code DOES.
+    """
+    for inner in ast.walk(fn_node):
+        if not isinstance(inner, ast.Call):
+            continue
+        func = inner.func
+        if getattr(func, "id", None) == "allocate_proportional":
+            return True
+        if getattr(func, "attr", None) == "allocate_proportional":
+            return True
+    return False
+
+
+def _git(*args):
+    import subprocess
+    try:
+        out = subprocess.run(["git", *args], cwd=_CODE_DIR,
+                             capture_output=True, text=True, timeout=30)
+    except Exception:                           # noqa: BLE001
+        return None
+    return out.stdout if out.returncode == 0 else None
+
+
+def _retired_body():
+    """The newest revision of study.py whose `stratified_sample` is the RETIRED
+    body, as a FunctionDef -- or a `<...>` marker string saying why not.
+
+    Returns (marker_or_node, revision). The marker shape is what the caller
+    reports as a RECORDED non-run in a tree with no history; it is never a
+    silent skip.
+    """
+    log = _git("log", "--format=%H", "--", _STUDY_REL)
+    if log is None:
+        return "<NO GIT: git log failed or git is absent>", None
+    revisions = log.split()
+    if not revisions:
+        return "<NO GIT: no history for that path>", None
+    for rev in revisions:
+        blob = _git("show", f"{rev}:{_STUDY_REL}")
+        if blob is None:
+            continue
+        node = _stratified_sample_node(blob)
+        if node is not None and not _calls_allocator(node):
+            return node, rev
+    return "<NO PRE-CONVERGENCE REVISION FOUND>", None
 
 
 def _normalise(fn_node):
@@ -726,12 +807,27 @@ def _normalise(fn_node):
     return "\n".join(ast.unparse(n) for n in kept)
 
 
-_git_fn = _git_body("HEAD:oncotriage/ablation/study.py")
+_git_fn, _git_rev = _retired_body()
 if isinstance(_git_fn, str):
     check(f"7c. the git transcription check could not run ({_git_fn}) -- "
           f"RECORDED, not skipped silently. The DRIVE above is unaffected.",
           _git_fn.startswith("<"), True)
 else:
+    # THE ERA BOUNDARY IS REAL, ASSERTED BEFORE THE COMPARISON IS TRUSTED.
+    # Without this the selector could silently be picking HEAD -- which is what
+    # it used to do -- and the comparison would then be between the converged
+    # body and a control that transcribes it, agreeing by construction. Both
+    # halves are needed: that the shipped body IS converged, and that the
+    # revision the selector chose is NOT the shipped one.
+    _head_blob = _git("show", f"HEAD:{_STUDY_REL}")
+    _head_fn = _stratified_sample_node(_head_blob) if _head_blob else None
+    check("7c-era. the SHIPPED body calls the shared allocator, so a "
+          "pre-convergence revision is a different era rather than the same "
+          "code under another name",
+          _calls_allocator(_head_fn) if _head_fn is not None else None, True)
+    check("7c-era-i. ...and the derived revision is NOT the one this "
+          "transcription would agree with by construction",
+          _calls_allocator(_git_fn), False)
     _local_fn = None
     for _n in ast.walk(ast.parse(open(os.path.abspath(__file__),
                                       encoding="utf-8").read())):

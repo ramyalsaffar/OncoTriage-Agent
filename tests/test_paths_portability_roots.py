@@ -901,22 +901,90 @@ check("8i    ...and it asks oncotriage.paths for that decision",
 # THE CONTROL: strip the spread from an in-memory copy and require 8e to
 # report it. Without it these checks pass for a walker that cannot see a
 # keyword at all.
-_control = _deps_src.replace(
-    "    tokenizer = AutoTokenizer.from_pretrained("
-    "config.CROSS_ENCODER_MODEL,\n"
-    "                                              **_cache_kwargs)",
-    "    tokenizer = AutoTokenizer.from_pretrained("
-    "config.CROSS_ENCODER_MODEL)", 1)
-if _control == _deps_src:
+#
+# THE PLANT IS AN AST EDIT AND NOT A SOURCE-STRING REPLACE, AND THAT IS A
+# CORRECTION RATHER THAN A PREFERENCE. It was written as a `str.replace` of the
+# two-line call site, indentation and all:
+#
+#     "    tokenizer = AutoTokenizer.from_pretrained(config.CROSS_ENCODER_MODEL,\n"
+#     "                                              **_cache_kwargs)"
+#
+# so it was pinned to the exact argument list of a call it does not own. Commit
+# `1f657ca` added `revision=config.CROSS_ENCODER_REVISION` between those two
+# lines -- a change to the reranker pin with nothing to do with caching -- the
+# needle stopped matching, and this section reported PLANT-FAILED on every run
+# from that commit onward. The guard behaved correctly: it refused to report a
+# control it had not actually planted, which is exactly what it is for. What
+# was wrong is that a whitespace-exact needle makes ANY later keyword addition
+# a false alarm, and the check it protects is a question about ONE keyword.
+#
+# So the plant now removes THE THING 8e ASSERTS -- the `**..._kwargs` spread --
+# from the tokenizer's `from_pretrained` call, by the same predicate 8e reads
+# it with, and is indifferent to every other argument that call carries now or
+# gains later. A rename of the FUNCTION or of `from_pretrained` still fires
+# PLANT-FAILED, which is the staleness this guard should still catch.
+
+
+def _plant_drop_cache_kwargs(source, function_name):
+    """Drop the `**..._kwargs` spread from `function_name`'s from_pretrained.
+
+    Returns (unparsed source, number of keywords removed). Zero removed means
+    the plant found nothing, which the caller reports as PLANT-FAILED rather
+    than as a passing control -- a control that planted nothing agrees with the
+    shipped code by construction.
+    """
+    tree = ast.parse(source)
+    removed = 0
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name != function_name:
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, ast.Call):
+                continue
+            if getattr(inner.func, "attr", None) != "from_pretrained":
+                continue
+            kept = [kw for kw in inner.keywords
+                    if not (kw.arg is None
+                            and getattr(kw.value, "id", "").endswith("_kwargs"))]
+            removed += len(inner.keywords) - len(kept)
+            inner.keywords = kept
+    return ast.unparse(tree), removed
+
+
+_control, _removed = _plant_drop_cache_kwargs(_deps_src,
+                                              "_build_medcpt_tokenizer")
+if not _removed:
     fail("8j    the control plant matched something",
-         "the tokenizer load was not found to strip; the plant is stale")
+         "the tokenizer load carried no **..._kwargs spread to strip; the "
+         "plant is stale (the function or the call was renamed)")
 else:
+    check("8j-plant the plant removed exactly one spread, so the control is "
+          "about ONE keyword rather than about the argument list "
+          "(non-degeneracy)", _removed, 1)
     _control_loads = _calls_named(_control, "_build_medcpt_tokenizer",
                                   callee_attr="from_pretrained")
     check("8j    a copy whose tokenizer load drops the cache decision is "
           "reported (control)",
           _spreads_cache_kwargs(_control_loads[0]) if _control_loads else None,
           False)
+    # THE PLANT IS SURGICAL, ASSERTED. Without this the control would also pass
+    # for a transform that emptied the argument list, or that removed the call
+    # -- either of which would make 8j a statement about a mangled copy rather
+    # than about the one keyword 8e reads.
+    #
+    # BOTH LISTS ARE TESTED BEFORE EITHER IS INDEXED. A bare `[0]` here would
+    # raise IndexError inside check()'s argument list -- the abort shape this
+    # project has closed repeatedly -- and it would do it on exactly the input
+    # this section exists to report. Unreachable today (8d pins one call, and a
+    # rename lands in the PLANT-FAILED branch above), which is precisely why it
+    # is worth not relying on.
+    _orig_loads = _calls_named(_deps_src, "_build_medcpt_tokenizer",
+                               callee_attr="from_pretrained")
+    check("8j-i   ...and the plant left the call itself and its other "
+          "arguments in place",
+          (len(_control_loads[0].keywords) == len(_orig_loads[0].keywords) - 1)
+          if (_control_loads and _orig_loads) else None,
+          True)
 
 check("8k    the shipped deps.py is untouched by the control",
       _source("oncotriage/agent/deps.py") == _deps_src, True)
