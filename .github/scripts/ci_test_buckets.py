@@ -838,6 +838,27 @@ BUCKETS = {
         "records element type 'vertical'; 1.46.0 emits 'flex_container'. That "
         "is a repository defect, not a CI one, and it is deliberately NOT "
         "suppressed here -- see the CI report."),
+    "test_judge_independence.py": (
+        _A, None,
+        "ran green in 0.9s, 136 checks, against ONLY the directory skeleton "
+        "this script provisions, with OPENAI_API_KEY empty -- the judge "
+        "independence guard and the OpenAI machinery the 2026-09-08 judge "
+        "port added. NO NETWORK, NO KEYS, NO SPEND, NO LIVE PROVIDER: every "
+        "response is a literal and section 9 replaces `openai.OpenAI` with a "
+        "constructor that RAISES for the duration of the batch drives, so a "
+        "path reaching for a real client fails there rather than billing; the "
+        "restore is asserted BY IDENTITY. No model load "
+        "(ONCOTRIAGE_DEFER_LOCAL_MODELS is set above the imports and "
+        "torch/transformers are asserted absent at the end), no corpus, no "
+        "database, no git history, no live server, no ragas -- the "
+        "interpreter that ran it green has no ragas distribution. It writes "
+        "only inside a tempfile.mkdtemp it removes and asserts gone, so it is "
+        "NOT in the collision matrix; it DOES read oncotriage/config.py, "
+        "which tests/test_config_snapshot_date_rot.py rewrites in place, so "
+        "the three files it reads are sha256-compared at the end. It EXECS "
+        "NOTHING and loads no module by location: every control is a "
+        "different INPUT to a pure function, an injected environ/classifier "
+        "argument, or an attribute rebound inside try/finally"),
     "test_evaluation_rater.py": (
         _A, None,
         "ran green in 1.1s, 311 checks, against ONLY the directory skeleton, "

@@ -1358,9 +1358,15 @@ BILLED_SITES = {
         "leaks rather than about whether it is one."),
     "oncotriage/evaluation/rater.py::submit_batches": (
         DISPOSITION_GATED_HERE, None,
-        "The independent judge, priced from `config.RATER_PRICING` and "
-        "charged through `rater.charge_batch_to_ledger`. Gated PER CHUNK "
-        "rather than once before the loop, so the overshoot is one batch."),
+        "The independent judge, on the OpenAI Batch API -- priced from "
+        "`config.RATER_PRICING` and charged through "
+        "`rater.charge_batch_to_ledger`. Gated PER CHUNK rather than once "
+        "before the loop, so the overshoot is one batch. AND THE GATE IS NO "
+        "LONGER THE ONLY BRAKE: `rater.require_reservation_fits` runs before "
+        "this function is entered and refuses a submission whose WORST CASE "
+        "cannot fit, because a batch reports no usage until it is collected "
+        "and a measured gate therefore cannot stop the batch that broke the "
+        "cap -- only the next one."),
     "oncotriage/evaluation/ragas_harness.py::build_judge": (
         DISPOSITION_GATED_HERE, None,
         "The ragas judge. The gate is inside the `recording_create` closure "
@@ -1390,13 +1396,26 @@ BILLED_SITES = {
         "job is to answer whether the index is healthy -- and a campaign that "
         "has just stopped on its cap is exactly when an operator runs it. "
         "`deps.peek` / `resolution_state` were added under this rule."),
-    "oncotriage/evaluation/rater.py::calibrate_chars_per_token": (
-        DISPOSITION_EXEMPT, None,
-        "NOT A BILLED CALL. `/v1/messages/count_tokens` is free -- stated on "
-        "the function and the reason it exists at all. It is named here "
-        "rather than left out because it is an Anthropic API call inside a "
-        "module this pass gated, so a reader auditing the gate WILL find it "
-        "and is owed the answer in the same place as the others."),
+    # ── TWO ENTRIES WERE REMOVED WHEN THE JUDGE MOVED TO OPENAI, AND THE
+    # ── REASON IS THIS TABLE'S OWN CONTRACT RATHER THAN A JUDGEMENT ABOUT
+    # ── WHETHER THEY MATTER.
+    #
+    # `oncotriage/evaluation/rater.py::calibrate_chars_per_token` was exempt
+    # and named Anthropic's free `/v1/messages/count_tokens`. OpenAI publishes
+    # no equivalent, so the replacement encodes locally with tiktoken and calls
+    # nothing at all. A site that touches no endpoint is not a billed site.
+    #
+    # `oncotriage/evaluation/rater.py::model_is_visible` -- the free
+    # `models.retrieve` visibility probe added with the port -- is
+    # DELIBERATELY NOT DECLARED HERE, and it was tried and taken out. This
+    # table is checked in BOTH directions: `tests/test_spend_coverage.py` 1a
+    # requires every DERIVED site to be declared, and 1b requires every
+    # DECLARED site to be derivable. The derivation matches on billed-endpoint
+    # attribute suffixes, `models.retrieve` is not one, and adding it to that
+    # list to admit this entry would make the scan report a zero-cost
+    # visibility probe as a billed site everywhere it appears. The old entry's
+    # own argument -- "a reader auditing the gate WILL find it" -- rested on
+    # the site NAMING a billed attribute, which this one does not.
     "oncotriage/fixtures/replay.py::main": (
         DISPOSITION_EXEMPT, None,
         "THE OPENAI TRIPWIRE, AND IT IS THE OPPOSITE OF A BILLED CALL. The "

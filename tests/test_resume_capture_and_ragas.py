@@ -105,6 +105,7 @@ from oncotriage.evaluation import ragas_harness as rh
 # a HARD guard -- a pin that did not take would leave every check below
 # silently measuring a refusal.
 import _provider_pin                                             # noqa: E402
+from oncotriage.evaluation import judge_independence              # noqa: E402
 
 _PROVIDER_BEFORE_PIN = _provider_pin.pin_openai_arm(os.path.basename(__file__))
 
@@ -1495,6 +1496,31 @@ def drive_ragas_main(argv, run_dir, suffix=""):
     stub.__version__ = IDENT_A["packages"]["ragas"]
     sys.modules["ragas"] = stub
 
+    # ── THE SAME-FAMILY OVERRIDE, AND THIS FILE IS THE REASON IT EXISTS ──
+    #
+    # THIS FILE PINS `config.MATCHING_PROVIDER` TO "openai" (see the block at
+    # the top), which makes the EFFECTIVE CLASSIFIER `gpt-5.6-terra` -- the
+    # same model as the ported ragas judge. So under this file's own pin the
+    # configuration genuinely IS same-family, and
+    # `judge_independence.require_independent_judge` genuinely does refuse it.
+    # That is the guard working on a REACHABLE configuration rather than a
+    # planted one: nothing here was arranged to make it fire.
+    #
+    # THE OVERRIDE IS THE ANSWER RATHER THAN A WEAKENED GUARD, because these
+    # sections are about `--resume` PLANNING and not about who judges -- the
+    # same argument the provider pin above already makes about the fixture
+    # harness's own refusal. Every run permitted this way records
+    # `judge_independence.override_applied: true` in its manifest, so the
+    # artifacts these drives write say what they were.
+    #
+    # SET AROUND EACH DRIVE AND RESTORED IN THE `finally`, never at module
+    # scope: a process-global permission to publish a circular measurement
+    # must not outlive the one function that needs it, and every check after
+    # this file's ragas sections is entitled to meet the guard armed.
+    _env_key = judge_independence.ENV_ALLOW_SAME_FAMILY_JUDGE
+    _env_before = os.environ.get(_env_key)
+    os.environ[_env_key] = "1"
+
     rh.load_run = lambda d, f=None: _make_run(
         response_field=f or rh.DEFAULT_RESPONSE_FIELD, response_suffix=suffix)
     rh.price_plan = lambda *a, **k: {"judge_calls_total": 10,
@@ -1513,6 +1539,10 @@ def drive_ragas_main(argv, run_dir, suffix=""):
                 code = f"RAISED {type(exc).__name__}"
         return code, cp.text
     finally:
+        if _env_before is None:
+            os.environ.pop(_env_key, None)
+        else:
+            os.environ[_env_key] = _env_before
         for k, v in saved.items():
             setattr(rh, k, v)
         if saved_ragas is None:

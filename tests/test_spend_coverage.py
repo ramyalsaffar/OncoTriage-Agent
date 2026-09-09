@@ -234,7 +234,24 @@ section("SECTION 1 -- every billed call site is derived, and accounted for")
 # scanner recognises.
 _BILLED_SUFFIXES = ("embeddings.create", "chat.completions.create",
                     "responses.create", "messages.batches.create",
-                    "messages.create", "messages.count_tokens", ".converse")
+                    "messages.create", "messages.count_tokens", ".converse",
+                    # THE OPENAI BATCH API. `batches.create` commits a whole
+                    # JSONL file of requests at once, and it is the site the
+                    # rater's gate now stands in front of. Without it in this
+                    # tuple the derivation reports a file that spends real
+                    # money on a judge as touching no billed endpoint -- the
+                    # exact false negative this list's own header records
+                    # having caught once already, on the other vendor.
+                    #
+                    # `messages.batches.create` also ends with this suffix, so
+                    # an Anthropic batch site now matches twice. Harmless: the
+                    # derivation collects qualnames into a set.
+                    "batches.create",
+                    # `models.retrieve` is DELIBERATELY ABSENT. It is free,
+                    # and adding it would make the derivation report a
+                    # zero-cost visibility probe as a billed site, which is
+                    # the over-approximation this scan is built to avoid.
+                    )
 
 # DIRECTORIES THAT ARE NOT PRODUCTION CODE. `tests/` is excluded because a test
 # stub NAMES these attributes by definition -- every stand-in in this suite
@@ -1030,17 +1047,52 @@ with clean_ledger(cap=1000.0) as ledger:
 
 
 class _BatchStub:
-    """Counts `messages.batches.create` calls. Sends nothing, bills nothing."""
+    """Counts `batches.create` calls. Sends nothing, bills nothing.
 
-    def __init__(self):
+    PORTED WITH THE HARNESS. It stood in for Anthropic's
+    `client.messages.batches.create(requests=[...])`, which took the requests
+    inline; the OpenAI Batch API takes a FILE, so the stub now answers
+    `files.create` as well and counts the requests by parsing the JSONL it is
+    handed. Counting the LINES rather than trusting a length argument is what
+    keeps 6f a statement about how many requests were committed rather than
+    about how many the caller said it was committing.
+    """
+
+    def __init__(self, on_create=None):
         self.created = []
+        self.uploaded = []
+        # A HOOK RATHER THAN A MONKEYPATCHED METHOD. `batches.create` is
+        # reached through a property now, so rebinding it on the instance
+        # reaches nothing -- 6f's driver used to rebind `stub.create` and
+        # would have silently stopped charging the ledger, turning the
+        # per-chunk measurement into a statement about nothing.
+        self.on_create = on_create
 
+    # -- the file half ---------------------------------------------------
     @property
-    def messages(self):
-        return types.SimpleNamespace(batches=self)
+    def files(self):
+        return types.SimpleNamespace(create=self._file_create)
 
-    def create(self, requests):
-        self.created.append(len(requests))
+    def _file_create(self, file=None, purpose=None, **_kw):
+        name, payload = file
+        body = payload.decode("utf-8") if isinstance(payload, bytes) else payload
+        lines = [ln for ln in body.splitlines() if ln.strip()]
+        self.uploaded.append(len(lines))
+        return types.SimpleNamespace(id=f"file_{len(self.uploaded)}",
+                                     filename=name, purpose=purpose)
+
+    # -- the batch half --------------------------------------------------
+    @property
+    def batches(self):
+        return types.SimpleNamespace(create=self._batch_create)
+
+    def _batch_create(self, input_file_id=None, endpoint=None,
+                      completion_window=None, metadata=None, **_kw):
+        # The file was uploaded immediately before this call, so its line
+        # count is this batch's request count.
+        self.created.append(self.uploaded[-1])
+        if self.on_create is not None:
+            self.on_create()
         return types.SimpleNamespace(id=f"batch_{len(self.created)}")
 
 
@@ -1061,7 +1113,24 @@ def drive_submit(*, spent, cap, chunks):
     return outcome, stub.created
 
 
-_CHUNKS = [[{"custom_id": "a"}], [{"custom_id": "b"}], [{"custom_id": "c"}]]
+def _req(cid):
+    """One request in the shape `to_batch_line` reads.
+
+    `params` IS REQUIRED NOW, where the Anthropic stub took the whole record
+    inline and never looked inside it. `submit_batches` serialises each request
+    to a JSONL line before uploading, so a fabricated request with no body is
+    a KeyError rather than a submission -- which is the right failure, and it
+    is why these fixtures carry a minimal but REAL body.
+    """
+    return {"custom_id": cid,
+            "params": {"model": "gpt-5.6-terra",
+                       "max_completion_tokens": 16,
+                       "messages": [{"role": "system", "content": "s"},
+                                    {"role": "user", "content": [
+                                        {"type": "text", "text": "u"}]}]}}
+
+
+_CHUNKS = [[_req("a")], [_req("b")], [_req("c")]]
 
 check("6d  CLEAN CONTROL: with budget, every chunk is submitted",
       drive_submit(spent=0.0, cap=100.0, chunks=_CHUNKS), (None, [1, 1, 1]))
@@ -1073,18 +1142,12 @@ check("6e  *** with the budget already spent, NOT ONE batch is created ***",
 # once before the loop would submit all three; this one stops at the chunk that
 # crosses.
 def drive_submit_crossing():
-    stub = _BatchStub()
     state, path = {}, os.path.join(_TMP, "rater_state_probe2.json")
     with clean_ledger(cap=10.0, rater_cap=10.0) as ledger:
         ledger.charge_usd(9.0, spend.SPEND_SOURCE_RATER)
-        _orig = stub.create
-
-        def _create_and_charge(requests):
-            out = _orig(requests)
-            ledger.charge_usd(1.0, spend.SPEND_SOURCE_RATER)
-            return out
-
-        stub.create = _create_and_charge
+        stub = _BatchStub(
+            on_create=lambda: ledger.charge_usd(1.0,
+                                                spend.SPEND_SOURCE_RATER))
         outcome = raised(_rater.submit_batches, stub, _CHUNKS, state, path,
                          "primary")
     return outcome, stub.created
@@ -1137,14 +1200,30 @@ with clean_ledger(cap=20.0, rater_cap=20.0) as ledger:
 
 section("SECTION 7 -- the ragas harness charges and is gated")
 
-_JUDGE_MODEL = config.RAGAS_JUDGE_MODEL if hasattr(
-    config, "RAGAS_JUDGE_MODEL") else "claude-sonnet-4-6"
+_JUDGE_MODEL = _ragas.DEFAULT_JUDGE_MODEL
 
 
 class _JudgeUsage:
-    def __init__(self, i, o):
-        self.input_tokens = i
-        self.output_tokens = o
+    """An OPENAI usage object, and the field names are the whole point.
+
+    This stub carried `input_tokens` / `output_tokens`, which are ANTHROPIC's
+    names, and `UsageTally.record_judge` read them. Ported to OpenAI both sides
+    have to move together -- and they are moved here rather than papered over,
+    because a stub that kept the old names would let a `record_judge` still
+    reading them pass 7a while reporting every real run as free.
+
+    `prompt_tokens` INCLUDES the cached part, so `cached` is carried as a
+    breakdown OF it rather than beside it.
+    """
+
+    def __init__(self, i, o, cached=0, reasoning=0):
+        # `i` is the UNCACHED figure the caller means; prompt_tokens is the sum.
+        self.prompt_tokens = i + cached
+        self.completion_tokens = o
+        self.prompt_tokens_details = types.SimpleNamespace(
+            cached_tokens=cached)
+        self.completion_tokens_details = types.SimpleNamespace(
+            reasoning_tokens=reasoning)
 
 
 class _EmbedUsage:

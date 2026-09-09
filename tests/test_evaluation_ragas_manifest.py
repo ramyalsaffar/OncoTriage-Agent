@@ -470,10 +470,19 @@ print("=" * 70)
 
 
 class _Args(object):
-    """The attribute surface build_manifest reads off the parsed arguments."""
+    """The attribute surface build_manifest reads off the parsed arguments.
 
-    judge_model = "claude-sonnet-4-6"
-    temperature = 0.0
+    PORTED WITH THE JUDGE. `judge_model` was `claude-sonnet-4-6` and is read
+    straight into the manifest, so leaving it would make every check below
+    assert that a manifest records the model this project deliberately stopped
+    using -- a fixture asserting the defect. `temperature` is None because that
+    is what the ported default IS: this judge accepts no value but its own, and
+    "omitted" is the run's real sampling configuration.
+    """
+
+    judge_model = _rh.DEFAULT_JUDGE_MODEL
+    temperature = None
+    reasoning_effort = _rh.DEFAULT_REASONING_EFFORT
     max_tokens = 4096
     embedding_model = "text-embedding-3-small"
     max_workers = 4
@@ -519,11 +528,38 @@ check("...and it is the stamp that was passed in, not a second reading",
 
 check("the pre-existing ragas_version field is untouched",
       field(_MANIFEST, "ragas_version"), "0.4.3")
+# THE JUDGE MOVED VENDOR AND THE EXPECTATION MOVED WITH IT. The values below
+# are DERIVED from the module's own default rather than retyped, so this check
+# is about the manifest carrying what the run was configured with -- which is
+# what it was always for -- rather than about one particular vendor. The
+# PROVIDER strings stay literal, because they are the manifest's own words and
+# the point of the check is that the two are recorded and are not confused.
 check("...and so are the judge and embedding model strings the item names",
       (field(_MANIFEST, "judge_model"), field(_MANIFEST, "judge_provider"),
        field(_MANIFEST, "embeddings_model"),
        field(_MANIFEST, "embeddings_provider")),
-      ("claude-sonnet-4-6", "anthropic", "text-embedding-3-small", "openai"))
+      (_rh.DEFAULT_JUDGE_MODEL, "openai", "text-embedding-3-small", "openai"))
+check("...and the judge and the embedder being ONE vendor is recorded rather "
+      "than hidden -- the property that matters is that neither is the "
+      "family that wrote the text, not that they differ from each other",
+      field(_MANIFEST, "judge_provider") ==
+      field(_MANIFEST, "embeddings_provider"), True)
+check("...and the manifest says no dated snapshot was pinned, because none "
+      "exists -- so a reader knows the id names a moving target",
+      field(_MANIFEST, "judge_model_snapshot_pinned"), False)
+check("...and it records the effort the run asked for, which is a priced "
+      "setting rather than a preference",
+      field(_MANIFEST, "judge_reasoning_effort"), _rh.DEFAULT_REASONING_EFFORT)
+check("...and it records temperature as OMITTED rather than absent: null "
+      "with a basis beside it, so 'not sent' and 'not recorded' are two "
+      "readings and not one",
+      (field(_MANIFEST, "judge_temperature"),
+       "omitted" in str(field(_MANIFEST, "judge_temperature_basis"))),
+      (None, True))
+check("...and it names the parameters this judge cannot carry, so a reader "
+      "is not left to infer an absence",
+      sorted(field(_MANIFEST, "judge_omitted_parameters") or []),
+      ["temperature", "top_p"])
 
 check("the schema version records that the field set moved",
       field(_MANIFEST, "schema_version"), 2)

@@ -191,6 +191,30 @@ dependencies = [
     "python-dateutil==2.9.0.post0",
 
     # --- OpenAI -------------------------------------------------------------
+    #
+    # 1.99.9 IS UNCHANGED, AND THE JUDGE PORT CHECKED IT RATHER THAN ASSUMING
+    # IT (2026-09-08). Both evaluation judges moved to `gpt-5.6-terra` on this
+    # SDK, and the port needs three things from it that the pipeline never
+    # asked for. Each was read out of the INSTALLED distribution, not out of a
+    # changelog:
+    #
+    #   * `chat.completions.create` accepts `reasoning_effort`, typed
+    #     `Literal['minimal','low','medium','high']` -- so 'medium' serialises.
+    #     (Note that `config.MATCHING_REASONING_EFFORT`'s own block records the
+    #     values THE MODEL accepted when probed: 'none' and 'xhigh' are in that
+    #     set and not in this Literal, and 'minimal' is in this Literal and not
+    #     in that set. Both records are kept; they answer different questions.)
+    #   * `client.batches` exists with create/retrieve/cancel/list, and
+    #     `batch_create_params` types `endpoint` as a Literal that includes
+    #     `/v1/chat/completions`.
+    #   * `response_format` accepts a `json_schema` block, which is what makes
+    #     the rater's strict output schema expressible.
+    #
+    # SO NO BUMP WAS NEEDED and none was made. That is worth writing down
+    # because the obvious assumption -- that a 2026 model needs a 2026 SDK --
+    # is what would have moved this pin for nothing, and moving it is not free:
+    # `ragas` is deliberately NOT a pipeline dependency precisely because
+    # installing it drags `openai` from 1.x to 2.x.
     "openai==1.99.9",
 
     # --- Vector database ----------------------------------------------------

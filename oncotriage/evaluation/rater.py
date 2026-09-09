@@ -8,6 +8,36 @@ not an accuracy rate. The rater is a measurement instrument with its own error,
 not ground truth, and nothing in this module decides which of the two models is
 right.
 
+**THE JUDGE IS GPT-5.6 TERRA ON THE OPENAI BATCH API, AND UNTIL 2026-09-08 THIS
+FILE SAID "DIFFERENT FAMILY" WHILE BEING THE SAME ONE.** Stage 5 moved to Claude
+Sonnet 4.6 over Bedrock Converse (`config.MATCHING_PROVIDER` is
+`bedrock_anthropic`) and this rater went on pinning `claude-sonnet-4-6` on the
+Anthropic API. The paragraph above was the claim; the code was its opposite; no
+check anywhere could see the contradiction, because the two facts live three
+modules apart and the only thing joining them was prose. Every agreement figure
+produced in that window is a Claude-rating-Claude number published under a
+heading that says otherwise.
+
+`oncotriage/evaluation/judge_independence.py` is what makes that
+unrepeatable-in-silence: it compares FAMILIES rather than model strings (a
+Claude on Bedrock is still an Anthropic model), it is called at this module's
+IMPORT and again immediately before the first billed request on the EFFECTIVE
+model after `--model`, and the one way past it is a named variable whose use is
+recorded in every manifest.
+
+WHAT MOVED WITH THE VENDOR, and each is argued at its own site rather than
+here: the wire shape (Anthropic Messages -> OpenAI chat completions), the batch
+mechanism (`messages.batches.create` over an inline list -> a JSONL file plus
+`batches.create`), the usage semantics (DISJOINT counts -> `prompt_tokens`
+INCLUDING its cached part), the cache (explicit `cache_control` with a chosen
+TTL -> automatic prefix caching with no field to send and no TTL to choose),
+the sampling parameters (`temperature=0` -> OMITTED, because this model rejects
+every value but its default) and the reply ceiling (`max_tokens` ->
+`max_completion_tokens`, which is what a reasoning model requires). What did NOT
+move is everything above the wire: the rubric lift, the two modes, the request
+CONTENT, the custom_id scheme, the join, the bucketing of every failure and the
+order the requests are built in.
+
 TWO MODES, AND THE DEFAULT IS THE WEAKER ONE ON PURPOSE.
 
 ANCHORED (the default, and what the 1.4.0 run was rated under) shows the rater
@@ -70,10 +100,19 @@ the criterion text, the recorded patient_value -- and, in ANCHORED mode only,
 the recorded status. Anything else would let it rate the trial, or the vendor,
 instead of the decision.
 
-THIS SPENDS MONEY, ON THE ANTHROPIC API. Every criterion decision is one billed
-request. ``--dry-run`` builds every request, prices it, and submits nothing.
-Actual spend is recomputed from the returned usage objects, never from the
-estimate.
+THIS SPENDS MONEY, ON THE OPENAI BATCH API. Every criterion decision is one
+billed request. ``--dry-run`` builds every request, prices it, and submits
+nothing. Actual spend is recomputed from the returned usage objects, never from
+the estimate.
+
+**AND NOTHING IS SUBMITTED UNTIL THE MAXIMUM LIABILITY IS RESERVED.** A batch
+reports no usage until it is collected, so a gate that checks AFTER submission
+cannot enforce anything: by the time the first token count is readable the whole
+batch has been billed. ``reserve_batch_liability`` prices each chunk at its
+WORST CASE -- every input token uncached at the dearest input class, every reply
+at the full configured ceiling, at batch rates -- and refuses the submission if
+that exceeds what the rater budget has left. See its docstring for why the
+worst case is not "no cache hits".
 
 Entry point: ``rater_run.py`` at the code root.
 """
@@ -87,6 +126,7 @@ from collections import Counter, OrderedDict
 
 from oncotriage import config, paths, spend
 from oncotriage.agent.prompts import PROMPT_VERSION, render_system_prompt
+from oncotriage.evaluation import judge_independence
 from oncotriage.observability import console, get_logger
 
 log = get_logger(__name__)
@@ -628,6 +668,109 @@ be omitted:
 "rationale"
     One sentence. State the rule or the record content that decided the status.
     It may not be empty."""
+
+
+#------------------------------------------------------------------------------
+# Structured output
+#------------------------------------------------------------------------------
+
+
+RESPONSE_SCHEMA_NAME = {
+    MODE_ANCHORED: "criterion_decision_rating",
+    MODE_BLIND: "criterion_decision_blind_rating",
+}
+if tuple(sorted(RESPONSE_SCHEMA_NAME)) != tuple(sorted(MODES)):
+    raise RuntimeError(
+        f"RESPONSE_SCHEMA_NAME must name every rating mode exactly once: "
+        f"modes={MODES}, table={tuple(RESPONSE_SCHEMA_NAME)}")
+
+# EVERY STATUS EITHER ARM CAN CARRY, as one flat vocabulary. DERIVED from
+# ARM_STATUSES rather than retyped, so a status added to an arm cannot be
+# legal at the parser and rejected by the schema.
+ALL_STATUSES = tuple(sorted({s for v in ARM_STATUSES.values() for s in v}))
+
+
+def build_response_format(mode):
+    """A strict ``json_schema`` response format for one rating mode, or None.
+
+    **THE SCHEMA IS PER MODE AND DELIBERATELY NOT PER ARM, AND THAT IS A
+    MEASUREMENT DECISION RATHER THAN A CONVENIENCE.** ``corrected_status`` is
+    only legal from the arm under audit -- ``ARM_STATUSES`` is keyed by arm
+    precisely because the two vocabularies are disjoint -- so a per-arm schema
+    is expressible and would forbid a wrong-arm answer outright. It is not
+    built, for two reasons:
+
+      * ``parse_rating`` ALREADY measures that mistake. A status from the other
+        arm is bucketed ``bad_corrected_status`` and counted. Letting the
+        provider's constrained decoder make it impossible would not improve the
+        rating -- it would DELETE a measurement this harness exists to take,
+        and the count would silently read zero forever.
+      * the schema is part of the request body, and whether it participates in
+        OpenAI's automatic prefix cache is not something this project has
+        measured. A schema that varied by arm would, if it does participate,
+        split each patient's cached prefix in two -- doubling the write volume
+        for a constraint the parser does not need.
+
+    THE ANCHORED SCHEMA REQUIRES ALL FOUR KEYS, INCLUDING THE ONE THE PARSER
+    TOLERATES ABSENT. OpenAI's ``strict`` mode requires every property to be in
+    ``required``; nullability is expressed by a type union instead. That is
+    STRICTER than ``REQUIRED_RATING_KEYS`` and compatible with it: an explicit
+    ``null`` and an omitted key say the same thing on an "agree", the parser
+    accepts both, and the tolerance stays for a response that arrives without
+    the schema (a retry against an older era, a hand-fed fixture).
+
+    Returns None for an unknown mode rather than raising, because the caller
+    that builds requests has already refused an unknown mode by then and a
+    second refusal here would be dead code with a message nobody reads.
+    """
+    if mode == MODE_ANCHORED:
+        properties = {
+            "patient_value_support": {
+                "type": "string", "enum": list(SUPPORT_VALUES)},
+            "status_verdict": {
+                "type": "string", "enum": list(VERDICT_VALUES)},
+            "corrected_status": {
+                "anyOf": [{"type": "string", "enum": list(ALL_STATUSES)},
+                          {"type": "null"}]},
+            "rationale": {"type": "string"},
+        }
+        keys = list(RATING_KEYS)
+    elif mode == MODE_BLIND:
+        properties = {
+            "assigned_status": {
+                "type": "string", "enum": list(ALL_STATUSES)},
+            "patient_value_support": {
+                "type": "string", "enum": list(SUPPORT_VALUES)},
+            "rationale": {"type": "string"},
+        }
+        keys = list(BLIND_RATING_KEYS)
+    else:
+        return None
+    # The property set and the contract's key tuple must agree. Not an
+    # ``assert``: ``python -O`` deletes those, and a schema that named four
+    # keys while the parser expected three would reject every response at the
+    # provider, once per decision, for a whole batch.
+    if sorted(properties) != sorted(keys):
+        raise RaterRefusal(
+            f"the {mode} response schema declares {sorted(properties)} but the "
+            f"contract is {sorted(keys)}; every response would be refused.",
+            code="schema_contract_mismatch")
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": RESPONSE_SCHEMA_NAME[mode],
+            "strict": True,
+            "schema": {
+                "type": "object",
+                "properties": properties,
+                "required": keys,
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+#------------------------------------------------------------------------------
 
 
 def build_system_prompt(rubric, mode=MODE_ANCHORED):
@@ -1384,23 +1527,42 @@ class RequestIndex(object):
 
 
 def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
-                   temperature, cache_ttl, limit=0, mode=MODE_ANCHORED,
-                   arm_definitions=None, retest_fraction=0.0,
-                   retest_seed=DEFAULT_RETEST_SEED, include_keys=None,
-                   include_keys_meta=None):
+                   temperature, reasoning_effort=None, limit=0,
+                   mode=MODE_ANCHORED, arm_definitions=None,
+                   retest_fraction=0.0, retest_seed=DEFAULT_RETEST_SEED,
+                   include_keys=None, include_keys_meta=None,
+                   structured_output=True):
     """One request per criterion decision, in the run's deterministic order.
 
-    THE MESSAGE IS SPLIT INTO TWO USER BLOCKS ON PURPOSE, and it is the single
-    biggest cost decision in this file. The patient record averages ~11,500
-    characters and is identical across all of one patient's decisions -- 95 to
-    298 of them in this run. Sent whole on every request it dominates the bill.
-    Split out as its own content block with a cache breakpoint, it is written
-    once per patient and read at a tenth of the price thereafter.
+    THE MESSAGE IS SPLIT INTO TWO USER CONTENT PARTS ON PURPOSE, and it is the
+    single biggest cost decision in this file. The patient record averages
+    ~11,500 characters and is identical across all of one patient's decisions --
+    95 to 298 of them in this run. Sent whole on every request it dominates the
+    bill. Split out as its own part, with the per-decision block after it, every
+    request for one patient shares a long identical PREFIX.
+
+    **THAT PREFIX IS THE WHOLE CACHE STRATEGY NOW, AND THERE IS NO FIELD TO
+    SEND.** Anthropic's cache was explicit: a `cache_control` breakpoint and a
+    chosen TTL. OpenAI's is automatic -- it keys on the longest common prefix of
+    the request, with no parameter, no breakpoint and no TTL to choose. So the
+    ORDER of the parts stopped being a stylistic decision and became the
+    mechanism: system prompt, then patient record, then the one part that
+    differs per decision. Reverse the last two and every request for a patient
+    has a different prefix from the second token onward, the cache serves
+    nothing, and NOTHING RAISES -- the only trace is `cached_tokens` reading 0.
+    `tests/test_evaluation_rater.py` pins the order for that reason.
 
     The record goes in the USER turn rather than the system turn even though
     both would cache. The system turn carries instruction authority; the patient
     record is third-party data under audit, and the data-boundary rule above
     says so. Putting audited data where instructions live would contradict it.
+
+    ``reasoning_effort`` is sent when given and OMITTED when None. It is not
+    defaulted here: `_prepare` resolves it, so the manifest, the plan banner and
+    the wire cannot disagree about what was asked for.
+
+    ``structured_output`` attaches a strict JSON schema for the mode. See
+    ``build_response_format``.
 
     IN BLIND MODE the per-decision block is built by
     ``build_blind_decision_block``, which takes no status, and a seeded
@@ -1460,7 +1622,8 @@ def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
         decisions, reserve=len(RETEST_SUFFIX) if retest else 0)
     patient_by_ordinal = {v: k for k, v in run.patient_order.items()}
 
-    cache_control = {"type": "ephemeral", "ttl": cache_ttl}
+    response_format = (build_response_format(mode)
+                       if structured_output else None)
 
     def _content_block(d):
         if mode == MODE_BLIND:
@@ -1531,18 +1694,40 @@ def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
         if is_retest:
             retest_ids.add(cid)
 
+        # ── THE WIRE BODY. OpenAI chat completions. ───────────────────
+        #
+        # `max_completion_tokens` AND NOT `max_tokens`: this is a reasoning
+        # model, the legacy field is rejected on the GPT-5 family, and the
+        # rename is not cosmetic -- reasoning tokens count against this ceiling
+        # and are billed as output, which is the same reason
+        # ASSUMED_OUTPUT_TOKENS could not survive the port.
+        #
+        # THE SYSTEM PROMPT IS A `system` MESSAGE, first, so the shared prefix
+        # begins at the first token of the request. `developer` is the newer
+        # spelling for reasoning models and `system` is still accepted and
+        # still what every earlier run used; keeping `system` costs nothing and
+        # keeps the two eras' request text comparable.
         params = {
             "model": model,
-            "max_tokens": max_tokens,
-            "system": [{"type": "text", "text": system_prompt,
-                        "cache_control": dict(cache_control)}],
-            "messages": [{"role": "user", "content": [
-                {"type": "text",
-                 "text": build_patient_block(run.summaries[d.patient_id]),
-                 "cache_control": dict(cache_control)},
-                {"type": "text", "text": _content_block(d)},
-            ]}],
+            "max_completion_tokens": max_tokens,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [
+                    {"type": "text",
+                     "text": build_patient_block(run.summaries[d.patient_id])},
+                    {"type": "text", "text": _content_block(d)},
+                ]},
+            ],
         }
+        if reasoning_effort is not None:
+            params["reasoning_effort"] = reasoning_effort
+        if response_format is not None:
+            params["response_format"] = response_format
+        # OMITTED BY DEFAULT AND REFUSED BY `resolve_temperature`, which is
+        # where the argument lives. The branch stays because the parameter is
+        # still expressible for a judge model that accepts it, and because a
+        # silently-dropped sampling parameter is the failure this project has
+        # a counter for elsewhere.
         if temperature is not None:
             params["temperature"] = temperature
         requests.append({"custom_id": cid, "params": params})
@@ -1599,9 +1784,59 @@ def build_requests(run, system_prompt, rubric_meta, model, max_tokens,
 #------------------------------------------------------------------------------
 
 
-MAX_REQUESTS_PER_BATCH = 100000       # API cap
-MAX_BATCH_BYTES = 256 * 1024 * 1024   # API cap
+# OPENAI BATCH CAPS, AND BOTH NUMBERS MOVED WITH THE VENDOR. Anthropic's
+# Message Batches allowed 100,000 requests and a 256 MB payload; OpenAI's Batch
+# API allows 50,000 requests per batch and a 200 MB input FILE. Halving the
+# request cap and shrinking the byte budget are both in the safe direction, and
+# neither binds on this run (2,212 requests, ~28 MB) -- but a cap that is too
+# HIGH is discovered by a rejected submission after the file has been uploaded,
+# which is the failure `chunk_requests` exists to prevent.
+MAX_REQUESTS_PER_BATCH = 50000        # API cap
+MAX_BATCH_BYTES = 200 * 1024 * 1024   # API cap, on the uploaded JSONL file
 _CHUNK_BYTE_HEADROOM = 0.90           # leave room for the envelope
+
+BATCH_ENDPOINT = "/v1/chat/completions"
+BATCH_COMPLETION_WINDOW = "24h"
+"""The batch's own two wire constants.
+
+``BATCH_ENDPOINT`` is the per-request ``url`` AND the ``endpoint`` argument to
+``batches.create``; the two must agree or the batch is rejected, so there is one
+constant rather than two literals. It is ``/v1/chat/completions`` and not
+``/v1/responses``: the Responses API is the other batchable surface, this
+harness's parser, its ``stop_reason`` bucketing and its 2,212 rows of comparable
+history are all chat-completions shaped, and moving surfaces is a second change
+with its own proof.
+
+``24h`` is the only completion window the API currently accepts, and it is what
+the 50% discount is for.
+"""
+
+
+def to_batch_line(request):
+    """One request in the JSONL line shape the OpenAI Batch API reads.
+
+    ``{"custom_id", "method", "url", "body"}`` -- where Anthropic took
+    ``{"custom_id", "params"}`` in an inline list. The internal record keeps the
+    name ``params`` for the body, deliberately: it is read by the estimator, the
+    retry pass, the smoke report and the manifest, ``params`` has always meant
+    "the request body" in this file, and renaming it across nine call sites to
+    match one wire format would be a diff nobody could review against the
+    history it is supposed to preserve.
+    """
+    return {"custom_id": request["custom_id"], "method": "POST",
+            "url": BATCH_ENDPOINT, "body": request["params"]}
+
+
+def batch_jsonl(requests):
+    """The uploaded file's exact bytes, as one str.
+
+    ``ensure_ascii=False`` and a trailing newline on every line, matching what
+    ``chunk_requests`` measures. The two must agree or the byte budget is a
+    number about a different string than the one that is uploaded.
+    """
+    return "".join(
+        json.dumps(to_batch_line(r), ensure_ascii=False) + "\n"
+        for r in requests)
 
 
 def chunk_requests(requests, max_requests=MAX_REQUESTS_PER_BATCH,
@@ -1622,7 +1857,12 @@ def chunk_requests(requests, max_requests=MAX_REQUESTS_PER_BATCH,
     current = []
     current_bytes = 0
     for req in requests:
-        size = len(json.dumps(req, ensure_ascii=False).encode("utf-8"))
+        # MEASURED ON THE UPLOADED LINE, not on the internal record. The two
+        # differ by the `method`/`url` envelope and by the `params` -> `body`
+        # rename, so measuring the record would under-count every request by
+        # ~60 bytes and the file could exceed the cap the check just passed.
+        size = len(json.dumps(to_batch_line(req),
+                              ensure_ascii=False).encode("utf-8")) + 1
         if size > budget:
             raise RaterRefusal(
                 f"single request {req['custom_id']!r} serialises to {size} "
@@ -1645,6 +1885,10 @@ def chunk_requests(requests, max_requests=MAX_REQUESTS_PER_BATCH,
 #------------------------------------------------------------------------------
 
 
+CACHE_MODEL_OPENAI = "openai_implicit"
+CACHE_MODEL_ANTHROPIC = "anthropic_ttl_tiers"
+
+
 def rater_pricing(model):
     """Per-token USD rates for one model at BATCH prices, or raise.
 
@@ -1652,6 +1896,21 @@ def rater_pricing(model):
     indistinguishable from a genuinely free run and every aggregate over it
     under-reports silently -- the same argument ``get_model_cost`` makes in
     ``oncotriage/utils.py``, applied to a second vendor.
+
+    **THE RATE KEYS DEPEND ON THE ROW'S ``cache_model`` AND THAT IS THE POINT.**
+    The two vendors' caches are not the same mechanism: Anthropic charges a
+    write premium per TTL tier and reports DISJOINT token counts; OpenAI caches
+    implicitly with one write dimension (new in GPT-5.6) and reports
+    ``prompt_tokens`` INCLUDING the cached part. Pricing one through the
+    other's keys is not an error the arithmetic can catch -- it is a silent
+    mis-charge -- so the row says which it is and this function returns the
+    keys that row's usage objects can actually populate.
+
+    ``price_usage`` consumes whatever comes back with ``.get(..., 0)``, so a
+    total carrying a key this row does not price contributes nothing rather
+    than raising. That is the right direction here and it is NOT a licence to
+    mix: ``translate_openai_usage`` produces exactly the OpenAI keys, and the
+    Anthropic keys survive only so an archived manifest can be re-priced.
     """
     table = config.RATER_PRICING
     entry = table.get("models", {}).get(model)
@@ -1664,25 +1923,217 @@ def rater_pricing(model):
     batch = table["batch_discount"]
     base_in = entry["input_per_mtok"] / 1e6
     base_out = entry["output_per_mtok"] / 1e6
-    return {
+    cache_model = entry.get("cache_model")
+    rates = {
         "input": base_in * batch,
         "output": base_out * batch,
-        "cache_write_5m": base_in * table["cache_write_5m_multiplier"] * batch,
-        "cache_write_1h": base_in * table["cache_write_1h_multiplier"] * batch,
-        "cache_read": base_in * table["cache_read_multiplier"] * batch,
+        "cache_model": cache_model,
+        "batch_discount": batch,
         "pricing_version": table["last_updated"],
+        "rate_verified": entry.get("verified"),
     }
+    if cache_model == CACHE_MODEL_OPENAI:
+        # ONE read rate and ONE write rate, both per-row: this vendor has no
+        # TTL to choose, so a 5m/1h split here would be two names for one
+        # number and would invite a caller to pick the wrong one.
+        rates["cache_read"] = (
+            base_in * entry["cache_read_multiplier"] * batch)
+        rates["cache_write"] = (
+            base_in * entry["cache_write_multiplier"] * batch)
+    elif cache_model == CACHE_MODEL_ANTHROPIC:
+        rates["cache_write_5m"] = (
+            base_in * table["cache_write_5m_multiplier"] * batch)
+        rates["cache_write_1h"] = (
+            base_in * table["cache_write_1h_multiplier"] * batch)
+        rates["cache_read"] = base_in * table["cache_read_multiplier"] * batch
+    else:                                       # pragma: no cover - guarded
+        # Unreachable while config.py's import-time guard stands. Kept because
+        # this function is also reached with a hand-built table in a test, and
+        # a missing cache_model must not silently price the cache at zero.
+        raise RaterRefusal(
+            f"model {model!r} has no cache_model in config.RATER_PRICING; its "
+            f"cached tokens would be priced at zero.",
+            code="cache_model_absent")
+    return rates
+
+
+# EVERY TOKEN CLASS THAT CAN BE BILLED, mapped to the rate key that prices it.
+# ONE table, read by `price_usage` and by `reserve_batch_liability`, so the
+# actual figure and the reservation cannot disagree about what a class costs.
+PRICED_TOKEN_CLASSES = (
+    ("input_tokens", "input"),
+    ("output_tokens", "output"),
+    ("cache_read_input_tokens", "cache_read"),
+    ("cache_write_tokens", "cache_write"),
+    ("cache_creation_5m", "cache_write_5m"),
+    ("cache_creation_1h", "cache_write_1h"),
+)
 
 
 def price_usage(model, usage_totals):
-    """Dollars from measured token counts. Used for the ACTUAL figure."""
+    """Dollars from measured token counts. Used for the ACTUAL figure.
+
+    A class the row does not price contributes nothing rather than raising --
+    see ``rater_pricing``. An OpenAI total carries no ``cache_creation_*`` and
+    an Anthropic one carries no ``cache_write_tokens``, so each is priced by
+    exactly the keys its own vendor reports.
+    """
     rates = rater_pricing(model)
-    return (usage_totals.get("input_tokens", 0) * rates["input"]
-            + usage_totals.get("output_tokens", 0) * rates["output"]
-            + usage_totals.get("cache_creation_5m", 0) * rates["cache_write_5m"]
-            + usage_totals.get("cache_creation_1h", 0) * rates["cache_write_1h"]
-            + usage_totals.get("cache_read_input_tokens", 0)
-            * rates["cache_read"])
+    return sum(usage_totals.get(tok, 0) * rates[rate]
+               for tok, rate in PRICED_TOKEN_CLASSES if rate in rates)
+
+
+#------------------------------------------------------------------------------
+# The pre-submission reservation
+#------------------------------------------------------------------------------
+
+
+class SpendReservationRefused(RaterRefusal):
+    """The maximum liability of a batch exceeds what the budget has left.
+
+    A ``RaterRefusal`` subclass rather than a ``spend.SpendLimitReached``, and
+    the difference is which of the two events happened. ``SpendLimitReached``
+    means MONEY IS ALREADY GONE and the ledger says stop; this means nothing has
+    been spent and the arithmetic says this batch cannot fit. The first is
+    reported as a budget stop and exits 3; this is a refusal, exits 1, and its
+    remedy is to narrow the run or raise the cap BEFORE anything is submitted.
+    """
+
+    def __init__(self, message, reserved_usd=None, remaining_usd=None):
+        super().__init__(message, code="reservation_exceeds_budget")
+        self.reserved_usd = reserved_usd
+        self.remaining_usd = remaining_usd
+
+
+def worst_case_input_rate(rates):
+    """The dearest per-token rate any INPUT token could be billed at.
+
+    **THIS IS WHY THE RESERVATION IS NOT "ASSUME NO CACHE HITS".** That
+    formulation is correct only while a cache read and a cache write are both
+    CHEAPER than uncached input, which was true of every OpenAI model before
+    GPT-5.6 and is FALSE of this one: a write bills at 1.25x input. Reserving at
+    the uncached rate would therefore under-reserve by 25% of every token the
+    provider chose to cache -- silently, because a batch reports no usage until
+    it is collected and by then the money is spent.
+
+    So the reservation prices every input token at ``max`` over the input
+    classes this row can be billed under. On ``gpt-5.6-terra`` that is the
+    write rate; on a row with no write charge it collapses to the input rate
+    and the reservation is exactly the classical one.
+    """
+    return max(rates[key] for key in
+               ("input", "cache_read", "cache_write",
+                "cache_write_5m", "cache_write_1h") if key in rates)
+
+
+def reserve_batch_liability(model, requests, max_tokens, chars_per_token,
+                            input_tokens=None):
+    """The maximum this chunk can cost, in US dollars, at batch rates.
+
+    input tokens x the dearest input rate + requests x the FULL output ceiling
+    x the output rate.
+
+    ``input_tokens`` may be supplied when a measured or calibrated figure
+    exists; otherwise it is estimated from characters, which is an ESTIMATE and
+    is the one soft spot in an otherwise hard bound. ``chars_per_token`` erring
+    high under-counts tokens and therefore under-reserves, which is why
+    ``_prepare`` uses the pessimistic end of the calibration and why the
+    per-chunk ``spend.require_budget`` gate stays behind this: an estimate
+    guards the submission, a measurement guards the next one.
+    """
+    rates = rater_pricing(model)
+    if input_tokens is None:
+        chars = sum(_request_chars(r) for r in requests)
+        input_tokens = chars / float(chars_per_token or CHARS_PER_TOKEN_FALLBACK)
+    output_tokens = len(requests) * max_tokens
+    usd = (input_tokens * worst_case_input_rate(rates)
+           + output_tokens * rates["output"])
+    return {
+        "requests": len(requests),
+        "input_tokens_assumed": int(round(input_tokens)),
+        "output_tokens_assumed": int(output_tokens),
+        "input_rate_per_mtok": worst_case_input_rate(rates) * 1e6,
+        "output_rate_per_mtok": rates["output"] * 1e6,
+        "input_rate_basis": "the dearest input class this row can be billed "
+                            "at, which on a model with a cache-write premium "
+                            "is the WRITE rate rather than uncached input",
+        "output_tokens_basis": "the full configured max_completion_tokens, "
+                               "because reasoning tokens bill as output and "
+                               "no smaller figure is a bound",
+        "reserved_usd": usd,
+        "pricing_version": rates["pricing_version"],
+    }
+
+
+def _request_chars(request):
+    """Every character of prompt text in one built request.
+
+    Reads the body's own structure rather than a cached figure, so a change to
+    the message shape cannot leave the reservation measuring a request that is
+    no longer sent.
+    """
+    total = 0
+    for message in request["params"]["messages"]:
+        content = message["content"]
+        if isinstance(content, str):
+            total += len(content)
+        else:
+            total += sum(len(part.get("text", "")) for part in content)
+    return total
+
+
+def require_reservation_fits(model, chunks, max_tokens, chars_per_token):
+    """Refuse the WHOLE submission unless every chunk's worst case fits.
+
+    **BEFORE ANY BATCH IS CREATED, NOT BEFORE EACH ONE.** The per-chunk gate
+    inside ``submit_batches`` stops a session that has ALREADY spent its
+    budget; this stops one that provably cannot finish, and it does so while
+    nothing has been submitted -- so the remedy is a flag rather than a resume.
+    Summing every chunk is what makes it a statement about the SESSION: a
+    two-chunk run whose chunks each fit but whose total does not would
+    otherwise submit the first, spend, and be declined on the second.
+
+    Returns the reservation record for the manifest. Raises
+    ``SpendReservationRefused`` when it does not fit, and returns the record
+    with ``budget_remaining_usd = None`` when there is no cap at all -- an
+    uncapped run is not an error and the record still says what it would have
+    cost at worst.
+    """
+    # THE SOURCE IS NAMED, NOT PARAMETERISED AND NOT DEFAULTED. This function
+    # had a `source=None` parameter for one call site, and
+    # `tests/test_spend_budget_split.py` 3d is right to forbid it: the rater is
+    # bound by its OWN budget, and a budget-selecting call that reaches its
+    # answer through a variable is one refactor away from asking the campaign's
+    # balance about a judge session -- which is exactly what
+    # `describe_rater_cap` had to be introduced to undo one banner over.
+    per_chunk = [reserve_batch_liability(model, chunk, max_tokens,
+                                         chars_per_token)
+                 for chunk in chunks]
+    total = sum(c["reserved_usd"] for c in per_chunk)
+    left = spend.remaining(spend.SPEND_SOURCE_RATER)
+    budget = spend.budget_for(spend.SPEND_SOURCE_RATER)
+    record = {
+        "chunks": per_chunk,
+        "reserved_usd_total": total,
+        "budget_remaining_usd": left,
+        "budget": budget,
+        "cap_constant": spend.BUDGET_CAP_CONSTANTS[budget],
+        "fits": True if left is None else total <= left,
+    }
+    if left is not None and total > left:
+        raise SpendReservationRefused(
+            f"NOTHING WAS SUBMITTED. The maximum this submission can cost is "
+            f"${total:,.2f} -- {sum(c['requests'] for c in per_chunk)} "
+            f"requests, every input token priced at the dearest input class "
+            f"(${record['chunks'][0]['input_rate_per_mtok']:.2f}/Mtok) and "
+            f"every reply at the full {max_tokens}-token ceiling -- against "
+            f"${left:,.2f} left in the {record['budget']} budget. A batch "
+            f"reports no usage until it is collected, so a limit checked after "
+            f"submission cannot stop anything: this is refused before the "
+            f"money moves. Narrow the run with --limit or --include-keys, or "
+            f"raise {record['cap_constant']}.",
+            reserved_usd=total, remaining_usd=left)
+    return record
 
 
 #------------------------------------------------------------------------------
@@ -1691,7 +2142,43 @@ def price_usage(model, usage_totals):
 
 
 CHARS_PER_TOKEN_FALLBACK = 4.0
-ASSUMED_OUTPUT_TOKENS = 110   # a four-key object with a one-sentence rationale
+
+# ``ASSUMED_OUTPUT_TOKENS`` WAS 110 AND IS DELETED. It was measured on a
+# NON-REASONING model ("a four-key object with a one-sentence rationale") and it
+# is not merely stale for GPT-5.6 Terra at medium effort -- it is the wrong
+# QUANTITY. Reasoning tokens are billed at the output rate and arrive inside
+# ``completion_tokens``, so the visible four-key object is a floor on a number
+# whose other component nobody here has measured. A liability computed from 110
+# would under-reserve by whatever the model thought, which on a reasoning model
+# is routinely the larger half.
+#
+# ``None`` IS THE DEFAULT AND MEANS "USE THE CONFIGURED CEILING". That is the
+# only figure available that cannot be an under-estimate: the API cannot bill
+# more output than ``max_completion_tokens`` permits. It over-estimates the dry
+# run's upper bound and that is the safe direction; the LOWER bound was already
+# labelled a bound rather than a projection.
+#
+# WHAT REPLACES IT IS A MEASUREMENT, AND THE FIRST ONE NOW EXISTS. Six ANCHORED
+# requests at ``reasoning_effort="medium"`` (2026-09-08, batch
+# ``batch_6aa09bc83110819091cc6a2eb15e4299``) reported::
+#
+#     completion_tokens   69, 162, 184, 54, 59, 118   -- max 184, mean 108
+#     of which reasoning   0,  89, 112,  0,  0,  44   -- max 112
+#
+# So the visible object costs about what the old 110 said, the reasoning term
+# is real but modest at this effort, and the shipped 4096 ceiling is ~22x the
+# observed maximum. THAT IS DELIBERATELY NOT WRITTEN IN HERE AS A CONSTANT:
+# n = 6, on ONE mode, on the anchored contract, and a ceiling derived from six
+# samples is the same mistake as the 110 with a smaller sample behind it. What
+# it IS good for is choosing a value to PASS: an operator sizing a full run can
+# hand `assumed_output_tokens` a percentile of a real distribution and get a
+# reservation that is not 38x the truth. Until then the ceiling is the bound,
+# which is the only figure that cannot be an under-estimate.
+#
+# THE BLIND CONTRACT IS UNMEASURED ON THIS JUDGE. Blind replies ran longer than
+# anchored ones on the previous vendor (p90 at the ceiling), and nothing
+# carries that across.
+ASSUMED_OUTPUT_TOKENS = None
 
 
 def charge_batch_to_ledger(model, usage_totals):
@@ -1793,7 +2280,7 @@ def rater_spend_before(state):
         source=spend.SEED_SOURCE_RATER_STATE)
 
 
-def estimate_tokens(index, run, chars_per_token, cache_ttl,
+def estimate_tokens(index, run, chars_per_token, max_tokens,
                     assumed_output_tokens=ASSUMED_OUTPUT_TOKENS):
     """Two bounds on the bill, because caching makes a single number a lie.
 
@@ -1804,6 +2291,10 @@ def estimate_tokens(index, run, chars_per_token, cache_ttl,
     figure comes from the returned usage objects.
     """
     n = len(index.requests)
+    # ``None`` means "no measured figure exists yet", and the ceiling is the
+    # only number that cannot be an under-estimate. See ASSUMED_OUTPUT_TOKENS.
+    if assumed_output_tokens is None:
+        assumed_output_tokens = max_tokens
     sys_chars = len(index.system_prompt)
     sys_tok = sys_chars / chars_per_token
 
@@ -1816,7 +2307,10 @@ def estimate_tokens(index, run, chars_per_token, cache_ttl,
     for req in index.requests:
         d = index.by_custom_id[req["custom_id"]]
         patient_request_counts[d.patient_id] += 1
-        decision_tok += (len(req["params"]["messages"][0]["content"][1]["text"])
+        # messages[1] is the USER turn (messages[0] is the system turn on this
+        # wire, where Anthropic carried the system prompt in its own field);
+        # content[1] is the per-decision part, after the patient record.
+        decision_tok += (len(req["params"]["messages"][1]["content"][1]["text"])
                          / chars_per_token)
 
     cached_prefix_tok = sum(
@@ -1832,19 +2326,28 @@ def estimate_tokens(index, run, chars_per_token, cache_ttl,
     read_tok = sum((sys_tok + per_patient_tok[pid]) * (cnt - 1)
                    for pid, cnt in patient_request_counts.items())
 
-    write_key = ("cache_creation_1h" if cache_ttl == "1h"
-                 else "cache_creation_5m")
     return {
         "requests": n,
         "chars_per_token": chars_per_token,
         "assumed_output_tokens": assumed_output_tokens,
+        "assumed_output_tokens_basis": (
+            "the configured max_completion_tokens ceiling, because reasoning "
+            "tokens bill as output and no measured figure exists for this "
+            "model and effort"
+            if assumed_output_tokens == max_tokens
+            else "supplied by the caller from a measured run"),
         "system_prompt_tokens": int(round(sys_tok)),
         "no_cache": {
             "input_tokens": int(round(uncached_input)),
             "output_tokens": int(round(output_tok)),
         },
+        # ONE WRITE KEY, because this vendor has one write dimension and no TTL
+        # to choose. The bound itself is unchanged in shape: each distinct
+        # prefix written once and read thereafter -- which on an IMPLICIT cache
+        # is a bound rather than a plan, since nothing in the request asks for
+        # it and the provider may decline to cache at all.
         "full_cache": {
-            write_key: int(round(write_tok)),
+            "cache_write_tokens": int(round(write_tok)),
             "cache_read_input_tokens": int(round(read_tok)),
             "input_tokens": int(round(decision_tok)),
             "output_tokens": int(round(output_tok)),
@@ -1872,9 +2375,16 @@ def measured_cache_report(usage_by_cid, index):
     prefix_sizes = []
     uncached_tail = []
     outputs = []
+    write_unreported = 0
     for cid, u in usage_by_cid.items():
         read = u["cache_read_input_tokens"]
-        created = u["cache_creation_input_tokens"]
+        created = u.get("cache_write_tokens", 0)
+        if not u.get("cache_write_reported"):
+            # THE WRITE COUNT WAS NOT IN THE RESPONSE. Counted separately from
+            # a reported zero: "the provider wrote nothing" and "the provider
+            # does not tell us" are different findings, and only the second
+            # makes `cache_writes` below a number about nothing.
+            write_unreported += 1
         if read:
             reads += 1
         if created:
@@ -1908,10 +2418,19 @@ def measured_cache_report(usage_by_cid, index):
             if uncached_tail else None),
         "mean_output_tokens": (sum(outputs) / float(len(outputs))
                                if outputs else None),
+        # WHAT THE WRITE FIGURES ARE WORTH. Zero here means every response
+        # carried a write count and the numbers above are measured; anything
+        # else means that many responses reported none, so `cache_writes` is a
+        # LOWER bound and the write charge is unmeasured rather than nil.
+        "responses_with_no_write_field": write_unreported,
+        "write_figures_are_measured": write_unreported == 0,
+        "cache_mechanism": "openai_implicit -- no cache_control is sent and no "
+                           "TTL is chosen; the provider caches on the request "
+                           "prefix at its own discretion",
     }
 
 
-def project_full_run(measured, run, model, cache_ttl, n_full):
+def project_full_run(measured, run, model, n_full):
     """Project the full run from MEASURED token sizes, as a range.
 
     WHY THIS IS STILL A RANGE, AND WHY THE SMOKE'S OWN HIT RATE IS NOT THE
@@ -1934,12 +2453,10 @@ def project_full_run(measured, run, model, cache_ttl, n_full):
 
     counts = Counter(d.patient_id for d in run.decisions)
     n_patients = len(counts)
-    write_key = ("cache_creation_1h" if cache_ttl == "1h"
-                 else "cache_creation_5m")
 
     upper = {"input_tokens": int(round((prefix + tail) * n_full)),
              "output_tokens": int(round(out * n_full))}
-    lower = {write_key: int(round(prefix * n_patients)),
+    lower = {"cache_write_tokens": int(round(prefix * n_patients)),
              "cache_read_input_tokens": int(round(prefix
                                                   * (n_full - n_patients))),
              "input_tokens": int(round(tail * n_full)),
@@ -1957,38 +2474,84 @@ def project_full_run(measured, run, model, cache_ttl, n_full):
     }
 
 
-def calibrate_chars_per_token(client, model, index, sample_size=12):
-    """Measure chars-per-token on real requests with the free count_tokens
-    endpoint, rather than trusting the 4.0 rule of thumb.
+TOKENIZER_ENCODING = "o200k_base"
+"""The local encoding used by ``--count-tokens``, and it is AN ASSUMPTION.
 
-    Costs nothing: /v1/messages/count_tokens is not billed. It needs a key, so
-    it is opt-in -- a dry run must stay runnable with no credentials at all.
+``tiktoken.encoding_for_model("gpt-5.6-terra")`` raises -- the library carries no
+mapping for this id -- so the encoding is NAMED here rather than resolved, and
+``o200k_base`` is the GPT-4o/GPT-5 family encoding. **It is not established that
+this is the model's own tokenizer**, and the calibration record says so in a
+field rather than in this comment. It is used because it is closer than 4.0
+chars/token and because it is FREE and OFFLINE; it is labelled because a
+measured-looking number carrying an unstated assumption is worse than an
+admitted rule of thumb.
+
+WHAT WAS LOST WITH THE VENDOR. Anthropic's ``/v1/messages/count_tokens`` is the
+model's OWN tokenizer, is free, and is authoritative. OpenAI publishes no
+equivalent endpoint, so the honest replacement is a local encoder plus this
+caveat. Every consequence of being wrong is in the same direction and is
+bounded: an encoding that under-counts makes ``reserve_batch_liability``
+under-reserve, which is why the reservation is not the only gate and why the
+per-chunk ``spend.require_budget`` runs behind it.
+"""
+
+
+def calibrate_chars_per_token(client, model, index, sample_size=12):
+    """Measure chars-per-token on real requests with a LOCAL encoder.
+
+    Costs nothing, sends nothing, and -- unlike the endpoint it replaces --
+    needs no credentials at all. ``client`` is accepted and unused, so the one
+    call site keeps its shape; it is named ``_client`` nowhere because the
+    signature is part of this module's surface and two of its callers pass
+    positionally.
     """
+    del client                       # no network call is made on this arm
     n = len(index.requests)
     if n == 0:
         return None
+    try:
+        import tiktoken
+    except ImportError as exc:
+        raise RaterRefusal(
+            f"--count-tokens needs a local tokenizer and tiktoken is not "
+            f"importable ({exc}). `pip install tiktoken`, or drop the flag and "
+            f"accept the {CHARS_PER_TOKEN_FALLBACK} chars/token rule of thumb. "
+            f"Nothing has been sent either way -- this calibration is offline.",
+            code="tokenizer_missing")
+    enc = tiktoken.get_encoding(TOKENIZER_ENCODING)
     step = max(1, n // max(1, sample_size))
     picked = index.requests[::step][:sample_size]
     total_chars = 0
     total_tokens = 0
     for req in picked:
-        p = req["params"]
-        chars = sum(len(b["text"]) for b in p["system"])
-        chars += sum(len(b["text"]) for b in p["messages"][0]["content"])
-        counted = client.messages.count_tokens(
-            model=model,
-            system=[{"type": "text", "text": b["text"]} for b in p["system"]],
-            messages=[{"role": "user", "content": [
-                {"type": "text", "text": b["text"]}
-                for b in p["messages"][0]["content"]]}],
-        )
-        total_chars += chars
-        total_tokens += counted.input_tokens
+        for text in _request_texts(req):
+            total_chars += len(text)
+            total_tokens += len(enc.encode(text))
     if not total_tokens:
         return None
     return {"sampled_requests": len(picked), "sampled_chars": total_chars,
             "sampled_tokens": total_tokens,
-            "chars_per_token": total_chars / float(total_tokens)}
+            "chars_per_token": total_chars / float(total_tokens),
+            "encoding": TOKENIZER_ENCODING,
+            "encoding_is_the_models_own": False,
+            "basis": "a LOCAL tiktoken encoding, free and offline. It is an "
+                     "assumption rather than the model's own tokenizer: "
+                     "tiktoken has no mapping for this model id and OpenAI "
+                     "publishes no count-tokens endpoint. It excludes the "
+                     "per-message envelope, so it under-counts slightly.",
+            "model": model}
+
+
+def _request_texts(request):
+    """Every prompt string in one built request, in wire order."""
+    out = []
+    for message in request["params"]["messages"]:
+        content = message["content"]
+        if isinstance(content, str):
+            out.append(content)
+        else:
+            out.extend(part.get("text", "") for part in content)
+    return out
 
 
 #------------------------------------------------------------------------------
@@ -1996,74 +2559,80 @@ def calibrate_chars_per_token(client, model, index, sample_size=12):
 #------------------------------------------------------------------------------
 
 
-ENV_ANTHROPIC_API_KEY = "ANTHROPIC_API_KEY"
+ENV_OPENAI_API_KEY = "OPENAI_API_KEY"
 
 
-def resolve_anthropic_api_key():
+def resolve_openai_api_key():
     """(present, source) -- never the value.
 
-    The environment first, then the project's credentials file. It reads that
-    file directly rather than through ``paths.load_env_keys()`` on purpose:
-    that function POPS and reloads three named OpenAI/Qdrant variables with
-    override=True, and routing a fourth, unrelated credential through it would
+    The environment first, then the project's credentials file through
+    ``paths.load_env_keys()``.
+
+    **IT GOES THROUGH THAT LOADER WHERE THE ANTHROPIC VERSION DELIBERATELY DID
+    NOT, AND THE REASON REVERSED WITH THE VENDOR.** The old function read the
+    .env by hand and said why: ``load_env_keys()`` pops and reloads three named
+    variables and routing a FOURTH, unrelated credential through it would
     couple this harness to the pipeline's credential handling for no gain.
+    ``OPENAI_API_KEY`` is one of the three it owns -- it is in
+    ``paths.ALLOWLISTED_ENV_KEYS`` -- so re-implementing the read here would be
+    the second copy, and the two would disagree the first time the allowlist
+    moved. ``oncotriage/evaluation/ragas_harness.py:resolve_api_key`` already
+    takes this route for the same key.
 
     Returns the SOURCE, not the secret. A harness that prints which file
     answered is debuggable; one that prints the key is a leak in every
-    scrollback, CI log and screen share -- the argument pass 20f-3 applied to
-    the Airflow password.
+    scrollback, CI log and screen share.
     """
-    value = os.environ.get(ENV_ANTHROPIC_API_KEY)
+    value = os.environ.get(ENV_OPENAI_API_KEY)
     if value and value.strip():
         return True, "environment"
-
     try:
-        keys_file = os.path.join(paths.keys_path, ".env")
+        paths.load_env_keys()
     except Exception as exc:                       # noqa: BLE001
-        log.warning("rater.keys_path_unavailable",
-                    error_type=type(exc).__name__)
-        return False, "absent"
-
-    if not os.path.isfile(keys_file):
-        return False, "absent"
-    try:
-        with io.open(keys_file, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                name, _, raw = line.partition("=")
-                if name.strip() != ENV_ANTHROPIC_API_KEY:
-                    continue
-                secret = raw.strip().strip('"').strip("'")
-                if secret:
-                    os.environ[ENV_ANTHROPIC_API_KEY] = secret
-                    return True, "keys_file"
-    except OSError as exc:
         log.warning("rater.keys_file_unreadable",
                     error_type=type(exc).__name__)
+        return False, "absent"
+    value = os.environ.get(ENV_OPENAI_API_KEY)
+    if value and value.strip():
+        return True, "keys_file"
     return False, "absent"
 
 
 def require_client():
     """The SDK and a key, or a refusal that names what to do."""
     try:
-        import anthropic
+        import openai
     except ImportError as exc:
         raise RaterRefusal(
-            f"the anthropic SDK is not importable ({exc}). "
-            f"`pip install anthropic` before submitting.",
+            f"the openai SDK is not importable ({exc}). "
+            f"`pip install openai` before submitting.",
             code="sdk_missing")
-    present, source = resolve_anthropic_api_key()
+    present, source = resolve_openai_api_key()
     if not present:
         raise RaterRefusal(
-            f"{ENV_ANTHROPIC_API_KEY} is not set and no such entry exists in "
+            f"{ENV_OPENAI_API_KEY} is not set and no such entry exists in "
             f"the project's credentials file. Export it, or add it there, "
             f"before submitting. Nothing has been sent.",
             code="api_key_absent")
     log.info("rater.credentials_resolved", stage="credentials",
              reason=source)
-    return anthropic.Anthropic(), source
+    return openai.OpenAI(), source
+
+
+def model_is_visible(client, model):
+    """(visible, detail) from the FREE model-listing endpoint. Bills nothing.
+
+    ``models.retrieve`` rather than a completion: it is the cheapest possible
+    answer to "does this account see this model", it costs nothing, and it
+    turns the most common configuration failure -- a key with no access to the
+    judge -- into a refusal before the reservation rather than into 2,212
+    identically-errored batch rows.
+    """
+    try:
+        got = client.models.retrieve(model)
+    except Exception as exc:                                    # noqa: BLE001
+        return False, f"{type(exc).__name__}: {str(exc)[:200]}"
+    return True, getattr(got, "id", None)
 
 
 #------------------------------------------------------------------------------
@@ -2081,6 +2650,14 @@ UNRATED_REASONS = (
     "bad_verdict_value", "missing_corrected_status",
     "wrong_vocabulary_corrected_status", "corrected_equals_recorded",
     "agree_with_corrected_status", "empty_rationale", "no_result",
+    # THE BATCH ITSELF DID NOT RUN, as distinct from "this request errored".
+    # The OpenAI Batch API has three terminal statuses that produce no output
+    # file at all -- failed, expired, cancelled -- and the first has no
+    # Anthropic counterpart, because a Messages batch that could not start
+    # reported per-request errors instead. Folding it into `api_error` would
+    # say the provider answered every request badly when in fact it answered
+    # none of them, and only one of those is worth resubmitting unchanged.
+    "batch_failed",
     # BLIND MODE ADDS EXACTLY TWO, and they are two rather than one because
     # the difference between them is a measurement.
     #
@@ -2118,6 +2695,10 @@ RETRYABLE_REASONS = frozenset({
     # stays non-retryable is unchanged -- a refusal and an
     # api_invalid_request are deterministic in the request itself.
     "wrong_vocabulary_assigned_status", "bad_assigned_status",
+    # `batch_failed` is DELIBERATELY ABSENT. A batch the provider rejected
+    # outright was rejected on the submission, not on the answer, so an
+    # identical resubmission is rejected identically -- money for nothing, in
+    # exactly the shape the refusal exclusion above already argues against.
 })
 
 
@@ -2323,43 +2904,239 @@ def apply_offline_agreement(rating, recorded_status):
 
 def _usage_totals():
     return {"input_tokens": 0, "output_tokens": 0,
-            "cache_read_input_tokens": 0,
-            "cache_creation_5m": 0, "cache_creation_1h": 0,
-            "cache_creation_input_tokens": 0,
-            "breakdown_mismatch_tokens": 0, "breakdown_absent": 0,
-            "responses": 0}
+            "cache_read_input_tokens": 0, "cache_write_tokens": 0,
+            "reasoning_tokens": 0,
+            "prompt_tokens_reported": 0, "completion_tokens_reported": 0,
+            "cache_write_reported_responses": 0,
+            "prompt_reconcile_mismatch_tokens": 0,
+            "usage_absent": 0, "responses": 0}
+
+
+def _num(obj, name):
+    """One numeric field off a usage object, tolerating dict or model.
+
+    A batch result arrives as PARSED JSON -- a dict -- while a synchronous
+    response is a pydantic model, and this harness reads both (the batch path
+    and the probe). ``getattr`` alone silently returns the default for every
+    dict, which would report every batch response as having spent nothing.
+    """
+    if obj is None:
+        return 0
+    if isinstance(obj, dict):
+        value = obj.get(name)
+    else:
+        value = getattr(obj, name, None)
+    return value or 0
+
+
+def _sub(obj, name):
+    """One nested sub-object off a usage object, dict or model."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
+
+
+def translate_openai_usage(usage):
+    """One OpenAI usage object, in this harness's own token vocabulary.
+
+    **THE ONE THING THAT WOULD BE SILENTLY WRONG IF IT WERE RENAMED RATHER THAN
+    TRANSLATED.** Anthropic reports DISJOINT counts: ``input_tokens`` is the
+    non-cached input only, with ``cache_read_input_tokens`` and the two
+    ``cache_creation`` figures beside it. OpenAI reports ``prompt_tokens``
+    INCLUDING its cached part, with ``prompt_tokens_details.cached_tokens`` as
+    a breakdown OF it. So::
+
+        uncached input = prompt_tokens - cached_tokens        (OpenAI)
+        uncached input = input_tokens                          (Anthropic)
+
+    A rename would price the cached tokens TWICE -- once at the full input rate
+    inside ``prompt_tokens`` and once at the cache-read rate beside it --
+    over-reporting by the cached amount on every cache hit. The inverse of the
+    mistake ``oncotriage/agent/bedrock_anthropic_adapter.py`` had to avoid for
+    Converse, in the other direction, which is why neither file's mapping can
+    be copied from the other.
+
+    ``reasoning_tokens`` are INSIDE ``completion_tokens`` and are reported as an
+    informational breakdown only. They are recorded and NOT priced separately:
+    the output rate already covers them, and a second term would double-charge.
+
+    **THE CACHE WRITE FIELD IS ``prompt_tokens_details.cache_write_tokens``,
+    AND THAT IS MEASURED RATHER THAN GUESSED.** Read off a real batch response
+    on 2026-09-08 (6 requests, batch
+    ``batch_6aa09bc83110819091cc6a2eb15e4299``)::
+
+        "prompt_tokens_details": {"cached_tokens": 3202,
+                                  "cache_write_tokens": 2627,
+                                  "audio_tokens": 0}
+
+    Two things follow, and the second is the one worth writing down.
+
+    FIRST: the installed SDK's ``PromptTokensDetails`` model declares only
+    ``cached_tokens`` and ``audio_tokens``, so this field arrives as an EXTRA
+    that the typed model does not name. Reading it by attribute off a parsed
+    pydantic object would therefore return nothing; the batch path parses raw
+    JSON and sees it, which is why ``_sub`` handles the dict form first.
+
+    SECOND: ``config.PRICING_CONFIG``'s own note says OpenAI "bills no separate
+    write dimension" and that its absence there "is a reading rather than an
+    omission". That reading was correct for the models it was written against
+    and is now FALSE for this one, confirmed on the wire rather than inferred
+    from a pricing page. `RATER_PRICING`'s gpt-5.6-terra row carries the write
+    multiplier; that note is corrected in place.
+
+    THE OTHER SPELLINGS ARE KEPT BEHIND THE CONFIRMED ONE and are not
+    speculation for its own sake: a field name is a vendor's to change, this
+    harness prices what it finds, and the alternative to looking is a run that
+    pays a write charge and reports zero. When NONE is present,
+    ``cache_write_reported`` is False -- which is what lets a manifest say the
+    write term was ABSENT rather than MEASURED ZERO. A run that pays no write
+    charge because the API reported none is honest; a run that pays none
+    because nobody looked is not, and the two must not read the same.
+    """
+    details = _sub(usage, "prompt_tokens_details")
+    completion_details = _sub(usage, "completion_tokens_details")
+    prompt = _num(usage, "prompt_tokens")
+    completion = _num(usage, "completion_tokens")
+    cached = _num(details, "cached_tokens")
+
+    write = 0
+    write_reported = False
+    # THE CONFIRMED NAME FIRST. The others are fallbacks, in the order a
+    # vendor is most likely to have used; the first HIT wins, so a response
+    # carrying the real field never reaches them.
+    for name in ("cache_write_tokens", "cache_creation_tokens",
+                 "cached_tokens_write", "cache_creation_input_tokens"):
+        raw = _sub(details, name)
+        if raw is None:
+            raw = _sub(usage, name)
+        if raw is not None:
+            write = raw or 0
+            write_reported = True
+            break
+
+    # A cached count larger than the prompt it is a breakdown OF is not
+    # arithmetic this harness can price. Clamped to zero rather than allowed
+    # negative -- a negative input class silently REFUNDS money in the total --
+    # and the discrepancy is recorded so the manifest shows it happened.
+    uncached = prompt - cached
+    mismatch = 0
+    if uncached < 0:
+        mismatch = -uncached
+        uncached = 0
+    return {
+        "input_tokens": uncached,
+        "output_tokens": completion,
+        "cache_read_input_tokens": cached,
+        "cache_write_tokens": write,
+        "cache_write_reported": write_reported,
+        "reasoning_tokens": _num(completion_details, "reasoning_tokens"),
+        "prompt_tokens_reported": prompt,
+        "completion_tokens_reported": completion,
+        "prompt_reconcile_mismatch_tokens": mismatch,
+    }
 
 
 def _accumulate_usage(totals, usage):
-    totals["input_tokens"] += getattr(usage, "input_tokens", 0) or 0
-    totals["output_tokens"] += getattr(usage, "output_tokens", 0) or 0
-    totals["cache_read_input_tokens"] += (
-        getattr(usage, "cache_read_input_tokens", 0) or 0)
-    created = getattr(usage, "cache_creation_input_tokens", 0) or 0
-    totals["cache_creation_input_tokens"] += created
+    """Fold one translated OpenAI usage object into a running total."""
     totals["responses"] += 1
-    breakdown = getattr(usage, "cache_creation", None)
-    if breakdown is not None:
-        five = getattr(breakdown, "ephemeral_5m_input_tokens", 0) or 0
-        hour = getattr(breakdown, "ephemeral_1h_input_tokens", 0) or 0
-        totals["cache_creation_5m"] += five
-        totals["cache_creation_1h"] += hour
-        # The breakdown is documented to sum to the total. RECONCILED rather
-        # than trusted: the two are priced at different rates, so a silent
-        # divergence would mis-price every write. Recorded, not raised -- a
-        # billing-report discrepancy must not destroy a run that has already
-        # spent the money.
-        if five + hour != created:
-            totals["breakdown_mismatch_tokens"] += abs(five + hour - created)
-    else:
-        # No breakdown: attribute to 5m, the cheaper write, so an unpriced
-        # split cannot silently inflate the reported bill.
-        totals["cache_creation_5m"] += created
-        totals["breakdown_absent"] += 1
+    if usage is None:
+        # A response with no usage block is not a free response; it is one
+        # whose cost is unknown. Counted, so the ACTUAL figure below it can be
+        # read as the floor it becomes.
+        totals["usage_absent"] += 1
+        return
+    t = usage if isinstance(usage, dict) and "input_tokens" in usage \
+        else translate_openai_usage(usage)
+    for key in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                "cache_write_tokens", "reasoning_tokens",
+                "prompt_tokens_reported", "completion_tokens_reported",
+                "prompt_reconcile_mismatch_tokens"):
+        totals[key] += t.get(key, 0)
+    if t.get("cache_write_reported"):
+        totals["cache_write_reported_responses"] += 1
 
 
-def submit_batches(client, chunks, state, state_path, tag):
-    """Create one batch per chunk, recording each id BEFORE polling starts."""
+BATCH_TERMINAL_STATUSES = ("completed", "failed", "expired", "cancelled")
+BATCH_PENDING_STATUSES = ("validating", "in_progress", "finalizing",
+                          "cancelling")
+BATCH_STATUSES = BATCH_TERMINAL_STATUSES + BATCH_PENDING_STATUSES
+"""The API's own status vocabulary, PARTITIONED, and the partition is the point.
+
+Anthropic had one terminal status (``ended``) and this vendor has four, three of
+which mean the batch produced no output worth joining. A poll loop written
+against ``== "completed"`` would spin until its timeout on a ``failed`` batch and
+report a timeout, sending an operator to look at latency for a submission the
+provider rejected in the first second. ``poll_batch`` returns on ANY terminal
+status and lets ``collect_results`` say which one it was.
+"""
+
+RAW_REPLIES_BASENAME = "raw_batch_output"
+
+
+def raw_reply_path(out_dir, batch_id, kind="output"):
+    """Where one batch's untouched JSONL is kept.
+
+    Named by BATCH ID rather than by tag or index, because the id is what
+    ``--resume`` takes and what the state file records, so a file on disk and a
+    line in the state file can be matched by eye.
+    """
+    return os.path.join(out_dir,
+                        f"{RAW_REPLIES_BASENAME}_{kind}_{batch_id}.jsonl")
+
+
+def persist_raw_replies(out_dir, batch_id, text, kind="output"):
+    """Write one batch's raw JSONL, and REFUSE to overwrite an existing file.
+
+    **PAID EVIDENCE MUST NOT BE DESTROYABLE BY A SECOND RUN.** These bytes are
+    the only untransformed record of what was bought: every other artifact this
+    harness writes is parsed, bucketed and summarised, so a defect in the parser
+    is unrecoverable once the raw file is gone. A second ``--resume`` of the
+    same batch id is an ordinary gesture -- it is what an operator does when a
+    poll times out -- and under a plain ``open(..., "w")`` it would truncate the
+    first run's evidence before the second had retrieved anything.
+
+    The refusal is a ``RaterRefusal`` rather than a silent skip because the two
+    cases are not the same: a file that already exists MIGHT be byte-identical,
+    and might not, and this function cannot tell without reading it -- so it
+    reads it. Identical content is accepted as a no-op, because refusing an
+    idempotent re-retrieval would make ``--resume`` unusable. Different content
+    under one batch id is a fact an operator has to see.
+    """
+    path = raw_reply_path(out_dir, batch_id, kind)
+    if os.path.exists(path):
+        try:
+            with io.open(path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+        except OSError as exc:
+            raise RaterRefusal(
+                f"{path} already exists and could not be read ({exc}); "
+                f"refusing to overwrite paid evidence.",
+                code="raw_replies_unreadable")
+        if existing == text:
+            return path, "unchanged"
+        raise RaterRefusal(
+            f"{path} already exists and its contents DIFFER from what batch "
+            f"{batch_id} just returned. This file is the only untransformed "
+            f"record of what was paid for, so it is not overwritten. Move it "
+            f"aside deliberately if you mean to replace it.",
+            code="raw_replies_would_be_overwritten")
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    return path, "written"
+
+
+def submit_batches(client, chunks, state, state_path, tag, out_dir=None):
+    """Upload one JSONL file per chunk, create one batch each, record the ids.
+
+    **TWO API CALLS PER CHUNK WHERE ANTHROPIC TOOK ONE.** The requests go up as
+    a FILE (``purpose="batch"``) and the batch then names that file. The upload
+    is not itself billed by the model, but it is the point of no return in
+    practice, so the gate is above it rather than between the two.
+    """
     ids = []
     for i, chunk in enumerate(chunks):
         # ── THE SPEND GATE, IMMEDIATELY BEFORE THE MONEY IS COMMITTED ─────
@@ -2373,60 +3150,130 @@ def submit_batches(client, chunks, state, state_path, tag):
         # is stated rather than glossed because it is the number an operator
         # needs when choosing a cap.
         #
-        # PER CHUNK RATHER THAN ONCE BEFORE THE LOOP, which is what makes the
-        # bound one batch instead of all of them: a retry pass submitted after
-        # the primary batches have been collected and charged is declined on a
-        # ledger that already knows what the primary cost.
+        # AND IT IS NO LONGER THE ONLY GATE. `require_reservation_fits` runs
+        # once, before this loop is entered, and refuses a submission whose
+        # WORST CASE cannot fit -- which is the only question that can be
+        # asked before a batch reports anything. This one is the measured
+        # brake behind that estimate: a retry pass submitted after the primary
+        # batches have been collected and charged is declined on a ledger that
+        # already knows what the primary cost.
         #
-        # IT RAISES INTO main()'s `except RaterRefusal` ... IT DOES NOT.
-        # `SpendLimitReached` is deliberately NOT a `RaterRefusal`: a refusal
-        # is this module's own contract for "I will not do this", exits 1, and
-        # its handler prints a message shaped for a configuration defect. A
-        # budget stop is a different event with a different remedy, and
-        # main()'s own handler names it. The batch ids already created are
-        # written to the state file before this point on every iteration, so a
-        # stop here loses nothing: `--resume` collects them.
+        # IT RAISES `SpendLimitReached`, NOT a `RaterRefusal`, and main()'s
+        # own handler names it: a budget stop is "the money is gone and
+        # everything already submitted is still retrievable", which has a
+        # different remedy from "the configuration is wrong". The batch ids
+        # already created are written to the state file before this point on
+        # every iteration, so a stop here loses nothing: `--resume` collects
+        # them.
         spend.require_budget(spend.SPEND_SOURCE_RATER,
                              f"the rater's {tag} batch {i + 1}/{len(chunks)}")
-        batch = client.messages.batches.create(requests=chunk)
+        payload = batch_jsonl(chunk).encode("utf-8")
+        # A FILENAME THE PROVIDER ECHOES BACK, carrying the tag and the chunk
+        # index, so a stray file in the account's storage is attributable.
+        upload = client.files.create(
+            file=(f"oncotriage_rater_{tag}_{i + 1}.jsonl", payload),
+            purpose="batch")
+        batch = client.batches.create(
+            input_file_id=upload.id,
+            endpoint=BATCH_ENDPOINT,
+            completion_window=BATCH_COMPLETION_WINDOW,
+            metadata={"harness": "oncotriage-rater", "tag": tag,
+                      "chunk": str(i)})
         ids.append(batch.id)
         state.setdefault("batches", []).append(
-            {"id": batch.id, "tag": tag, "chunk": i, "requests": len(chunk)})
+            {"id": batch.id, "tag": tag, "chunk": i, "requests": len(chunk),
+             "input_file_id": upload.id})
         write_state(state_path, state)
         console.out(f"  [{tag}] batch {i + 1}/{len(chunks)} created: "
-                    f"{batch.id}  ({len(chunk)} requests)")
+                    f"{batch.id}  ({len(chunk)} requests, file {upload.id})")
         console.out(f"           resume with: --resume {batch.id}")
         log.info("rater.batch_created", stage=tag, count=len(chunk))
     return ids
 
 
 def poll_batch(client, batch_id, interval, timeout):
-    """Block until the batch ends, or raise naming the elapsed time."""
+    """Block until the batch reaches ANY terminal status, or raise.
+
+    Returns the batch object. It does NOT judge the status -- a ``failed`` or
+    ``expired`` batch is returned exactly like a completed one, because the
+    distinction belongs to ``collect_results``, which can name what was lost.
+    """
     started = time.time()
     last = None
     while True:
-        batch = client.messages.batches.retrieve(batch_id)
-        status = batch.processing_status
-        counts = batch.request_counts
+        batch = client.batches.retrieve(batch_id)
+        status = batch.status
+        counts = getattr(batch, "request_counts", None)
         line = (f"    {batch_id}: {status} "
-                f"processing={counts.processing} succeeded={counts.succeeded} "
-                f"errored={counts.errored} canceled={counts.canceled} "
-                f"expired={counts.expired}")
+                f"total={getattr(counts, 'total', '?')} "
+                f"completed={getattr(counts, 'completed', '?')} "
+                f"failed={getattr(counts, 'failed', '?')}")
         if line != last:
             console.out(line)
             last = line
-        if status == "ended":
+        if status in BATCH_TERMINAL_STATUSES:
             return batch
+        if status not in BATCH_PENDING_STATUSES:
+            # AN UNKNOWN STATUS IS A REFUSAL RATHER THAN A SPIN. The vocabulary
+            # is closed today; a member added by the provider would otherwise
+            # be polled until the timeout and reported as slowness.
+            raise RaterRefusal(
+                f"batch {batch_id} reported status {status!r}, which is in "
+                f"neither {BATCH_TERMINAL_STATUSES} nor "
+                f"{BATCH_PENDING_STATUSES}. Nothing is lost -- re-run with "
+                f"--resume {batch_id} once this module knows the status.",
+                code="unknown_batch_status")
         elapsed = time.time() - started
         if elapsed > timeout:
             raise RaterRefusal(
                 f"batch {batch_id} still {status} after {elapsed:.0f}s. "
-                f"Nothing is lost -- results stay retrievable for 29 days; "
-                f"re-run with --resume {batch_id}.")
+                f"Nothing is lost -- the results stay retrievable; re-run with "
+                f"--resume {batch_id}.")
         time.sleep(interval)
 
 
-def collect_results(client, batch_id, index, model):
+def _read_file_text(client, file_id):
+    """One output file's whole body as text, or None when there is no file."""
+    if not file_id:
+        return None
+    content = client.files.content(file_id)
+    # The SDK returns an HttpxBinaryResponseContent; `.text` decodes it. A
+    # plain `str` is accepted so a stand-in can hand back the body directly.
+    if isinstance(content, str):
+        return content
+    text = getattr(content, "text", None)
+    if text is not None:
+        return text
+    return bytes(content.read()).decode("utf-8")
+
+
+def parse_batch_output(text):
+    """Every line of a batch output file, as (custom_id, line) pairs.
+
+    A LINE THAT WILL NOT PARSE IS RETURNED AS A NAMED FAULT rather than
+    dropped. A dropped line is a decision that silently becomes ``no_result``,
+    which reads as "the provider never answered" -- the opposite of the truth,
+    which is that it answered and this harness could not read it.
+    """
+    rows, faults = [], []
+    for n, raw in enumerate(text.splitlines(), start=1):
+        if not raw.strip():
+            continue
+        try:
+            row = json.loads(raw)
+        except ValueError as exc:
+            faults.append({"line": n, "error": str(exc)[:200],
+                           "excerpt": raw[:200]})
+            continue
+        if not isinstance(row, dict) or not row.get("custom_id"):
+            faults.append({"line": n, "error": "no custom_id",
+                           "excerpt": raw[:200]})
+            continue
+        rows.append(row)
+    return rows, faults
+
+
+def collect_results(client, batch_id, index, model, out_dir=None):
     """Join one batch's results back onto decisions, bucketing every outcome.
 
     Joined on custom_id, never on position: the API states result order is not
@@ -2439,9 +3286,41 @@ def collect_results(client, batch_id, index, model):
     usage_by_cid = {}
     seen = set()
     stop_reasons = Counter()
+    answering_models = Counter()
 
-    for result in client.messages.batches.results(batch_id):
-        cid = result.custom_id
+    batch = client.batches.retrieve(batch_id)
+    status = getattr(batch, "status", None)
+    output_text = _read_file_text(client, getattr(batch, "output_file_id", None))
+    error_text = _read_file_text(client, getattr(batch, "error_file_id", None))
+
+    if out_dir:
+        # BEFORE ANYTHING IS PARSED. A parser that raises must not be able to
+        # take the evidence with it.
+        os.makedirs(out_dir, exist_ok=True)
+        if output_text is not None:
+            persist_raw_replies(out_dir, batch_id, output_text, "output")
+        if error_text is not None:
+            persist_raw_replies(out_dir, batch_id, error_text, "error")
+
+    if output_text is None and status != "completed":
+        # No output file at all. Every request in this batch is unrated for one
+        # named reason rather than for `no_result`, which would say the join
+        # found nothing when in fact the batch never ran.
+        reason = {"failed": "batch_failed", "expired": "expired",
+                  "cancelled": "canceled"}.get(status, "api_error")
+        for cid in index.by_custom_id:
+            unrated[cid] = {"reason": reason if reason in UNRATED_REASONS
+                            else "api_error",
+                            "detail": f"batch status={status}"}
+        return {"rated": rated, "unrated": unrated, "usage": usage,
+                "usage_by_cid": usage_by_cid,
+                "missing": set(index.by_custom_id),
+                "stop_reasons": {}, "batch_status": status,
+                "answering_models": {}, "output_faults": []}
+
+    rows, faults = parse_batch_output(output_text or "")
+    for row in rows + parse_batch_output(error_text or "")[0]:
+        cid = row["custom_id"]
         if cid in seen:
             raise RaterRefusal(
                 f"batch {batch_id} returned custom_id {cid!r} twice; the join "
@@ -2455,50 +3334,56 @@ def collect_results(client, batch_id, index, model):
                 f"directory has changed since the batch was submitted; the "
                 f"join cannot be trusted.")
 
-        kind = result.result.type
-        if kind != "succeeded":
-            if kind == "errored":
-                err = getattr(result.result, "error", None)
-                etype = getattr(getattr(err, "error", None), "type", None) \
-                    or getattr(err, "type", None) or "unknown"
-                reason = ("api_invalid_request"
-                          if etype == "invalid_request_error" else "api_error")
-                detail = etype
-            else:
-                reason = kind if kind in UNRATED_REASONS else "api_error"
-                detail = kind
-            unrated[cid] = {"reason": reason, "detail": detail}
+        error = row.get("error")
+        response = row.get("response") or {}
+        code = response.get("status_code")
+        body = response.get("body") or {}
+        if error or code != 200:
+            detail = ""
+            if isinstance(error, dict):
+                detail = str(error.get("code") or error.get("message") or "")
+            elif error:
+                detail = str(error)
+            if not detail and isinstance(body, dict):
+                detail = str((body.get("error") or {}).get("type") or code)
+            reason = ("api_invalid_request"
+                      if code in (400, 404, 422) else "api_error")
+            unrated[cid] = {"reason": reason, "detail": detail[:200]}
             continue
 
-        message = result.result.message
-        _accumulate_usage(usage, message.usage)
-        u = message.usage
-        bd = getattr(u, "cache_creation", None)
-        usage_by_cid[cid] = {
-            "input_tokens": getattr(u, "input_tokens", 0) or 0,
-            "output_tokens": getattr(u, "output_tokens", 0) or 0,
-            "cache_read_input_tokens":
-                getattr(u, "cache_read_input_tokens", 0) or 0,
-            "cache_creation_input_tokens":
-                getattr(u, "cache_creation_input_tokens", 0) or 0,
-            "cache_creation_5m":
-                (getattr(bd, "ephemeral_5m_input_tokens", 0) or 0) if bd else 0,
-            "cache_creation_1h":
-                (getattr(bd, "ephemeral_1h_input_tokens", 0) or 0) if bd else 0,
-        }
-        stop_reasons[message.stop_reason or "none"] += 1
+        _accumulate_usage(usage, body.get("usage"))
+        usage_by_cid[cid] = translate_openai_usage(body.get("usage"))
+        answering_models[body.get("model") or "<absent>"] += 1
 
-        if message.stop_reason == "refusal":
+        choices = body.get("choices") or []
+        if not choices:
+            unrated[cid] = {"reason": "no_text_block",
+                            "detail": "no choices in the response"}
+            continue
+        choice = choices[0]
+        finish = choice.get("finish_reason") or "none"
+        stop_reasons[finish] += 1
+        message = choice.get("message") or {}
+
+        # A REFUSAL IS ITS OWN FIELD ON THIS VENDOR, not a finish_reason.
+        if message.get("refusal"):
             unrated[cid] = {"reason": "refusal",
-                            "detail": str(getattr(message, "stop_reason", ""))}
+                            "detail": str(message["refusal"])[:200]}
             continue
-        if message.stop_reason == "max_tokens":
+        if finish == "length":
             unrated[cid] = {"reason": "truncated_max_tokens",
-                            "detail": "stop_reason=max_tokens"}
+                            "detail": "finish_reason=length"}
+            continue
+        if finish == "content_filter":
+            unrated[cid] = {"reason": "refusal",
+                            "detail": "finish_reason=content_filter"}
             continue
 
-        text = "".join(b.text for b in message.content
-                       if getattr(b, "type", None) == "text")
+        text = message.get("content") or ""
+        if isinstance(text, list):
+            # The content-parts form, should the provider return one.
+            text = "".join(part.get("text", "") for part in text
+                           if isinstance(part, dict))
         if not text.strip():
             unrated[cid] = {"reason": "no_text_block", "detail": ""}
             continue
@@ -2511,7 +3396,12 @@ def collect_results(client, batch_id, index, model):
         if index.mode == MODE_BLIND:
             # AT COLLECTION, never before. The request is long gone.
             apply_offline_agreement(rating, decision.status)
-        rating["rated_by"] = message.model or model
+        # THE MODEL THAT ANSWERED, read off the response, never the one that
+        # was asked for. `gpt-5.6-terra` has no dated snapshot, so this is the
+        # only record of which weights produced the rating -- and if OpenAI
+        # ever begins echoing a dated id, this field is where it shows up
+        # without anything here having to change.
+        rating["rated_by"] = body.get("model") or model
         rating["batch_id"] = batch_id
         rating["is_retest"] = cid in index.retest_ids
         rated[cid] = rating
@@ -2519,7 +3409,9 @@ def collect_results(client, batch_id, index, model):
     missing = set(index.by_custom_id) - seen
     return {"rated": rated, "unrated": unrated, "usage": usage,
             "usage_by_cid": usage_by_cid, "missing": missing,
-            "stop_reasons": dict(stop_reasons)}
+            "stop_reasons": dict(stop_reasons), "batch_status": status,
+            "answering_models": dict(answering_models),
+            "output_faults": faults}
 
 
 #------------------------------------------------------------------------------
@@ -3561,7 +4453,88 @@ def write_json(path, payload):
 #------------------------------------------------------------------------------
 
 
-DEFAULT_MODEL = "claude-sonnet-4-6"
+DEFAULT_MODEL = "gpt-5.6-terra"
+"""The judge. OpenAI, so that it is a different FAMILY from the classifier.
+
+**NO DATED SNAPSHOT IS PINNED BECAUSE NONE EXISTS**, and that was established
+against the live API rather than assumed: ``models.list`` on 2026-09-08 returns
+``gpt-5.6-terra`` and no dated variant of it, and ``models.retrieve`` on
+``gpt-5.6-terra-2026-08-04`` and ``gpt-5.6-terra-latest`` both 404. So this is
+the base id, which is a MOVING TARGET -- the weights behind it can change under
+a fixed string, and two runs a month apart are not guaranteed to have been rated
+by the same model. That is a real limitation of this measurement and it is
+recorded three ways rather than in a comment: the manifest carries
+``model_snapshot_pinned: false``, every rating carries ``rated_by`` read off the
+response, and the manifest's ``answering_models`` counts the distinct ids that
+answered. If OpenAI begins publishing dated snapshots for this family, pin one
+here; nothing else has to change, because the identity is read rather than
+assumed everywhere it matters.
+
+``config.MATCHING_MODEL`` is the same string, and that is a COINCIDENCE OF THIS
+CONFIGURATION rather than a link: it is the OpenAI arm's priced identity for the
+CLASSIFIER, currently dormant behind ``MATCHING_PROVIDER = "bedrock_anthropic"``.
+Reading it here would make this judge follow a classifier flip into being the
+same model -- which is exactly the failure ``judge_independence`` exists to
+prevent, arrived at by trying to avoid duplicating a literal.
+"""
+
+DEFAULT_REASONING_EFFORT = "medium"
+"""``reasoning_effort`` for the judge, sent on every request.
+
+MEDIUM RATHER THAN THE PIPELINE'S 'none'. ``config.MATCHING_REASONING_EFFORT`` is
+``'none'`` for Stage 5 and that choice is calibrated against a measured 69.1%
+agreement figure on a JUDGING task of a different shape -- it is a decision about
+what the CLASSIFIER should spend, taken to control per-patient cost across 15
+trials. This is one criterion decision per request over a five-value rubric, and
+the operator's ruling is medium. The two are not the same knob on the same
+workload and neither number carries to the other.
+
+REASONING TOKENS ARE BILLED AS OUTPUT AND COUNT AGAINST
+``max_completion_tokens``. Both consequences are load-bearing rather than
+trivia: the reply ceiling has to leave room for thinking as well as for the
+answer, and ``ASSUMED_OUTPUT_TOKENS``' 110 -- measured on a non-reasoning model
+-- had to be deleted rather than adjusted.
+"""
+
+# ── LAYER 1 OF THE INDEPENDENCE GUARD ────────────────────────────────────
+#
+# AT MODULE SCOPE, SO A SAME-FAMILY CONFIGURATION CANNOT BE IMPORTED. It reads
+# the SHIPPED DEFAULT against `config.matching_wire_model()`, which is the one
+# function that answers what Stage 5 actually sends -- so a provider flip that
+# made the classifier an OpenAI model would stop this module from loading at
+# all, rather than producing a paid GPT-rating-GPT run under a heading that
+# says "different family".
+#
+# IT IS REACHABLE, NOT THEORETICAL: `MATCHING_PROVIDER = "openai"` is a member
+# of a closed three-member vocabulary and was the shipped value until recently.
+#
+# A RuntimeError SUBCLASS AT IMPORT rather than a check inside main(), on this
+# project's own precedent for a table that must total (`MAX_TOKENS_BY_MODE`,
+# `TRACKING_STATUS_FOR`) -- and NOT an `assert`, which `python -O` deletes.
+# `--help` failing is the intended cost: the file ships misconfigured and the
+# message says which default to move.
+#
+# LAYER 2 IS `require_independent_judge`, in `_prepare`, on the EFFECTIVE model
+# after `--model`. Neither layer subsumes the other: this one cannot see a
+# judge named on the command line, and that one cannot fail before argparse.
+judge_independence.assert_import_time_independence(
+    DEFAULT_MODEL, "oncotriage/evaluation/rater.py::DEFAULT_MODEL")
+
+
+REASONING_EFFORTS = ("minimal", "low", "medium", "high")
+"""What the installed SDK's type permits, read from
+``openai.types.shared.reasoning_effort.ReasoningEffort`` on 2026-09-08.
+
+Note that ``config.MATCHING_REASONING_EFFORT``'s own note records the values
+THE MODEL accepted when probed on 2026-08-04 -- ``none``, ``low``, ``medium``,
+``high``, ``xhigh`` -- which is a DIFFERENT SET in both directions: the model
+took ``none`` and ``xhigh``, which this SDK's Literal does not carry, and the
+SDK carries ``minimal``, which that probe found the model rejects. Both records
+are kept because the disagreement is the useful part: this tuple is what the
+CLIENT will send without complaint, and the model is the authority on what it
+will accept. The go-live probe is what settles the intersection for this
+harness's own request shape.
+"""
 
 # THE REPLY CEILING IS PER MODE, AND THE MEASUREMENT THAT MOVED IT ALSO SAYS
 # THE ANCHORED VALUE IS NOT SAFE EITHER. Both halves are recorded because the
@@ -3617,8 +4590,48 @@ DEFAULT_MODEL = "claude-sonnet-4-6"
 # therefore a decision about that guarantee rather than a one-line default, it
 # needs the pin re-argued and re-measured, and it is a separate item. This item
 # rated no anchored decisions, so it does not take it.
-DEFAULT_MAX_TOKENS = 300
-DEFAULT_MAX_TOKENS_BLIND = 1024
+# ══ AND THE PORT MADE BOTH OF THOSE NUMBERS UNSAFE, INCLUDING THE ONE THE
+# ══ BLOCK ABOVE RAISED. Everything above is a measurement of a NON-REASONING
+# ══ model's VISIBLE reply and it is kept because it is the provenance of the
+# ══ two numbers this block replaces.
+#
+# REASONING TOKENS COUNT AGAINST THIS CEILING AND ARE GENERATED BEFORE THE
+# ANSWER. At `reasoning_effort="medium"` the model thinks first and the visible
+# object is emitted afterwards, out of whatever budget is left -- so a ceiling
+# sized for the visible object alone does not truncate the rationale, it
+# truncates BEFORE THE FIRST CHARACTER OF JSON. Every response comes back
+# `finish_reason="length"` with empty content, every decision buckets
+# `truncated_max_tokens`, and the retry pass doubles a ceiling that is still
+# nowhere near enough. 300 and 1024 would have spent a batch to learn that.
+#
+# 4096 IN BOTH MODES, AND THE FIGURE IS BORROWED RATHER THAN MEASURED. Ragas'
+# own `InstructorModelArgs` docstring -- read from the installed ragas 0.4.3 --
+# says "For GPT-5 and o-series models, you may need to increase max_tokens to
+# 4096+ for structured output to work properly", which is the same failure from
+# the other side: a structured object that never gets emitted. It is a floor
+# somebody else measured on a different task, so it is a STARTING POINT and the
+# probe is what turns it into a number. `usage.completion_tokens_details.
+# reasoning_tokens` is recorded per response precisely so the next pass can set
+# this from data.
+#
+# WHAT IT COSTS, STATED RATHER THAN DISCOVERED. Output bills on tokens
+# GENERATED, so headroom is free at run time and a reply that fits is
+# byte-identical whatever the ceiling was. The RESERVATION is where it is not
+# free: it prices every reply at the full ceiling, so 2,212 requests at 4096
+# reserve 2,212 x 4096 x $6.00/Mtok = $54.35 -- ABOVE the $50
+# `RATER_SPEND_CAP_USD`. A full-run submission is therefore refused until
+# either the cap moves or the ceiling is set from measured reasoning usage.
+# That is the reservation working: at this ceiling the run genuinely could cost
+# that much, and a gate that admitted it would be admitting a batch it cannot
+# pay for.
+#
+# THE MODE SPLIT IS KEPT AND BOTH SIDES NOW CARRY THE SAME NUMBER, because the
+# reasoning term dwarfs the difference the split was about (a blind rationale
+# runs a few hundred tokens longer than an anchored one, which is noise against
+# a thinking budget). The table stays so that a measured per-mode figure has
+# somewhere to go.
+DEFAULT_MAX_TOKENS = 4096
+DEFAULT_MAX_TOKENS_BLIND = 4096
 
 # TOTAL over ``MODES``, guarded at import rather than by an ``assert``, which
 # ``python -O`` deletes. A mode with no ceiling would fall through to whatever
@@ -3633,48 +4646,123 @@ if tuple(sorted(MAX_TOKENS_BY_MODE)) != tuple(sorted(MODES)):
         f"MAX_TOKENS_BY_MODE must name every rating mode exactly once: "
         f"modes={MODES}, table={tuple(MAX_TOKENS_BY_MODE)}")
 
-DEFAULT_TEMPERATURE = 0.0
+# OMITTED, AND THE VALUE THAT MEANS "OMIT" IS NEGATIVE BECAUSE argparse CANNOT
+# EXPRESS "ABSENT" FOR A FLOAT. The flag's own help says so and `--temperature 0`
+# still asks for zero explicitly.
+#
+# WHY IT IS OMITTED RATHER THAN SET TO ZERO. Probed live against this model on
+# 2026-08-04 and recorded at `config.MATCHING_TEMPERATURE`:
+#
+#     temperature=0 -> 400 unsupported_value: "'temperature' does not support 0
+#     with this model. Only the default (1) value is supported."
+#
+# So a temperature of any kind fails EVERY request of a batch, once per
+# decision, and the failure is a 400 the retry pass would not retry. The old
+# default of 0.0 was correct for the Anthropic judge and is a whole-batch
+# outage here. `resolve_temperature` refuses a supplied value for this family
+# rather than sending it and discovering that per request.
+DEFAULT_TEMPERATURE = -1.0
 DEFAULT_POLL_SECONDS = 45
 DEFAULT_POLL_TIMEOUT = 86400
 
-# 5m, AND THE SAVING IS 1.7% RATHER THAN THE 25% IT WAS CHANGED FOR. Both
-# figures are kept because the difference between them is the lesson.
+# ``DEFAULT_CACHE_TTL`` AND ``--cache-ttl`` ARE DELETED, AND SO IS ``--no-cache``.
 #
-# WHY IT WAS CHANGED. A cache WRITE is the most expensive token class, and batch
-# parallelism makes far more of them than the estimator's floor assumes: on the
-# 1.8.0 blind run (``rater_blind_1_8_0_20260816/cost_forensics.json``) the floor
-# assumed one write per distinct prefix -- ten patients, ten writes -- and the
-# API made 432. 2,463,401 write tokens at the 1h premium (2.0x base) was $7.39
-# of a $13.58 bill. Re-priced at the 5m premium (1.25x) that is $4.62, putting
-# the run at $10.81 under its $13.00 gate. That arithmetic is correct and it
-# holds the WRITE VOLUME FIXED, which is the assumption the forensics itself
-# declined to stand behind, in writing: "not a prediction: a 5m ttl can also
-# change the write VOLUME, since an entry that expires mid-batch is rewritten".
+# They were real controls on the Anthropic wire: a `cache_control` breakpoint
+# with a chosen 5m or 1h TTL, and the long block that used to stand here
+# recorded a measured 1.7% saving from the choice, the write-volume effect that
+# ate the predicted 25%, and the workload conditions under which either wins.
+# That measurement is history now and is kept in git; it describes a mechanism
+# this arm does not have.
 #
-# WHAT ACTUALLY HAPPENED, measured on the 1.9.0 blind run
-# (``rater_blind_1_9_0_20260817/analysis.json :: section5.ttl_measurement``):
+# **OPENAI'S CACHE IS AUTOMATIC. THERE IS NO FIELD TO SEND, NO BREAKPOINT TO
+# PLACE AND NO TTL TO CHOOSE.** Keeping the flags would have been worse than
+# deleting them: `--cache-ttl 1h` would have been accepted, printed in the plan
+# banner, written into the manifest, and reached nothing -- an operator's
+# deliberate choice recorded as having been honoured when it was discarded.
+# This project deletes a tunable that does nothing rather than leaving it to be
+# believed; `BATCH_SIZE` and `EXPANSION_TEMPERATURE` set that precedent.
 #
-#     write rate      $3.0000 -> $1.8750 /Mtok    0.625x
-#     write volume     1,026  ->  1,648  tok/req  1.606x
-#     write COST       $7.3902 -> $7.2304         0.978x
-#     cache hit rate    94.3%  ->   80.3%
-#     wall time         369.6s ->   415.6s   -- BOTH outrun the 300s window
-#
-# The rate saving was eaten by the volume. A 5m entry that expires mid-batch is
-# rewritten, so tokens moved out of the read bucket ($0.15/Mtok) into the write
-# bucket ($1.875/Mtok) -- 12.5x dearer per token. Counterfactual, and it is an
-# assumption rather than a measurement because the only way to measure it is to
-# pay for the other arm: that run at 1h with the 1.8.0 run's per-request cache
-# behaviour is $13.13 against the $12.90 paid, so 5m saved $0.23, or 1.7%.
-#
-# SO THE DEFAULT STANDS ON A SMALL MEASURED SAVING, NOT A LARGE PREDICTED ONE,
-# and it is workload-dependent in a way worth stating: a batch that finishes
-# inside five minutes keeps the cheaper rate AND the hit rate, and gains the
-# full ~37%; a batch that outruns it trades most of that back. Both batches
-# measured so far outran it. ``--cache-ttl 1h`` is the right choice for a long
-# batch and is one flag away. Read ``measured_cache`` -- hit rate and write
-# count -- on every run rather than trusting either figure above.
-DEFAULT_CACHE_TTL = "5m"
+# WHAT REPLACES THEM IS THE REQUEST ORDER AND A MEASUREMENT. The only lever left
+# is the shared PREFIX -- see `build_requests`, where the part order is the
+# mechanism -- and whether it worked is read off `prompt_tokens_details.
+# cached_tokens` per response by `measured_cache_report`, never assumed.
+
+
+def resolve_reasoning_effort(model, requested=None):
+    """The effort to send, or None to omit. Refuses a value the SDK rejects.
+
+    ``requested`` of ``None`` means the operator named none, which takes
+    ``DEFAULT_REASONING_EFFORT``. The literal string ``"omit"`` is the one way
+    to send no effort at all, for a judge model that is not a reasoning model.
+
+    REFUSED RATHER THAN SENT AND DISCOVERED. An effort the client will not
+    serialise raises inside the SDK on the first request, after the file has
+    been uploaded and the batch created -- so the money is committed and the
+    diagnosis names a pydantic validator. This runs inside ``_prepare``, which
+    is everything that must hold before a cent is spent.
+    """
+    del model                    # accepted for symmetry with the other resolvers
+    if requested is None:
+        requested = DEFAULT_REASONING_EFFORT
+    if requested == OMIT_REASONING_EFFORT:
+        return None
+    if requested not in REASONING_EFFORTS:
+        raise RaterRefusal(
+            f"--reasoning-effort must be one of {REASONING_EFFORTS} or "
+            f"{OMIT_REASONING_EFFORT!r}; got {requested!r}. That tuple is what "
+            f"the installed SDK will serialise. Note that the MODEL's accepted "
+            f"set is not identical to it -- see REASONING_EFFORTS -- so a value "
+            f"in this tuple can still be refused by the provider, which the "
+            f"probe is for.",
+            code="bad_reasoning_effort")
+    return requested
+
+
+def resolve_temperature(model, requested):
+    """The temperature to send, or None to omit. Refuses one this model rejects.
+
+    A NEGATIVE ``requested`` MEANS OMIT and is the default; anything else is an
+    explicit ask. For a judge whose family is known to reject the parameter the
+    explicit ask is REFUSED rather than honoured, because honouring it fails
+    every request in the batch with a 400 that the retry pass will not retry --
+    2,212 identical failures and a whole submission's worth of nothing.
+
+    THE CAPABILITY IS DECLARED, NOT PROBED. ``config.MATCHING_TEMPERATURE_
+    MODEL_ACCEPTS`` records the same fact for the classifier arms and this
+    table is its judge-side counterpart; discovering it by sending is precisely
+    what this refusal exists to avoid.
+    """
+    if requested is None or requested < 0:
+        return None
+    if not TEMPERATURE_ACCEPTED_BY_FAMILY.get(
+            judge_independence.family_of(model), True):
+        raise RaterRefusal(
+            f"--temperature {requested} was requested for {model!r}, whose "
+            f"family does not accept the parameter: probed live on 2026-08-04, "
+            f"temperature=0 returns 400 unsupported_value ('Only the default "
+            f"(1) value is supported'). Sending it would fail EVERY request in "
+            f"the batch. Omit the flag -- the default omits the parameter -- or "
+            f"choose a judge that accepts it.",
+            code="temperature_unsupported")
+    return requested
+
+
+OMIT_REASONING_EFFORT = "omit"
+
+TEMPERATURE_ACCEPTED_BY_FAMILY = {
+    judge_independence.FAMILY_OPENAI: False,
+    judge_independence.FAMILY_ANTHROPIC: True,
+}
+"""Whether a judge family accepts a ``temperature`` at all. DECLARED.
+
+Keyed by FAMILY rather than by model id, which is a deliberate
+over-approximation: it is wrong about a non-reasoning OpenAI model, which does
+accept temperature, and it is wrong in the SAFE direction -- it refuses a flag
+rather than spending a batch to learn the same thing. Anything unlisted defaults
+to accepting, so a new judge family is not blocked by a table that has not heard
+of it. The `.get(..., True)` in `resolve_temperature` is that default and is
+where the asymmetry is argued.
+"""
 
 
 def resolve_max_tokens(mode, requested=None):
@@ -3717,7 +4805,7 @@ def _parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="rater_run.py",
         description="Have an independent LLM rate every criterion decision in "
-                    "an evaluation run. SPENDS MONEY on the Anthropic API "
+                    "an evaluation run. SPENDS MONEY on the OpenAI Batch API "
                     "unless --dry-run is given.")
     p.add_argument("--run-dir", default=None,
                    help="the evaluation run to rate (default: the 10-patient "
@@ -3735,28 +4823,37 @@ def _parse_args(argv=None):
                            "(repeatable via comma separation)")
     p.add_argument("--model", default=DEFAULT_MODEL)
     p.add_argument("--max-tokens", type=int, default=None,
-                   help="reply ceiling. Default: the mode decides -- "
-                        f"{DEFAULT_MAX_TOKENS} anchored, "
-                        f"{DEFAULT_MAX_TOKENS_BLIND} blind, because a "
-                        "blind reply overran the anchored ceiling 18.1%% "
-                        "of the time on the item 9 run and output bills "
-                        "on tokens generated, so headroom is free. An "
-                        "explicit value wins in either mode.")
+                   help="reply ceiling, as max_completion_tokens. Default: "
+                        f"the mode decides -- {DEFAULT_MAX_TOKENS} anchored, "
+                        f"{DEFAULT_MAX_TOKENS_BLIND} blind. REASONING TOKENS "
+                        "COUNT AGAINST IT and are generated before the "
+                        "answer, so a ceiling sized for the visible object "
+                        "truncates before the first character of JSON. "
+                        "Output bills on tokens GENERATED, so headroom is "
+                        "free at run time -- but the pre-submission "
+                        "reservation prices every reply at this number, so "
+                        "raising it shrinks what will fit in one session. "
+                        "(For scale: at the pre-port 300 a blind reply "
+                        "overran 18.1%% of the time on a NON-reasoning "
+                        "model.) An explicit value wins in either mode.")
     p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
-                   help="pass a negative value to omit the parameter entirely, "
-                        "which is required on models that reject non-default "
-                        "sampling parameters")
-    p.add_argument("--cache-ttl", choices=("5m", "1h"),
-                   default=DEFAULT_CACHE_TTL,
-                   help="prompt-cache lifetime. Default 5m: a cache WRITE is "
-                        "the most expensive token class and batch parallelism "
-                        "makes many of them, so the write premium (1.25x at "
-                        "5m, 2.0x at 1h) dominates. Use 1h for a batch "
-                        "expected to run longer than five minutes, where a 5m "
-                        "entry expiring mid-batch is rewritten rather than "
-                        "read.")
-    p.add_argument("--no-cache", action="store_true",
-                   help="omit cache_control; costs several times more")
+                   help="OMITTED BY DEFAULT (a negative value means omit), "
+                        "because gpt-5.6-terra rejects every value but its "
+                        "own default and sending one 400s every request in "
+                        "the batch. Supplying a non-negative value for a "
+                        "family known to reject it is refused rather than "
+                        "sent.")
+    p.add_argument("--reasoning-effort", default=None,
+                   choices=REASONING_EFFORTS + (OMIT_REASONING_EFFORT,),
+                   help=f"reasoning effort for the judge (default "
+                        f"{DEFAULT_REASONING_EFFORT!r}; {OMIT_REASONING_EFFORT!r} "
+                        f"sends no effort at all). Reasoning tokens bill as "
+                        f"OUTPUT and count against the reply ceiling.")
+    p.add_argument("--no-structured-output", action="store_true",
+                   help="do not attach the strict JSON schema. The parser "
+                        "accepts free JSON either way; this exists so a "
+                        "provider-side schema failure can be told apart from "
+                        "a model that cannot follow the contract.")
     p.add_argument("--blind", action="store_true",
                    help="withhold the recorded status: the rater assigns its "
                         "own from the arm's vocabulary and agreement is "
@@ -3781,8 +4878,10 @@ def _parse_args(argv=None):
     p.add_argument("--poll-seconds", type=int, default=DEFAULT_POLL_SECONDS)
     p.add_argument("--poll-timeout", type=int, default=DEFAULT_POLL_TIMEOUT)
     p.add_argument("--count-tokens", action="store_true",
-                   help="dry run only: calibrate the token estimate against "
-                        "the free count_tokens endpoint (needs a key)")
+                   help="dry run only: calibrate the token estimate with a "
+                        "LOCAL tiktoken encoding. Free, offline, needs no key "
+                        "-- and the encoding is an assumption rather than the "
+                        "model's own tokenizer, which the record says.")
     p.add_argument("--no-retry", action="store_true",
                    help="do not submit a second batch for retryable failures")
     p.add_argument("--top", type=int, default=30,
@@ -3851,20 +4950,42 @@ def _prepare(args):
             f"would measure a temporal-rule mismatch as disagreement.",
             code="reference_date_mismatch")
 
-    temperature = None if args.temperature < 0 else args.temperature
-    cache_ttl = None if args.no_cache else args.cache_ttl
+    # ── LAYER 2 OF THE INDEPENDENCE GUARD ─────────────────────────────
+    #
+    # ON THE EFFECTIVE MODEL, AFTER `--model`, AND BEFORE ANYTHING IS BUILT.
+    # Layer 1 read the shipped default at import; this reads what THIS
+    # invocation will actually send, which is the only thing a `--model` flag
+    # cannot get past. It runs inside `_prepare` -- everything that must hold
+    # before a cent is spent -- and before the requests are built, so a
+    # same-family run does not even get as far as rendering a patient record.
+    #
+    # THE RECORD IS RETURNED AND CARRIED INTO THE MANIFEST, override and all,
+    # so a run permitted by the switch says so in its own artifact forever
+    # rather than only in whoever's shell set the variable.
+    independence = judge_independence.require_independent_judge(
+        args.model, "oncotriage/evaluation/rater.py::_prepare")
+    if independence.get("override_applied"):
+        console.out("")
+        console.out("  *** SAME-FAMILY JUDGE PERMITTED BY "
+                    f"{judge_independence.ENV_ALLOW_SAME_FAMILY_JUDGE}. ***")
+        console.out(f"      judge {independence['judge_model']!r} and "
+                    f"classifier {independence['classifier_model']!r} are "
+                    f"both {independence['judge_family']} models, so any "
+                    f"agreement figure this run produces is partly FAMILY")
+        console.out("      agreement. It is recorded in the manifest.")
+
+    temperature = resolve_temperature(args.model, args.temperature)
+    reasoning_effort = resolve_reasoning_effort(
+        args.model, getattr(args, "reasoning_effort", None))
+    args.reasoning_effort = reasoning_effort
     index = build_requests(
         run, system_prompt, rubric_meta, args.model, args.max_tokens,
-        temperature, cache_ttl or "5m", limit=max(0, args.limit), mode=mode,
+        temperature, reasoning_effort=reasoning_effort,
+        limit=max(0, args.limit), mode=mode,
         arm_definitions=arm_definitions, retest_fraction=retest_fraction,
         retest_seed=getattr(args, "retest_seed", DEFAULT_RETEST_SEED),
-        include_keys=include_keys, include_keys_meta=include_meta)
-    if args.no_cache:
-        for req in index.requests:
-            for block in req["params"]["system"]:
-                block.pop("cache_control", None)
-            for block in req["params"]["messages"][0]["content"]:
-                block.pop("cache_control", None)
+        include_keys=include_keys, include_keys_meta=include_meta,
+        structured_output=not getattr(args, "no_structured_output", False))
 
     # THE DEFAULT OUTPUT DIRECTORY IS PER MODE. Both modes write ratings.json,
     # rater_manifest.json and summary.json, and ``write_json`` replaces rather
@@ -3883,12 +5004,13 @@ def _prepare(args):
             f"configuration defect must reach the operator before the spend, "
             f"not after it.",
             code="output_parent_absent")
-    return run, index, out_dir, temperature, cache_ttl
+    return run, index, out_dir, temperature, independence
 
 
-def _report_plan(run, index, out_dir, args, cache_ttl, calibration=None):
+def _report_plan(run, index, out_dir, args, calibration=None,
+                 independence=None):
     cpt = (calibration or {}).get("chars_per_token", CHARS_PER_TOKEN_FALLBACK)
-    est = estimate_tokens(index, run, cpt, cache_ttl or "5m")
+    est = estimate_tokens(index, run, cpt, args.max_tokens)
     rates = rater_pricing(args.model)
     no_cache_cost = price_usage(args.model, est["no_cache"])
     full_cache_cost = price_usage(args.model, est["full_cache"])
@@ -3925,12 +5047,25 @@ def _report_plan(run, index, out_dir, args, cache_ttl, calibration=None):
                     f"seed {rm['seed']!r}, over "
                     f"{rm['patients_covered']} patients")
     console.out(f"  batches            {len(chunks):>8}")
-    console.out(f"  model              {args.model}")
-    console.out(f"  max_tokens         {args.max_tokens}")
+    console.out(f"  model              {args.model}"
+                f"   (no dated snapshot exists; the id is a moving target and "
+                f"every rating records what answered)")
+    console.out(f"  max_completion_tok {args.max_tokens}"
+                f"   (reasoning tokens count against this AND bill as output)")
     console.out(f"  temperature        "
-                f"{'omitted' if args.temperature < 0 else args.temperature}")
-    console.out(f"  prompt caching     "
-                f"{'off' if cache_ttl is None else cache_ttl + ' ttl'}")
+                f"{'omitted' if args.temperature < 0 else args.temperature}"
+                f"   (this model accepts no value but its own default)")
+    console.out(f"  reasoning_effort   "
+                f"{getattr(args, 'reasoning_effort', None) or 'omitted'}")
+    console.out(f"  structured output  "
+                f"{'off' if getattr(args, 'no_structured_output', False) else 'strict json_schema'}")
+    console.out(f"  prompt caching     automatic (no field is sent; the "
+                f"shared prefix is the mechanism)")
+    if independence:
+        console.out(f"  judge independence {independence['verdict']}"
+                    f"   judge={independence['judge_family']} vs "
+                    f"classifier={independence['classifier_family']} "
+                    f"({independence['classifier_model']})")
     console.out(f"  custom_id form     {index.form}")
     console.out(f"  rubric             {index.rubric_meta['rubric_chars']} "
                 f"chars, sha {index.rubric_meta['rubric_sha256'][:12]}, "
@@ -3939,16 +5074,19 @@ def _report_plan(run, index, out_dir, args, cache_ttl, calibration=None):
                 f"{index.rubric_meta['reference_date_in_rules']}")
     console.out("")
     if calibration:
-        console.out(f"  token calibration  measured on "
-                    f"{calibration['sampled_requests']} real requests via "
-                    f"count_tokens (free)")
+        console.out(f"  token calibration  {calibration['sampled_requests']} "
+                    f"real requests encoded LOCALLY with "
+                    f"{calibration['encoding']} (free, offline)")
         console.out(f"                     {cpt:.3f} chars/token "
                     f"({calibration['sampled_tokens']} tokens for "
                     f"{calibration['sampled_chars']} chars)")
+        console.out(f"                     the encoding is an ASSUMPTION, not "
+                    f"this model's own tokenizer, and it omits the "
+                    f"per-message envelope")
     else:
         console.out(f"  token calibration  none; using the {cpt:.1f} "
                     f"chars/token rule of thumb. Pass --count-tokens for a "
-                    f"measured figure (free, needs a key).")
+                    f"local tiktoken figure (free, offline, no key).")
     console.out("")
     console.out("  Cost is reported as a RANGE, not a number. Batch requests "
                 "run in parallel, so a")
@@ -3961,22 +5099,48 @@ def _report_plan(run, index, out_dir, args, cache_ttl, calibration=None):
                 f"in {est['no_cache']['input_tokens']:>9} tok  "
                 f"out {est['no_cache']['output_tokens']:>7} tok   "
                 f"${no_cache_cost:,.2f}")
-    if cache_ttl is not None:
-        fc = est["full_cache"]
-        write = fc.get("cache_creation_1h", 0) + fc.get("cache_creation_5m", 0)
-        console.out(f"    lower bound (every prefix cached)    "
-                    f"in {fc['input_tokens']:>9} tok  "
-                    f"out {fc['output_tokens']:>7} tok   "
-                    f"${full_cache_cost:,.2f}")
-        console.out(f"                                         "
-                    f"cache write {write} tok, "
-                    f"read {fc['cache_read_input_tokens']} tok")
+    fc = est["full_cache"]
+    console.out(f"    lower bound (every prefix cached)    "
+                f"in {fc['input_tokens']:>9} tok  "
+                f"out {fc['output_tokens']:>7} tok   "
+                f"${full_cache_cost:,.2f}")
+    console.out(f"                                         "
+                f"cache write {fc['cache_write_tokens']} tok, "
+                f"read {fc['cache_read_input_tokens']} tok")
+    console.out(f"    output is priced at the FULL {args.max_tokens}-token "
+                f"ceiling: reasoning bills as output and no measured figure "
+                f"exists yet.")
     console.out("")
-    console.out(f"  batch rates ({rates['pricing_version']}, 50% batch "
-                f"discount applied): "
+    console.out(f"  batch rates ({rates['pricing_version']}, "
+                f"{rates['batch_discount']:.0%} batch discount applied): "
                 f"in ${rates['input'] * 1e6:,.2f}/Mtok  "
                 f"out ${rates['output'] * 1e6:,.2f}/Mtok  "
-                f"cache-read ${rates['cache_read'] * 1e6:,.2f}/Mtok")
+                f"cache-read ${rates['cache_read'] * 1e6:,.2f}/Mtok  "
+                f"cache-write ${rates.get('cache_write', 0) * 1e6:,.2f}/Mtok")
+
+    # ── THE RESERVATION, PRINTED WHETHER OR NOT ANYTHING IS SUBMITTED ────
+    #
+    # A dry run's whole job is to show what a submit would do, and the
+    # reservation is now the thing that decides whether a submit is allowed to
+    # start. Printing it only on --submit would make --dry-run stop being a
+    # preview of the gate it is meant to preview.
+    reservation = [reserve_batch_liability(args.model, c, args.max_tokens, cpt)
+                   for c in chunks]
+    reserved = sum(r["reserved_usd"] for r in reservation)
+    left = spend.remaining(spend.SPEND_SOURCE_RATER)
+    console.out("")
+    console.out(f"  RESERVATION (what is checked before anything is sent)")
+    console.out(f"    worst case      ${reserved:>9,.2f}   every input token "
+                f"at ${reservation[0]['input_rate_per_mtok']:.2f}/Mtok (the "
+                f"dearest input class), every")
+    console.out(f"                                 reply at the full "
+                f"{args.max_tokens}-token ceiling, at batch rates")
+    console.out(f"    budget left     "
+                f"{'no cap' if left is None else f'${left:>9,.2f}'}   "
+                f"({spend.BUDGET_CAP_CONSTANTS[spend.budget_for(spend.SPEND_SOURCE_RATER)]})")
+    if left is not None and reserved > left:
+        console.out(f"    *** A SUBMIT WOULD BE REFUSED: the worst case "
+                    f"exceeds the remaining budget. ***")
     if run.problems:
         console.out("")
         console.out(f"  problems reading the run ({len(run.problems)}):")
@@ -3984,7 +5148,8 @@ def _report_plan(run, index, out_dir, args, cache_ttl, calibration=None):
             console.out(f"    - {p}")
     return {"estimate": est, "no_cache_usd": no_cache_cost,
             "full_cache_usd": full_cache_cost, "calibration": calibration,
-            "chunks": len(chunks)}
+            "chunks": len(chunks), "reservation_usd": reserved,
+            "reservation": reservation}
 
 
 def main(argv=None):
@@ -3997,7 +5162,7 @@ def main(argv=None):
         return 2
 
     try:
-        run, index, out_dir, temperature, cache_ttl = _prepare(args)
+        run, index, out_dir, temperature, independence = _prepare(args)
     except RaterRefusal as exc:
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="prepare", reason=exc.code)
@@ -4008,13 +5173,17 @@ def main(argv=None):
         calibration = None
         if args.count_tokens:
             try:
-                client, _src = require_client()
-                calibration = calibrate_chars_per_token(client, args.model,
+                # NO CLIENT AND NO KEY. The replacement calibration is a local
+                # tiktoken encoding, so a dry run stays runnable with no
+                # credentials at all -- which the Anthropic version could not
+                # claim, because count_tokens needed one.
+                calibration = calibrate_chars_per_token(None, args.model,
                                                         index)
             except RaterRefusal as exc:
                 console.out(f"  (--count-tokens skipped: {exc})")
         try:
-            _report_plan(run, index, out_dir, args, cache_ttl, calibration)
+            _report_plan(run, index, out_dir, args, calibration,
+                         independence=independence)
         except RaterRefusal as exc:
             console.out(f"REFUSED: {exc}")
             return 1
@@ -4029,6 +5198,34 @@ def main(argv=None):
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="credentials", reason=exc.code)
         return 1
+
+    # ── THE FREE VISIBILITY CHECK, BEFORE ANYTHING IS UPLOADED ───────────
+    #
+    # `models.retrieve` costs nothing and answers the commonest configuration
+    # failure there is: a key that resolves and has no access to the judge.
+    # Without it that failure is discovered by a batch in which every one of N
+    # requests errors identically -- which is a refusal an operator pays the
+    # upload for and then has to read out of an error file.
+    #
+    # IT RUNS ON THE SUBMIT PATH AND ON --resume ALIKE, because a resume also
+    # needs the key to retrieve, and being told "this key cannot see the model"
+    # is a better diagnosis than a 404 out of `batches.retrieve`.
+    #
+    # A FAILURE IS A REFUSAL, NOT A WARNING. Everything downstream of here
+    # spends money or reads something that was paid for, and the whole of
+    # `_prepare`'s contract is that a configuration defect reaches the operator
+    # before the spend rather than after it.
+    _visible, _detail = model_is_visible(client, args.model)
+    if not _visible:
+        console.out(f"REFUSED: this key cannot see the judge model "
+                    f"{args.model!r} ({_detail}). Nothing has been uploaded "
+                    f"and nothing has been spent. Check the model id and the "
+                    f"key's access before submitting.")
+        log.error("rater.refused", stage="model_visibility",
+                  reason="model_not_visible")
+        return 1
+    console.out(f"  model {args.model!r} is visible to this key "
+                f"(free check; the API echoes {_detail!r})")
 
     os.makedirs(out_dir, exist_ok=True)
     state_path = os.path.join(out_dir, state_filename(index.mode))
@@ -4071,9 +5268,13 @@ def main(argv=None):
 
     plan = None
     batch_ids = []
+    # None on a --resume, where nothing is submitted and so nothing is
+    # reserved. An empty dict would read as "reserved, and it came to nothing".
+    reservation = None
     try:
         if args.submit:
-            plan = _report_plan(run, index, out_dir, args, cache_ttl)
+            plan = _report_plan(run, index, out_dir, args,
+                                independence=independence)
             console.out("")
             if args.limit:
                 console.out("")
@@ -4138,14 +5339,42 @@ def main(argv=None):
                                 f"the run with")
                     console.out(f"      --limit / --include-keys, if you want "
                                 f"it to finish in one session.")
+            # ── THE RESERVATION. NOTHING IS SENT UNTIL THIS PASSES. ───
+            #
+            # THE MEASURED GATE INSIDE `submit_batches` CANNOT ENFORCE A CAP ON
+            # A BATCH API AND THAT IS WHY THIS EXISTS. A batch reports no usage
+            # until it is collected, so by the time the ledger can be charged
+            # the whole submission has been billed -- a limit checked after the
+            # fact stops the NEXT batch, never this one. This prices every
+            # chunk at its worst case and refuses the submission outright.
+            #
+            # IT REFUSES WHERE THE OLD PREFLIGHT WARNED, and that is the
+            # change. The old block printed "*** THE UPPER-BOUND ESTIMATE
+            # EXCEEDS THE REMAINING BUDGET ***" and submitted anyway, on the
+            # argument that an estimate must not decide and that the measured
+            # gate was right behind it batch by batch. That argument was sound
+            # for a per-request charge and is wrong for a batch: there is no
+            # "behind it" inside one submission.
+            chunks = chunk_requests(index.requests)
+            _cpt = (plan.get("calibration") or {}).get(
+                "chars_per_token", CHARS_PER_TOKEN_FALLBACK)
+            reservation = require_reservation_fits(
+                args.model, chunks, args.max_tokens, _cpt)
+            _left = reservation["budget_remaining_usd"]
+            _left_text = ("an uncapped budget" if _left is None
+                          else f"${_left:,.2f} remaining")
+            console.out("")
+            console.out(f"  RESERVED  "
+                        f"${reservation['reserved_usd_total']:,.2f} of "
+                        f"{_left_text}  -- the worst case. Nothing is sent "
+                        f"unless it fits.")
             console.out("")
             console.out("  SUBMITTING. Batch ids are printed as they are "
                         "created and written to")
             console.out(f"  {state_path} -- an interrupted session resumes "
                         f"with --resume <id>.")
-            chunks = chunk_requests(index.requests)
             batch_ids = submit_batches(client, chunks, state, state_path,
-                                       "primary")
+                                       "primary", out_dir=out_dir)
         else:
             batch_ids = [b.strip() for b in args.resume.split(",")
                          if b.strip()]
@@ -4168,9 +5397,11 @@ def main(argv=None):
         usage = _usage_totals()
         usage_by_cid = {}
         stop_reasons = Counter()
+        answering_models = Counter()
         for bid in batch_ids:
             poll_batch(client, bid, args.poll_seconds, args.poll_timeout)
-            got = collect_results(client, bid, index, args.model)
+            got = collect_results(client, bid, index, args.model,
+                                  out_dir=out_dir)
             rated.update(got["rated"])
             for cid, u in got["unrated"].items():
                 unrated[cid] = u
@@ -4178,6 +5409,7 @@ def main(argv=None):
                 usage[k] += v
             usage_by_cid.update(got["usage_by_cid"])
             stop_reasons.update(got["stop_reasons"])
+            answering_models.update(got.get("answering_models") or {})
             # CHARGED PER BATCH, NOT ONCE AT THE END. The retry pass below
             # submits through the same gate, so the primary batches' measured
             # cost has to be in the ledger before it asks -- otherwise a
@@ -4211,14 +5443,16 @@ def main(argv=None):
                     # recorded per rating. A deterministic truncation would
                     # truncate identically on an identical retry, so retrying
                     # unchanged would spend money to learn nothing.
-                    req["params"]["max_tokens"] = args.max_tokens * 2
+                    req["params"]["max_completion_tokens"] = \
+                        args.max_tokens * 2
                 retry_requests.append(req)
             retry_ids = submit_batches(
                 client, chunk_requests(retry_requests), state, state_path,
-                "retry")
+                "retry", out_dir=out_dir)
             for bid in retry_ids:
                 poll_batch(client, bid, args.poll_seconds, args.poll_timeout)
-                got = collect_results(client, bid, index, args.model)
+                got = collect_results(client, bid, index, args.model,
+                                      out_dir=out_dir)
                 for cid, rating in got["rated"].items():
                     rated[cid] = rating
                     unrated.pop(cid, None)
@@ -4230,6 +5464,7 @@ def main(argv=None):
                     usage[k] += v
                 usage_by_cid.update(got["usage_by_cid"])
                 stop_reasons.update(got["stop_reasons"])
+                answering_models.update(got.get("answering_models") or {})
                 _spent = charge_batch_to_ledger(args.model, got["usage"])
                 state[STATE_SPEND_KEY] = round(
                     float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
@@ -4250,8 +5485,14 @@ def main(argv=None):
         # `oncotriage/control.py`'s EXIT_LOCKED argument, applied to money.
         console.out("")
         console.out(f"STOPPED ON BUDGET: {exc}")
-        console.out(f"  Nothing already submitted is lost: results stay "
-                    f"retrievable for 29 days.")
+        # "29 days" WAS ANTHROPIC'S RETENTION AND IS NOT THIS VENDOR'S. OpenAI
+        # keeps a batch's output as a FILE in the account's storage, which does
+        # not expire on a documented clock but can be deleted by anyone with
+        # the key -- so the honest statement is about the batch id and the
+        # file, not about a number of days this harness would be guessing.
+        console.out(f"  Nothing already submitted is lost: each batch's "
+                    f"output file stays in the account's storage and its raw "
+                    f"JSONL is written here as it is retrieved.")
         console.out(f"  Batch ids are in {state_path}; resume with "
                     f"--resume <id> once the cap is raised.")
         for _line in spend.report_lines():
@@ -4268,7 +5509,7 @@ def main(argv=None):
     actual_cost = price_usage(args.model, usage)
     measured = measured_cache_report(usage_by_cid, index)
     projection = project_full_run(measured, run, args.model,
-                                  cache_ttl or "5m", len(run.decisions))
+                                  len(run.decisions))
     rows = build_rating_rows(index, rated, unrated, retried)
     summary = summarize(index, rated, unrated, run)
     fenced = sum(1 for r in rows if r.get("response_was_fenced"))
@@ -4283,6 +5524,23 @@ def main(argv=None):
         "run_environment": run.manifest.get("environment"),
         "output_dir": out_dir,
         "model": args.model,
+        # THE IDENTITY QUESTION, ANSWERED THREE WAYS BECAUSE ONE IS NOT
+        # ENOUGH. `model` is what was ASKED FOR; `answering_models` counts
+        # what actually answered, read off every response; and
+        # `model_snapshot_pinned` says whether the asked-for id can even name
+        # one set of weights. On this judge it cannot -- no dated snapshot
+        # exists -- so two runs a month apart may have been rated by different
+        # models under one string, and this block is the only place that is
+        # recorded.
+        "model_snapshot_pinned": False,
+        "model_snapshot_note": (
+            "gpt-5.6-terra publishes no dated snapshot: models.list returns "
+            "the base id only and models.retrieve on a dated variant 404s "
+            "(checked 2026-09-08). The id is therefore a moving target. Every "
+            "rating carries `rated_by` read off its own response, and "
+            "`answering_models` below counts the distinct ids that answered."),
+        "answering_models": dict(answering_models),
+        "judge_independence": independence,
         "api_key_source": key_source,
         "mode": index.mode,
         "retest": index.retest_meta,
@@ -4292,9 +5550,23 @@ def main(argv=None):
         # population, so this block is what says what that population was.
         "include_keys": index.include_keys_meta,
         "request": {
-            "max_tokens": args.max_tokens,
+            "max_completion_tokens": args.max_tokens,
+            # RECORDED AS `null` RATHER THAN OMITTED, because "omitted" is the
+            # answer and an absent key would read as "not recorded". The two
+            # are different facts and this judge's whole temperature story is
+            # that the parameter is deliberately not sent.
             "temperature": temperature,
-            "cache_ttl": cache_ttl,
+            "temperature_basis": (
+                "omitted: this model accepts no value but its own default"
+                if temperature is None else "explicitly requested"),
+            "reasoning_effort": getattr(args, "reasoning_effort", None),
+            "reasoning_billed_as": "output tokens, inside completion_tokens",
+            "structured_output": not getattr(args, "no_structured_output",
+                                             False),
+            "response_schema": build_response_format(index.mode),
+            "endpoint": BATCH_ENDPOINT,
+            "completion_window": BATCH_COMPLETION_WINDOW,
+            "prompt_cache": "automatic; no field is sent and no TTL is chosen",
             "custom_id_form": index.form,
             "limit": args.limit or None,
             "include_keys_file": (index.include_keys_meta or {}).get("path"),
@@ -4338,6 +5610,15 @@ def main(argv=None):
                 "upper_bound_no_cache_usd": plan["no_cache_usd"],
                 "lower_bound_full_cache_usd": plan["full_cache_usd"],
             },
+            "reservation": reservation,
+            # WHETHER THE WRITE TERM WAS MEASURED OR MERELY ABSENT. GPT-5.6
+            # introduced a cache-write charge and the installed SDK's usage
+            # model declares no field for it, so a manifest reporting $0 of
+            # write cost has to say which of the two it means.
+            "cache_write_measured": bool(
+                usage["cache_write_reported_responses"]),
+            "cache_write_responses_reporting": usage[
+                "cache_write_reported_responses"],
         },
         "rubric": index.rubric_meta,
         "wall_time_s": round(time.time() - started, 1),
@@ -4353,9 +5634,13 @@ def main(argv=None):
     print_summary(summary, top_n=args.top)
     console.out("")
     console.out(f"  tokens   in {usage['input_tokens']:>9}   "
-                f"cache-write {usage['cache_creation_input_tokens']:>9}   "
+                f"cache-write {usage['cache_write_tokens']:>9}   "
                 f"cache-read {usage['cache_read_input_tokens']:>9}   "
-                f"out {usage['output_tokens']:>8}")
+                f"out {usage['output_tokens']:>8}   "
+                f"(of which reasoning {usage['reasoning_tokens']})")
+    console.out(f"           the vendor reported prompt_tokens "
+                f"{usage['prompt_tokens_reported']} INCLUDING its cached part; "
+                f"'in' above is the uncached remainder")
     rates = rater_pricing(args.model)
     console.out("  cost by component, each at its stacked rate "
                 "(multiplier x batch discount):")
@@ -4363,13 +5648,14 @@ def main(argv=None):
             ("uncached input", usage["input_tokens"], rates["input"]),
             ("cache read", usage["cache_read_input_tokens"],
              rates["cache_read"]),
-            ("cache write 5m", usage["cache_creation_5m"],
-             rates["cache_write_5m"]),
-            ("cache write 1h", usage["cache_creation_1h"],
-             rates["cache_write_1h"]),
+            ("cache write", usage["cache_write_tokens"],
+             rates.get("cache_write", 0.0)),
             ("output", usage["output_tokens"], rates["output"])):
         console.out(f"    {label:<16}{tok:>10} tok  x "
                     f"${rate * 1e6:7.4f}/Mtok  = ${tok * rate:9.4f}")
+    if not usage["cache_write_reported_responses"] and measured["responses"]:
+        console.out("    NOTE: no response carried a cache-write count, so "
+                    "the write line above is ABSENT rather than measured zero.")
     console.out(f"  ACTUAL COST  ${actual_cost:,.4f}   "
                 f"(batch prices, from the returned usage objects)")
     console.out("")
@@ -4380,13 +5666,17 @@ def main(argv=None):
                 f"({_fmt_rate(measured['write_rate'])}), of which "
                 f"{measured['responses_that_both_read_and_wrote']} did both; "
                 f"{measured['full_price_misses']} full-price misses")
-    if usage["breakdown_mismatch_tokens"] or usage["breakdown_absent"]:
-        console.out(f"  cache_creation breakdown discrepancies: "
-                    f"{usage['breakdown_mismatch_tokens']} tokens, "
-                    f"{usage['breakdown_absent']} responses with no breakdown")
+    if usage["prompt_reconcile_mismatch_tokens"] or usage["usage_absent"]:
+        console.out(f"  usage discrepancies: "
+                    f"{usage['prompt_reconcile_mismatch_tokens']} tokens where "
+                    f"cached_tokens exceeded prompt_tokens, "
+                    f"{usage['usage_absent']} responses with no usage block")
     else:
-        console.out("  cache_creation breakdown reconciles: 5m + 1h == total "
-                    "on every response")
+        console.out("  usage reconciles: cached_tokens <= prompt_tokens on "
+                    "every response, and every response carried a usage block")
+    if answering_models and set(answering_models) != {args.model}:
+        console.out(f"  ANSWERING MODEL(S) differ from the requested "
+                    f"{args.model!r}: {dict(answering_models)}")
     if projection and args.limit:
         console.out("")
         console.out(f"  FULL-RUN PROJECTION from measured token sizes "

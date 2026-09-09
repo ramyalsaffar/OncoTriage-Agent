@@ -676,43 +676,86 @@ print("SECTION 5 -- collect_results joins on custom_id")
 print("=" * 70)
 
 
-def _usage(inp=100, out=90, read=5000, create=0):
-    return types.SimpleNamespace(
-        input_tokens=inp, output_tokens=out, cache_read_input_tokens=read,
-        cache_creation_input_tokens=create,
-        cache_creation=types.SimpleNamespace(
-            ephemeral_5m_input_tokens=0, ephemeral_1h_input_tokens=create))
+# ── THE STUB IS A BATCH OUTPUT FILE NOW, NOT A RESULT ITERATOR ───────────
+#
+# Anthropic streamed typed result objects out of `messages.batches.results`;
+# the OpenAI Batch API writes a JSONL FILE and hands back its id, so the stub
+# below is a two-endpoint fake: `batches.retrieve` returns a status and a file
+# id, and `files.content` returns the bytes. Every response is a plain DICT,
+# because that is what the harness parses -- a SimpleNamespace stub would let a
+# `getattr`-based reader pass while the real, dict-shaped path reported every
+# response as free.
+#
+# NO NETWORK, NO KEYS, NO SPEND. Every byte here is a literal.
+_JUDGE = "gpt-5.6-terra"
 
 
-def _message(text, stop="end_turn"):
-    return types.SimpleNamespace(
-        model=_MODEL, stop_reason=stop, usage=_usage(),
-        content=[types.SimpleNamespace(type="text", text=text)])
+def _usage(inp=100, out=90, cached=5000, reasoning=0, write=None):
+    """An OpenAI usage block. `inp` is UNCACHED; prompt_tokens is the sum."""
+    block = {"prompt_tokens": inp + cached, "completion_tokens": out,
+             "total_tokens": inp + cached + out,
+             "prompt_tokens_details": {"cached_tokens": cached},
+             "completion_tokens_details": {"reasoning_tokens": reasoning}}
+    if write is not None:
+        block["prompt_tokens_details"]["cache_creation_tokens"] = write
+    return block
 
 
-def _ok(msg):
-    return types.SimpleNamespace(type="succeeded", message=msg)
+def _message(text, stop="stop", refusal=None, model=None, usage=None):
+    """One `response.body`: a ChatCompletion, as JSON."""
+    return {"id": "chatcmpl-stub", "object": "chat.completion",
+            "model": model or _JUDGE,
+            "usage": _usage() if usage is None else usage,
+            "choices": [{"index": 0, "finish_reason": stop,
+                         "message": {"role": "assistant", "content": text,
+                                     "refusal": refusal}}]}
 
 
-def _errored(kind):
-    return types.SimpleNamespace(
-        type="errored",
-        error=types.SimpleNamespace(error=types.SimpleNamespace(type=kind)))
+def _ok(body):
+    return {"response": {"status_code": 200, "request_id": "req_stub",
+                         "body": body}, "error": None}
+
+
+def _errored(kind, code=500):
+    return {"response": {"status_code": code, "request_id": "req_stub",
+                         "body": {"error": {"type": kind, "message": kind}}},
+            "error": {"code": kind, "message": kind}}
 
 
 class _StubClient(object):
-    """Yields canned batch results. Never touches the network."""
+    """Serves one canned batch output file. Never touches the network."""
 
-    def __init__(self, plan):
+    def __init__(self, plan, status="completed", output=True, error_plan=None):
         outer = self
+        self.plan = plan
+        self.status = status
+        self.error_plan = error_plan or []
+        self.reads = []
+
+        def _lines(rows):
+            return "".join(
+                json.dumps(dict(result, custom_id=cid), ensure_ascii=False)
+                + "\n" for cid, result in rows)
 
         class _Batches(object):
-            def results(self, batch_id):
-                for cid, result in outer.plan:
-                    yield types.SimpleNamespace(custom_id=cid, result=result)
+            def retrieve(self, batch_id):
+                return types.SimpleNamespace(
+                    id=batch_id, status=outer.status,
+                    output_file_id=("out_file" if output else None),
+                    error_file_id=("err_file" if outer.error_plan else None),
+                    request_counts=types.SimpleNamespace(
+                        total=len(outer.plan), completed=len(outer.plan),
+                        failed=0))
 
-        self.plan = plan
-        self.messages = types.SimpleNamespace(batches=_Batches())
+        class _Files(object):
+            def content(self, file_id):
+                outer.reads.append(file_id)
+                if file_id == "err_file":
+                    return _lines(outer.error_plan)
+                return _lines(outer.plan)
+
+        self.batches = _Batches()
+        self.files = _Files()
 
 
 _JOIN_DECISIONS = [
@@ -734,13 +777,16 @@ _CIDS = list(_BY_CID)
 _PLAN = [
     (_CIDS[0], _ok(_message(OK))),
     (_CIDS[1], _ok(_message("```json\n" + OK + "\n```"))),
-    (_CIDS[2], _ok(_message("refused", stop="refusal"))),
-    (_CIDS[3], _ok(_message(OK[:30], stop="max_tokens"))),
-    (_CIDS[4], _errored("api_error")),
+    # A REFUSAL IS ITS OWN FIELD ON THIS VENDOR, not a finish_reason. The old
+    # plan set stop="refusal", which is Anthropic's shape; here the content is
+    # null and `message.refusal` carries the text.
+    (_CIDS[2], _ok(_message(None, refusal="I cannot help with that"))),
+    (_CIDS[3], _ok(_message(OK[:30], stop="length"))),
+    (_CIDS[4], _errored("server_error")),
     # _CIDS[5] deliberately omitted -> must surface as an absence, not vanish.
 ]
-got = drive(R.collect_results, _StubClient(_PLAN), "msgbatch_stub", _INDEX,
-            _MODEL)
+got = drive(R.collect_results, _StubClient(_PLAN), "batch_stub", _INDEX,
+            _JUDGE)
 check("5a  the two well-formed responses are rated",
       len(got["rated"]) if isinstance(got, dict) else got, 2)
 check("5a  a refusal is bucketed as a refusal", bucket(got, _CIDS[2]),
@@ -752,8 +798,8 @@ check("5a  an API error is bucketed as an API error",
 check("5a  an invalid_request is bucketed apart from other API errors",
       bucket(drive(R.collect_results,
                    _StubClient([(_CIDS[0],
-                                 _errored("invalid_request_error"))]),
-                   "b", _INDEX, _MODEL), _CIDS[0]),
+                                 _errored("invalid_request_error", 400))]),
+                   "b", _INDEX, _JUDGE), _CIDS[0]),
       "api_invalid_request")
 check("5a  a custom_id with NO result is reported missing",
       sorted(got["missing"]) if isinstance(got, dict) else got, [_CIDS[5]])
@@ -785,12 +831,12 @@ check("5c  rows round-trip through JSON",
 # A duplicate custom_id would double-count; an unknown one means the run
 # directory changed under the batch. Both refuse rather than guess.
 did, kind = raises(R.collect_results, _StubClient(_PLAN + [_PLAN[0]]), "b",
-                   _INDEX, _MODEL)
+                   _INDEX, _JUDGE)
 check("5d  a duplicate custom_id refuses", (did, kind),
       (True, "RaterRefusal"))
 did, kind = raises(R.collect_results,
                    _StubClient([("no_such_custom_id", _ok(_message(OK)))]),
-                   "b", _INDEX, _MODEL)
+                   "b", _INDEX, _JUDGE)
 check("5d  an unknown custom_id refuses", (did, kind), (True, "RaterRefusal"))
 
 # NEGATIVE CONTROL: the partition assertions must be able to fail. Dropping a
@@ -1213,9 +1259,10 @@ def built(mode, run=None, retest_fraction=0.0, seed=42, rubric=None):
         return defs
     return drive(R.build_requests, run or planted_run(),
                  drive(R.build_system_prompt, rubric, mode=mode),
-                 {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h",
+                 {"rubric_sha256": "x"}, _MODEL, 300, None,
                  mode=mode, arm_definitions=defs,
-                 retest_fraction=retest_fraction, retest_seed=seed)
+                 retest_fraction=retest_fraction, retest_seed=seed,
+                 structured_output=False)
 
 
 def blob(index):
@@ -1231,16 +1278,82 @@ def sha(text):
 
 
 # --- 8a -- ANCHORED IS BYTE-IDENTICAL WITH THE FLAG OFF -------------------
-# The value was measured against git show HEAD: before the blind change
-# existed. See the section header.
+#
+# ** THE PIN SURVIVED THE PORT TO OPENAI, AND HOW IT SURVIVED IS THE POINT. **
+#
+# The value below was measured against `git show HEAD:` before blind mode
+# existed, over the ANTHROPIC request body. The port to the OpenAI Batch API
+# necessarily changes that body -- `system` becomes a message, `max_tokens`
+# becomes `max_completion_tokens`, the `cache_control` breakpoints go away --
+# so hashing the new list against the old value could only fail.
+#
+# THE OBVIOUS RESPONSE IS TO RE-MEASURE THE PIN AGAINST THE PORTED MODULE, AND
+# IT IS THE WRONG ONE: a golden value refreshed to accommodate the change it is
+# meant to guard makes whatever the code does correct by definition. This
+# project's own rule, from `tests/test_dashboard_reproducibility_tab.py`.
+#
+# WHAT THE PIN WAS ACTUALLY ABOUT is the CONTENT and the ORDER: the system
+# prompt text, each patient block, each decision block, the custom_ids and the
+# sequence they are built in. None of that moved -- the port changed the
+# envelope those strings travel in and nothing else. So the check reconstructs
+# the ANTHROPIC envelope from the ported requests and hashes THAT against the
+# original value. It fails if a single character of rendered text moved, if the
+# order moved, or if a custom_id moved; it passes only because the port really
+# was a transport change.
+#
+# `_as_anthropic_body` LIVES HERE AND NOT IN THE MODULE, deliberately. It is a
+# statement about history, it has no production caller, and putting it in
+# `rater.py` would be a dead declaration -- the shape
+# `tests/test_package_invariants.py` check 2h exists to report.
 _ANCHORED_PIN = \
     "bfab8d8257cfbbf4937cf275af4ba94b646a47edc54fcd7cbfda9a8ddeb15a5a"
 
+
+def _as_anthropic_body(request):
+    """One ported request, re-expressed in the pre-port wire shape.
+
+    A pure re-envelope: it moves strings, it invents none. The `1h` ttl and the
+    `temperature: 0.0` are what `built()` passed BEFORE the port and are
+    restored here so the comparison is against the same historical request.
+    """
+    params = request["params"]
+    system_text = params["messages"][0]["content"]
+    user_parts = params["messages"][1]["content"]
+    cc = {"type": "ephemeral", "ttl": "1h"}
+    return {
+        "custom_id": request["custom_id"],
+        "params": {
+            "model": params["model"],
+            "max_tokens": params["max_completion_tokens"],
+            "system": [{"type": "text", "text": system_text,
+                        "cache_control": dict(cc)}],
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": user_parts[0]["text"],
+                 "cache_control": dict(cc)},
+                {"type": "text", "text": user_parts[1]["text"]},
+            ]}],
+            "temperature": 0.0,
+        },
+    }
+
+
 _anch = built(R.MODE_ANCHORED)
-check("8a  anchored request bodies hash to the value measured from the "
-      "PRE-BLIND module (git show HEAD:), so the flag being off is "
-      "byte-identical rather than merely similar",
-      sha(blob(_anch)), _ANCHORED_PIN)
+_anch_historical = ([_as_anthropic_body(r) for r in _anch.requests]
+                    if hasattr(_anch, "requests") else [])
+check("8a  the anchored requests' CONTENT and ORDER still hash to the value "
+      "measured from the PRE-BLIND, PRE-PORT module (git show HEAD:), once "
+      "the OpenAI envelope is translated back -- so the port moved the "
+      "transport and not one character of what is asked",
+      sha(json.dumps(_anch_historical, sort_keys=True, ensure_ascii=False)),
+      _ANCHORED_PIN)
+check("8a  non-degeneracy: the translation is over the PORTED body, so the "
+      "check would fail if build_requests had stopped emitting one",
+      bool(_anch_historical)
+      and all("max_completion_tokens" in r["params"]
+              for r in _anch.requests), True)
+check("8a  CONTROL: the translation is not a no-op -- the ported and the "
+      "historical shapes really differ",
+      sha(blob(_anch)) != _ANCHORED_PIN, True)
 check("8a  non-degeneracy: the pin is over a real, non-empty request list",
       len(_anch.requests) if hasattr(_anch, "requests") else 0, len(_PLANT))
 check("8a  ...and the ORDER is the run's own order, which is what the first "
@@ -1252,7 +1365,8 @@ check("8a  ...and the ORDER is the run's own order, which is what the first "
 
 # CONTROL: the pin must be capable of failing. A one-field perturbation of the
 # same list must not hash to it.
-_perturbed = json.loads(blob(_anch))
+_perturbed = json.loads(
+    json.dumps(_anch_historical, sort_keys=True, ensure_ascii=False))
 _perturbed[0]["params"]["max_tokens"] = 301
 check("8a  CONTROL: a single changed field breaks the pin",
       sha(json.dumps(_perturbed, sort_keys=True, ensure_ascii=False))
@@ -2119,9 +2233,10 @@ def built_with(keys, mode=R.MODE_BLIND, run=None, meta=None, limit=0):
         return defs
     return drive(R.build_requests, run or planted_run(),
                  drive(R.build_system_prompt, rubric, mode=mode),
-                 {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "1h",
+                 {"rubric_sha256": "x"}, _MODEL, 300, None,
                  mode=mode, arm_definitions=defs, limit=limit,
-                 include_keys=keys, include_keys_meta=meta)
+                 include_keys=keys, include_keys_meta=meta,
+                 structured_output=False)
 
 
 _ALL = planted_run().decisions
@@ -2472,42 +2587,107 @@ check("9k  the message names both populations and the fix",
           {"include_keys_sha256": _SUB_SHA}, _full_idx, "/s")))
           for w in ("whole run", _SUB_SHA[:12], "--output-dir")), True)
 
-# --- 9l -- THE CACHE TTL DEFAULT -------------------------------------
-# NOT A STYLE ASSERTION. The 1.8.0 blind run breached its $13.00 gate at
-# $13.5831, and 88.9% of the overrun was cache WRITE tokens at the 1h premium
-# (2.0x base against 1.25x at 5m): 2,463,401 write tokens cost $7.39 where 5m
-# would have cost $4.62, landing the run at $10.81 under the gate. The default
-# is the whole fix, so it is pinned with the reason beside it.
-check("9l  the default cache TTL is 5m", R.DEFAULT_CACHE_TTL, "5m")
-check("9l  and an unmodified invocation carries it onto the request",
-      drive(R._parse_args, ["--dry-run"]).cache_ttl, "5m")
-check("9l  1h is still reachable for a batch expected to run long",
-      drive(R._parse_args, ["--dry-run", "--cache-ttl", "1h"]).cache_ttl, "1h")
-check("9l  the ttl reaches every cache_control block on the wire, both the "
-      "system prompt and the patient record",
-      ttls_of(built_with(_SUBSET_KEYS)), ["1h"])
-_five = drive(
-    R.build_requests, planted_run(),
-    drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_ANCHORED),
-    {"rubric_sha256": "x"}, _MODEL, 300, 0.0, "5m")
-check("9l  CONTROL: built at 5m, every block says 5m -- so the check above "
-      "reads the argument rather than a constant",
-      ttls_of(_five), ["5m"])
-# The estimator prices a write into the ttl-specific bucket, and the two rates
-# differ. A default change that did not reach the estimate would leave every
-# dry run quoting the old premium.
-_est5 = drive(R.estimate_tokens, _five, planted_run(), 4.0, "5m")
-_est1 = drive(R.estimate_tokens, built_with(_SUBSET_KEYS), planted_run(),
-              4.0, "1h")
-check("9l  the estimate books cache writes into the ttl's own bucket",
-      (has(_est5, "full_cache", "cache_creation_5m"),
-       has(_est5, "full_cache", "cache_creation_1h"),
-       has(_est1, "full_cache", "cache_creation_1h")), (True, False, True))
-_rates9 = drive(R.rater_pricing, _MODEL)
-check("9l  and a 5m write really is cheaper than a 1h write at these rates, "
-      "which is the only reason the default moved",
-      drive(lambda: dig(_rates9, "cache_write_5m")
-            < dig(_rates9, "cache_write_1h")), True)
+# --- 9l -- THERE IS NO CACHE TTL, AND THE FLAGS THAT SET ONE ARE GONE ----
+#
+# WHAT THIS BLOCK USED TO PIN, and why it could not simply be deleted. It held
+# `DEFAULT_CACHE_TTL == "5m"` with the whole measurement behind it: the 1.8.0
+# blind run breached its $13.00 gate at $13.5831, 88.9% of the overrun was
+# cache WRITE tokens at the 1h premium, and re-priced at 5m the run lands at
+# $10.81. That is real history and it is kept in git.
+#
+# IT DESCRIBES A MECHANISM THIS ARM DOES NOT HAVE. OpenAI's prompt cache is
+# automatic: no `cache_control`, no breakpoint, no TTL to choose, nothing to
+# send. So the checks are replaced rather than removed, and what replaces them
+# is the property the flags used to be a proxy for -- that the ONE remaining
+# cache lever, the shared request prefix, is actually built.
+#
+# THE ABSENCE IS PINNED IN BOTH DIRECTIONS. A reinstated `--cache-ttl` would
+# be a flag an operator sets deliberately, sees echoed in the plan banner and
+# the manifest, and which reaches nothing -- the dead-tunable shape this
+# project deletes rather than tolerates.
+for _gone in ("DEFAULT_CACHE_TTL",):
+    check("9l  %s is gone: there is no TTL to choose on this vendor, and a "
+          "constant that cannot reach the wire is one an operator would set "
+          "and be silently ignored on" % _gone,
+          hasattr(R, _gone), False)
+_ns = drive(R._parse_args, ["--dry-run"])
+check("9l  ...and so are the two flags that set it: neither survives on the "
+      "parsed namespace, so nothing downstream can read one and believe it "
+      "was honoured",
+      [a for a in ("cache_ttl", "no_cache") if hasattr(_ns, a)], [])
+def _argparse_rejects(flag, value="1h"):
+    """Does argparse REFUSE this flag? True when it exits, False when it takes.
+
+    ``SystemExit`` IS NOT AN ``Exception`` -- argparse calls ``sys.exit(2)`` on
+    an unknown flag, and this file's own ``raises()`` helper catches
+    ``Exception``, so a bare drive of ``_parse_args`` here does not fail the
+    check, it ENDS THE RUN at exit code 2 with no summary and every check below
+    unreported. That is the abort shape this project has shipped repeatedly and
+    it is why this helper exists rather than an inline call. argparse also
+    writes its usage to stderr, which is captured so a passing run stays
+    readable.
+    """
+    import contextlib
+    import io as _io
+    buf = _io.StringIO()
+    try:
+        with contextlib.redirect_stderr(buf):
+            R._parse_args(["--dry-run", flag, value])
+    except SystemExit:
+        return True
+    except Exception:                                           # noqa: BLE001
+        return True
+    return False
+
+
+check("9l  ...and argparse REFUSES them rather than ignoring them, so an "
+      "operator who types one is told rather than quietly given the default",
+      [f for f in ("--cache-ttl", "--no-cache") if not _argparse_rejects(f)],
+      [])
+check("9l  CONTROL: a flag that IS defined, given a value of its own type, "
+      "is not reported as rejected -- so the check above discriminates "
+      "between an absent flag and a mistyped value",
+      _argparse_rejects("--max-tokens", "512"), False)
+check("9l  no request carries a cache_control block, because there is no such "
+      "field on this API",
+      any("cache_control" in json.dumps(r["params"])
+          for r in built(R.MODE_ANCHORED).requests), False)
+
+# *** THE ONE CACHE LEVER THAT IS LEFT: THE SHARED PREFIX. ***
+#
+# OpenAI caches on the longest common PREFIX of the request, so the order of
+# the parts is the mechanism. System prompt, then patient record, then the one
+# part that differs per decision. Reverse the last two and every request for a
+# patient diverges at its second part, the cache serves nothing, and NOTHING
+# RAISES -- the only trace is `cached_tokens` reading 0 on a bill nobody
+# queried. That is why this is pinned rather than left to the shape of the
+# code.
+_pref = built(R.MODE_ANCHORED)
+_by_patient = {}
+for _r in _pref.requests:
+    _d = _pref.by_custom_id[_r["custom_id"]]
+    _parts = _r["params"]["messages"]
+    _prefix = (_parts[0]["content"], _parts[1]["content"][0]["text"])
+    _by_patient.setdefault(_d.patient_id, set()).add(_prefix)
+check("9l  every request for one patient shares an identical (system prompt, "
+      "patient record) prefix -- which is the whole of the cache strategy "
+      "now",
+      {p: len(v) for p, v in _by_patient.items()},
+      {p: 1 for p in _by_patient})
+check("9l  non-degeneracy: there is more than one request per patient, so "
+      "the check above is not one prefix compared with itself",
+      max(sum(1 for r in _pref.requests
+              if _pref.by_custom_id[r["custom_id"]].patient_id == p)
+          for p in _by_patient) > 1, True)
+check("9l  ...and the two patients' prefixes DIFFER, so the check is about "
+      "the record rather than about a constant",
+      len({tuple(sorted(v))[0] for v in _by_patient.values()}),
+      len(_by_patient))
+check("9l  the per-decision block is the LAST part, after the record: it is "
+      "what must differ, and anything after it would be outside the cached "
+      "prefix for no reason",
+      all(len(r["params"]["messages"][1]["content"]) == 2
+          for r in _pref.requests), True)
 
 # --- 9m -- THE REPLY CEILING IS PER MODE ---------------------------------
 # Item 9 measured 179 of 990 BLIND messages (18.1%) stopping on ``max_tokens``
@@ -2524,15 +2704,32 @@ check("9l  and a 5m write really is cheaper than a 1h write at these rates, "
 # property it asserts stopped holding for a real invocation. This check is what
 # turns that from a habit into a pin: raising the anchored default fails HERE,
 # where the reason is written down, rather than nowhere.
-check("9m  the anchored default is unchanged, which is what keeps the 8a "
-      "byte-identity pin true of a real invocation and not only of the "
-      "literal it passes",
-      R.DEFAULT_MAX_TOKENS, 300)
-check("9m  blind gets its own, larger ceiling",
-      R.DEFAULT_MAX_TOKENS_BLIND, 1024)
-check("9m  non-degeneracy: the two really differ, so every check below is "
-      "about the mode rather than about one shared number",
-      R.DEFAULT_MAX_TOKENS_BLIND > R.DEFAULT_MAX_TOKENS, True)
+# ** AND THE PORT MOVED BOTH CEILINGS, INCLUDING THE ONE THIS BLOCK PINNED AT
+# ** 300 SPECIFICALLY TO KEEP 8a HONEST.
+#
+# The old reasoning was: `max_tokens` is a serialized field of the anchored
+# request body, 8a hashes that body as comparable history, so moving the
+# default would leave 8a passing on a literal while the property stopped being
+# true of a real invocation. That argument was correct and its premise is gone
+# -- 8a now pins the CONTENT through a translated envelope, and the ceiling is
+# `max_completion_tokens`, a field the historical Anthropic body did not have.
+#
+# WHAT FORCED THE MOVE IS THE JUDGE, NOT THE PIN. Reasoning tokens count
+# against this ceiling AND are generated BEFORE the answer, so at medium effort
+# a 300-token ceiling truncates before the first character of JSON: every
+# response comes back `finish_reason="length"` with empty content, every
+# decision buckets `truncated_max_tokens`, and the retry doubles a number still
+# nowhere near enough.
+check("9m  both ceilings leave room for reasoning, which is generated BEFORE "
+      "the answer and counted against this same budget",
+      (R.DEFAULT_MAX_TOKENS, R.DEFAULT_MAX_TOKENS_BLIND), (4096, 4096))
+check("9m  non-degeneracy: the new ceiling is far above the pre-port one, "
+      "which is what the reasoning budget costs",
+      R.DEFAULT_MAX_TOKENS >= 4 * 300, True)
+check("9m  ...and it reaches the wire under the field a reasoning model "
+      "requires, not the legacy one",
+      sorted(k for k in built(R.MODE_ANCHORED).requests[0]["params"]
+             if "token" in k), ["max_completion_tokens"])
 
 # The table is TOTAL over MODES. A mode with no ceiling is a paid request
 # governed by a number nobody chose.
@@ -2543,9 +2740,10 @@ check("9m  ...and each entry is that mode's own constant",
        R.MAX_TOKENS_BY_MODE[R.MODE_BLIND]),
       (R.DEFAULT_MAX_TOKENS, R.DEFAULT_MAX_TOKENS_BLIND))
 
-check("9m  resolve_max_tokens gives each mode its own default",
+check("9m  resolve_max_tokens gives each mode its table entry",
       (drive(R.resolve_max_tokens, R.MODE_ANCHORED),
-       drive(R.resolve_max_tokens, R.MODE_BLIND)), (300, 1024))
+       drive(R.resolve_max_tokens, R.MODE_BLIND)),
+      (R.DEFAULT_MAX_TOKENS, R.DEFAULT_MAX_TOKENS_BLIND))
 check("9m  an explicit ceiling wins in either mode -- the mode decides only "
       "when the operator named nothing",
       (drive(R.resolve_max_tokens, R.MODE_ANCHORED, 777),
@@ -2603,25 +2801,28 @@ check("9m  ...and the literal percent survives expansion as one percent",
 
 _ceil_anch = built(R.MODE_ANCHORED)
 _ceil_blind = built(R.MODE_BLIND)
-check("9m  CONTROL: the 8a pin's request list is still built at 300, so this "
-      "section moves no byte of it",
-      sorted({r["params"]["max_tokens"] for r in _ceil_anch.requests})
+check("9m  CONTROL: the 8a pin's request list is still built at the 300 the "
+      "helper hands it, so this section moves no byte of it",
+      sorted({r["params"]["max_completion_tokens"]
+              for r in _ceil_anch.requests})
       if hasattr(_ceil_anch, "requests") else [], [300])
 check("9m  build_requests carries whatever ceiling it is handed onto EVERY "
       "request, in both modes",
-      (sorted({r["params"]["max_tokens"] for r in _ceil_blind.requests})
+      (sorted({r["params"]["max_completion_tokens"]
+               for r in _ceil_blind.requests})
        if hasattr(_ceil_blind, "requests") else []), [300])
 
 _wired = drive(R.build_requests, planted_run(),
                drive(R.build_system_prompt, _FIXED_RUBRIC, mode=R.MODE_BLIND),
                {"rubric_sha256": "x"}, _MODEL,
-               drive(R.resolve_max_tokens, R.MODE_BLIND), 0.0, "1h",
+               drive(R.resolve_max_tokens, R.MODE_BLIND), None,
                mode=R.MODE_BLIND,
                arm_definitions=drive(R.lift_arm_status_definitions,
                                      _FIXED_RUBRIC))
-check("9m  a blind run that names no ceiling puts 1024 on every request",
-      sorted({r["params"]["max_tokens"] for r in _wired.requests})
-      if hasattr(_wired, "requests") else [], [1024])
+check("9m  a blind run that names no ceiling puts the mode's own default on "
+      "every request",
+      sorted({r["params"]["max_completion_tokens"] for r in _wired.requests})
+      if hasattr(_wired, "requests") else [], [R.DEFAULT_MAX_TOKENS_BLIND])
 check("9m  non-degeneracy: that request list is not empty",
       len(_wired.requests) if hasattr(_wired, "requests") else 0, len(_PLANT))
 

@@ -5066,12 +5066,32 @@ PRICING_CONFIG = {
             # It changes nothing for `get_model_cost()`, which reads "input"
             # and "output" and no other key.
             #
-            # NO "cache_write" KEY, and its absence is a reading rather than an
-            # omission: OpenAI's cache is implicit and bills no separate write
-            # dimension, and this arm's translated usage carries no
-            # `cache_write_tokens` at all -- only Converse emits that field.
-            # An absent key means "no rate is known", which is exactly right
-            # here because there are never any write tokens to price.
+            # THE PARAGRAPH THAT STOOD HERE WAS MEASURED FALSE ON 2026-09-08
+            # AND IS CORRECTED RATHER THAN DELETED, because the correction is
+            # the useful part. It read: "NO 'cache_write' KEY, and its absence
+            # is a reading rather than an omission: OpenAI's cache is implicit
+            # and bills no separate write dimension, and this arm's translated
+            # usage carries no `cache_write_tokens` at all -- only Converse
+            # emits that field."
+            #
+            # Every clause was true of the models it was written against
+            # (2026-08-04). GPT-5.6 introduced a cache-write charge, and a real
+            # batch response from this model carries the field by name::
+            #
+            #     "prompt_tokens_details": {"cached_tokens": 3202,
+            #                               "cache_write_tokens": 2627, ...}
+            #
+            # STILL NO KEY HERE, AND THE REASON IS NOW A DIFFERENT ONE.
+            # `get_model_cost()` takes an {input, output} pair and has no
+            # cached term at all, so a rate it cannot read would be a
+            # declaration nothing consults. The JUDGE path prices the write --
+            # `RATER_PRICING`'s row for this model carries
+            # `cache_write_multiplier` -- because that path's own pricing
+            # function reads it. What this means for the PIPELINE's stored
+            # `estimated_cost_usd` is unchanged and was already recorded above:
+            # prompt caching is not turned on for Stage 5, so there are no
+            # write tokens on this arm to mis-price. If it is ever turned on,
+            # this row needs the key AND `get_model_cost` needs the term.
             "cache_read": 0.20
         },
         # ---- The same judge, served by Amazon Bedrock (MATCHING_PROVIDER) ---
@@ -5306,26 +5326,126 @@ PRICING_CONFIG = {
 # from a genuinely free run, and every aggregate over it under-reports by
 # exactly the amount nobody noticed.
 RATER_PRICING = {
-    "last_updated": "2026-08-11",
+    # 2026-09-08, THE DATE THE OPENAI ROWS WERE ADDED. It moved from 2026-08-11
+    # because the TABLE changed, and it is written into every judge manifest as
+    # `pricing_version`. The Anthropic rows' own rates did NOT move -- each row
+    # carries its own `verified` date so a manifest's version stamp and a row's
+    # provenance stay separable.
+    "last_updated": "2026-09-08",
     "batch_discount": 0.50,
+    # ---- ANTHROPIC's cache tiers. Vendor-level because they are properties of
+    # THAT vendor's explicit `cache_control` mechanism, which has two TTLs and
+    # charges a premium per write. An OpenAI row must NOT be priced through
+    # them: see `cache_model` below.
     "cache_write_5m_multiplier": 1.25,
     "cache_write_1h_multiplier": 2.00,
     "cache_read_multiplier": 0.10,
+    # ---- HOW A ROW'S CACHE IS BILLED. A CLOSED vocabulary, because the two
+    # vendors' cache mechanisms are not the same shape and pricing one through
+    # the other's table is a silent mis-charge rather than an error.
+    #
+    #   anthropic_ttl_tiers  explicit `cache_control`, two TTLs, a write
+    #                        premium per tier, reads at 0.10x. The usage object
+    #                        reports DISJOINT counts.
+    #   openai_implicit      automatic prefix caching, no TTL choice, no
+    #                        `cache_control` field to send. The usage object
+    #                        reports `prompt_tokens` INCLUDING the cached part,
+    #                        with `prompt_tokens_details.cached_tokens` beside
+    #                        it -- so uncached input is a SUBTRACTION, not a
+    #                        field. See `rater.translate_openai_usage`.
+    "cache_models": ("anthropic_ttl_tiers", "openai_implicit"),
     "models": {
+        # ---- OPENAI ------------------------------------------------------
+        #
+        # THE JUDGE AS OF 2026-09-08. Both judge surfaces moved here from
+        # claude-sonnet-4-6 because the CLASSIFIER moved to Claude: see
+        # `oncotriage/evaluation/judge_independence.py` for why a same-family
+        # judge measures family agreement rather than decision quality.
+        #
+        # RATES: $2.00 input / $12.00 output per 1M, standard tier. These are
+        # the same two numbers PRICING_CONFIG's own `gpt-5.6-terra` row carries
+        # for the classifier arm, and they are deliberately NOT read from there:
+        # that table prices what the PIPELINE spends and this one prices what
+        # the JUDGE spends, the two are consulted by different code paths with
+        # different discounts, and a shared row would make a judge's manifest
+        # cite a `pricing_version` belonging to the pipeline's table.
+        #
+        # CACHE READ at 0.10x input ($0.20/1M) -- identical to PRICING_CONFIG's
+        # `cache_read: 0.20` for this model, cross-checked rather than assumed.
+        #
+        # CACHE WRITE at 1.25x input ($2.50/1M), AND THIS IS THE ONE FIGURE
+        # THIS PROJECT HELD THE OPPOSITE VIEW ON. `PRICING_CONFIG`'s note reads
+        # "NO 'cache_write' KEY, and its absence is a reading rather than an
+        # omission: OpenAI's cache is implicit and bills no separate write
+        # dimension". That was correct for the models it was written against
+        # (2026-08-04) and GPT-5.6 introduced a write charge. Both readings are
+        # kept, because the disagreement is the useful part:
+        #
+        #   * this row prices a write when the API REPORTS one, and
+        #   * `rater.translate_openai_usage` records
+        #     `cache_write_tokens_reported` so a manifest says whether the
+        #     write term was MEASURED or merely absent.
+        #
+        # A run whose usage objects carry no write field therefore pays no
+        # write charge BY MEASUREMENT rather than by assumption, and a reader
+        # can tell the two apart. The RESERVATION does not get that luxury and
+        # must assume the worst -- see `rater.reserve_batch_liability`.
+        "gpt-5.6-terra": {
+            "input_per_mtok": 2.00,
+            "output_per_mtok": 12.00,
+            "cache_model": "openai_implicit",
+            "cache_read_multiplier": 0.10,
+            "cache_write_multiplier": 1.25,
+            "verified": "2026-09-08",
+            # Reasoning tokens bill at the OUTPUT rate and arrive INSIDE
+            # `usage.completion_tokens` (with `completion_tokens_details.
+            # reasoning_tokens` as an informational breakdown), so the output
+            # rate above prices them with no separate term. Adding one would
+            # double-charge. Same reading PRICING_CONFIG's row already records.
+            "reasoning_billed_as": "output",
+        },
+        # ---- ANTHROPIC ---------------------------------------------------
+        #
+        # KEPT, AND NOT BECAUSE ANYTHING STILL CALLS THEM. Every judge run
+        # before 2026-09-08 was priced through these rows, their manifests
+        # record `pricing_version` and the rates that produced their reported
+        # cost, and `rater_pricing` is what a reader re-pricing one of those
+        # runs would call. Deleting them would make a historical manifest
+        # unreproducible to save three dict entries.
         "claude-sonnet-4-6": {
             "input_per_mtok": 3.00,
             "output_per_mtok": 15.00,
+            "cache_model": "anthropic_ttl_tiers",
+            "verified": "2026-08-11",
         },
         "claude-opus-4-8": {
             "input_per_mtok": 5.00,
             "output_per_mtok": 25.00,
+            "cache_model": "anthropic_ttl_tiers",
+            "verified": "2026-08-11",
         },
         "claude-haiku-4-5": {
             "input_per_mtok": 1.00,
             "output_per_mtok": 5.00,
+            "cache_model": "anthropic_ttl_tiers",
+            "verified": "2026-08-11",
         },
     },
 }
+
+# TOTAL over the models table, guarded at import rather than by an `assert`,
+# which `python -O` deletes. A row with no `cache_model` would fall through to
+# whichever branch `rater_pricing`'s `.get` default happened to name -- an
+# Anthropic TTL premium charged against an OpenAI run, or an OpenAI write rate
+# of zero against an Anthropic one. Both are silent mis-charges.
+for _rater_model, _rater_row in RATER_PRICING["models"].items():
+    if _rater_row.get("cache_model") not in RATER_PRICING["cache_models"]:
+        raise RuntimeError(
+            f"RATER_PRICING row {_rater_model!r} declares cache_model "
+            f"{_rater_row.get('cache_model')!r}, which is not one of "
+            f"{RATER_PRICING['cache_models']}. Every row must say how its "
+            f"cache is billed; a missing answer is a silent mis-charge.")
+del _rater_model, _rater_row
 
 
 #------------------------------------------------------------------------------

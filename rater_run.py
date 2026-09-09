@@ -5,9 +5,13 @@
 an evaluation run, then persist the ratings and an agreement summary. Entry
 point.
 
-THIS COSTS MONEY, ON THE ANTHROPIC API -- a different vendor from the one the
-pipeline calls, which is the point: a rater from the same family as the judge
-measures family agreement, not decision quality. Every criterion decision in
+THIS COSTS MONEY, ON THE OPENAI BATCH API -- a different FAMILY from the one
+the pipeline calls, which is the point: a rater from the same family as the
+classifier measures family agreement, not decision quality. Until 2026-09-08
+this file said exactly that while the rater was Claude and the classifier had
+moved to Claude, so the claim is now CHECKED at import and again before the
+first billed request (`oncotriage/evaluation/judge_independence.py`) rather than
+asserted here. Every criterion decision in
 the run is one billed request; the 10-patient run under
 ``09- Testing/Evaluation Runs/`` holds 2,212 of them. ``--dry-run`` builds every
 request, prices it as a range, and submits nothing. It is free and it needs no
@@ -35,10 +39,20 @@ the match score, the assessment text, any rank or retrieval score, and the name
 of the model that produced the decisions -- and in blind mode, the recorded
 status itself. One criterion decision per request, in isolation.
 
-WHAT IT DOES NOT TOUCH. It calls no OpenAI endpoint, re-runs no pipeline stage,
-opens no database, reads no characterization fixture and writes nothing inside
-this repository. It reads an evaluation run directory and writes three JSON
-files beside it.
+NOTHING IS SUBMITTED UNTIL THE WORST CASE IS RESERVED. A batch reports no
+usage until it is collected, so a cap checked afterwards cannot stop the batch
+that broke it. Every chunk is priced at its maximum liability -- every input
+token at the dearest input class, every reply at the full ceiling, at batch
+rates -- and the submission is refused outright if that exceeds what the rater
+budget has left.
+
+WHAT IT DOES NOT TOUCH. It re-runs no pipeline stage, opens no database, reads
+no characterization fixture and writes nothing inside this repository. It reads
+an evaluation run directory and writes three JSON files beside it, plus one raw
+JSONL per batch which it REFUSES to overwrite -- that file is the only
+untransformed record of what was paid for. (It does call OpenAI now, which this
+line used to say it did not: that changed with the judge, and the embedder was
+never on this path at all.)
 
 WHY THIS FILE IS NOT NUMBERED. Same reason as ``evaluation_run.py``,
 ``fixture_capture.py``, ``fixture_replay.py``, ``measure_medcpt_scores.py`` and
@@ -54,7 +68,7 @@ USAGE
     python rater_run.py --dry-run                 # free: counts, tokens, cost
     python rater_run.py --dry-run --count-tokens  # free: measured token counts
     python rater_run.py --submit                  # COSTS MONEY
-    python rater_run.py --resume msgbatch_...     # poll/retrieve, no new spend
+    python rater_run.py --resume batch_...        # poll/retrieve, no new spend
     python rater_run.py --submit --limit 40       # a cheap pilot
     python rater_run.py --submit --output-dir <scratch>
 

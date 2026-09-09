@@ -14,23 +14,35 @@ pipeline itself produced would measure the pipeline's agreement with itself. It
 is out of scope until labels exist, and ``ragas_manifest.json`` records that as
 a field rather than leaving it to be inferred from an absence.
 
-THE JUDGE IS A DIFFERENT FAMILY FROM THE PIPELINE, deliberately, on the same
-argument ``oncotriage/evaluation/rater.py`` makes: Stage 5 runs
-``config.MATCHING_MODEL`` (OpenAI) and the judge here is Anthropic's
-``claude-sonnet-4-6``. A judge from the vendor that produced the text measures
-family agreement rather than text quality.
+THE JUDGE IS A DIFFERENT FAMILY FROM THE PIPELINE, AND UNTIL 2026-09-08 THIS
+PARAGRAPH WAS FALSE. It read: "Stage 5 runs ``config.MATCHING_MODEL`` (OpenAI)
+and the judge here is Anthropic's ``claude-sonnet-4-6``." The first clause went
+stale when ``config.MATCHING_PROVIDER`` flipped to ``bedrock_anthropic`` --
+Stage 5 has been Claude Sonnet 4.6 over Converse since -- and the second stayed
+true, so the two together described a Claude judging Claude while asserting the
+opposite. ``config.MATCHING_MODEL`` still reads ``gpt-5.6-terra``, which is what
+made the claim survive a reading: it is the OpenAI arm's PRICED IDENTITY, not
+what the pipeline sends. ``config.matching_wire_model()`` is the one function
+that answers that.
 
-THE ONE OPENAI CALL, NAMED. ``ResponseRelevancy`` reverse-engineers questions
-from the response and scores their COSINE SIMILARITY to the real question, so it
-needs an embedding model; that is an OpenAI call
-(``config.EMBEDDING_MODEL``). It is an embedder, not a judge -- it renders no
-verdict and reads no criterion -- so family separation is intact. Nothing else
-in this module calls OpenAI, and nothing at all re-runs the pipeline, opens a
-database, or touches a characterization fixture.
+The judge is ``gpt-5.6-terra`` on OpenAI now, and the claim is CHECKED rather
+than asserted: ``oncotriage/evaluation/judge_independence.py`` compares
+FAMILIES (a Claude on Bedrock is still an Anthropic model) at this module's
+import and again on the effective model immediately before the first judged
+request.
+
+THE EMBEDDER WAS ALREADY OPENAI AND IS UNCHANGED. ``ResponseRelevancy``
+reverse-engineers questions from the response and scores their COSINE SIMILARITY
+to the real question, so it needs an embedding model
+(``config.EMBEDDING_MODEL``). It renders no verdict and reads no criterion.
+**It is now the same VENDOR as the judge, which it was not before, and that
+changes nothing about independence**: the property that matters is that neither
+is the family that WROTE the text under audit, and the classifier is Anthropic.
+Nothing here re-runs the pipeline, opens a database, or touches a fixture.
 
 THIS SPENDS MONEY AT STANDARD (NON-BATCH) RATES. Ragas drives the judge
-synchronously, one request at a time inside each metric, so the Message Batches
-API the rater uses is not available here and its 50% discount does not apply.
+synchronously, one request at a time inside each metric, so the Batch API the
+rater uses is not available here and its 50% discount does not apply.
 ``--dry-run`` builds both datasets, counts the calls, prices them and submits
 nothing.
 
@@ -47,6 +59,7 @@ import sys
 import time
 
 from oncotriage import config, paths, spend
+from oncotriage.evaluation import judge_independence
 from oncotriage.observability import console, get_logger
 
 log = get_logger(__name__)
@@ -76,8 +89,57 @@ class RagasRefusal(RuntimeError):
 #------------------------------------------------------------------------------
 
 
-DEFAULT_JUDGE_MODEL = "claude-sonnet-4-6"
-DEFAULT_TEMPERATURE = 0.0
+DEFAULT_JUDGE_MODEL = "gpt-5.6-terra"
+"""The judge. OpenAI, so that it is a different FAMILY from the classifier.
+
+NO DATED SNAPSHOT IS PINNED BECAUSE NONE EXISTS -- checked against the live API
+on 2026-09-08, exactly as ``oncotriage/evaluation/rater.py:DEFAULT_MODEL``
+records. The consequence is the same and is recorded the same way: the manifest
+carries ``judge_model_snapshot_pinned: false``.
+
+**AND THE IDENTITY IT RETURNS CANNOT BE READ ON THIS PATH, WHICH IS A REAL GAP
+RATHER THAN AN OVERSIGHT.** Ragas' ``InstructorLLM.agenerate`` returns the
+parsed Pydantic model and throws the raw response away -- the same fact that
+makes ``UsageTally`` necessary -- so the ``model`` field of each response is not
+reachable from anything ragas hands back. It IS reachable inside the recording
+seam this module installs, and ``build_judge`` reads it there. That is why the
+seam records the answering id rather than only the usage.
+"""
+
+# ── LAYER 1 OF THE INDEPENDENCE GUARD ────────────────────────────────────
+#
+# AT MODULE SCOPE, so a same-family CONFIGURATION cannot be imported. See
+# `oncotriage/evaluation/rater.py`'s copy for the full argument; the short form
+# is that this checks the SHIPPED DEFAULT against `config.matching_wire_model()`
+# and layer 2 checks the EFFECTIVE model after `--judge-model`.
+#
+# THIS MODULE IS IMPORTED IN THE PROJECT ENVIRONMENT FOR `--help` AND
+# `--dry-run`, where ragas is absent -- which is deliberate and is why every
+# ragas import is inside a function body. The guard is at module scope anyway,
+# because a misconfiguration that would produce a circular measurement should
+# stop `--help` too: the flag list is not worth printing for a run that must
+# not happen.
+judge_independence.assert_import_time_independence(
+    DEFAULT_JUDGE_MODEL,
+    "oncotriage/evaluation/ragas_harness.py::DEFAULT_JUDGE_MODEL")
+
+DEFAULT_REASONING_EFFORT = "medium"
+"""``reasoning_effort`` for the judge. See the rater's copy for the argument.
+
+**WHETHER RAGAS CAN EXPRESS IT WAS VERIFIED AGAINST THE INSTALLED VERSIONS AND
+THE ANSWER IS "YES, BUT ONLY BECAUSE `build_judge` REPAIRS THE PARAMETER
+MAPPING".** ragas 0.4.3 forwards any unknown kwarg into ``model_args`` and on to
+``client.chat.completions.create``, so the effort itself travels. What does NOT
+work is ragas' own reasoning-model detection: see
+``ragas_maps_reasoning_params``.
+"""
+
+# OMITTED. gpt-5.6-terra rejects every temperature but its own default (probed
+# live 2026-08-04; see config.MATCHING_TEMPERATURE), so a value here 400s every
+# judge request ragas issues. `None` means "send nothing", and `build_judge`
+# POPS the parameter out of ragas' defaults rather than passing this through --
+# ragas seeds `temperature=0.01` whether or not a caller asks for one.
+DEFAULT_TEMPERATURE = None
 DEFAULT_MAX_TOKENS = 4096
 DEFAULT_MAX_WORKERS = 4
 DEFAULT_CLIENT_RETRIES = 5
@@ -838,11 +900,20 @@ def apply_limit(run, limit):
 def judge_pricing(model):
     """Per-token USD rates for the judge at STANDARD prices, or raise.
 
-    Reuses ``config.RATER_PRICING`` -- one pricing table for the Anthropic
-    vendor, not a second one to drift -- and deliberately does NOT apply its
-    ``batch_discount``: Ragas drives the judge synchronously and the Message
-    Batches API is not on this path, so a discounted figure here would
-    under-report every run by half.
+    Reuses ``config.RATER_PRICING`` -- one JUDGE pricing table, not a second
+    one to drift -- and deliberately does NOT apply its ``batch_discount``:
+    Ragas drives the judge synchronously and the Batch API is not on this path,
+    so a discounted figure here would under-report every run by half. The
+    rater's ``rater_pricing`` is the same row with the discount applied, and
+    keeping the two functions separate is what makes that difference visible
+    rather than a flag somebody can forget.
+
+    ``cache_read`` IS RETURNED WHEN THE ROW DECLARES ONE, and it matters on
+    this path for a reason it did not on the old one. OpenAI reports
+    ``prompt_tokens`` INCLUDING its cached part, so pricing the whole of it at
+    the input rate over-charges by the difference between the two rates on
+    every cached token -- and this harness sends one long, identical metric
+    prompt over and over, which is the shape that caches best.
 
     Never returns a zero rate for an unpriced model, on the argument
     ``get_model_cost`` makes in ``oncotriage/utils.py``: a zero-cost row is
@@ -856,9 +927,13 @@ def judge_pricing(model):
             f"config.RATER_PRICING before spending anything; a run priced at "
             f"zero would under-report by exactly its own cost.",
             code="model_unpriced")
-    return {"input": entry["input_per_mtok"] / 1e6,
-            "output": entry["output_per_mtok"] / 1e6,
-            "pricing_version": config.RATER_PRICING["last_updated"]}
+    base_in = entry["input_per_mtok"] / 1e6
+    rates = {"input": base_in,
+             "output": entry["output_per_mtok"] / 1e6,
+             "pricing_version": config.RATER_PRICING["last_updated"]}
+    if "cache_read_multiplier" in entry:
+        rates["cache_read"] = base_in * entry["cache_read_multiplier"]
+    return rates
 
 
 def embedding_pricing(model):
@@ -896,8 +971,11 @@ class UsageTally(object):
 
     def __init__(self, judge_model=None, embedding_model=None):
         self.judge_calls = 0
-        self.judge_input_tokens = 0
+        self.judge_input_tokens = 0          # UNCACHED input only
+        self.judge_cached_input_tokens = 0
         self.judge_output_tokens = 0
+        self.judge_reasoning_tokens = 0
+        self.judge_usage_absent = 0
         self.embedding_calls = 0
         self.embedding_tokens = 0
         # THE TWO MODEL IDS, SO THIS TALLY CAN PRICE AS IT RECORDS. They
@@ -909,15 +987,48 @@ class UsageTally(object):
         self.embedding_model = embedding_model
 
     def record_judge(self, usage):
+        """Fold one OpenAI usage object in, and charge it.
+
+        **THE FIELD NAMES ARE THE VENDOR'S AND THEY CHANGED WITH THE PORT.**
+        This method read ``usage.input_tokens`` / ``usage.output_tokens``, which
+        are ANTHROPIC's names. OpenAI's are ``prompt_tokens`` and
+        ``completion_tokens``, and ``getattr(usage, "input_tokens", 0)`` on an
+        OpenAI usage object returns the DEFAULT -- so an unported version of
+        this method reports every judge call as having cost nothing, charges
+        nothing to the ledger, and lets the run sail past its cap while
+        printing ``total_usd: 0.0``. That is precisely the failure the
+        recording seam exists to make impossible, reached through the seam.
+
+        AND THE SEMANTICS ARE NOT A RENAME. ``prompt_tokens`` INCLUDES the
+        cached part; Anthropic's ``input_tokens`` excludes it. So the uncached
+        figure is a SUBTRACTION, and ``judge_input_tokens`` now holds uncached
+        input with ``judge_cached_input_tokens`` beside it. Adding the two back
+        together gives ``prompt_tokens``; pricing them at one rate would
+        over-charge every cached token.
+
+        ``reasoning_tokens`` are INSIDE ``completion_tokens`` and are recorded
+        for sizing only -- pricing them separately would double-charge.
+        """
         self.judge_calls += 1
         if usage is None:
+            # NOT A FREE CALL: a call whose cost is unknown. Counted, so
+            # `cost()` can be read as the floor it becomes.
+            self.judge_usage_absent += 1
             return
-        _in = getattr(usage, "input_tokens", 0) or 0
-        _out = getattr(usage, "output_tokens", 0) or 0
-        self.judge_input_tokens += _in
-        self.judge_output_tokens += _out
-        self._charge(judge_pricing, self.judge_model, _in, _out,
-                     spend.SPEND_SOURCE_RAGAS_JUDGE)
+        prompt = getattr(usage, "prompt_tokens", 0) or 0
+        completion = getattr(usage, "completion_tokens", 0) or 0
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = (getattr(details, "cached_tokens", 0) or 0) if details else 0
+        cdetails = getattr(usage, "completion_tokens_details", None)
+        reasoning = ((getattr(cdetails, "reasoning_tokens", 0) or 0)
+                     if cdetails else 0)
+        uncached = max(0, prompt - cached)
+        self.judge_input_tokens += uncached
+        self.judge_cached_input_tokens += cached
+        self.judge_output_tokens += completion
+        self.judge_reasoning_tokens += reasoning
+        self._charge(judge_pricing, self.judge_model, uncached, completion,
+                     spend.SPEND_SOURCE_RAGAS_JUDGE, cached_tokens=cached)
 
     def record_embedding(self, usage):
         self.embedding_calls += 1
@@ -934,7 +1045,8 @@ class UsageTally(object):
         self._charge(embedding_pricing, self.embedding_model, _tok, 0,
                      spend.SPEND_SOURCE_RAGAS_EMBEDDING)
 
-    def _charge(self, pricing, model, input_tokens, output_tokens, source):
+    def _charge(self, pricing, model, input_tokens, output_tokens, source,
+                cached_tokens=0):
         """Add one response's measured cost to the shared run ledger.
 
         **THE PRICING STAYS WITH THE PATH.** ``config.RAGAS_PRICING`` is this
@@ -973,7 +1085,13 @@ class UsageTally(object):
             # default is 0.0 because that is what `cost()` has always used for
             # this vendor: `embedding_tokens * embed["input"]`, no output term.
             usd = (input_tokens * rates["input"]
-                   + output_tokens * rates.get("output", 0.0))
+                   + output_tokens * rates.get("output", 0.0)
+                   # A cached token is priced at its own rate when the row
+                   # declares one, and at the FULL input rate when it does not
+                   # -- the over-charging direction, which is the safe one for
+                   # a gate. `cached_tokens` is 0 on the embedding path, so
+                   # this term vanishes there.
+                   + cached_tokens * rates.get("cache_read", rates["input"]))
         except Exception as exc:                                # noqa: BLE001
             spend.SPEND_LEDGER_FAULTS[
                 f"ragas_unpriced:{type(exc).__name__}"] += 1
@@ -983,13 +1101,26 @@ class UsageTally(object):
     def cost(self, judge_model, embedding_model):
         judge = judge_pricing(judge_model)
         embed = embedding_pricing(embedding_model)
-        judge_usd = (self.judge_input_tokens * judge["input"]
-                     + self.judge_output_tokens * judge["output"])
+        judge_usd = (
+            self.judge_input_tokens * judge["input"]
+            + self.judge_cached_input_tokens * judge.get("cache_read",
+                                                         judge["input"])
+            + self.judge_output_tokens * judge["output"])
         embed_usd = self.embedding_tokens * embed["input"]
         return {
             "judge_calls": self.judge_calls,
+            "judge_calls_with_no_usage_block": self.judge_usage_absent,
             "judge_input_tokens": self.judge_input_tokens,
+            "judge_input_tokens_basis": "UNCACHED input. OpenAI's prompt_tokens "
+                                        "includes the cached part; this is the "
+                                        "remainder after subtracting it.",
+            "judge_cached_input_tokens": self.judge_cached_input_tokens,
+            "judge_prompt_tokens_as_reported": (
+                self.judge_input_tokens + self.judge_cached_input_tokens),
             "judge_output_tokens": self.judge_output_tokens,
+            "judge_reasoning_tokens": self.judge_reasoning_tokens,
+            "judge_reasoning_note": "inside judge_output_tokens; billed at the "
+                                    "output rate and not priced separately",
             "judge_usd": round(judge_usd, 6),
             "embedding_calls": self.embedding_calls,
             "embedding_tokens": self.embedding_tokens,
@@ -1060,35 +1191,86 @@ def resolve_api_key(name):
         f"harness cannot run without it.", code="missing_credentials")
 
 
-def build_judge(model, temperature, max_tokens, tally, max_retries):
-    """The Ragas judge LLM, wired to Anthropic, with usage recorded.
+def ragas_maps_reasoning_params(model):
+    """Does the INSTALLED ragas recognise ``model`` as a reasoning model?
 
-    THE ``top_p`` REMOVAL IS REQUIRED, NOT A PREFERENCE, AND IT IS ASSERTED.
-    Ragas builds every InstructorLLM from ``InstructorModelArgs``, whose
-    defaults are ``temperature=0.01`` AND ``top_p=0.1``, and it sends both on
-    every request. Claude 4-family models reject that pair outright:
+    **IT DOES NOT RECOGNISE ``gpt-5.6-terra``, AND THE CAUSE IS A DOTTED
+    VERSION.** ragas 0.4.3's ``InstructorLLM._map_openai_params`` detects a
+    reasoning model by taking the text after ``gpt-`` up to the first ``-`` and
+    calling ``int()`` on it. For ``gpt-5.6-terra`` that text is ``"5.6"``,
+    ``int("5.6")`` raises ``ValueError``, the surrounding ``except ValueError:
+    pass`` swallows it, and the function returns False. Verified by running it,
+    not by reading it.
 
-        400 invalid_request_error -- `temperature` and `top_p` cannot both be
-        specified for this model. Please use only one.
+    THREE THINGS THEREFORE DO NOT HAPPEN, and each one alone fails every
+    request:
 
-    Measured against the live API on 2026-08-11, not inferred: with both, every
-    single request fails and the harness scores nothing; with ``top_p`` popped
-    and temperature 0.0, the identical call succeeds. So this is the one place
-    this module reaches into a Ragas object's state, and the assertion below is
-    what turns a future Ragas change into a named failure here instead of a run
-    that 400s on every sample.
+      * ``max_tokens`` is not renamed to ``max_completion_tokens`` -- rejected
+        on the GPT-5 family;
+      * ``temperature`` is not removed and ragas seeds ``0.01`` -- this model
+        accepts only its own default and 400s on any value;
+      * ``top_p`` is not removed and ragas seeds ``0.1`` -- not supported.
+
+    ``build_judge`` repairs all three explicitly. This function exists so the
+    repair is CONDITIONAL ON THE DEFECT rather than unconditional: the day ragas
+    fixes its parser, it will have done the renaming itself, and a second
+    unconditional rename would pop a key that is no longer there and silently
+    send no ceiling at all.
     """
-    from anthropic import AsyncAnthropic
+    from ragas.llms.base import InstructorLLM
+    probe = InstructorLLM.__new__(InstructorLLM)
+    probe.model = model
+    probe.provider = "openai"
+    probe.model_args = {"max_tokens": 1, "temperature": 0.5, "top_p": 0.5}
+    mapped = probe._map_openai_params()
+    return "max_completion_tokens" in mapped
+
+
+def build_judge(model, temperature, max_tokens, tally, max_retries,
+                reasoning_effort=DEFAULT_REASONING_EFFORT):
+    """The Ragas judge LLM, wired to OpenAI, with usage and identity recorded.
+
+    **THE THREE PARAMETER REPAIRS ARE REQUIRED, NOT PREFERENCES, AND EACH IS
+    ASSERTED.** The previous version of this function repaired exactly one --
+    it popped ``top_p``, because Claude 4-family models reject the
+    ``temperature``/``top_p`` pair -- and recorded that it was measured against
+    the live API rather than inferred. The same discipline applies here and the
+    list is longer, because ragas does not recognise this model as a reasoning
+    model at all (see ``ragas_maps_reasoning_params``):
+
+        max_tokens  -> max_completion_tokens   (the legacy field is rejected)
+        temperature -> removed                 (only the default is accepted)
+        top_p       -> removed                 (not supported)
+
+    Every one is checked after the fact, so a future ragas that changes its
+    mapping produces a NAMED failure here rather than a run that 400s on every
+    sample.
+
+    **THE EFFORT IS REFUSED LOUDLY IF IT CANNOT BE EXPRESSED.** It travels as an
+    ordinary kwarg through ``llm_factory`` into ``model_args`` and out to
+    ``client.chat.completions.create``; if it is not in the mapped arguments
+    after all of the above, this raises rather than dropping it. A judge that
+    silently ran at the provider's default effort would produce numbers that
+    are not the numbers the run says it took.
+
+    **THE SEAM MUST BE INSTALLED BEFORE ``llm_factory``, AND THAT IS A FACT
+    ABOUT INSTRUCTOR RATHER THAN A STYLE.** ``instructor.patch`` captures
+    ``client.chat.completions.create`` as a local at patch time and calls it
+    through that reference. Patch first and instructor closes over the recorder,
+    which then sees every request; patch afterwards and the recorder REPLACES
+    instructor's wrapper, so ``response_model=`` reaches the raw SDK and every
+    call is a TypeError. Verified by identity below, and the reachability of
+    the recorder inside instructor's wrapper is verified too -- an assertion
+    that only checks the attribute would pass in both orders.
+    """
+    from openai import AsyncOpenAI
     from ragas.llms import llm_factory
 
-    client = AsyncAnthropic(api_key=resolve_api_key("ANTHROPIC_API_KEY"),
-                            max_retries=max_retries)
+    client = AsyncOpenAI(api_key=resolve_api_key("OPENAI_API_KEY"),
+                         max_retries=max_retries)
 
-    # The usage seam. ``client.messages`` is a cached_property, so this patches
-    # the one object every later call goes through, and instructor's
-    # ``from_anthropic`` reaches it at request time. Verified by identity
-    # immediately below rather than assumed.
-    real_create = client.messages.create
+    real_create = client.chat.completions.create
+    seen = {"models": {}}
 
     async def recording_create(*args, **kwargs):
         # ── THE SPEND GATE, IMMEDIATELY BEFORE THE REQUEST ────────────────
@@ -1105,34 +1287,121 @@ def build_judge(model, temperature, max_tokens, tally, max_retries):
         # may mark the sample failed and continue asking for more. Both are
         # SAFE, because every later ask meets this same gate and is declined
         # too, so the worst case is a run that reports a wall of failed samples
-        # having spent nothing further. This harness is not exercised here and
-        # that limit is named rather than papered over.
+        # having spent nothing further.
         spend.require_budget(spend.SPEND_SOURCE_RAGAS_JUDGE,
                              "the ragas judge")
         response = await real_create(*args, **kwargs)
+        # THE ANSWERING MODEL, READ OFF THE RESPONSE. This is the ONLY place on
+        # the ragas path where it is reachable -- `InstructorLLM.agenerate`
+        # returns the parsed Pydantic model and discards the raw response -- so
+        # a judge id that differs from the configured one is visible here or
+        # nowhere.
+        answered = getattr(response, "model", None) or "<absent>"
+        seen["models"][answered] = seen["models"].get(answered, 0) + 1
         tally.record_judge(getattr(response, "usage", None))
         return response
 
-    client.messages.create = recording_create
-    if client.messages.create is not recording_create:
+    client.chat.completions.create = recording_create
+    if client.chat.completions.create is not recording_create:
         raise RagasRefusal(
-            "could not install the usage recorder on the Anthropic client, so "
+            "could not install the usage recorder on the OpenAI client, so "
             "every cost this run reported would be zero while real money was "
             "spent. Refusing to run.", code="usage_seam_failed")
 
-    llm = llm_factory(model, provider="anthropic", client=client,
-                      temperature=temperature, max_tokens=max_tokens)
+    llm = llm_factory(model, provider="openai", client=client,
+                      max_tokens=max_tokens,
+                      **({"reasoning_effort": reasoning_effort}
+                         if reasoning_effort else {}))
+
+    # ── THE REPAIRS ──────────────────────────────────────────────────────
+    if not ragas_maps_reasoning_params(model):
+        # ragas did not recognise this as a reasoning model, so it did none of
+        # the three. Do them here, in ragas' own order, so the request is the
+        # one ragas WOULD have built had its version parser handled a dotted
+        # version.
+        if "max_tokens" in llm.model_args:
+            llm.model_args["max_completion_tokens"] = \
+                llm.model_args.pop("max_tokens")
     llm.model_args.pop("top_p", None)
-    if "top_p" in llm.model_args:
+    llm.model_args.pop("temperature", None)
+    if temperature is not None:
+        # An explicit request. Honoured rather than silently dropped -- and it
+        # will 400 on this model, which is why DEFAULT_TEMPERATURE is None and
+        # why nothing in this harness passes one.
+        llm.model_args["temperature"] = temperature
+
+    mapped = llm._map_provider_params()
+    problems = []
+    if "top_p" in mapped:
+        problems.append("top_p is still present; this model does not support "
+                        "it and every request would 400")
+    if temperature is None and "temperature" in mapped:
+        problems.append(
+            f"temperature is still present ({mapped['temperature']!r}); this "
+            f"model accepts only its own default and every request would 400")
+    if "max_tokens" in mapped:
+        problems.append("max_tokens survived; the GPT-5 family requires "
+                        "max_completion_tokens and rejects this field")
+    if mapped.get("max_completion_tokens") != max_tokens:
+        problems.append(
+            f"max_completion_tokens is "
+            f"{mapped.get('max_completion_tokens')!r}, not the requested "
+            f"{max_tokens!r}")
+    if reasoning_effort and mapped.get("reasoning_effort") != reasoning_effort:
+        problems.append(
+            f"reasoning_effort is {mapped.get('reasoning_effort')!r}, not the "
+            f"requested {reasoning_effort!r}. The installed ragas cannot carry "
+            f"it to the request, so this run would silently judge at the "
+            f"provider's default effort while reporting {reasoning_effort!r}")
+    if problems:
         raise RagasRefusal(
-            "ragas kept top_p in the judge's model_args alongside temperature; "
-            "this model rejects that pair and every request would 400.",
-            code="top_p_not_removed")
-    if llm.model_args.get("temperature") != temperature:
+            "the installed ragas cannot express this judge's required request "
+            "shape: " + "; ".join(problems)
+            + ". Nothing has been sent. Fix the mapping here, or pin a ragas "
+              "that maps reasoning models with dotted versions.",
+            code="ragas_cannot_express_request")
+
+    # THE SEAM, VERIFIED BY REACHABILITY RATHER THAN BY IDENTITY. instructor
+    # may or may not have replaced the attribute (it wraps rather than mutates
+    # in the installed version), so an identity check here would be true for
+    # the wrong reason in one of the two cases. What must hold either way is
+    # that the recorder is still REACHED at request time.
+    if not _recorder_is_reachable(client.chat.completions.create,
+                                  recording_create):
         raise RagasRefusal(
-            f"judge temperature is {llm.model_args.get('temperature')!r}, not "
-            f"the requested {temperature!r}.", code="temperature_not_applied")
+            "after ragas built the judge, the usage recorder is no longer "
+            "reachable from client.chat.completions.create. Every cost this "
+            "run reported would be zero while real money was spent.",
+            code="usage_seam_lost")
+    llm.oncotriage_answering_models = seen["models"]
     return llm
+
+
+def _recorder_is_reachable(fn, target, depth=0):
+    """Is ``target`` still called by ``fn``, directly or through a wrapper?
+
+    Walks closure cells and the usual wrapper attributes. Bounded depth, because
+    a cycle in ``__wrapped__`` would otherwise hang the one check standing
+    between a silent zero-cost report and a real bill.
+    """
+    if fn is target:
+        return True
+    if depth > 6:
+        return False
+    for cell in (getattr(fn, "__closure__", None) or ()):
+        try:
+            value = cell.cell_contents
+        except ValueError:                      # an empty cell
+            continue
+        if value is target:
+            return True
+        if callable(value) and _recorder_is_reachable(value, target, depth + 1):
+            return True
+    for attr in ("__wrapped__", "func", "__func__"):
+        value = getattr(fn, attr, None)
+        if callable(value) and _recorder_is_reachable(value, target, depth + 1):
+            return True
+    return False
 
 
 def build_embeddings(model, tally):
@@ -2375,13 +2644,24 @@ def superseded_record(run_dir, out_dir, active):
 
 def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
                    plan, active, supersedes=None, environment=None,
-                   resumed_from=None, pairs_scored_here=None):
+                   resumed_from=None, pairs_scored_here=None,
+                   judge_answering_models=None, independence=None):
     """The record of what ran, under what, at what cost.
 
     ``environment`` defaults to a stamp taken here rather than to ``None``, so a
     caller that forgets it writes a truthful record instead of a null field.
     ``main()`` passes the same object it printed, so the plan an operator read
     and the manifest they keep cannot describe different environments.
+
+    ``judge_answering_models`` and ``independence`` ARE PARAMETERS RATHER THAN
+    THINGS READ OFF ``args``, and both come from objects this function has no
+    business holding. The answering ids live on the judge LLM (the recording
+    seam is the only place they are reachable at all, because ragas discards
+    the raw response) and the independence record comes from a guard that runs
+    before the judge is built. Passing them keeps this function what it is: a
+    pure serialiser of things its caller already has. Both default to ``None``
+    -- which is honest for a caller that has neither, and reads as "not
+    recorded" rather than as "there were none".
     """
     return {
         # SCHEMA 2 ADDS ``environment`` AND NOTHING ELSE. The two manifests
@@ -2412,9 +2692,38 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
         # before --limit is applied.
         "response_field_census": run.field_census,
         "judge_model": args.judge_model,
-        "judge_provider": "anthropic",
+        "judge_provider": "openai",
+        # NO DATED SNAPSHOT EXISTS for this judge, so the id names a moving
+        # target. Recorded as a field rather than left to be inferred from the
+        # absence of a date in the id.
+        "judge_model_snapshot_pinned": False,
+        # WHAT ACTUALLY ANSWERED, counted inside the recording seam. This is
+        # the ONLY place it is reachable on the ragas path: InstructorLLM
+        # returns the parsed model and discards the raw response.
+        "judge_answering_models": (dict(judge_answering_models)
+                                   if judge_answering_models else None),
+        # `null` MEANS OMITTED AND SAYS SO, rather than being absent. This
+        # judge accepts no temperature but its own default, so "not sent" is
+        # the run's actual sampling configuration and has to be legible.
         "judge_temperature": args.temperature,
-        "judge_max_tokens": args.max_tokens,
+        "judge_temperature_basis": (
+            "omitted: this model accepts no value but its own default"
+            if args.temperature is None else "explicitly requested"),
+        # `getattr` WITH A DEFAULT, because this function is also called with
+        # a fabricated args object that predates the flag. A missing attribute
+        # is "not recorded", which is what None already means here.
+        "judge_reasoning_effort": (
+            None if getattr(args, "reasoning_effort", None) == "omit"
+            else getattr(args, "reasoning_effort", None)),
+        "judge_reasoning_billed_as": "output tokens",
+        "judge_omitted_parameters": ["temperature", "top_p"],
+        "judge_omitted_parameters_reason": (
+            "temperature: rejected by this model (only its own default is "
+            "accepted); top_p: not supported on this model. Both are seeded "
+            "by ragas' InstructorModelArgs defaults and are popped by "
+            "build_judge, which then asserts they are gone."),
+        "judge_independence": independence,
+        "judge_max_completion_tokens": args.max_tokens,
         "embeddings_model": args.embedding_model,
         "embeddings_provider": "openai",
         "relevancy_strictness": RELEVANCY_STRICTNESS,
@@ -2668,13 +2977,25 @@ def _parse_args(argv=None):
     p.add_argument("--judge-model", default=DEFAULT_JUDGE_MODEL)
     p.add_argument("--embedding-model", default=None,
                    help=f"default: config.EMBEDDING_MODEL")
-    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE)
+    p.add_argument("--temperature", type=float, default=DEFAULT_TEMPERATURE,
+                   help="OMITTED BY DEFAULT. gpt-5.6-terra accepts no value "
+                        "but its own default, so a value here 400s every "
+                        "judge request. Supplying one is honoured rather than "
+                        "silently dropped, and will fail.")
+    p.add_argument("--reasoning-effort", default=DEFAULT_REASONING_EFFORT,
+                   choices=("minimal", "low", "medium", "high", "omit"),
+                   help=f"judge reasoning effort (default "
+                        f"{DEFAULT_REASONING_EFFORT!r}; 'omit' sends none). "
+                        f"Reasoning tokens bill as OUTPUT and count against "
+                        f"--max-tokens. If the installed ragas cannot carry "
+                        f"it to the request, the run is REFUSED rather than "
+                        f"judged at the provider's default.")
     p.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     p.add_argument("--max-workers", type=int, default=DEFAULT_MAX_WORKERS,
                    help=f"concurrent (sample, metric) scorings "
                         f"(default: {DEFAULT_MAX_WORKERS})")
     p.add_argument("--max-retries", type=int, default=DEFAULT_CLIENT_RETRIES,
-                   help="Anthropic SDK retries for 429/5xx")
+                   help="OpenAI SDK retries for 429/5xx")
     p.add_argument("--metrics", nargs="+", choices=ALL_METRICS,
                    default=list(ALL_METRICS), metavar="METRIC",
                    help="score only these metrics (default: all three). "
@@ -2895,8 +3216,27 @@ def main(argv=None):
         spend.SPEND_LEDGER.reset()
         spend.SPEND_STOP.reset()
         console.out(spend.describe_cap())
+        # ── LAYER 2 OF THE INDEPENDENCE GUARD ─────────────────────────
+        #
+        # ON THE EFFECTIVE MODEL, AFTER `--judge-model`, AND BEFORE THE CLIENT
+        # IS BUILT. Layer 1 read the shipped default at import; this reads what
+        # THIS invocation will send, which is the only thing a flag cannot get
+        # past. The record goes into the manifest below, override and all.
+        independence = judge_independence.require_independent_judge(
+            args.judge_model,
+            "oncotriage/evaluation/ragas_harness.py::main")
+        if independence.get("override_applied"):
+            console.out("*** SAME-FAMILY JUDGE PERMITTED BY "
+                        f"{judge_independence.ENV_ALLOW_SAME_FAMILY_JUDGE}: "
+                        f"judge {independence['judge_model']!r} and classifier "
+                        f"{independence['classifier_model']!r} are both "
+                        f"{independence['judge_family']} models. Every score "
+                        f"this run produces is partly FAMILY agreement. It is "
+                        f"recorded in the manifest. ***")
+        _effort = (None if args.reasoning_effort == "omit"
+                   else args.reasoning_effort)
         llm = build_judge(args.judge_model, args.temperature, args.max_tokens,
-                          tally, args.max_retries)
+                          tally, args.max_retries, reasoning_effort=_effort)
         # No embedder is CONSTRUCTED unless a selected metric needs one, so a
         # context-precision-only run reads no OPENAI_API_KEY and builds no
         # OpenAI client. Asserted after scoring by the embedding-call check
@@ -2960,7 +3300,15 @@ def main(argv=None):
                               pairs_scored_here=sum(
                                   1 for s in scores
                                   if pair_key(s.dataset, s.metric, s.join)
-                                  not in reuse)))
+                                  not in reuse),
+                              # READ OFF THE JUDGE, not off `args`: this is
+                              # what ANSWERED, counted inside the recording
+                              # seam, and it is the only place on the ragas
+                              # path where the response's own model id is
+                              # reachable.
+                              judge_answering_models=getattr(
+                                  llm, "oncotriage_answering_models", None),
+                              independence=independence))
 
     # THE PARTIAL FILE GOES ONLY NOW, once both outputs are on disk. Removing it
     # earlier would leave a window in which a crash had destroyed the recovery

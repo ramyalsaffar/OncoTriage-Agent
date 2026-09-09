@@ -4,10 +4,10 @@
 """Score a recorded evaluation run with reference-free Ragas metrics. Entry
 point.
 
-THIS COSTS MONEY, ON THE ANTHROPIC API, AT STANDARD (NON-BATCH) RATES. Ragas
+THIS COSTS MONEY, ON THE OPENAI API, AT STANDARD (NON-BATCH) RATES. Ragas
 drives the judge synchronously -- one request at a time inside each metric --
-so the Message Batches API that ``rater_run.py`` uses is not available here and
-its 50% discount does not apply. ``--dry-run`` builds both datasets, counts
+so the Batch API that ``rater_run.py`` uses is not available here and its 50%
+discount does not apply. ``--dry-run`` builds both datasets, counts
 every judge and embedding call exactly, prices them as a range, and calls
 nothing. It is free and needs no credentials.
 
@@ -21,12 +21,14 @@ WHAT IS OUT OF SCOPE, AND SAID SO IN THE OUTPUT. Context recall needs labelled
 reference contexts, which this project does not have; the scope note is a field
 in ``ragas_manifest.json`` rather than an absence a reader has to notice.
 
-THE ONE OPENAI CALL. Response relevancy scores cosine similarity between the
-real question and questions the judge reverse-engineered from the response, so
-it needs an embedding model -- ``config.EMBEDDING_MODEL``, on OpenAI. It is an
-embedder, not a judge: it renders no verdict and reads no criterion, so the
-different-family separation this harness exists to preserve is intact. Nothing
-else here calls OpenAI.
+THE JUDGE AND THE EMBEDDER ARE NOW THE SAME VENDOR, AND THAT IS NOT A LOSS OF
+SEPARATION. The judge is ``gpt-5.6-terra`` on OpenAI; the embedder is
+``config.EMBEDDING_MODEL``, also on OpenAI, and was always so. The property
+that matters is that NEITHER is the family that wrote the text under audit --
+the classifier is Claude Sonnet 4.6 on Bedrock -- and it is CHECKED rather than
+claimed: see ``oncotriage/evaluation/judge_independence.py``, which compares
+families rather than model strings, because a Claude on Bedrock is still an
+Anthropic model.
 
 WHAT IT DOES NOT TOUCH. It re-runs no pipeline stage, opens no database, reads
 no characterization fixture and writes nothing inside this repository. It reads
@@ -35,11 +37,21 @@ an evaluation run directory and writes two JSON files beside it.
 RAGAS IS NOT A PIPELINE DEPENDENCY AND IS NOT IN pyproject.toml. Installing it
 into the project environment would drag ``openai`` from 1.x to 2.x and bump
 ``langgraph``, both of which the pipeline depends on. Run this file from an
-isolated environment that has ragas, anthropic and openai installed; the
-harness itself imports all three lazily, inside function bodies, so importing
-``oncotriage.evaluation.ragas_harness`` loads neither ragas nor the Anthropic
-SDK -- which is what lets ``--help`` and ``--dry-run`` run in the project
-environment, where ragas is absent. It does load ``openai``, and this line used
+isolated environment that has ragas and openai installed; the harness imports
+ragas lazily, inside function bodies, so importing
+``oncotriage.evaluation.ragas_harness`` loads no part of ragas -- which is what
+lets ``--help`` and ``--dry-run`` run in the project environment, where ragas is
+absent. ``anthropic`` is no longer needed on this path at all.
+
+THE INSTALLED RAGAS CANNOT MAP THIS MODEL'S PARAMETERS AND THE HARNESS REPAIRS
+IT. ragas 0.4.3 decides whether a model is a reasoning model by ``int()``-ing
+the text between ``gpt-`` and the next dash; for ``gpt-5.6-terra`` that is
+``"5.6"``, which raises and is swallowed, so ragas leaves ``max_tokens``
+un-renamed and leaves ``temperature`` and ``top_p`` in place -- all three of
+which this model rejects. ``build_judge`` performs the mapping ragas would have
+performed, then ASSERTS the result, so a future ragas that changes its
+behaviour produces a named refusal rather than a run that 400s on every
+sample. It does load ``openai``, and this line used
 to say it loaded none of the three: ``oncotriage/config.py`` does a
 module-scope ``from openai import OpenAI`` and this harness imports ``config``
 at module scope, so ``openai`` has always arrived transitively. That costs
