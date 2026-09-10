@@ -291,21 +291,90 @@ def empty_accepted(name):
     return path
 
 
+class GateOutput(str):
+    """The gate's combined output, with the two streams still SEPARABLE.
+
+    A ``str`` SUBCLASS rather than a widened tuple, and the choice is forced
+    rather than clever: this value is a pinned contract at every call site
+    this file already had (26 of them, MEASURED by AST when this was
+    written), each of which treats it as ONE piece of text -- ``in``,
+    ``.count()``, ``.splitlines()``. Returning ``(exit, out, err)`` would
+    edit all of them to fix one, which is how a mechanical rename acquires a
+    behaviour change nobody proofread. A subclass of ``str`` compares,
+    hashes, formats and slices exactly as the concatenation did. The count
+    is deliberately NOT pinned by a check: adding a call site is ordinary,
+    and a check that went red for one would be a landmine rather than a
+    guard.
+
+    THE COMBINED TEXT STAYS THE VALUE, and that is a correctness requirement
+    rather than inertia: 3g asserts that none of the three planted values
+    appears in the gate's output, and a secret printed to STDERR is in the CI
+    log exactly as one printed to stdout is. Narrowing the default to stdout
+    would silently narrow that guarantee to half the evidence.
+
+    WHAT THE ATTRIBUTES ARE FOR: a check about the gate's own MESSAGE LAYOUT is
+    a check about what the GATE wrote, and stderr carries whatever the import
+    graph felt like saying. See 6z-z6, which this attribute exists for.
+
+    Alone among the built-in variable-length types ``str`` has ``tp_itemsize``
+    0 (PEP 393), which is what makes a non-empty ``__slots__`` legal here;
+    ``tuple``, ``int`` and ``bytes`` all refuse it. The same shape is already
+    shipped in oncotriage/storage/database_logger.py:InferenceWriteResult, and
+    a Python that ever refused it would raise at CLASS CREATION -- this file
+    would die at import with a named TypeError rather than answer wrongly.
+
+    Attributes:
+        out: the subprocess's stdout, verbatim.
+        err: the subprocess's stderr, verbatim.
+    """
+
+    # __slots__ so an instance cannot silently grow an attribute that a later
+    # reader then trusts; str subclasses get no __dict__ from this alone.
+    __slots__ = ("out", "err")
+
+    def __new__(cls, out, err):
+        obj = super().__new__(cls, out + err)
+        obj.out = out
+        obj.err = err
+        return obj
+
+
+def _gate_pythonpath(extra_dirs=()):
+    """The PYTHONPATH every gate subprocess gets. ONE owner, so it cannot drift.
+
+    The trailing inherited component is appended UNCONDITIONALLY, empty or not,
+    because that is what the expression this replaced did: with PYTHONPATH
+    unset it produced a trailing separator, i.e. an empty sys.path entry, i.e.
+    the working directory on the subprocess's path. Dropping it would be a
+    behaviour change to what the gate can import, wearing a tidy-up's clothes.
+    6z-z6-xv pins the no-extras value against the original expression.
+    """
+    return os.pathsep.join(
+        [_REPO_ROOT] + list(extra_dirs) + [os.environ.get("PYTHONPATH", "")])
+
+
 def run_gate(repo, scan_range, accepted, extra=(), env_extra=None):
-    """Drive the SHIPPED script as a subprocess. Returns (exit, stdout+stderr).
+    """Drive the SHIPPED script as a subprocess. Returns (exit, GateOutput).
+
+    The second member IS the concatenation ``stdout + stderr`` for every
+    purpose a caller had before -- see GateOutput, which is a ``str`` -- and it
+    additionally carries ``.out`` and ``.err`` for the one check that is about
+    the gate's own message rather than about everything the process emitted.
 
     PYTHONPATH carries the real repository root so the gate can import this
     project's scanner while `--repo` points somewhere else entirely. That is the
     same seam the hook uses from a checkout, and it is what lets these scratch
     repositories hold no copy of the package.
 
-    `env_extra` is for ONE case and is defaulted so no existing caller moves:
-    section 6 puts a `git` shim earlier on PATH to break the reachability probe
-    WITHOUT breaking the object census, which is the only way to reach the
-    refusal message on the probe-failure path from outside the process.
+    `env_extra` is defaulted so no existing caller moves, and has two uses, both
+    in section 6: a `git` shim earlier on PATH to break the reachability probe
+    WITHOUT breaking the object census (the only way to reach the refusal
+    message on the probe-failure path from outside the process), and a
+    sitecustomize on PYTHONPATH that makes the subprocess emit a hosted
+    runner's stderr warnings for the 6z-z6 controls.
     """
     env = dict(os.environ)
-    env["PYTHONPATH"] = _REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = _gate_pythonpath()
     if GITLEAKS:
         env["GITLEAKS_BIN"] = GITLEAKS
     if env_extra:
@@ -314,7 +383,7 @@ def run_gate(repo, scan_range, accepted, extra=(), env_extra=None):
         [sys.executable, _GATE, "--repo", repo, "--range", scan_range,
          "--accepted", accepted] + list(extra),
         capture_output=True, text=True, env=env)
-    return proc.returncode, proc.stdout + proc.stderr
+    return proc.returncode, GateOutput(proc.stdout, proc.stderr)
 
 
 # ===========================================================================
@@ -1009,23 +1078,70 @@ check("6z-z5 ...and the printed sections PARTITION the findings",
 # contains neither marker. A check that names the shape of one leak does not
 # catch the leak; the property is that the refusal has no line outside its own
 # indentation.
-# THE THREE LINES THAT ARE LEGITIMATELY UNINDENTED. `[Paths]` is the package's
-# own bootstrap banner, printed at module scope by oncotriage/paths.py and
-# concatenated into this output by run_gate because it arrives on stderr; the
-# other two are the gate's range header and its refusal headline. gitleaks'
-# own output is NOT among them -- scan_with_gitleaks captures it -- so this
-# check reads the same on a runner that has the binary.
-_KNOWN_UNINDENTED = ("range=", "SECRET SCAN FAILED:", "[Paths]")
+# THIS CHECK READS THE GATE'S STDOUT, NOT THE COMBINED TEXT, AND THAT WAS A
+# LIVE CI FAILURE RATHER THAN A PRECAUTION. The property is the layout of the
+# message THE GATE WROTE, and the gate writes it to STDOUT: every print() on
+# the refusal path is bare, and only the two "COULD NOT RUN" fatalities use
+# stderr. STDERR carries whatever the import graph felt like saying --
+# qdrant_client -> fastembed -> onnxruntime emits an UNINDENTED
+# device-discovery warning on hosted x86_64 runners and on no machine this file
+# was developed on -- so reading the concatenation made a locally green file
+# report 168 passed / 1 failed / 3 skipped on a runner while the gate it tests
+# was entirely correct. It is the SECOND check this one library's stderr has
+# broken: 2c-b records the same warning breaking 4f, harvested there as a
+# fingerprint because it carries three colons.
+#
+# THE COMBINED TEXT IS STILL THE DEFAULT FOR EVERY OTHER CALLER, deliberately:
+# 3g asserts that no planted value appears in the gate's output, and a secret
+# printed to stderr is in the CI log exactly as one printed to stdout is.
+#
+# THE TWO LINES THAT ARE LEGITIMATELY UNINDENTED are the gate's range header
+# and its refusal headline. gitleaks' own output is NOT among them --
+# scan_with_gitleaks captures it -- so this reads the same on a runner that has
+# the binary. `[Paths]`, the package's bootstrap banner, USED TO BE A THIRD
+# ENTRY and is not one any more: it is printed at module scope by
+# oncotriage/paths.py to STDERR (MEASURED against the real gate: stdout carries
+# exactly these two unindented lines, stderr carries exactly that banner), so
+# on stdout it exempts nothing. Keeping it would be worse than dead -- it would
+# silently tolerate that banner if it ever moved back onto the gate's own
+# stream, which this project treats as serious enough to guard at fd level in
+# mcp_server.py.
+_KNOWN_UNINDENTED = ("range=", "SECRET SCAN FAILED:")
+
+
+def unindented(text):
+    """The lines of `text` outside the message's own two-space indentation.
+
+    Named and shared rather than inlined, because the controls below apply the
+    IDENTICAL predicate to perturbed and to combined text: a control that
+    reimplements the rule tests the reimplementation.
+    """
+    return [ln for ln in text.splitlines()
+            if ln and not ln.startswith("  ")
+            and not ln.startswith(_KNOWN_UNINDENTED)]
+
+
 check("6z-z6 the refusal has no line outside its own two-space indentation",
-      [ln for ln in _out6p.splitlines()
-       if ln and not ln.startswith("  ")
-       and not ln.startswith(_KNOWN_UNINDENTED)], [])
+      unindented(_out6p.out), [])
 # ...WITH ITS NON-DEGENERACY PROBE. An empty output satisfies the above for
-# free, and the two known unindented lines have to actually be there.
+# free, and the two known unindented lines have to actually be there. It counts
+# on the SAME stream 6z-z6 reads: on the combined text it would be satisfied by
+# evidence 6z-z6 never looks at, which is this project's recurring "passed for
+# the wrong reason" shape.
+def structural_counts(text):
+    """(range header, refusal headline) occurrences in `text`.
+
+    The two lines a real refusal must carry. Shared by 6z-z6-i and by its
+    empty-output control so that the control exercises THIS FUNCTION rather
+    than a pair of string literals: written inline, the control read
+    `("".count(...), "".count(...)) == (1, 1)`, which is constant and could
+    not have failed however the probe was broken.
+    """
+    return (text.count("range=objects"), text.count("SECRET SCAN FAILED:"))
+
+
 check("6z-z6-i ...and both known unindented lines are present, so 6z-z6 had "
-      "something to check",
-      (_out6p.count("range=objects"),
-       _out6p.count("SECRET SCAN FAILED:")), (1, 1))
+      "something to check", structural_counts(_out6p.out), (1, 1))
 # AND THE NOTE ITSELF, at the source rather than through the layout. This is the
 # decisive one: the classifier is driven in-process with the shim on PATH, so a
 # note that carried git's newline fails here whatever the printed block happens
@@ -1043,6 +1159,147 @@ check("6z-z7-i the shim really reached the in-process probe",
       (_gate_module.REACHABILITY_UNVERIFIED, True))
 check("6z-z7-ii ...and git's TWO stderr lines arrive as ONE line of note",
       ("\n" in _note6d, "second stderr line" in _note6d), (False, True))
+
+# --- THE STREAM SPLIT, DRIVEN IN BOTH DIRECTIONS. --------------------------
+# 6z-z6 above now reads ONE stream. That is only worth anything if the noise it
+# was written to ignore is REALLY ignored and the leak it was written to catch
+# is REALLY still caught, so both are driven rather than argued -- against the
+# same repository, the same shim and the same predicate 6z-z6 itself uses.
+#
+# THE NOISE IS DELIVERED BY A REAL SUBPROCESS, not by editing a captured
+# string: a `sitecustomize.py` on the child's PYTHONPATH is imported by `site`
+# at interpreter startup, which is exactly how the real warning arrives -- a
+# library pulled in during the gate's own import writes to fd 2 before the gate
+# has printed a line. One of the two values is the runner's onnxruntime warning
+# VERBATIM (the same constant section 2 pins for 4f); the other is a different
+# warning this project has actually seen, so the control is about "unrelated
+# stderr" rather than about one string.
+_OTHER_STDERR_NOISE = ("UserWarning: Qdrant client version 1.18.0 is "
+                       "incompatible with server version 1.18.3")
+_noise_dir = os.path.join(_TMP, "runner-stderr-noise")
+os.makedirs(_noise_dir)
+with open(os.path.join(_noise_dir, "sitecustomize.py"), "w",
+          encoding="utf-8") as _handle:
+    _handle.write("import sys\n"
+                  "sys.stderr.write(%r)\n"
+                  "sys.stderr.write(%r)\n"
+                  "sys.stderr.flush()\n"
+                  % (_RUNNER_STDERR_NOISE + "\n", _OTHER_STDERR_NOISE + "\n"))
+# TWO DRIVES, BECAUSE ONE OF THEM CANNOT SHOW THE GENERAL PROPERTY. The plain
+# drive is the ordinary refusal every other check in this file reads: the
+# gate's own interpreter emits the noise at startup and it must stay on stderr.
+# The shim drive is 6z-z6's OWN condition, and there the noise ALSO arrives
+# inside the gate's stdout by a route worth knowing about -- the shim runs
+# sys.executable, so sitecustomize fires in the shim too, its stderr is what
+# the probe returns, and the gate folds it into the probe note. MEASURED, not
+# assumed: the first version of these checks asserted the noise was absent from
+# stdout on the shim drive and FAILED, which is the measurement correcting the
+# author.
+_noise_env_plain = {"PYTHONPATH": _gate_pythonpath([_noise_dir])}
+_code6nc, _out6nc = run_gate(_r6r, "objects", _a6r, env_extra=_noise_env_plain)
+_noise_env = dict(_shim_env)
+_noise_env["PYTHONPATH"] = _gate_pythonpath([_noise_dir])
+_code6n, _out6n = run_gate(_r6r, "objects", _a6r, env_extra=_noise_env)
+
+
+def _noise_lines(text):
+    """Lines of `text` carrying either injected warning."""
+    return [ln for ln in text.splitlines()
+            if _RUNNER_STDERR_NOISE in ln or _OTHER_STDERR_NOISE in ln]
+
+
+# --- (a) THE ORDINARY REFUSAL: STARTUP NOISE STAYS ON STDERR. --------------
+check("6z-z6-ii the noise really reached the plain drive -- both warnings are "
+      "on the child's stderr, so the three checks below are not vacuous",
+      (_RUNNER_STDERR_NOISE in _out6nc.err, _OTHER_STDERR_NOISE in _out6nc.err),
+      (True, True))
+check("6z-z6-iii ...and NEITHER reached the gate's own stdout, which is what "
+      "makes reading one stream the right instrument rather than a filter",
+      _noise_lines(_out6nc.out), [])
+check("6z-z6-iv ...and that drive still REFUSED, so 6z-z6-v is about a real "
+      "refusal rather than an empty run",
+      (_code6nc, _out6nc.out.count("SECRET SCAN FAILED:")), (1, 1))
+check("6z-z6-v ...so the layout check PASSES under hosted-runner stderr noise",
+      unindented(_out6nc.out), [])
+
+# --- (b) 6z-z6'S OWN DRIVE, WHERE THE NOISE ALSO REACHES STDOUT. -----------
+# It arrives INSIDE the indented block, via the probe note, which is 6z-z7-ii's
+# one-line collapse demonstrated end to end through the printed message under
+# real multi-line stderr rather than in process.
+check("6z-z6-vi the shim drive puts the noise on stderr AND, through the probe "
+      "note, into stdout -- so 6z-z6-vii is not vacuous",
+      (len(_noise_lines(_out6n.err)) > 0, len(_noise_lines(_out6n.out)) > 0),
+      (True, True))
+check("6z-z6-vii ...and every noise line that reached stdout is INSIDE the "
+      "indented block, collapsed into the probe note",
+      [ln for ln in _noise_lines(_out6n.out) if not ln.startswith("  ")], [])
+check("6z-z6-viii ...that drive still REFUSED",
+      (_code6n, _out6n.out.count("SECRET SCAN FAILED:")), (1, 1))
+check("6z-z6-ix ...so the layout check PASSES on 6z-z6's own drive too",
+      unindented(_out6n.out), [])
+# THE FIRING HALF OF THE PAIR. The identical predicate over the COMBINED text
+# -- which is what 6z-z6 read before the fix -- REPORTS the noise on both
+# drives. Without this the eight checks above are equally satisfied by a
+# predicate that has stopped looking at anything.
+check("6z-z6-x ...while the PRE-FIX reading, the same predicate over the "
+      "COMBINED text, reports BOTH warnings on BOTH drives -- so the fix is "
+      "load-bearing and this is the hosted CI failure, reproduced",
+      ([all(n in unindented(str(o)) for n in
+            (_RUNNER_STDERR_NOISE, _OTHER_STDERR_NOISE))
+        for o in (_out6nc, _out6n)],
+       [unindented(o.out) for o in (_out6nc, _out6n)]),
+      ([True, True], [[], []]))
+
+# THE OTHER DIRECTION: THE RULE IS UNCHANGED, ONLY THE STREAM IS. The leak this
+# check exists for -- git's second stderr line escaping the indented block
+# through the probe note, which revert R5 plants -- lands in the gate's OWN
+# stdout, so narrowing the stream must not have narrowed the rule. The real
+# refusal is perturbed by one line rather than fabricated, so what is measured
+# is the predicate's verdict on real gate output.
+_leaked6, _leak_line = _out6p.out, Absent("no indented line to perturb")
+_lines6 = _out6p.out.splitlines()
+for _i, _ln in enumerate(_lines6):
+    if _ln.startswith("  ") and _ln.strip():
+        _leak_line = _ln.lstrip()
+        _leaked6 = "\n".join(_lines6[:_i] + [_leak_line] + _lines6[_i + 1:])
+        break
+check("6z-z6-xi the perturbation target exists, so 6z-z6-xii is not vacuous",
+      bool(_leak_line), True)
+check("6z-z6-xii a genuinely unindented continuation in the gate's OWN stdout "
+      "is still REPORTED -- the fix narrows the stream, never the rule",
+      unindented(_leaked6), [_leak_line])
+
+# AN EMPTY OR MISSING REFUSAL MUST NOT PASS THIS PAIR, and the two halves are
+# shown separately because only one of them can catch it: the predicate is
+# vacuous on empty text by construction, and 6z-z6-i is the whole reason that
+# does not matter. The expressions are the ones 6z-z6-i actually uses.
+check("6z-z6-xiii the predicate is VACUOUS on empty output, by construction",
+      unindented(""), [])
+check("6z-z6-xiv ...and the non-degeneracy probe FAILS on it, so an empty or "
+      "missing refusal cannot pass the pair",
+      structural_counts("") == (1, 1), False)
+
+# THE HELPER CONTRACT EVERY PRE-EXISTING CALL SITE RESTS ON. GateOutput is a
+# str subclass precisely so none of them had to move; if that ever stopped
+# being true they would silently start comparing something else.
+check("6z-z6-xv run_gate's PYTHONPATH is unchanged by the refactor -- the "
+      "no-extras value is byte-identical to the expression it replaced, "
+      "trailing empty entry included",
+      _gate_pythonpath(),
+      _REPO_ROOT + os.pathsep + os.environ.get("PYTHONPATH", ""))
+check("6z-z6-xvi GateOutput IS the combined text, so every other caller in "
+      "this file reads exactly what it read before",
+      (_out6n == _out6n.out + _out6n.err, str(_out6n) == _out6n.out + _out6n.err,
+       isinstance(_out6n, str)),
+      (True, True, True))
+try:
+    _out6n.unexpected_attribute = 1
+    _grew6 = True
+except AttributeError:
+    _grew6 = False
+check("6z-z6-xvii ...and cannot silently grow an attribute a later reader "
+      "would then trust", _grew6, False)
+
 
 # --- THE CLAIM CORRECTION. -------------------------------------------------
 # The unreached message used to assert "It is in THIS object database and in no
