@@ -405,9 +405,11 @@ def object_census(repo):
     `--batch-all-objects` rather than `rev-list --objects --all`, and the
     difference is the point: the second walks only what a ref reaches, so an
     object left behind by an amended or rebased commit is invisible to it. On a
-    fresh CI clone the two sets are identical (a clone transfers only reachable
-    objects); on a developer machine this one is a superset, which is where a
-    hook wants to be looking.
+    clone driven by the transport the two sets are usually identical, because
+    the fetch is what refs reach; on a developer machine this one is a superset,
+    which is where a hook wants to be looking. NOT on a LOCAL clone, measured:
+    `git clone <path>` hardlinks the whole object directory, so unreferenced
+    objects come with it and the two sets differ there too.
     """
     out = _git(repo, ["cat-file", "--batch-all-objects",
                       "--batch-check=%(objecttype) %(objectname) %(objectsize)"])
@@ -505,6 +507,184 @@ def staged_entries(repo):
             continue
         entries.append((dst_oid, os.path.basename(path)))
     return entries
+
+
+# ---------------------------------------------------------------------------
+# REACHABILITY -- WHICH REMEDY A REFUSAL IS ALLOWED TO NAME
+# ---------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. `object_census` walks `--batch-all-objects`, so the gate sees
+# objects no ref reaches -- which is the point of that choice and is what lets a
+# force-push residue be refused. But the refusal MESSAGE offered one remedy for
+# every finding: "add the fingerprint to the accepted table". For an object no
+# ref reaches that remedy CARRIES A RISK THE MESSAGE DID NOT NAME, and the
+# measurement behind it is recorded in BLOCK 5 of the accepted table itself: a
+# fingerprint matches only where that object is present, so a checkout that
+# lacks it reports the entry under ACCEPTED TABLE IS STALE -- exit 2.
+#
+# WHICH CHECKOUTS LACK IT IS NOT SOMETHING THIS GATE ESTABLISHES, and an earlier
+# version of this comment and of the message both said it did. They asserted
+# that a fresh clone would not have such an object. MEASURED, and false for
+# three of the four clone forms tried: `git clone <local path>` hardlinks the
+# whole object directory and the unreferenced blob came with it, as did
+# `--no-hardlinks` and `--depth=1`; only a clone forced through the transport
+# (`file://`, or a network remote) filtered by reachability. So the risk is
+# real and CONDITIONAL, the message states it as one, and the deliberate
+# non-entry in BLOCK 5 rests on the case that was actually inspected rather
+# than on a universal.
+#
+# WHAT THIS PROBE CAN AND CANNOT ESTABLISH, MEASURED BOTH WAYS RATHER THAN
+# ASSUMED, AND IT IS NARROWER THAN THIS COMMENT USED TO CLAIM. It said a
+# reachable object "is in every clone" and an unreachable one "is in no clone".
+# Both are false, and both were refuted in scratch repositories:
+#
+#   * an object reachable from a LOCAL ref may be absent from an existing clone
+#     -- committed in `origin` after `worker` was cloned, it is listed by
+#     `rev-list --objects --all` there and is not in `worker`'s database at all;
+#
+#   * an object UNREACHABLE here may be reachable somewhere else -- the same
+#     content, the same oid, unreachable in one repository (`--all --reflog
+#     --indexed-objects` does not list it) and reachable from a branch in
+#     another;
+#
+#   * and an object unreachable here may be PRESENT and still unreachable in a
+#     fresh clone of this repository -- `git clone <local path>` hardlinks the
+#     object directory rather than fetching by reachability, so the
+#     unreferenced blob arrives with it. Three of four clone forms carried it.
+#
+# So this probe answers exactly one question -- IS THIS OBJECT REACHED BY THE
+# INSPECTED LOCAL REFS, REFLOGS OR INDEX -- and every sentence the refusal
+# prints is held to that. What any other repository contains is not something a
+# local probe can decide, and a message that claimed it would be inviting an
+# irreversible cleanup on the strength of a fact nobody established.
+#
+# SO A REFUSAL MUST KNOW WHICH IT IS, AND MUST VERIFY IT RATHER THAN INFER IT.
+# "No basename" is the symptom that first suggests an unreached blob (no tree
+# names it), and it is NOT evidence: `materialise` gives a nameless blob a
+# synthetic name, and a blob `git add`ed and never committed is reached by the
+# INDEX and named by no TREE. Guessing from the symptom would name a deletion
+# remedy for content that is about to be committed, which is the one direction
+# this must never fail in.
+
+REACHABILITY_REACHABLE = "reachable"
+REACHABILITY_UNREACHABLE = "unreachable"
+REACHABILITY_UNVERIFIED = "unverified"
+
+# CLOSED, and a caller may branch on it exhaustively. `unverified` is a MEMBER
+# rather than a fall-through: the natural way to write this check is
+# `if oid not in reachable: unreachable`, and then a probe that could not run
+# reports EVERY finding as unreached and recommends deleting content nobody
+# established anything about.
+#
+# THREE STATES, AND THE REFUSAL MUST PRINT THREE HEADINGS. The first version of
+# that message had two -- it partitioned on `== UNREACHABLE` and printed
+# everything else under a heading claiming the repository REACHES it, so an
+# `unverified` finding was reported as a verified reachable one. The
+# classification was three-state and the operator's reading of it was not, which
+# is worse than a missing state: it turns "I could not look" into a positive
+# claim. `main` partitions on all three by name and folds anything outside the
+# vocabulary into `unverified`, so the printed sections are TOTAL.
+REACHABILITY_STATES = (REACHABILITY_REACHABLE,
+                       REACHABILITY_UNREACHABLE,
+                       REACHABILITY_UNVERIFIED)
+
+# THE PROBE IS THE WIDEST ONE GIT OFFERS, AND EVERY FLAG IS LOAD-BEARING.
+#
+#   --all               every ref, including remote-tracking refs as this
+#                       checkout last saw them. A clone driven by the transport
+#                       fetches what refs reach, so an object a ref reaches is
+#                       the one most likely to exist outside this checkout --
+#                       which is why the accepted table is the right instrument
+#                       for it. NOT a guarantee in EITHER direction, both
+#                       measured: a commit made here and not pushed is
+#                       ref-reachable and was absent from a clone taken before
+#                       it, and a LOCAL clone carries unreferenced objects that
+#                       no ref reaches at all.
+#   --reflog            an object a local reflog entry still pins. `git prune`
+#                       will not touch it, so a message naming plain expiry as
+#                       the remedy would be false for it. Reported REACHABLE,
+#                       which is the conservative answer: the ordinary message
+#                       says nothing untrue, and no deletion is recommended for
+#                       content a local reference still points at.
+#   --indexed-objects   the index. MEASURED, in a scratch repository: a blob
+#                       that is `git add`ed and not committed is listed by this
+#                       flag and by no other, so the `staged` range -- whose
+#                       whole subject is content about to enter history -- is
+#                       covered and its findings are classified REACHABLE. That
+#                       measurement is why this module needs no special case
+#                       for that range: a hook must never tell somebody to
+#                       prune what they have just staged, and here it cannot.
+#
+# The three together are what BLOCK 5's own inspection used, and the remedy that
+# block names (`git prune --expire=now`) is true of an object reached by none of
+# them and of no other object.
+_REACHABILITY_PROBE = ("rev-list", "--objects", "--all", "--reflog",
+                       "--indexed-objects")
+
+
+def reachable_object_names(repo):
+    """The set of object names reachable from any ref, reflog entry or index.
+
+    `rev-list --objects` prints `<oid>` for a commit and `<oid> <path>` for a
+    blob or a tree, and a path may contain a space -- so the split is on the
+    FIRST space only. Filtered through `_OID_RE` for the reason recorded there:
+    this whole module is SHA-1-only by construction (`basenames_by_oid` reads
+    twenty raw bytes), so a name of any other length is not a name this gate can
+    be about. On a SHA-256 repository that filter empties the set, which
+    `classify_reachability` reads as UNVERIFIED -- the safe direction, and the
+    same answer the rest of this file gives such a repository.
+    """
+    out = _git(repo, list(_REACHABILITY_PROBE))
+    names = set()
+    for line in out.splitlines():
+        oid = line.split(" ", 1)[0]
+        if _OID_RE.match(oid):
+            names.add(oid)
+    return names
+
+
+def classify_reachability(repo, oids):
+    """(oid -> one of REACHABILITY_STATES, note). NEVER RAISES.
+
+    This runs on the refusal path, where the gate has already established that
+    it must refuse; its only job is to decide which remedy the message names. A
+    probe that fails must therefore not convert a refusal into exit 3, so
+    `ScanUnavailable` is caught here and nowhere else in this module -- the
+    finding is still refused, and the message says the classification could not
+    be made.
+
+    THE EMPTY-RESULT GUARD IS THE LOAD-BEARING HALF. A probe that answers
+    nothing -- an empty repository, a git that did not understand a flag, a
+    SHA-256 object format -- would otherwise report every finding as unreached
+    and recommend deleting content nobody established anything about. An empty
+    set is read as "not established" rather than as "nothing is reachable",
+    which is the one reading that cannot be wrong in the dangerous direction.
+
+    AND THE CALLER MUST PRINT THAT STATE UNDER ITS OWN HEADING. Returning
+    `unverified` and then printing it beside the reachable findings is the same
+    defect one layer up, and it shipped once: see the note at
+    `REACHABILITY_STATES`.
+    """
+    oids = list(oids)
+    try:
+        reachable = reachable_object_names(repo)
+    except ScanUnavailable as exc:
+        # WHITESPACE-COLLAPSED, BECAUSE THE NOTE IS PRINTED INSIDE AN INDENTED
+        # BLOCK. `_git` embeds git's own stderr, which is not guaranteed to be
+        # one line -- and a newline in there breaks the layout of the two
+        # places this string is printed, including the header of a refusal.
+        return ({oid: REACHABILITY_UNVERIFIED for oid in oids},
+                " ".join(f"the reachability probe could not run "
+                         f"({exc})".split()))
+    if not reachable:
+        return ({oid: REACHABILITY_UNVERIFIED for oid in oids},
+                "the reachability probe listed no objects at all, so its "
+                "answer establishes nothing")
+    states = {}
+    for oid in oids:
+        states[oid] = (REACHABILITY_REACHABLE if oid in reachable
+                       else REACHABILITY_UNREACHABLE)
+    return states, f"{len(reachable):,} object(s) reachable"
 
 
 # ---------------------------------------------------------------------------
@@ -908,18 +1088,178 @@ def main(argv=None):
              if args.scan_range == "objects" else [])
 
     if unaccepted:
+        # THE REMEDY IS CHOSEN BY A VERIFIED FACT, NOT BY THE SYMPTOM. See
+        # `classify_reachability`: the "add a fingerprint" remedy is measured to
+        # be WRONG for an object no ref reaches, and the probe runs here -- on
+        # the path that has already decided to refuse -- so a clean run pays
+        # nothing for it and a probe that cannot run cannot turn a refusal into
+        # exit 3.
+        #
+        # THE PARTITION IS TOTAL AND THAT IS DELIBERATE. Three states, three
+        # headings, and a fourth bucket for anything outside the vocabulary --
+        # folded into `unverified`, which is the honest place for "no state this
+        # code knows". Without that fold a finding whose state this branch does
+        # not recognise would be counted in the total and printed under no
+        # heading at all: the refusal would say N and list fewer than N, which
+        # is silent under-reporting on the one output an operator acts on.
+        states, probe_note = classify_reachability(
+            args.repo, sorted({f.oid for f in unaccepted}))
+        reaching = [f for f in unaccepted
+                    if states.get(f.oid) == REACHABILITY_REACHABLE]
+        unreached = [f for f in unaccepted
+                     if states.get(f.oid) == REACHABILITY_UNREACHABLE]
+        unverified = [f for f in unaccepted
+                      if states.get(f.oid) not in (REACHABILITY_REACHABLE,
+                                                   REACHABILITY_UNREACHABLE)]
+        unclassified = [f for f in unverified
+                        if states.get(f.oid) != REACHABILITY_UNVERIFIED]
+
         print()
         print(f"SECRET SCAN FAILED: {len(unaccepted)} unaccepted finding(s).")
-        print()
-        for finding in unaccepted:
-            print("    " + finding.describe())
-        print()
-        print("  Each line is <blob-oid>:<engine>:<detector>:<locator>.")
-        print(f"  Locate one with:  git cat-file -p <blob-oid>")
-        print("  If it is a false positive, add the fingerprint to")
-        print(f"  {args.accepted} with a comment saying why -- DESCRIBE the")
-        print("  value, never reproduce it: a suppression file that quotes what")
-        print("  it suppresses will suppress itself into existence.")
+        print(f"  reachability: {probe_note}")
+
+        if reaching:
+            print()
+            print(f"  {len(reaching)} finding(s) in content this repository "
+                  f"REACHES -- a ref, a reflog entry or the index:")
+            print()
+            for finding in reaching:
+                print("    " + finding.describe())
+            print()
+            print("  Each line is <blob-oid>:<engine>:<detector>:<locator>.")
+            print(f"  Locate one with:  git cat-file -p <blob-oid>")
+            print("  If it is a false positive, add the fingerprint to")
+            print(f"  {args.accepted} with a comment saying why -- DESCRIBE the")
+            print("  value, never reproduce it: a suppression file that quotes "
+                  "what")
+            print("  it suppresses will suppress itself into existence.")
+
+        if unreached:
+            # A DIFFERENT FINDING WITH A DIFFERENT REMEDY, AND THE MESSAGE MUST
+            # NOT OFFER THE OTHER ONE. A fingerprint keyed on one of these
+            # matches only where the object is present, so in a checkout that
+            # does not have it the gate reports the entry as STALE and exits 2.
+            # WHICH checkouts those are is NOT established -- see the
+            # measurement in the message: a local clone carries unreferenced
+            # objects. BLOCK 5 of the accepted table records the case this gate
+            # met, and it is a deliberate NON-entry for that reason.
+            print()
+            print(f"  {len(unreached)} finding(s) NOT REACHED by any inspected "
+                  f"local ref, reflog")
+            print("  entry or index entry:")
+            print()
+            for finding in unreached:
+                print("    " + finding.describe())
+            print()
+            print("  VERIFIED, not guessed: each of these object names is "
+                  "absent from")
+            print("  `git rev-list --objects --all --reflog "
+                  "--indexed-objects`, so no ref,")
+            print("  no reflog entry and no index entry here reaches it.")
+            print()
+            print("  WHAT THAT DOES AND DOES NOT SAY. It is in THIS object "
+                  "database and is")
+            print("  not reached by the inspected local refs, reflogs or "
+                  "index. It says")
+            print("  NOTHING about what any other repository contains -- a "
+                  "local probe")
+            print("  cannot establish that, and the same content can be "
+                  "unreachable here")
+            print("  and reachable from a branch somewhere else.")
+            print()
+            print("  DO NOT ADD THESE TO THE ACCEPTED TABLE. A fingerprint "
+                  "matches only")
+            print("  where the object is present. If another checkout lacks "
+                  "this object,")
+            print("  its accepted fingerprint will be reported as stale.")
+            print()
+            print("  WHICH CHECKOUTS LACK IT IS NOT ESTABLISHED HERE, and this "
+                  "gate cannot")
+            print("  establish it. A local `git clone` hardlinks the whole "
+                  "object")
+            print("  directory, unreferenced objects included -- MEASURED: of "
+                  "four clone")
+            print("  forms, THREE carried such a blob (default, "
+                  "--no-hardlinks, --depth=1)")
+            print("  and only one forced through the transport (file://, or a "
+                  "network")
+            print("  remote) did not. So the line above is a consequence that "
+                  "MAY follow,")
+            print("  not a prediction that it will.")
+            print()
+            print(f"  BLOCK 5 of {args.accepted}")
+            print("  records the case this gate met and what was established "
+                  "about it.")
+            print()
+            print("  THE REMEDY IS OPERATOR-REVIEWED LOCAL CLEANUP, AND THIS "
+                  "GATE PERFORMS")
+            print("  NONE OF IT. Expiring unreachable objects removes EVERY "
+                  "unreachable")
+            print("  object in this checkout, not only these -- including "
+                  "unreachable")
+            print("  commits that are sometimes somebody's only handle on "
+                  "abandoned")
+            print("  work. Review what would go, then decide:")
+            print()
+            print("      git fsck --unreachable          # what is unreachable")
+            print("      git prune --expire=now          # remove it")
+            print()
+            print("  Inspect one first with:  git cat-file -p <blob-oid>")
+
+        if unverified:
+            # NEITHER REMEDY IS OFFERED HERE, AND THAT IS THE POINT RATHER THAN
+            # AN OMISSION. The two above are OPPOSITES -- one says record the
+            # fingerprint, the other says recording it risks a stale entry in
+            # any checkout that lacks the object -- and which is correct
+            # follows from a fact this run failed to establish.
+            # Naming either would be advising an action on the strength of a
+            # coin toss, and one of the two is irreversible. The action is to
+            # make the probe answer; the remedy follows from what it then says.
+            print()
+            print(f"  {len(unverified)} finding(s) whose reachability could "
+                  f"NOT be established:")
+            print()
+            for finding in unverified:
+                print("    " + finding.describe())
+            print()
+            print(f"  Reachability could not be established: {probe_note}.")
+            print("  This run does not know whether any ref, reflog entry or "
+                  "index entry")
+            print("  here reaches these objects.")
+            if unclassified:
+                # LOUD, because it means this branch met a state it does not
+                # know -- a vocabulary member added without a heading.
+                print()
+                print(f"  {len(unclassified)} of them carry no state this gate "
+                      f"recognises at all, which")
+                print("  is a defect in the gate rather than in the "
+                      "repository. Report it.")
+            print()
+            print("  NO REMEDY IS RECOMMENDED FOR THESE. The two remedies this "
+                  "gate knows")
+            print("  are opposites -- recording a fingerprint is right for "
+                  "content a ref")
+            print("  reaches, and for content none reaches it risks a stale "
+                  "entry in any")
+            print("  checkout that lacks the object -- and which applies "
+                  "follows from the")
+            print("  fact this run could not get. Cleanup in particular is NOT "
+                  "advised")
+            print("  here: it is irreversible, and nothing has established "
+                  "that these")
+            print("  objects are unreached.")
+            print()
+            print("  RESOLVE THE PROBE FAILURE FIRST, then re-run this gate "
+                  "and act on the")
+            print("  heading it then prints. Check that `git` is on PATH and "
+                  "that --repo")
+            print("  names a repository, and that this command answers:")
+            print()
+            print("      git -C <repo> rev-list --objects --all --reflog "
+                  "--indexed-objects")
+            print()
+            print("  Inspect one finding with:  git cat-file -p <blob-oid>")
+
         return 1
 
     if stale:

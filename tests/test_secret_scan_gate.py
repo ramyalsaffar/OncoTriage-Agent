@@ -67,6 +67,7 @@ human and an in-process call produces none of them.
 
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -290,18 +291,25 @@ def empty_accepted(name):
     return path
 
 
-def run_gate(repo, scan_range, accepted, extra=()):
+def run_gate(repo, scan_range, accepted, extra=(), env_extra=None):
     """Drive the SHIPPED script as a subprocess. Returns (exit, stdout+stderr).
 
     PYTHONPATH carries the real repository root so the gate can import this
     project's scanner while `--repo` points somewhere else entirely. That is the
     same seam the hook uses from a checkout, and it is what lets these scratch
     repositories hold no copy of the package.
+
+    `env_extra` is for ONE case and is defaulted so no existing caller moves:
+    section 6 puts a `git` shim earlier on PATH to break the reachability probe
+    WITHOUT breaking the object census, which is the only way to reach the
+    refusal message on the probe-failure path from outside the process.
     """
     env = dict(os.environ)
     env["PYTHONPATH"] = _REPO_ROOT + os.pathsep + env.get("PYTHONPATH", "")
     if GITLEAKS:
         env["GITLEAKS_BIN"] = GITLEAKS
+    if env_extra:
+        env.update(env_extra)
     proc = subprocess.run(
         [sys.executable, _GATE, "--repo", repo, "--range", scan_range,
          "--accepted", accepted] + list(extra),
@@ -684,6 +692,443 @@ check("6e once the object is genuinely expired it is gone",
                   "--batch-check=%(objectname)").stdout, False)
 check("6f ...and the gate is clean again -- the control was removed",
       run_gate(_r6, "objects", _a6)[0], 0)
+
+# ---------------------------------------------------------------------------
+# 6g..6t  WHICH REMEDY THE REFUSAL NAMES, AND THE VERIFICATION BEHIND IT
+# ---------------------------------------------------------------------------
+# The gate refuses a dangling object and a clonable one alike -- 6c above and 4d
+# -- and until this block it offered ONE remedy for both: add the fingerprint to
+# the accepted table. For a dangling object that is the action BLOCK 5 of the
+# shipped table measured to break CI for everybody, so the message has to know
+# which finding it is looking at, and has to VERIFY rather than infer.
+#
+# THE TWO PATHS ARE DRIVEN AGAINST TWO REAL REPOSITORY STATES, not against a
+# stubbed classifier: a message that names a remedy must be measured against the
+# object database that remedy would be applied to.
+_REACH_REMEDY = "add the fingerprint to"
+_DANGLE_REMEDY = "DO NOT ADD THESE TO THE ACCEPTED TABLE"
+
+# --- PATH 1: A REACHABLE FINDING. The ordinary message, unchanged. -----------
+_r6r = new_repo("reachable-remedy")
+_a6r = empty_accepted("accepted-6r.txt")
+with open(os.path.join(_r6r, "plant.conf"), "wb") as _handle:
+    _handle.write(plant_text(seed=11))
+git(_r6r, "add", "plant.conf")
+git(_r6r, "commit", "-q", "-m", "plant")
+_oid6r = git(_r6r, "rev-parse", "HEAD:plant.conf").stdout.strip()
+_code6r, _out6r = run_gate(_r6r, "objects", _a6r)
+check("6g a committed plant is refused", _code6r, 1)
+check("6h ...named as content the repository REACHES",
+      "REACHES -- a ref, a reflog entry or the index" in _out6r, True)
+check("6i ...and offered the accepted-table remedy",
+      _REACH_REMEDY in _out6r, True)
+check("6j ...and NOT the cleanup remedy, which would be false of it",
+      _DANGLE_REMEDY in _out6r, False)
+check("6k ...and the probe reports what it established",
+      "reachability: " in _out6r and "object(s) reachable" in _out6r, True)
+
+# --- PATH 2: A VERIFIED-UNREACHABLE FINDING. --------------------------------
+# `git hash-object -w` reproduces BLOCK 5's own provenance exactly: a blob
+# written into the database and referenced by nothing at all. A `reset --hard`
+# residue would NOT do -- see 6q, where the reflog still pins it.
+_r6d = new_repo("dangling-remedy")
+_a6d = empty_accepted("accepted-6d.txt")
+_dangle = os.path.join(_TMP, "dangling-plant.conf")
+with open(_dangle, "wb") as _handle:
+    _handle.write(plant_text(seed=13))
+_oid6d = subprocess.run(["git", "-C", _r6d, "hash-object", "-w", _dangle],
+                        capture_output=True, text=True,
+                        check=True).stdout.strip()
+check("6l the orphan blob is in the object database",
+      _oid6d in git(_r6d, "cat-file", "--batch-all-objects",
+                    "--batch-check=%(objectname)").stdout, True)
+check("6m ...and is reached by no ref, reflog entry or index entry",
+      _oid6d in git(_r6d, "rev-list", "--objects", "--all", "--reflog",
+                    "--indexed-objects").stdout, False)
+_code6d, _out6d = run_gate(_r6d, "objects", _a6d)
+check("6n a verified-unreachable finding is STILL refused -- exit 1",
+      _code6d, 1)
+check("6o ...naming that exact blob", _oid6d in _out6d, True)
+check("6p ...named as verified unreachable rather than inferred",
+      "NOT REACHED by any inspected" in _out6d
+      and "VERIFIED, not guessed" in _out6d, True)
+check("6q ...offered operator-reviewed cleanup as the remedy",
+      "OPERATOR-REVIEWED LOCAL CLEANUP" in _out6d
+      and "git prune --expire=now" in _out6d, True)
+check("6r ...told NOT to accept it, which is the measured wrong action",
+      _DANGLE_REMEDY in _out6d, True)
+check("6s ...and NOT offered the accepted-table remedy",
+      _REACH_REMEDY in _out6d, False)
+check("6t ...and told this gate performs no cleanup itself",
+      "THIS GATE PERFORMS" in _out6d and "NONE OF IT" in _out6d, True)
+# THE 'VERIFIED, not guessed' CLAIM IN 6p IS A SENTENCE, AND A SENTENCE SURVIVES
+# THE CLASSIFICATION BEING REPLACED BY A GUESS -- measured: a revert that
+# classifies by the absence of a basename leaves 6p passing, because that
+# symptom happens to give the right answer for THIS blob. So the claim is tied
+# to its evidence: the probe must have run and reported a count.
+check("6p-b ...and the claim is backed by a probe that reported a count",
+      "reachability: " in _out6d and "object(s) reachable" in _out6d, True)
+
+# --- THE DANGEROUS-DIRECTION CONTROL: REACHABLE, AND WITH NO BASENAME. -------
+# `no basename` is the symptom that suggests a dangling blob, and this is the
+# shape that makes it false: a blob `git add`ed and never committed is reached
+# by the INDEX and named by no TREE, so `basenames_by_oid` has nothing for it on
+# the objects range. Inferring from the symptom here tells an operator to prune
+# the content they have just staged. Verification does not.
+_r6i = new_repo("indexed-no-basename")
+_a6i = empty_accepted("accepted-6i.txt")
+with open(os.path.join(_r6i, "plant.conf"), "wb") as _handle:
+    _handle.write(plant_text(seed=23))
+git(_r6i, "add", "plant.conf")
+_oid6i = git(_r6i, "rev-parse", ":plant.conf").stdout.strip()
+check("6p-c a staged-only blob is named by no tree in the database",
+      _oid6i in _gate_module.basenames_by_oid(
+          _r6i, _gate_module.object_census(_r6i)[1]), False)
+check("6p-d ...and is nonetheless reachable -- the index reaches it",
+      _oid6i in _gate_module.reachable_object_names(_r6i), True)
+_code6i, _out6i = run_gate(_r6i, "objects", _a6i)
+check("6p-e the objects range refuses it", _code6i, 1)
+check("6p-f ...reports it with no basename, which is the misleading symptom",
+      "(no basename)" in _out6i, True)
+check("6p-g ...and does NOT tell the operator to prune what they just staged",
+      _DANGLE_REMEDY in _out6i, False)
+check("6p-h ...offering the accepted-table remedy instead",
+      _REACH_REMEDY in _out6i, True)
+
+# --- THE DISCRIMINATING CONTROL: A REFLOG-PINNED OBJECT IS *NOT* DANGLING. ---
+# This is the conservative direction and it has to be measured, because getting
+# it wrong recommends `git prune` for an object prune will not touch -- advice
+# that reads as a remedy and does nothing. `_r6` above is in exactly that state
+# between its `reset --hard` and its `reflog expire`, so the state is rebuilt
+# here rather than borrowed from a repository 6e has already garbage-collected.
+_r6f = new_repo("reflog-pinned")
+_a6f = empty_accepted("accepted-6f.txt")
+with open(os.path.join(_r6f, "plant.conf"), "wb") as _handle:
+    _handle.write(plant_text(seed=17))
+git(_r6f, "add", "plant.conf")
+git(_r6f, "commit", "-q", "-m", "plant")
+_oid6f = git(_r6f, "rev-parse", "HEAD:plant.conf").stdout.strip()
+git(_r6f, "reset", "-q", "--hard", "HEAD~1")
+check("6u a reset --hard residue is unreachable from every REF",
+      _oid6f in git(_r6f, "rev-list", "--objects", "--all").stdout, False)
+check("6v ...and STILL reachable, because the reflog pins it",
+      _oid6f in git(_r6f, "rev-list", "--objects", "--all", "--reflog",
+                    "--indexed-objects").stdout, True)
+_code6f, _out6f = run_gate(_r6f, "objects", _a6f)
+check("6w so the gate does NOT call it dangling -- prune would not remove it",
+      _DANGLE_REMEDY in _out6f, False)
+check("6x ...and gives it the ordinary remedy", _REACH_REMEDY in _out6f, True)
+git(_r6f, "reflog", "expire", "--expire=now", "--all")
+check("6y once the reflog is expired the SAME blob becomes dangling",
+      _DANGLE_REMEDY in run_gate(_r6f, "objects", _a6f)[1], True)
+
+# --- THE STAGED RANGE. Measured, not special-cased. -------------------------
+# `--indexed-objects` is what covers it. Without that flag a hook refusing a
+# staged secret would tell the operator to prune the content they had just
+# staged, which is the worst advice in this file.
+_r6s = new_repo("staged-remedy")
+_a6s = empty_accepted("accepted-6s.txt")
+with open(os.path.join(_r6s, "plant.conf"), "wb") as _handle:
+    _handle.write(plant_text(seed=19))
+git(_r6s, "add", "plant.conf")
+_code6s, _out6s = run_gate(_r6s, "staged", _a6s)
+check("6z a staged plant is refused on the staged range", _code6s, 1)
+check("6z-b ...and is NOT called dangling: the index reaches it",
+      _DANGLE_REMEDY in _out6s, False)
+check("6z-c ...so the hook offers the accepted-table remedy",
+      _REACH_REMEDY in _out6s, True)
+
+# --- THE CLASSIFIER, DRIVEN DIRECTLY. ---------------------------------------
+# The three states are a CLOSED vocabulary a caller may branch on exhaustively,
+# and `unverified` is a member rather than a fall-through. Without it the
+# natural implementation reports every finding as dangling whenever the probe
+# cannot answer -- recommending deletion for content that may be in every clone.
+check("6z-d the reachability vocabulary is exactly three members",
+      _gate_module.REACHABILITY_STATES,
+      (_gate_module.REACHABILITY_REACHABLE,
+       _gate_module.REACHABILITY_UNREACHABLE,
+       _gate_module.REACHABILITY_UNVERIFIED))
+_st6, _note6 = _gate_module.classify_reachability(
+    _r6d, [_oid6d, git(_r6d, "rev-parse", "HEAD:README").stdout.strip()])
+check("6z-e the classifier calls the orphan unreachable",
+      _st6[_oid6d], _gate_module.REACHABILITY_UNREACHABLE)
+check("6z-f ...and a committed blob reachable",
+      _st6[git(_r6d, "rev-parse", "HEAD:README").stdout.strip()],
+      _gate_module.REACHABILITY_REACHABLE)
+# NEVER RAISES: the probe runs on a path that has already decided to refuse, so
+# a probe failure must not convert exit 1 into exit 3.
+_st6b, _note6b = _gate_module.classify_reachability(
+    os.path.join(_TMP, "no-such-repository-at-all"), [_oid6d])
+check("6z-g a probe that cannot run reports UNVERIFIED and does not raise",
+      _st6b[_oid6d], _gate_module.REACHABILITY_UNVERIFIED)
+check("6z-h ...and says so", "could not run" in _note6b, True)
+# AN EMPTY PROBE RESULT IS 'NOT ESTABLISHED', NOT 'NOTHING IS REACHABLE'. An
+# empty repository is the reachable shape of that: it has an object database a
+# blob can be written into and no ref at all.
+_r6e = os.path.join(_TMP, "empty-object-db")
+os.makedirs(_r6e)
+git(_r6e, "init", "-q", "-b", "main")
+_oid6e = subprocess.run(["git", "-C", _r6e, "hash-object", "-w", _dangle],
+                        capture_output=True, text=True,
+                        check=True).stdout.strip()
+check("6z-i an empty repository lists no reachable object",
+      _gate_module.reachable_object_names(_r6e), set())
+_st6c, _note6c = _gate_module.classify_reachability(_r6e, [_oid6e])
+check("6z-j ...so a finding there is UNVERIFIED, never unreachable",
+      _st6c[_oid6e], _gate_module.REACHABILITY_UNVERIFIED)
+check("6z-k ...and the note says the answer establishes nothing",
+      "establishes nothing" in _note6c, True)
+
+# ---------------------------------------------------------------------------
+# 6z-l .. 6z-x  THE THIRD HEADING -- WHAT THE OPERATOR READS WHEN THE PROBE
+#               COULD NOT ANSWER
+# ---------------------------------------------------------------------------
+# THIS BLOCK EXISTS BECAUSE THE FIRST VERSION OF IT PINNED THE DEFECT. 6z-l used
+# to read "and the gate there refuses with the ordinary remedy, not cleanup" and
+# assert `_REACH_REMEDY in _out` -- so it REQUIRED an `unverified` finding to be
+# printed under a heading claiming the repository REACHES it, and to be offered
+# the accepted-table remedy. The classification was three-state and the
+# operator's reading of it was two-state. A check written against the
+# classifier's return value cannot see that; only the PRINTED OUTPUT can, which
+# is what every check below drives.
+_UNVERIFIED_HEADING = "Reachability could not be established"
+_REACH_HEADING = "REACHES -- a ref, a reflog entry or the index"
+_UNREACHED_HEADING = "NOT REACHED by any inspected"
+_CLEANUP = "git prune --expire=now"
+_VERIFIED_CLAIM = "VERIFIED, not guessed"
+
+
+def heading_counts(out):
+    """(total, reaching, unreached, unverified) as the MESSAGE reports them.
+
+    Parsed from the printed text rather than from the classifier, because the
+    property under test is that the printed sections PARTITION the findings: a
+    refusal that says N and lists fewer than N is silent under-reporting on the
+    one output an operator acts on.
+    """
+    def one(pattern):
+        m = re.search(pattern, out)
+        return int(m.group(1)) if m else 0
+    return (one(r"SECRET SCAN FAILED: (\d+) unaccepted"),
+            one(r"(\d+) finding\(s\) in content this repository"),
+            one(r"(\d+) finding\(s\) NOT REACHED by any inspected"),
+            one(r"(\d+) finding\(s\) whose reachability could"))
+
+
+# --- (i) THE PROBE SUCCEEDED AND RETURNED NOTHING. -------------------------
+_code6e, _out6e = run_gate(_r6e, "objects", _a6d)
+check("6z-l an empty-probe finding is refused -- exit 1", _code6e, 1)
+check("6z-m ...under its own heading, not the reachable one",
+      (_UNVERIFIED_HEADING in _out6e, _REACH_HEADING in _out6e),
+      (True, False))
+check("6z-n ...and not the unreached one either",
+      _UNREACHED_HEADING in _out6e, False)
+check("6z-o ...claiming no verified reachability anywhere in the output",
+      _VERIFIED_CLAIM in _out6e, False)
+check("6z-p ...recommending NO cleanup",
+      (_CLEANUP in _out6e, "OPERATOR-REVIEWED LOCAL CLEANUP" in _out6e,
+       _DANGLE_REMEDY in _out6e), (False, False, False))
+# AND NOT THE ACCEPTED-TABLE REMEDY EITHER. The two remedies are opposites and
+# which applies follows from the fact this run failed to get, so naming either
+# is advising an action on a coin toss -- and one of the two is irreversible.
+check("6z-q ...and NOT the accepted-table remedy, which may be the wrong one",
+      _REACH_REMEDY in _out6e, False)
+check("6z-r ...still listing the finding, so the operator has the fingerprint",
+      _oid6e in _out6e, True)
+check("6z-s ...naming the probe result that establishes nothing",
+      "establishes nothing" in _out6e, True)
+check("6z-t ...and naming resolving the probe as the action",
+      "RESOLVE THE PROBE FAILURE FIRST" in _out6e, True)
+# ASSERTED AS A PROPERTY, NOT AS A TUPLE OF LITERALS. `plant_text` plants
+# several credential shapes, so ONE blob is FOUR findings -- a literal
+# expectation here was wrong on its first run and would rot again the next time
+# the plant's content moves. The three terms are: the run found something (so an
+# empty output cannot satisfy this), the sections SUM to the total (no finding
+# is counted and then printed under no heading), and every one of them is in the
+# unverified bucket.
+_hc6e = heading_counts(_out6e)
+check("6z-u ...and the printed sections PARTITION the findings",
+      (_hc6e[0] > 0, _hc6e[1] + _hc6e[2] + _hc6e[3] == _hc6e[0],
+       _hc6e[3] == _hc6e[0]),
+      (True, True, True))
+
+# --- (ii) THE PROBE COULD NOT RUN AT ALL. ----------------------------------
+# A `git` shim earlier on PATH that forwards every command except the
+# reachability probe. Pointing --repo at a non-repository would break the
+# CENSUS too and exit 3, never reaching the message this section is about, so
+# the census has to keep working and only the probe must fail.
+_shim_dir = os.path.join(_TMP, "git-shim")
+os.makedirs(_shim_dir)
+_real_git = shutil.which("git")
+check("6z-v the shim can be built -- a real git was found on PATH",
+      bool(_real_git), True)
+with open(os.path.join(_shim_dir, "git"), "w", encoding="utf-8") as _handle:
+    _handle.write(
+        "#!" + sys.executable + "\n"
+        "import os, sys\n"
+        "a = sys.argv[1:]\n"
+        "if 'rev-list' in a and '--indexed-objects' in a:\n"
+        "    sys.stderr.write('shim: probe broken\\nsecond stderr line\\n')\n"
+        "    sys.exit(128)\n"
+        "os.execv(" + repr(_real_git) + ", [" + repr(_real_git) + "] + a)\n")
+os.chmod(os.path.join(_shim_dir, "git"), 0o755)
+_shim_env = {"PATH": _shim_dir + os.pathsep + os.environ.get("PATH", "")}
+# THE SHIM IS SHOWN TO BE SELECTIVE BEFORE ANYTHING RESTS ON IT: a shim that
+# broke every git call would fail the census and this drive would be measuring
+# exit 3 rather than the message.
+check("6z-w the shim breaks the probe and nothing else -- the census still ran",
+      run_gate(_r6r, "objects", _a6r, env_extra=_shim_env)[1].count(
+          "range=objects"), 1)
+_code6p, _out6p = run_gate(_r6r, "objects", _a6r, env_extra=_shim_env)
+check("6z-x a probe FAILURE refuses -- exit 1, not 3", _code6p, 1)
+check("6z-y ...under the unverified heading, not the reachable one",
+      (_UNVERIFIED_HEADING in _out6p, _REACH_HEADING in _out6p),
+      (True, False))
+check("6z-z ...not the unreached one, and claiming no verified reachability",
+      (_UNREACHED_HEADING in _out6p, _VERIFIED_CLAIM in _out6p),
+      (False, False))
+check("6z-z2 ...recommending NO cleanup and NOT the accepted-table remedy",
+      (_CLEANUP in _out6p, "OPERATOR-REVIEWED LOCAL CLEANUP" in _out6p,
+       _DANGLE_REMEDY in _out6p, _REACH_REMEDY in _out6p),
+      (False, False, False, False))
+check("6z-z3 ...still listing the finding", _oid6r in _out6p, True)
+check("6z-z4 ...naming the probe failure", "could not run" in _out6p, True)
+_hc6p = heading_counts(_out6p)
+check("6z-z5 ...and the printed sections PARTITION the findings",
+      (_hc6p[0] > 0, _hc6p[1] + _hc6p[2] + _hc6p[3] == _hc6p[0],
+       _hc6p[3] == _hc6p[0]),
+      (True, True, True))
+# THE NOTE IS PRINTED INSIDE AN INDENTED BLOCK, so a multi-line git stderr must
+# not reach it. The shim writes TWO stderr lines on purpose.
+#
+# ASSERTED AS THE LAYOUT PROPERTY, NOT AS A LITERAL LINE, and the first version
+# of these two checks was MISSED by exactly the revert they exist to catch. They
+# looked for a line equal to `second stderr line` and for a line containing
+# `could not run` that was unindented -- and the real leak produces
+# `second stderr line)`, with the closing paren of the note, on a line that
+# contains neither marker. A check that names the shape of one leak does not
+# catch the leak; the property is that the refusal has no line outside its own
+# indentation.
+# THE THREE LINES THAT ARE LEGITIMATELY UNINDENTED. `[Paths]` is the package's
+# own bootstrap banner, printed at module scope by oncotriage/paths.py and
+# concatenated into this output by run_gate because it arrives on stderr; the
+# other two are the gate's range header and its refusal headline. gitleaks'
+# own output is NOT among them -- scan_with_gitleaks captures it -- so this
+# check reads the same on a runner that has the binary.
+_KNOWN_UNINDENTED = ("range=", "SECRET SCAN FAILED:", "[Paths]")
+check("6z-z6 the refusal has no line outside its own two-space indentation",
+      [ln for ln in _out6p.splitlines()
+       if ln and not ln.startswith("  ")
+       and not ln.startswith(_KNOWN_UNINDENTED)], [])
+# ...WITH ITS NON-DEGENERACY PROBE. An empty output satisfies the above for
+# free, and the two known unindented lines have to actually be there.
+check("6z-z6-i ...and both known unindented lines are present, so 6z-z6 had "
+      "something to check",
+      (_out6p.count("range=objects"),
+       _out6p.count("SECRET SCAN FAILED:")), (1, 1))
+# AND THE NOTE ITSELF, at the source rather than through the layout. This is the
+# decisive one: the classifier is driven in-process with the shim on PATH, so a
+# note that carried git's newline fails here whatever the printed block happens
+# to look like.
+_path_before = os.environ.get("PATH", "")
+try:
+    os.environ["PATH"] = _shim_dir + os.pathsep + _path_before
+    _st6d, _note6d = _gate_module.classify_reachability(_r6r, [_oid6r])
+finally:
+    os.environ["PATH"] = _path_before
+check("6z-z7 PATH was restored after the in-process shim drive",
+      os.environ.get("PATH", ""), _path_before)
+check("6z-z7-i the shim really reached the in-process probe",
+      (_st6d[_oid6r], "could not run" in _note6d),
+      (_gate_module.REACHABILITY_UNVERIFIED, True))
+check("6z-z7-ii ...and git's TWO stderr lines arrive as ONE line of note",
+      ("\n" in _note6d, "second stderr line" in _note6d), (False, True))
+
+# --- THE CLAIM CORRECTION. -------------------------------------------------
+# The unreached message used to assert "It is in THIS object database and in no
+# clone". MEASURED FALSE, both directions, in scratch repositories: an object
+# reachable from a local ref can be ABSENT from an existing clone (committed
+# after that clone was taken), and an object unreachable HERE can be reachable
+# from a branch SOMEWHERE ELSE -- same content, same oid. A local probe decides
+# one question only.
+# THE FORBIDDEN SET GREW WITH THE SECOND CORRECTION, and it is checked against
+# EVERY HEADING rather than against one. Two things were retired here: the
+# assertion that a FRESH CLONE would not have the object -- false for three of
+# the four clone forms tried, because `git clone <local path>` hardlinks the
+# whole object directory and the unreferenced blob arrives with it (measured;
+# `--no-hardlinks` and `--depth=1` too, and only `file://` filtered by
+# reachability) -- and the blanket claim that accepting such an object breaks
+# CI, where what is established is conditional on a checkout lacking it.
+#
+# THE SCOPE IS THE POINT AND THE FIRST VERSION OF THIS CHECK GOT IT WRONG. It
+# read `_out6d`, the UNREACHED output, and the blanket "breaks CI" sentence
+# lives in the UNVERIFIED one -- so a revert that put that sentence back was
+# MISSED. A residue check scoped to one of three headings is a residue check
+# with two blind spots. Every refusal output this section produces is scanned.
+# MATCHED CASE-INSENSITIVELY, and that was found by a revert rather than by
+# reading: the same claim reads "since a clone is driven by refs" mid-sentence
+# and "A clone is driven by refs" at the start of one, and a case-SENSITIVE
+# scan MISSED the flag-table comment for exactly that reason. A paraphrase that
+# differs only in capitalisation is the same claim.
+_FORBIDDEN_CLAIMS = ("in no clone",
+                     "in every clone",
+                     "matches nothing anywhere else",
+                     "only this checkout holds",
+                     "which a fresh clone will not",
+                     "a clone is driven by refs",
+                     "a clone transfers only reachable",
+                     "breaks ci")
+
+
+def claims_in(text):
+    """Every retired claim present in `text`, matched case-insensitively."""
+    low = text.lower()
+    return [c for c in _FORBIDDEN_CLAIMS if c in low]
+_SCANNED_OUTPUTS = {"reachable": _out6r, "unreached": _out6d,
+                    "unverified/empty-probe": _out6e,
+                    "unverified/probe-failed": _out6p}
+check("6z-z8 no refusal output claims what other repositories hold, or that "
+      "accepting is unconditionally fatal",
+      sorted((where, claim) for where, out in _SCANNED_OUTPUTS.items()
+             for claim in claims_in(out)), [])
+# ...WITH ITS NON-DEGENERACY PROBE. Four empty strings satisfy the above for
+# free; each output has to be a real refusal that reached its own heading.
+check("6z-z8-i ...and all four scanned outputs are real refusals",
+      sorted(where for where, out in _SCANNED_OUTPUTS.items()
+             if "SECRET SCAN FAILED" not in out), [])
+# AND THE SAME SET AT THE SOURCE, BECAUSE A DOCSTRING IS NEVER PRINTED. The
+# check above reads the OUTPUT and therefore cannot see the third layer -- and
+# that layer is exactly where the claim survived the first correction: the
+# `object_census` docstring said "a clone transfers only reachable objects" for
+# a whole pass after the printed message had stopped saying it. Measured: a
+# revert that restores it is MISSED by 6z-z8 and caught here.
+#
+# THE RULE IS NOT "THE WORDS ARE ABSENT", because the file QUOTES the retired
+# claims in the note that records their retirement -- the trap this project has
+# met four times, a file that argues about its own settings being grepped for
+# them. The rule is that any occurrence must BE such a quotation: on a comment
+# line, inside a note that says the claims are false. A re-assertion fails it
+# either way -- a message literal is not a comment line, and a bare comment has
+# no retirement marker beside it.
+_RETIREMENT_MARKER = "Both are false"
+_gate_lines = open(_GATE, encoding="utf-8").read().splitlines()
+_claim_sites = [(i, ln) for i, ln in enumerate(_gate_lines) if claims_in(ln)]
+check("6z-z8-ii every retired claim in the gate's SOURCE is a quotation in the "
+      "note retiring it, not an assertion",
+      [ln.strip()[:60] for i, ln in _claim_sites
+       if not (ln.lstrip().startswith("#")
+               and any(_RETIREMENT_MARKER in nxt
+                       for nxt in _gate_lines[i:i + 4]))], [])
+# ...AND ITS NON-DEGENERACY PROBE. With no occurrence at all the check above is
+# vacuous, so the retirement note has to still be there saying what it retired.
+check("6z-z8-iii ...and the retirement note is present, so 6z-z8-ii had "
+      "something to check",
+      (len(_claim_sites) > 0,
+       any(_RETIREMENT_MARKER in ln for ln in _gate_lines)), (True, True))
+check("6z-z9 ...and states the local-probe scope instead",
+      "not reached by the inspected local refs, reflogs or" in _out6d, True)
+check("6z-z10 ...and says explicitly that it establishes nothing elsewhere",
+      "NOTHING about what any other repository contains" in _out6d, True)
 
 
 # ===========================================================================

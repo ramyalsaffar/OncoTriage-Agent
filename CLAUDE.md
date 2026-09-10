@@ -135,7 +135,7 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/dashboard/sidebar.py` | File 21's `render_sidebar` — filters, Refresh, CSV export | nothing from the project |
 | `oncotriage/dashboard/tiers.py` | `MATCH_TIERS`, `MATCH_TIER_COLORS`, the **three** `TRIAL_STATUS_*` (per-trial) and the **four** `PATIENT_OUTCOME_*` + `PATIENT_OUTCOME_LABELS` (per-patient; pass 20f-3), `classify_trial_score`, `enrich_match_tiers` | nothing at all |
 | `oncotriage/dashboard/app.py` | File 21's `main` — page config, sidebar, the nine tabs | `config`, `dashboard.{data,sidebar,tiers}`, `dashboard.tabs.*` |
-| `oncotriage/dashboard/tabs/*.py` | one `render_*_tab` each, nine of them | `dashboard.{data,tiers}`, `config`, `utils` |
+| `oncotriage/dashboard/tabs/*.py` | one `render_*_tab` each, **ten of them** (MEASURED on disk; this cell said nine, which was true before the run-health tab). The one WILDCARD row in this table, which is also the evidence that the table is not an inventory | the UNION over the ten, MEASURED by AST rather than listed: `config`, `constants`, `dashboard.{call_mode,data,nullsafe,tiers}`, `monitoring.drift`, `storage.{database_logger,queries}`, `utils` |
 | `oncotriage/retrieval/qdrant_backup.py` | File 29 whole — `default_output_dir`, `download_all_collections` | `config`, `paths` |
 | `oncotriage/orchestration/home.py` | **the one** `airflow_path` read — `resolve_airflow_home` | `paths` |
 | `oncotriage/orchestration/airflow_setup.py` | File 22 whole — `setup_airflow` | `orchestration.home` |
@@ -166,6 +166,31 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/agent/terminal.py` | the three terminal nodes + `_pipeline_provenance` | `agent.state`, `registries.primary_cancer`, `utils` |
 | `oncotriage/agent/graph.py` | `build_matching_graph`, `match_patient_to_trials` | every stage module |
 | `oncotriage/agent/display.py` | console rendering | `config` |
+| `oncotriage/control.py` | **the run lock and the operator stop switch, ONE OWNER FOR BOTH** — `lock_directory` / `ensure_lock_directory` (0700, uid-keyed, `O_NOFOLLOW`), `hold_exclusive_lock`, `EXIT_LOCKED`, the `AlreadyRunning` / `LockUnavailable` sibling pair and their refusal texts, `StopSwitch` with its latching poll, `read_stop_message`, `clear_stop_switch` and `STOP_CLEAR_OUTCOMES`, `cancel_queued`. **IMPORTS NOTHING FROM THE PROJECT ON PURPOSE** — a `usercustomize` hook loads it at interpreter startup, and `tests/run_serial_tests.py` keeps a pinned COPY of the lock half for the same reason | nothing from the project |
+| `oncotriage/degradation.py` | **the one place a run says what degraded, so silence is a statement** — `register` / `registered_names` / `snapshot` / `totals` / `report_lines` / `print_report` / `log_summary`, and the SECOND registry beside it (`census_names` / `census_snapshot` / `census_report_lines` / `print_census_report`) for counters that are observations rather than degradations. `assert_registries_disjoint` keeps the two apart. It binds counter OBJECTS, which is why registering a counter puts its module in every batch run's import graph and why `_READER_EXEMPTIONS` exists | `agent.{bedrock_adapter,bedrock_anthropic_adapter,deps,evaluation,filtering,patient,readiness}`, `deid`, `environment`, `extraction.stage`, `fhir.parser`, `observability`, `registries.{cancer_code_registry,mesh}`, `run_fingerprint`, `spend`, `spend_journal`, `storage.database_logger`, `tracking`, `utils` |
+| `oncotriage/deid.py` | **the de-identification stage — what may be rendered, and the guard that proves it** — `RENDERED_FIELDS` / `DEMOGRAPHIC_FIELDS` (the closed key sets `DeidentifiedRecord` carries), `AGE_CAP_YEARS` + `AGE_CAP_LABEL`, `pseudonym_for_identity`, `deidentify`, `harvest_identifiers`, the five provenance-free shape rules, `scan_for_identifiers`, `assert_no_identifiers` and `DEID_REFUSALS` / `DEID_CENSUS`. In `RENDERER_MODULES`, so an edit here moves `llm_classifier_renderer_digest` | nothing from the project |
+| `oncotriage/environment.py` | **what produced this run, as facts a reader can diff two runs on** — `git_commit`, `image_identity`, `package_snapshot`, `snapshot_hash`, `model_identities`, `current`, `clear_cache`. The MACHINE half of provenance; `run_fingerprint` is the CONFIGURATION half and gates the resume | `config`, `embedding`, `observability`, `paths`, `settings` |
+| `oncotriage/run_fingerprint.py` | **what configuration produced a partial artifact, and whether this run may continue it** — `FINGERPRINT_VERSION`, `FINGERPRINT_FIELDS`, `current`, `compare` and the five closed outcomes (`FP_MATCH` / `FP_CHANGED` / `FP_ABSENT` / `FP_VERSION` / `FP_UNRESOLVED`), `ResumeRefusal`, `refusal_lines`, `summary`, `disagreements`, plus the renderer digest (`RENDERER_MODULES`, `RENDERER_MODULES_EXCLUDED`, `RENDERER_COVERAGE`, `normalized_module_source`, `renderer_module_digests`, `renderer_digest`). The resolution cache is behind an `RLock` because both consumers stamp from a done-callback on a worker thread | `agent.{prompts,readiness}`, `config`, `observability`, `utils` |
+| `oncotriage/spend.py` | **how much this campaign has spent, and whether it may spend more** — `SpendLedger` (charged at the RESPONSE, which is what bounds the overshoot), `require_budget`, `SPEND_STOP`, `Stage5SpendStopped`, the closed `SPEND_BUDGETS` / `SPEND_POLICIES` vocabularies and the four TOTAL tables (`BILLED_SITES`, `BUDGET_FOR_SOURCE`, `BUDGET_SOURCES`, `BUDGET_FOR_SEED_SOURCE`), `spend_cap` / `serving_spend_cap` / `rater_spend_cap`, `latch_on_limit`, `report_lines`. PROCESS-LOCAL by design and says so | `config`, `observability`, `utils` |
+| `oncotriage/spend_journal.py` | **the CROSS-PROCESS spend record: one append-only file, one owner** — `journal_path`, `entry_id`, `append_with_outcome` + the closed `APPEND_OUTCOMES`, `append`, `read_entries`, `total`, `confirmed_usd_for_scope`, `rater_spend_before`, `RunSpendCheckpointer`, `decode_journal_line` and `_needs_boundary` — the byte-level boundary recovery that stops an interrupted write making the next append unreadable. Every reader is documented NEVER RAISES | `observability`, `paths`, `settings`, `spend` |
+| `oncotriage/agent/prompts.py` | **Stage 5's system prompt: the template, its version, and its hash** — `PROMPT_VERSION` (hand-maintained, which is why `run_fingerprint` gates a DERIVED renderer digest beside it), `render_system_prompt`, `prompt_sha256`. In `RENDERER_MODULES` | `utils` |
+| `oncotriage/agent/response_schema.py` | **the shape the prompt asks for, as an enforceable JSON Schema** — `build_response_schema`, `build_response_format`, `schema_object_paths`, `TRIAL_FIELDS` / `CRITERION_FIELDS`. `additionalProperties: False` with a complete `required` list at every level is what makes every "the model cannot forge this" argument in `agent/evaluation.py` true | `agent.state` |
+| `oncotriage/mcp/server.py` | **three tools over the matching pipeline, spoken to an MCP client on stdio** — `TOOL_SPECS`, `parse_fhir_bundle`, `match_patient`, `lookup_trial`, `_guard_response` (EVERY return path goes through it), the readiness and spend refusals that carry NO `result` key, the fd-level stdout guard, and `TOOL_FAILURES` / `DEID_REFUSALS` accounting. Reads `oncotriage.__version__` | `agent.{graph,patient,readiness}`, `config`, `constants`, `deid`, `fhir.parser`, `observability`, `retrieval.trial_lookup`, `spend`, `utils` |
+| `oncotriage/retrieval/trial_lookup.py` | **fetch ONE indexed trial by its NCT ID, read only** — `normalize_nct_id`, `lookup_trial`, `TrialLookupError`. It RAISES rather than reporting `found: False` when the index could not be asked, because "no such trial" and "the server is unreachable" are the same empty list at the Qdrant API. Takes the AGENT's client seam on `index_validator`'s precedent | `agent.deps`, `config`, `retrieval.index_validator`, `utils` |
+| `oncotriage/dashboard/nullsafe.py` | **rendering a cell that may be NULL, for every dashboard tab** — `is_absent`, `as_int`, `as_float`, `as_text`, `optional_int_text`, `format_number`, `format_timestamp`. ONE OWNER: `tabs/run_health.py` carried four private copies of this shape, and a second copy is how one tab renders an em dash where another renders `0` for the same cell | nothing from the project |
+| `oncotriage/dashboard/call_mode.py` | **which Stage 5 arm produced these rows, and how to say so on a panel** — `bucket_of`, `describe`, `label_suffix`, `caption`, `split`, `annotate`, `ledger`. Reads `inferences.matching_call_mode`, so a panel's label cannot claim an arm the rows were not produced under | `config`, `storage.queries` |
+| `oncotriage/evaluation/run_harness.py` | **run the pipeline over a stratified slice and persist what two downstream harnesses consume** — `new_output_dir`, `select_patients`, `build_environment` (the fingerprint stamp and `environment_history`), `environment_gate` + `--allow-environment-change`, `RESUME_SKIP_STATUSES` / `RUN_STATUSES` (which must PARTITION, guarded at import), `build_contexts` (each trial's own registry criteria, fences included), `price_result` and `cost_complete`, `post_check`, the manifest writer. Entry point: `evaluation_run.py` | `agent.{evaluation,graph,patient,prompts,readiness,state}`, `config`, `degradation`, `deid`, `fhir.parser`, `fixtures.capture`, `observability`, `paths`, `run_fingerprint`, `utils` |
+| `oncotriage/evaluation/rater.py` | **a different-family LLM rater over an evaluation run's criterion decisions** — `lift_rubric` (the rules taken VERBATIM out of `agent/prompts.py`, so the pipeline and its auditor are judged against one text), `build_system_prompt`, `build_blind_decision_block` (which takes no status, so the blinding is structural), `build_criteria_reference_block`, `REQUEST_SHAPE_VERSION`, `submit_batches` (Anthropic Batches, gated per chunk), the six `require_state_*` provenance guards and `STATE_PROVENANCE_KEYS`, `price_usage` (the four DISJOINT cache tiers, never summed the OpenAI way), `cohens_kappa`. Entry point: `rater_run.py` | `agent.prompts`, `config`, `evaluation.judge_independence`, `observability`, `paths`, `spend`, `spend_journal` |
+| `oncotriage/evaluation/ragas_harness.py` | **reference-free Ragas metrics over a recorded evaluation run** — `load_run`, `build_judge` / `build_embeddings` (both gated), `RESUME_IDENTITY_KEYS` + `identity_disagreement` (a MISSING key is a disagreement, never a pass), `normalize_reasoning_effort` and `OMIT_REASONING_EFFORT`, `UsageTally`, `judge_pricing` / `embedding_pricing`, `record_run`. Entry point: `ragas_run.py` | `config`, `evaluation.judge_independence`, `observability`, `paths`, `spend`, `spend_journal` |
+| `oncotriage/evaluation/judge_independence.py` | **the judge may not come from the family that produced the text it judges** — `family_of`, `normalise_model_id`, `classifier_model` / `classifier_family`, `assess`, `require_independent_judge`, `assert_import_time_independence`, `resolve_same_family_override`, `JudgeIndependenceError`. The family rules are asserted DISJOINT at import | `config` |
+| `oncotriage/evaluation/cohort_groups.py` | **one parse of the corpus, producing the `stem -> cancer group` map the stratified cohort draw needs** — `scan`, `group_map`, `patient_ids`, `grouper`, plus the cache and its invalidation (`cache_path`, `grouper_digest` over the grouper's own AST, `file_signature`, `load_cache`, `save_cache`). The 170-second full parse the draw would otherwise pay before its first patient | `degradation`, `evaluation.cohort`, `fhir.parser`, `observability`, `paths`, `registries.{cancer_code_registry,primary_cancer}` |
+| `oncotriage/evaluation/criterion_clauses.py` | **how an eligibility criterion is DIVIDED for window-scope analysis** — `split_clauses`, `Clause`, `top_level_bracket_spans`, `coordination_cut_count`, `exception_spans` / `exception_scope` / `ExceptionScope`, `classify_window_scope`, `unwindowed_clauses`, `is_compound`. Its `is_window` argument is REQUIRED and deliberately has no default, so the owner of that predicate is always the caller's choice. ANALYSIS-SIDE ONLY | nothing from the project |
+| `oncotriage/evaluation/medcpt_calibration.py` | **measure the distribution of `medcpt_score_max` so `MEDCPT_SCORE_FLOOR` is SET FROM DATA rather than chosen** — `select_patients` (the seeded PROPORTIONAL draw that retired the three-group 10/10/10 rule), `rerank_sample`, `measure`, `floor_impact`, `print_report`, `main`. Runs Stages 1-3 only. Entry point: `measure_medcpt_scores.py` | `agent.{graph,retrieval}`, `evaluation.{cohort,sampling}`, `fhir.parser`, `observability`, `paths`, `registries.primary_cancer`, `utils` |
+| `oncotriage/evaluation/mmr_redundancy.py` | **quantify near-duplicate redundancy inside Stage 4's kept pools, and simulate Maximal Marginal Relevance offline** — `run_stages_1_to_4`, `tfidf_matrix` / `cosine_matrix`, `redundancy_for_pool`, `mmr_select`, `estimate_dense_channel_cost`, `pool_digest`. An OFFLINE measurement for an operator ruling; it changes no shipped stage | `agent.{deps,filtering,graph,retrieval,text}`, `config`, `evaluation.{cohort,cohort_groups}`, `fhir.parser`, `observability`, `paths`, `utils` |
+| `oncotriage/staging/exclusions.py` | **load, validate and apply `s3_staging_exclusions.json`** — `load_manifest`, `build_plan` / `StagingPlan`, `classify`, `excluded_kinds`, `cross_check_path_names` (every `PATH_NAMES` entry must be classified, or `PathNamesUnclassified`), `ManifestError` | `observability`, `paths` |
+| `oncotriage/staging/manifest.py` | **walk the project root, apply the rulings, and report what WOULD upload** — `walk` / `WalkResult`, `estimate_cost` (priced from `config.S3_PRICING`, whose `last_updated` and `quoted_region` it prints), `build_report`, `render_report` | `config`, `observability`, `staging.exclusions` |
+| `oncotriage/staging/secrets_scan.py` | **a hard refusal, not a filter: if any file about to upload looks credential shaped, the whole run stops** — the nine detectors, `scan_bytes`, `scan_filename`, `scan_file`, `scan_files` / `ScanResult`, `refuse_if_dirty`, `SecretsRefusal`, `_is_program_identifier` and its `_IDENTIFIER_EXEMPTION_MAX_LENGTH` cap. **ALSO THE PROJECT ENGINE OF THE GIT-HISTORY GATE**: `.github/scripts/secret_scan_gate.py` imports `scan_bytes` and `scan_filename` from here | `config`, `observability` |
+| `oncotriage/staging/s3_sync.py` | **the AWS half: preflight now, bucket guardrails and upload once credentials exist** — `preflight` / `PreflightResult`, `execute_refusal_reason`. The wrong-Region refusal is unchanged in behaviour and its expected side is now `ONCOTRIAGE_S3_STAGING_REGION`-settable | `config`, `observability`, `settings` |
 
 **The dependency seam — `oncotriage/agent/deps.py` (pass 20c-2c).** Every client,
 model and registry the agent uses is reached through an accessor there:
@@ -663,7 +688,7 @@ python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on
 # of its argument -- including a control MODULE written to that temp directory
 # and PARSED, never imported -- an ast walk, or a registry entry removed inside
 # try/finally with the restore asserted. Bucket A, ~3 s.
-python tests/test_degradation_counter_readers.py                    # 158 (UNCHANGED across the determinism pass, which added a counter -- OPENAI_PARAMETER_DEGRADATIONS -- and no check: section 1's registration scan is ONE aggregate check over every module-level Counter it discovers, so a registered addition moves nothing and an UNregistered one fails there. Was 157, was 155; the pre-diagnosis ECOG pass added ECOG_ANCHOR_COUNTS to _READER_EXEMPTIONS on the parser's other four counters' footing -- a census read by load_all_patients(), whose own pass has an end where oncotriage/degradation.py's does not -- and the table drives its own follow-up checks. Before that 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
+python tests/test_degradation_counter_readers.py                    # 160 (MEASURED 2026-09-10; this line said 158 and was stale by 2 -- the criteria-reference pass added the two per-entry checks its new CRITERIA_REFERENCE_ABSENT exemption drives, and recorded 160 in its own account while this line stayed at 158. Before that 158, UNCHANGED across the determinism pass, which added a counter -- OPENAI_PARAMETER_DEGRADATIONS -- and no check: section 1's registration scan is ONE aggregate check over every module-level Counter it discovers, so a registered addition moves nothing and an UNregistered one fails there. Was 157, was 155; the pre-diagnosis ECOG pass added ECOG_ANCHOR_COUNTS to _READER_EXEMPTIONS on the parser's other four counters' footing -- a census read by load_all_patients(), whose own pass has an end where oncotriage/degradation.py's does not -- and the table drives its own follow-up checks. Before that 154; the de-identification pass added DEID_CENSUS to the census registry -- a capped age is the stage working -- and derived the "All N census counters are zero" number from the registry instead of the literal 4 it had gone stale as. Before that 152; the API-shutdown-gate pass added SHUTDOWN_GATE_DEGRADATIONS to _READER_EXEMPTIONS on oncotriage/mcp/server.py's TOOL_FAILURES precedent -- a long-lived SERVER has no run end, and degradation.py binds counter OBJECTS, so registering it would put FastAPI in every batch run's import graph. Before that 138; the operator-control pass added the two new dual-owned counters and replaced the adjacency pin on report_checkpoint_faults with a transitive call-graph walk)
 
 # The Docker pass. Same shape, same directory. No network, no keys, no spend,
 # and no Docker daemon: every Qdrant client is a stand-in and section 1's
@@ -749,7 +774,7 @@ python tests/test_agent_patient_hash_coverage.py                    #  73 (was 7
 # matrix, and it execs nothing -- the missing-package control masks
 # sys.modules['mlflow'], which drives the SHIPPED function because the import is
 # deferred into it. ~1.4 s.
-python tests/test_tracking_mlflow_index.py                          # 109 (was 104; the determinism pass added matching_temperature_sent to _DERIVED_PARAM_KEYS and drove it BOTH DIRECTIONS across the arm -- 'what was set' and 'what was sent' are different facts and both are in the index. Before that 99; the call-mode pass added the arm parameter and its both-directions drive)
+python tests/test_tracking_mlflow_index.py                          # 114 (MEASURED 2026-09-10; this line said 109 and was stale by 5. Before that 109, was 104; the determinism pass added matching_temperature_sent to _DERIVED_PARAM_KEYS and drove it BOTH DIRECTIONS across the arm -- 'what was set' and 'what was sent' are different facts and both are in the index. Before that 99; the call-mode pass added the arm parameter and its both-directions drive)
 
 # The token-persistence pass's BEHAVIOURAL half -- the structural half is
 # Test 2 of tests/test_storage_inference_logging_contract.py, and neither
@@ -947,7 +972,7 @@ python tests/test_agent_cross_encoder_sequence_limit.py             #  70 (this 
 # agent/evaluation.py, one plant each, argued at _EXEC_ALLOWLIST. Bucket A,
 # ~1.6 s (MEASURED; the first version was 21.6 s because its own harness
 # deadlocked and a timeout hid it -- see the pass's own findings).
-python tests/test_spend_gate.py                                     # 162 (this line said 158; the empty-verdict retry pass drove the gate against the retry's own extra call. MEASURED 2026-09-03. Before that 158, was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
+python tests/test_spend_gate.py                                     # 164 (MEASURED 2026-09-10; this line said 162 and was stale by 2. Before that 162, said 158; the empty-verdict retry pass drove the gate against the retry's own extra call. MEASURED 2026-09-03. Before that 158, was 151; the spend-coverage pass moved 1j's SEED_SOURCES pin from two members to three -- `rater_state` is a third seed source, not a reuse of `campaign_rows` -- and added 1j-i, its distinctness probe. The pin stays EXACT, which is what makes a fourth member added without an argument fail there)
 
 # The spend-coverage pass. Same shape, same directory. No network, no keys, NO
 # SPEND -- every provider client is a stand-in, the ablation study's
@@ -1004,7 +1029,7 @@ python tests/test_evaluation_sample_naming.py                       #  72
 # collision matrix; it DOES read oncotriage/config.py, which
 # tests/test_config_snapshot_date_rot.py rewrites, so all three files it reads
 # are sha256-compared at the end. Bucket A, ~4.8 s.
-python tests/test_fixture_call_mode_pin.py                          #  87 (unchanged across the consolidation pass, which moved its closed-port literal to tests/_control_harness.py. Was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
+python tests/test_fixture_call_mode_pin.py                          #  91 (MEASURED 2026-09-10; this line said 87 and was stale by 4. Before that 87, unchanged across the consolidation pass, which moved its closed-port literal to tests/_control_harness.py. Was 81; the default-flip pass found 1c's non-degeneracy probe pinned the LITERAL per_trial, which agrees with the default after the flip -- it pins the OPPOSITE arm, derived, and gained a cleared-pin check)
 
 # The Bedrock-adapter pass. Same shape, same directory. NO AWS CALL AND NO
 # BILLED CALL OF ANY KIND -- every client is a stand-in installed through
@@ -1016,7 +1041,7 @@ python tests/test_fixture_call_mode_pin.py                          #  87 (uncha
 # copies of oncotriage/agent/bedrock_adapter.py, one mapping broken in each,
 # argued at _EXEC_ALLOWLIST (the module is new, so `git show` has no revision
 # carrying a version with one mapping missing). ~2 s.
-python tests/test_agent_bedrock_adapter.py                          # 292 (was 284; the determinism pass added the temperature drop's own warn-once -- counted on the first CALL, silent on the second, and silent under the declared opt-out -- and two checks that the arm's refusal is DECLARED rather than discovered by sending. Before that 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
+python tests/test_agent_bedrock_adapter.py                          # 294 (MEASURED 2026-09-10; this line said 292 and was stale by 2. Before that 292, was 284; the determinism pass added the temperature drop's own warn-once -- counted on the first CALL, silent on the second, and silent under the declared opt-out -- and two checks that the arm's refusal is DECLARED rather than discovered by sending. Before that 275; the Converse pass moved two pins -- the provider tuple 2 -> 3 members and call_matching_model's return count 2 -> 3 -- and re-asserted what each protected in a stronger form. Before that 273; the cache-warmup pass added the `**` expansion pin)
 
 # The Converse pass: the SECOND Bedrock branch, Claude Sonnet 4.6. Same shape,
 # same directory. NO AWS CALL AND NO BILLED CALL OF ANY KIND -- every client is
@@ -1181,7 +1206,7 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 # and printed when the binary is absent -- which is the state of the `tests` job
 # on a hosted runner. NOT in the collision matrix. It EXECS NOTHING. Bucket A,
 # ~22 s with gitleaks / ~16 s without.
-python tests/test_secret_scan_gate.py                               # 108 with gitleaks (DERIVED as 102 + the 6 gitleaks checks, not measured -- this machine has no gitleaks binary); 102 passed / 0 failed / 3 SKIPPED without it, MEASURED 2026-09-08. Was 92 / 86; the pinned-requirements pass replaced 10f with eleven checks over the pyproject-derived pins and added six more that scope the install step -- its run block located, the flag's output captured in one substitution, that substitution an assignment, never a pip argument, the empty result refused explicitly, and `set -euo pipefail` present IN THAT STEP rather than anywhere in the file
+python tests/test_secret_scan_gate.py                               # 175 with gitleaks (DERIVED as 169 + the 6 gitleaks checks, not measured -- this machine has no gitleaks binary); 169 passed / 0 failed / 3 SKIPPED without it, MEASURED 2026-09-10. Was 108 / 102; the unreachable-remedy pass added section 6's 6g..6z-z10 -- 74 checks in that section now -- over WHICH REMEDY A REFUSAL IS ALLOWED TO NAME. All THREE message paths are driven against real repository states (a committed plant, an orphan blob, an empty-result probe and a probe broken by a `git` shim), with the reflog-pinned and staged-only shapes as the discriminating controls and the classifier's three states driven directly. The retired scope claims are pinned in the four refusal OUTPUTS and in the gate's SOURCE, case-insensitively, because two of the three layers are unreachable from the other scan. Seven reverts on the logic and six on the claims, all thirteen caught. Was 92 / 86; the pinned-requirements pass replaced 10f with eleven checks over the pyproject-derived pins and added six more that scope the install step -- its run block located, the flag's output captured in one substitution, that substitution an assignment, never a pip argument, the empty result refused explicitly, and `set -euo pipefail` present IN THAT STEP rather than anywhere in the file
 #   (was 87/81; the CI-green pass added 2a-0 and 2c-b..2c-e over the oid
 #   validation parse_fingerprint gained. Check 4f used to fail on a hosted
 #   x86_64 runner ONLY: it harvests --emit-accepted through that parser from
@@ -5248,7 +5273,7 @@ refuse every record already written. The stamp carries its own
 # is a different INPUT to a pure function or an attribute rebind inside
 # try/finally with the restore asserted BY IDENTITY -- so it needs no
 # _EXEC_ALLOWLIST entry. ~2 s.
-python tests/test_resume_configuration_fingerprint.py            # 494 (was 488; the determinism pass gated matching_temperature_sent as FINGERPRINT_VERSION 7 and added it to the mismatch table with its stored value DERIVED as 'whichever of the two states this process is not'. Before that 488, was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
+python tests/test_resume_configuration_fingerprint.py            # 500 (MEASURED 2026-09-10; this line said 494 and was stale by 6. Before that 494, was 488; the determinism pass gated matching_temperature_sent as FINGERPRINT_VERSION 7 and added it to the mismatch table with its stored value DERIVED as 'whichever of the two states this process is not'. Before that 488, was 460; the cohort-selection pass added the two new gated fields to the mismatch table -- which that section's own round trip REQUIRES, so a field gated and left undriven fails there -- and one check that the cohort digest is written as its own checkpoint key rather than smuggled into the stamp. Before that 460; the pre-migration pass drove the future-era stamp both directions)
 ```
 
 **TEST COUNTS.** `tests/test_agent_degraded_run_and_reporting.py` **118 → 118**
@@ -11714,7 +11739,7 @@ true as it was. Both the pin and the docstring it pins say so.
 # sentence). It DOES exec: nine in-memory copies
 # (evaluation.py, bedrock_anthropic_adapter.py and config.py), one plant each,
 # argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_agent_bedrock_anthropic_per_trial.py              # 199 (this line said 198; MEASURED 2026-09-03)
+python tests/test_agent_bedrock_anthropic_per_trial.py              # 211 (MEASURED 2026-09-10; this line said 199 and was stale by 12. Before that 199, said 198; MEASURED 2026-09-03)
 
 # The per-trial go-live probe for the Converse branch. NOT RUN by this pass.
 python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
@@ -14875,7 +14900,7 @@ firing control rather than claimed. The bucket-A justification in
 # (default_run_dir() is never called), no database, no git history. It writes
 # only inside three tempfile.mkdtemp trees, each removed in a finally with the
 # removal ASSERTED. Bucket A, ~2.4 s.
-python tests/test_evaluation_rater.py                               # 524 (was 467)
+python tests/test_evaluation_rater.py                               # 592 (MEASURED 2026-09-10; this line said 524 and was stale by 68 -- the evaluation-safeguards pass recorded 592 in its own account and this line never moved. Before that 524, was 467)
 ```
 
 **VERIFIED BY RUNNING.** `tests/test_evaluation_rater.py` **467 -> 534**;
@@ -15537,6 +15562,342 @@ the path, and nothing drives it there.
    session the retry still doubles `args.max_tokens` and records that nowhere,
    so a session's ratings can mix primary and retry ceilings with no column
    saying which.
+
+
+### A refusal names the remedy that is true of it (the unreachable-remedy pass)
+
+**FOUR ITEMS, AND THE FIRST TWO ARE VERIFICATIONS THAT WENT DIFFERENT WAYS.**
+No billed call, no AWS call, no commit: three files in the working tree. The
+renderer digest (`5ea2c6cc...`), `PROMPT_VERSION` 1.11.0, `FINGERPRINT_VERSION`
+8 and `SCHEMA_USER_VERSION` 15 are **byte-identical to HEAD**, measured in a
+`git worktree`, so no model-visible classifier input moved; the production
+`inferences.db` (`ab1403e3...`, 90,185,728 bytes), `ablation_results.db`
+(`f2bc23c6...`) and the spend journal (`a9682eb9...`, 14,789 bytes) are
+unchanged, and so is the twelve-fixture set.
+
+**1. THE ACCEPTED-TABLE PARSER IS CORRECT AND NOTHING WAS CHANGED.** The
+premise was that `read_accepted` mishandles a trailing comment block -- BLOCK 5
+of `.github/scan-accepted-fingerprints.txt`, which carries no fingerprint on
+purpose. **DRIVEN, against the real file and six constructed cases**: the real
+file yields **24 entries**, none of them carrying BLOCK 5's text; a trailing
+block blank-separated, a trailing block NOT blank-separated, a
+separator-rule-only block, a comment-ONLY file, and a trailing block with no
+final newline all parse without raising and without misattributing a reason.
+The mechanism is that a reason is consumed AT the fingerprint line, so a block
+with no fingerprint after it accumulates and is dropped at EOF. The real file
+was additionally surveyed: **24 fingerprint lines, 92 non-blank lines after the
+last one, all of them comments, and ZERO cases of a comment line immediately
+following a fingerprint** -- which is the one shape whose behaviour is
+surprising (it accumulates into the NEXT entry's reason, which is what "blank
+lines end a block" means and is documented). **No change, no test added.**
+
+**2. THE REFUSAL OFFERED ONE REMEDY, AND FOR A DANGLING OBJECT IT WAS THE
+MEASURED WRONG ONE.** `object_census` walks `--batch-all-objects`, so the gate
+sees objects no ref reaches -- deliberately, and it is what lets a force-push
+residue be refused. But the message said, for every finding, "add the
+fingerprint to the accepted table". BLOCK 5 is the measurement that this breaks
+CI: a fingerprint keyed on an object one developer's database holds matches
+nothing in any clone, so every other checkout reports it under ACCEPTED TABLE IS
+STALE and exits **2**. **The message was sending an operator to the one action
+that turns a local finding into a permanent CI failure**, and this checkout
+reaches it today -- `python .github/scripts/secret_scan_gate.py` exits 1 on
+`7348124f...`, driven before and after.
+
+**THE CLASSIFICATION IS VERIFIED, NOT INFERRED, AND THE SYMPTOM IS THE TRAP.**
+"No basename" is what first suggests a dangling blob and it is **not evidence**:
+measured in a scratch repository, a blob `git add`ed and never committed is
+reached by the INDEX and named by no TREE, so on the objects range it is
+reported with no basename and is nonetheless in the very next commit.
+Classifying from the symptom tells that operator to prune what they have just
+staged. `classify_reachability` asks git instead.
+
+**THE PROBE IS `rev-list --objects --all --reflog --indexed-objects` AND EVERY
+FLAG WAS MEASURED**, in a scratch repository, before the code was written:
+
+| shape | `--all` | `+ --reflog --indexed-objects` | in the object database |
+|---|---|---|---|
+| `git add`ed, never committed | no | **yes** | yes |
+| `hash-object -w`, referenced by nothing | no | **no** | yes |
+| `reset --hard` residue | no | **yes** | yes |
+| ...after `reflog expire --expire=now` | no | **no** | yes |
+
+So the three flags together are exactly BLOCK 5's own inspection, and the remedy
+that block names (`git prune --expire=now`) is true of an object reached by none
+of them **and of no other object**. A reflog-pinned residue is reported
+REACHABLE -- the conservative answer, because prune will not touch it and a
+message naming expiry would be a remedy that does nothing.
+
+**THREE STATES, AND `unverified` IS A MEMBER RATHER THAN A FALL-THROUGH.** The
+natural implementation is `if oid not in reachable: unreachable`, and then a
+probe that could not answer reports EVERY finding as dangling and recommends
+deleting content that may be in every clone. `REACHABILITY_STATES` is closed;
+`classify_reachability` **never raises** (it runs on a path that has already
+decided to refuse, so a probe failure must not turn exit 1 into exit 3); and an
+EMPTY probe result is read as "not established" rather than as "nothing is
+reachable" -- the load-bearing half, with an empty repository as its reachable
+shape.
+
+**THE EXIT CODE DOES NOT MOVE.** A verified-unreachable finding is still exit
+**1**. The object is in this database, `git push --mirror` and a recovery can
+still reach it, and a gate that stopped refusing would be a gate that decided an
+operator's cleanup had happened. What changes is the sentence: the finding names
+itself verified-unreachable, says the accepted table is the wrong instrument and
+why, and names operator-reviewed local cleanup -- **`git fsck --unreachable`
+first, then `git prune --expire=now`** -- while stating that this gate performs
+none of it, because expiry removes every unreachable object in the checkout and
+not only the one reported.
+
+**ALL THREE PATHS ARE DRIVEN AGAINST REAL REPOSITORY STATES, and the
+discriminating controls are the point.** `tests/test_secret_scan_gate.py`
+section 6 is **74 checks** (6g..6z-z10): a committed plant gets the ordinary
+remedy and not the cleanup one; an orphan blob written with `hash-object -w`
+gets the cleanup remedy and not the ordinary one; a **reflog-pinned** residue
+gets the ordinary remedy and then becomes unreached once its reflog is expired,
+in one repository, on one blob; a **staged-only** blob is refused, reported with
+no basename, and NOT called unreached; an **empty-result** probe and a probe
+**broken by a `git` shim** each get the third heading and neither remedy; and
+the classifier's three states are driven directly.
+
+**SEVEN REVERTS, SEVEN CAUGHT**, each planted into a `git worktree` copy carrying
+this pass's two files, with the clean control green at 169/0/3 and the restore
+asserted byte-identical: the unverified findings folded back under the reachable
+heading (**7** recorded failures), the unverified heading deleted so its
+findings are counted and printed under nothing (**7**), the split removed
+(**20**), `unverified` collapsed into a fall-through (**18**), the
+classification replaced by the symptom guess (**16**), the unfounded scope claim
+reinstated (**3**) and the probe note left un-collapsed (**2**).
+
+**AND THE MATRIX CORRECTED ONE OF THIS PASS'S OWN CHECKS.** 6p asserts the
+message says "VERIFIED, not guessed" -- and a SENTENCE survives the
+classification being replaced by a guess, measured: the symptom revert left 6p
+passing, because "no basename" happens to give the right answer for that
+particular blob. **A claim in the text is not the fact it claims.** 6p-b ties it
+to its evidence (the probe must have run and reported a count) and 6p-c..6p-h
+are the dangerous-direction control described above; the same revert now fires
+six checks instead of three.
+
+**3. THE MODULE TABLE WAS MISSING 25 SUBSTANTIVE MODULES, NOT SEVEN, AND ONE
+CELL WAS STALE.** Derived rather than taken: **114 `.py` files under
+`oncotriage/`, 62 rows**, 53 files unrowed. Of those, **18 are `__init__.py`** --
+every one of them a docstring plus `__all__`, none holding code, and none has
+ever been in the table, which is a consistent category decision rather than a
+gap -- and **10 are dashboard tabs** covered by the one WILDCARD row. The
+remaining **25 are now rows**, and **every one of their Imports cells was
+DERIVED BY AST and is exactly correct**, checked by expanding the table's own
+`a.{b,c}` brace convention back out and comparing to the module's real import
+set. The wildcard row's own cell was wrong in both halves: it said "nine of
+them" (there are ten, since the run-health tab) and named four of the seven
+modules the ten tabs actually import; it now carries the **measured union**.
+The table covers every substantive module on disk.
+
+**NO COMPLETENESS TEST WAS BUILT, AND THAT IS THE INSTRUCTION FOLLOWED RATHER
+THAN A GAP.** The table's intent is nowhere stated, and the evidence points AWAY
+from "an inventory": it carries a wildcard row, it lists no `__init__.py`, and
+the prose above it points a reader at `PIPELINE SEQUENCE.md` for the stage-by-
+stage reading order. A completeness check would therefore pin a property the
+table has never claimed, and its first failure would be an argument about
+whether a package marker is a module. **Reported instead of built.**
+
+**4. NINE CURRENT REFERENCE COUNTS WERE STALE, AND THE SWEEP THAT FOUND THEM IS
+THE ONE BUCKET-A RUN.** Every `python tests/test_*.py  # N` line in this file was
+compared against a measurement taken through `ci_test_buckets._run_one` -- the
+runner's own execution path, so the isolation is CI's -- over all **112 bucket-A
+members: 112 ran, 0 failed**. 55 agreed. Six report `RESULTS: N passed` rather
+than `passed: N`, so the sweep's parser missed them and each was measured
+directly: **186, 167, 82, 79, 165, 130, all agreeing**. The nine that did not:
+
+| line | was | is |
+|---|---|---|
+| `test_evaluation_rater.py` | 524 | **592** (stale by 68; the evaluation-safeguards pass recorded 592 in its own account and this line never moved) |
+| `test_secret_scan_gate.py` | 108 / 102 | **146 / 140** (this pass) |
+| `test_agent_bedrock_anthropic_per_trial.py` | 199 | **211** |
+| `test_resume_configuration_fingerprint.py` | 494 | **500** |
+| `test_tracking_mlflow_index.py` | 109 | **114** |
+| `test_fixture_call_mode_pin.py` | 87 | **91** |
+| `test_agent_bedrock_adapter.py` | 292 | **294** |
+| `test_spend_gate.py` | 162 | **164** |
+| `test_degradation_counter_readers.py` | 158 | **160** |
+
+Every historical trail is preserved and every dated past-tense account is
+untouched. **The "Version state, CURRENT" block was re-measured from source and
+needed no edit** -- all thirteen of its values agree, `MATCHING_PROVIDER`
+through the boto3/botocore pin.
+
+**THE FIRST VERSION OF THIS MESSAGE WAS TWO-STATE WHERE THE OPERATOR READ IT,
+AND ONE OF ITS OWN CHECKS PINNED THAT.** Recorded here rather than quietly
+corrected, because the failure shape is the one this whole pass is about.
+`classify_reachability` answered three states from the start; the printed
+refusal partitioned on `== UNREACHABLE` and put **everything else** -- including
+`unverified` -- under a heading reading "in content this repository REACHES -- a
+ref, a reflog entry or the index", with the accepted-table remedy under it. So a
+run that COULD NOT LOOK printed a positive claim that it had looked and found
+the content reachable, which is strictly worse than having no third state: it
+converts "I do not know" into evidence. **And check 6z-l REQUIRED it** -- it read
+"the gate there refuses with the ordinary remedy, not cleanup" and asserted the
+accepted-table remedy was present, so the defect was not merely unnoticed, it
+was pinned. The lesson is the one this project keeps paying for from a new
+direction: **a check written against a classifier's RETURN VALUE cannot see that
+the classifier's answer is misreported downstream.** Every check in the repaired
+block drives the FINAL PRINTED OUTPUT.
+
+**THREE HEADINGS, AND THE THIRD OFFERS NEITHER REMEDY.** `reaching` gets the
+accepted-table remedy; `unreached` gets do-not-accept plus operator-reviewed
+cleanup; `unverified` gets **"Reachability could not be established."**, the
+findings listed, the probe result named, and the instruction to resolve the
+probe and re-run. **Cleanup is not offered there, and neither is the accepted
+table** -- the brief for the repair asked only for the first, and withholding
+both is what the situation actually supports: the two remedies are OPPOSITES,
+which one applies follows from the fact the run failed to establish, and one of
+the two is irreversible. Naming either would be advising an action on a coin
+toss. Exit stays **1**: the object is in this database whatever its
+reachability.
+
+**THE PARTITION IS TOTAL BY CONSTRUCTION, WHICH IS ONE LINE MORE THAN THE THREE
+HEADINGS NEEDED.** `unverified` is `not in (REACHABLE, UNREACHABLE)` rather than
+`== UNVERIFIED`, so a state outside the vocabulary is folded there and named
+loudly rather than being counted in the total and printed under no heading at
+all -- a refusal that says N and lists fewer than N. `heading_counts` parses the
+printed text and 6z-u / 6z-z5 require the three sections to SUM to the total,
+with their own non-degeneracy; revert R0b deletes the third heading and fires
+seven checks.
+
+**THE SCOPE CLAIMS WERE UNFOUNDED IN BOTH DIRECTIONS, AND BOTH WERE REFUTED BY
+MEASUREMENT RATHER THAN BY ARGUMENT.** The message said an unreached object "is
+in THIS object database and in no clone" and that a fingerprint keyed on it
+"matches nothing anywhere else"; the module comment said a ref-reachable object
+"is in every clone". In scratch repositories:
+
+* **an object reachable from a LOCAL ref can be absent from an existing clone.**
+  Committed in `origin` after `worker` was cloned: listed by
+  `rev-list --objects --all` in `origin`, and **not in `worker`'s object
+  database at all** (present in a *fresh* clone).
+* **an object unreachable HERE can be reachable somewhere ELSE.** The same
+  content and the same oid: in `fresh`'s database and listed by
+  `--all --reflog --indexed-objects` **zero** times there, while reachable from
+  a branch in `worker`.
+
+The second is the direct refutation of the flagged sentence. Every claim is now
+held to what the probe answers -- **"not reached by the inspected local refs,
+reflogs or index"** -- and the message says in as many words that it establishes
+NOTHING about any other repository. **The correction was applied to the comments
+and docstrings as well as to the printed message**, which is wider than the
+repair brief asked: leaving the file's own argument asserting what the message
+had just stopped asserting is the "a file that argues about its own settings"
+trap this project has met four times.
+
+**AND THE REPLACEMENT WAS ITSELF WRONG, WHICH IS THE THIRD CORRECTION TO ONE
+PARAGRAPH AND THE REASON THE CLAIM IS NOW PINNED BY A SCAN RATHER THAN BY
+CARE.** The repaired do-not-accept advice read: a fingerprint matches only where
+the object is present, "which a fresh clone will not [have], since a clone is
+driven by refs". **MEASURED, AND FALSE FOR THREE OF THE FOUR CLONE FORMS
+TRIED** -- `git clone <local path>` uses the local optimisation and HARDLINKS
+the whole object directory, so an unreferenced blob arrives in the clone with
+the same inode; `--no-hardlinks` copies it; `--depth=1` carried it too; and only
+a clone forced through the transport (`file://`, or a network remote) filtered
+by reachability. The blob is still UNREACHABLE in that clone, so the gate there
+reports it under the same heading and an accepted fingerprint keyed on it WOULD
+match. The message now states only what is established -- **"If another checkout
+lacks this object, its accepted fingerprint will be reported as stale."** -- and
+says in the next paragraph that WHICH checkouts lack it is not something this
+gate can decide, with the four-form measurement beside it. The blanket
+"accepting it breaks CI" is gone from all three layers for the same reason: what
+is established is conditional on a checkout lacking the object.
+
+**THE CLAIM IS PINNED IN TWO PLACES NOW, AND EACH CATCHES WHAT THE OTHER
+CANNOT.** `6z-z8` scans **all four refusal outputs** for a set of retired
+phrasings -- its first version read only the unreached one, and the blanket
+"breaks CI" sentence lives in the UNVERIFIED one, so a revert restoring it was
+MISSED. `6z-z8-ii` scans the gate's **source**, which is the only way to reach
+the comment and docstring layers: the `object_census` docstring said "a clone
+transfers only reachable objects" for a whole pass after the printed message had
+stopped saying it, and a revert restoring it is invisible to any check that
+reads output. Its rule is not "the words are absent" -- the file QUOTES the
+retired claims in the note recording their retirement -- but that any occurrence
+IS such a quotation: on a comment line, inside a note that says the claims are
+false. **Both scans are case-INSENSITIVE, and that was found by a revert rather
+than by reading**: the same claim reads "since a clone is driven by refs"
+mid-sentence and "A clone is driven by refs" at the start of one, and the
+case-sensitive version MISSED the flag-table comment.
+
+**SIX PLANTS ACROSS THE THREE LAYERS, SIX CAUGHT** -- the clone assertion
+restored in the message, in the docstring and in the flag-table comment
+(capitalised), the blanket "breaks CI" restored in the unverified message and in
+an inline comment, and the retirement note itself deleted, which fires the
+non-degeneracy probe. **AND THE SOURCE SCAN FOUND A RESIDUE OF MY OWN ON ITS
+FIRST RUN**: the `if unverified:` inline comment still read "recording it breaks
+CI" after I had corrected the printed sentence four lines away.
+
+**AND THE REVERT MATRIX FOUND A WEAK CHECK OF MINE THAT READING DID NOT.**
+R5 -- the probe note left un-collapsed, so git's multi-line stderr breaks the
+indented block it is printed inside -- was **MISSED** on the first run. The two
+checks written for it named the shape of one leak: a line equal to
+`second stderr line`, and a line containing `could not run` that was unindented.
+The real leak produces `second stderr line)` -- the note's closing paren -- on a
+line carrying neither marker. They assert the PROPERTY now (**no line of the
+refusal falls outside its own two-space indentation**, with a non-degeneracy
+probe and the three legitimately-unindented prefixes named) plus the decisive
+one at the source: the classifier driven in-process with the shim on `PATH`, its
+note required to contain no newline, `PATH` restored in a `finally` and the
+restore asserted. R5 now fires two checks.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **42 BUCKET-A TEST FILES HAVE NO RUN-BLOCK ENTRY AT ALL** in this file --
+   measured, and it is a different gap from a stale count: there is no number to
+   be stale. Among them are files as large as
+   `test_agent_summary_temporal_tagging.py` (245),
+   `test_staging_exclusions.py` (148) and `test_indexer_criteria_split_gate.py`
+   (153). Adding them is a documentation pass of its own.
+2. **THE EXISTING ROWS' `Imports` CELLS ARE STALE, and the 25 new ones are not.**
+   Spot-checked by AST: `agent/readiness.py` also imports `observability`;
+   `storage/queries.py` also imports `observability` and
+   `storage.database_logger`; `agent/models.py` also imports `spend`;
+   `agent/evaluation.py`'s cell names four `agent.*` modules and `utils` where
+   the module imports seven, plus `deid`, `observability` and `spend` and NOT
+   `utils`. Refreshing all 62 is mechanical -- the extractor is in this pass's
+   scratch work -- and it is not a row addition, so it was left.
+3. **BLOCK 5 OF THE ACCEPTED TABLE STILL LEADS WITH THE SYMPTOM.** It says the
+   absent basename "is the first symptom", which this pass measured to be
+   evidence of nothing. The gate now names the finding verified-unreachable on
+   its own, so that block could point at the message instead of at the symptom.
+   Editing the accepted table was outside this bundle.
+4. **THE GITLEAKS HALF OF THE NEW CHECKS IS UNMEASURED.** This machine has no
+   gitleaks binary, so 169 is the one-engine count and 175 is derived. Nothing
+   in section 6's new block is gitleaks-specific, and the classification is
+   engine-independent by construction (it keys on the oid), but the number is
+   arithmetic rather than a measurement.
+5. **THE DANGLING OBJECT IS STILL THERE.** No pruning was performed, per the
+   instruction and per BLOCK 5's own argument that 295 unreachable objects would
+   go with it. `python .github/scripts/secret_scan_gate.py` therefore still
+   exits 1 in this checkout -- with a message that now names the right remedy.
+6. **THE `unverified` HEADING HAS NEVER BEEN REACHED IN PRODUCTION.** Both of
+   its drives are constructed -- an empty repository and a `git` shim -- because
+   the two real ways in are a broken `git` and a SHA-256 object format, and
+   neither is this checkout. The message is verified; the CIRCUMSTANCE is not
+   one anybody has met.
+7. **THE PROBE-NOTE LINE IS NOT WRAPPED.** `Reachability could not be
+   established: <note>.` runs past 80 characters when git's stderr is long. The
+   note is collapsed to one LINE, which is what the block's layout needs, and it
+   is not wrapped to a width, which a reader of a narrow terminal will notice.
+8. **`_KNOWN_UNINDENTED` IS A PREFIX LIST.** A leaked stderr line beginning
+   `range=`, `SECRET SCAN FAILED:` or `[Paths]` would pass 6z-z6. Implausible
+   for git's stderr, and stated rather than left as an assumption.
+9. **THE CLAIM SCAN IS A PHRASE LIST, NOT A MEANING.** `_FORBIDDEN_CLAIMS` holds
+   the eight phrasings this file has actually used; a NEW paraphrase of the same
+   unfounded universal -- "no other repository will have it", say -- passes both
+   scans. Three corrections to one paragraph is why the list exists at all, and
+   a phrase list is the strongest thing available: no check can decide whether a
+   sentence asserts something a probe cannot establish.
+10. **THE FOUR CLONE FORMS ARE THE FOUR THAT WERE TRIED.** `git clone <path>`,
+   `--no-hardlinks`, `--depth=1` and `file://`. A network remote was NOT driven
+   -- it needs a server -- so "only a clone forced through the transport
+   filtered by reachability" rests on `file://` standing in for it, which is the
+   documented mechanism (the local optimisation is skipped) rather than a
+   measurement of a real remote.
+11. **`--reference` AND `--shared` WERE NOT TRIED**, and both borrow the source
+   object directory outright, so both would carry an unreferenced object as
+   well. Naming them would strengthen the message; measuring them was outside
+   this correction.
 
 
 Data and keys live outside this folder. Never write an
