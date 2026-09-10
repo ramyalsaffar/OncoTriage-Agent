@@ -95,6 +95,64 @@ production cluster.
 """
 
 
+QDRANT_URL_ENV = "ONCOTRIAGE_QDRANT_URL"
+QDRANT_API_KEY_ENV = "ONCOTRIAGE_QDRANT_API_KEY"
+"""The two names that decide where a Qdrant client is pointed and what it
+sends. Named here rather than written out at each call site: four places set
+them now -- the CI runner and three test files -- and a typo in one of four
+copies is a file that silently keeps reaching the production cluster."""
+
+
+def isolate_qdrant(env):
+    """Point `env` at CLOSED_PORT_URL and remove the key. Mutates and returns it.
+
+    HARD-SET RATHER THAN `setdefault`, in every caller. A `setdefault` fills a
+    hole and leaves an exported value standing, which is the one case that
+    matters: `ONCOTRIAGE_QDRANT_URL` is the documented override that beats the
+    credentials file, so an operator or a runner with a cloud endpoint exported
+    puts every unstubbed Qdrant reach on the wire. The first version of this
+    rule was hard-set in one file and `setdefault` in another, on the argument
+    that a single file run by hand should respect a deliberate override; that
+    asymmetry is gone, because a file whose own header says it makes no live
+    call must not have that be conditional on the invoking shell.
+
+    THE KEY IS POPPED RATHER THAN SET. `config.get_qdrant_api_key()` returns
+    None when the URL was overridden without one -- "does not fall back to the
+    .env", its own docstring -- so removing the name is what leaves an isolated
+    process carrying no credential at all, rather than one addressed to a port
+    nothing answers.
+
+    Pure with respect to output: the announcement is `qdrant_isolation_note`,
+    which a caller prints ONCE. Printing here would emit one identical line per
+    call for a caller that builds a child environment per drive.
+    """
+    env[QDRANT_URL_ENV] = CLOSED_PORT_URL
+    env.pop(QDRANT_API_KEY_ENV, None)
+    return env
+
+
+def qdrant_isolation_note(env, who):
+    """What to tell an operator whose exported endpoint was overridden.
+
+    None when there is nothing to say, which is every CI environment and every
+    shell that did not export one -- so the absence of this line is not
+    evidence that the isolation did not happen. `who` is the name that did the
+    overriding, because a reader meeting this line needs to know which of the
+    four callers it came from.
+
+    Read BEFORE `isolate_qdrant` has run, or from a separate mapping: it
+    reports what WAS there.
+    """
+    external = env.get(QDRANT_URL_ENV)
+    if external is None or external == CLOSED_PORT_URL:
+        return None
+    dropped = (f" {QDRANT_API_KEY_ENV} was dropped with it."
+               if QDRANT_API_KEY_ENV in env else "")
+    return (f"[isolation] {who}: {QDRANT_URL_ENV}={external!r} was exported; "
+            f"it was overridden with {CLOSED_PORT_URL!r} so nothing here can "
+            f"reach a live index.{dropped}")
+
+
 # --- the park protocol ------------------------------------------------------
 
 ENV_PARK = "ONC_PARK"

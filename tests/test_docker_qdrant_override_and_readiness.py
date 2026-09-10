@@ -701,11 +701,29 @@ if TestClient is not None:
     try:
         _server.graph = object()          # "the graph compiled"
 
+        # THE STUB IS INSTALLED BEFORE `__enter__`, AND IT HAS TO BE. The
+        # comment inside the block used to say "It is entered once, with a
+        # populated stub installed" while the install sat one line BELOW the
+        # `with` -- so lifespan ran with no override and `serving_readiness` ->
+        # `probe_index` reached the REAL client, which on any machine with a
+        # credentials file is the production Qdrant Cloud endpoint. MEASURED
+        # with a recorder that logged and REFUSED every outbound attempt it
+        # intercepted -- what it saw in this process, not total egress: 2
+        # connection attempts to that host, from this file, every run. Nothing failed --
+        # the cloud index answers -- so the only symptom was a startup that was
+        # healthy for a reason the test did not choose.
+        #
+        # This is the shape section 5d thirty lines below already uses for
+        # `_c2`; the two are consistent now.
+        _deps.set_override(_deps.QDRANT_CLIENT,
+                           _StubQdrant(exists=True, points=42))
+        _readiness.reset_index_probe_cache()
+
         with TestClient(_server.app, raise_server_exceptions=False) as _c:
-            # TestClient's context manager RUNS lifespan, which compiles the
-            # real graph. It is entered once, with a populated stub installed,
-            # so startup is the healthy case and the unhealthy ones below are
-            # per-request.
+            # Entered once, with the populated stub above already installed, so
+            # startup IS the healthy case and the unhealthy ones below are
+            # per-request. Re-installed here so this block still states the
+            # precondition each request depends on.
             _deps.set_override(_deps.QDRANT_CLIENT,
                                _StubQdrant(exists=True, points=42))
             _readiness.reset_index_probe_cache()

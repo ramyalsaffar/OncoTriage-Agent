@@ -215,7 +215,7 @@ _PROVIDER_BEFORE_PIN = _provider_pin.pin_openai_arm(os.path.basename(__file__))
 # MINIMAL ASSERTION HARNESS
 # ===========================================================================
 
-_RESULTS = {"passed": 0, "failed": 0}
+_RESULTS = {"passed": 0, "failed": 0, "skipped": 0}
 _FAILURES = []
 
 
@@ -236,6 +236,27 @@ def check(label: str, actual, expected) -> None:
 
 def check_true(label: str, actual) -> None:
     check(label, bool(actual), True)
+
+
+_SKIPS = []
+
+
+def skip(label: str, reason: str) -> None:
+    """Record coverage that could NOT be exercised in this environment.
+
+    A SKIP IS NOT A PASS AND IS NEVER COUNTED AS ONE, which is
+    tests/test_package_invariants.py's rule adopted verbatim rather than
+    reinvented. It has its own counter, its own line in the summary and its own
+    list, so a run that could not exercise something says so instead of
+    reporting a smaller green number that reads identically to a full one. It
+    does not affect the exit code: the thing skipped is not broken, it is
+    absent.
+
+    The only caller today is SECTION E's live-Qdrant probe.
+    """
+    _RESULTS["skipped"] += 1
+    _SKIPS.append(f"{label}\n          {reason}")
+    print(f"  SKIP  {label}")
 
 
 # ===========================================================================
@@ -752,30 +773,61 @@ print("\n" + "=" * 75)
 print("SECTION E -- live Qdrant probe (informational)")
 print("=" * 75)
 
-_probe_url = os.environ.get("ONCOTRIAGE_QDRANT_PROBE_URL")
+# THE PROBE IS OPT-IN AND NEVER FALLS BACK TO THE PRODUCTION CLIENT.
+#
+# It used to read `deps.get_qdrant_client()` when ONCOTRIAGE_QDRANT_PROBE_URL
+# was unset, which is the pipeline's own client: on any machine with a
+# credentials file that is the live Qdrant Cloud endpoint. MEASURED, with every
+# outbound attempt recorded and refused: this file made 2 connection attempts
+# to that host, both from this line, in a file whose bucket-A entry said it
+# "makes no live call". Nothing failed and nothing was billed -- the cloud
+# index answers -- so the only trace was a PROBE line that read like a local
+# success.
+#
+# The fallback was not a convenience. This section asserts NOTHING (see the
+# header above: "Reported, never asserted"), so the fallback bought a printed
+# line about a server nobody asked it to reach, at the cost of a live network
+# dependency in the file that runs first in bucket A.
+#
+# UNSET IS A SKIP, BY NAME. The variable is named in the message because that
+# is the whole remedy, and the skip is COUNTED -- a section that did not run
+# must not be invisible in a summary that reports only passes and failures.
+_PROBE_URL_ENV = "ONCOTRIAGE_QDRANT_PROBE_URL"
+_probe_url = os.environ.get(_PROBE_URL_ENV)
 _probe_collection = os.environ.get("ONCOTRIAGE_QDRANT_PROBE_COLLECTION",
                                    COLLECTION_NAME)
 
-try:
-    _probe_client = (QdrantClient(url=_probe_url, timeout=15)
-                     if _probe_url else deps.get_qdrant_client())
-    _probe_points = _probe_client.query_points(
-        collection_name=_probe_collection,
-        query=SparseVector(indices=[], values=[]),
-        using="title-bm25",
-        limit=5,
-        with_payload=False,
-    ).points
-    print(f"  PROBE  empty SparseVector accepted by "
-          f"{_probe_url or 'the configured server'}: "
-          f"{len(_probe_points)} points returned, no exception")
-    print("         -> matches the recorded finding: Qdrant does not reject it")
-except Exception as _probe_error:
-    print(f"  SKIP   no reachable Qdrant "
-          f"({type(_probe_error).__name__}: {str(_probe_error)[:120]})")
-    print("         Recorded finding stands: Qdrant v1.18.3 ACCEPTS an empty")
-    print("         SparseVector and returns zero points. Re-run with")
-    print("         ONCOTRIAGE_QDRANT_PROBE_URL set to reproduce.")
+if not _probe_url:
+    skip("SECTION E  live Qdrant probe (empty SparseVector behaviour)",
+         f"{_PROBE_URL_ENV} is not set, so there is no server this file was "
+         f"asked to reach. It does NOT fall back to the pipeline's own client: "
+         f"that is the live index on any machine with a credentials file, and "
+         f"this section asserts nothing that would justify reaching it.\n"
+         f"          Recorded finding stands: Qdrant v1.18.3 ACCEPTS an empty "
+         f"SparseVector and returns zero points -- no exception, no 4xx.\n"
+         f"          Re-run with {_PROBE_URL_ENV}=<url> to reproduce it.")
+else:
+    try:
+        _probe_client = QdrantClient(url=_probe_url, timeout=15)
+        _probe_points = _probe_client.query_points(
+            collection_name=_probe_collection,
+            query=SparseVector(indices=[], values=[]),
+            using="title-bm25",
+            limit=5,
+            with_payload=False,
+        ).points
+        print(f"  PROBE  empty SparseVector accepted by {_probe_url}: "
+              f"{len(_probe_points)} points returned, no exception")
+        print("         -> matches the recorded finding: Qdrant does not reject it")
+    except Exception as _probe_error:
+        # A NAMED server that could not be reached is a SKIP and not a pass:
+        # the operator asked for this probe and did not get it.
+        skip("SECTION E  live Qdrant probe (empty SparseVector behaviour)",
+             f"{_PROBE_URL_ENV}={_probe_url!r} was set and could not be "
+             f"reached ({type(_probe_error).__name__}: "
+             f"{str(_probe_error)[:120]}).\n"
+             f"          Recorded finding stands: Qdrant v1.18.3 ACCEPTS an "
+             f"empty SparseVector and returns zero points.")
 
 
 # ===========================================================================
@@ -1123,11 +1175,22 @@ print("SUMMARY")
 print("=" * 75)
 print(f"  Passed: {_RESULTS['passed']}")
 print(f"  Failed: {_RESULTS['failed']}")
+# ALWAYS PRINTED, even at zero -- tests/test_package_invariants.py's rule. A
+# skip count that only appears when non-zero makes its absence ambiguous: the
+# reader cannot tell a run with nothing skipped from a run by a version of this
+# file that had no skip mechanism at all.
+print(f"  Skipped: {_RESULTS['skipped']}   (a skip is NOT a pass and is not "
+      f"counted as one)")
 
 if _FAILURES:
     print("\nFAILURES:")
     for _f in _FAILURES:
         print(f"  - {_f}")
+
+if _SKIPS:
+    print("\nSKIPPED:")
+    for _s in _SKIPS:
+        print(f"  - {_s}")
 
 print(f"\nTemporary database: {inferences_path}")
 

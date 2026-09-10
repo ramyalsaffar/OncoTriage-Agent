@@ -103,10 +103,48 @@ except ImportError:
         raise
     del _candidate, _how
 
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+
 # The graph is a stand-in and is never invoked, so nothing here can reach a
 # model. The flag is the second line of defence: a stand-in forgotten in a
 # future edit becomes a named RuntimeError instead of a 110 MB download.
 os.environ.setdefault("ONCOTRIAGE_DEFER_LOCAL_MODELS", "1")
+
+# ...AND THE SAME SECOND LINE OF DEFENCE FOR THE INDEX, WHICH THIS FILE DID NOT
+# HAVE. The graph is a stand-in and `process_patient` is a stand-in, so no
+# billed call is reachable -- and the run-identity machinery underneath them is
+# the REAL thing, and it resolves the collection over the wire.
+# MEASURED with a recorder that logged and REFUSED every outbound attempt it
+# intercepted -- it reports what it saw in this process, not total egress:
+# this file made 26 connection attempts to the production Qdrant Cloud
+# endpoint, all of them in THIS process -- `run_fingerprint._resolve_collection`
+# -> `utils.resolve_qdrant_collection`, and `readiness.probe_index`. Nothing
+# failed, because the cloud index answers; the cost was a live dependency in a
+# file classified as making none.
+#
+# IT IS SET HERE, ABOVE THE IMPORTS, BECAUSE THE READER IS IN-PROCESS. The
+# sigterm and stop-switch harnesses hand `_control_harness.CLOSED_PORT_URL` to
+# a CHILD, which is right for them and reaches nothing here: this file spawns
+# no subprocess at all. `oncotriage/config.py` caches the resolved endpoint per
+# process, so the assignment has to precede the first `oncotriage` import that
+# could reach it -- which is what every line below this one is.
+#
+# HARD-SET, NOT `setdefault`, AND THE ANNOUNCEMENT IS WHAT MAKES THAT HONEST.
+# The first version of this guard filled the hole and left an exported value
+# standing, on the argument that a file run by hand should respect a deliberate
+# override. That argument is wrong for this file: its own header says it makes
+# no live call, and a claim that is true only when the invoking shell happens
+# to be empty is not a claim. The rule and its argument live in
+# `tests/_control_harness.isolate_qdrant`, which four callers share.
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+import _control_harness as _harness                                # noqa: E402
+
+_ISOLATION_NOTE = _harness.qdrant_isolation_note(
+    os.environ, os.path.basename(__file__))
+_harness.isolate_qdrant(os.environ)
+if _ISOLATION_NOTE:
+    print(_ISOLATION_NOTE)
 
 import ast
 import contextlib

@@ -69,6 +69,21 @@ _TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
 _CODE_DIR = os.path.dirname(_TESTS_DIR)
 if _CODE_DIR not in sys.path:
     sys.path.insert(0, _CODE_DIR)
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+
+import _control_harness as _harness                              # noqa: E402
+
+# THE OVERRIDE IS ANNOUNCED ONCE, HERE, rather than per drive: `_run_driver`
+# builds a child environment on every call and a note printed there would be
+# one identical line per drive. Read BEFORE anything is isolated, because it
+# reports what WAS exported. Its ABSENCE is not evidence that the isolation did
+# not happen -- there is simply nothing to report in a shell that exported
+# nothing, which is every CI environment.
+_ISOLATION_NOTE = _harness.qdrant_isolation_note(
+    os.environ, os.path.basename(__file__))
+if _ISOLATION_NOTE:
+    print(_ISOLATION_NOTE)
 
 
 passed = 0
@@ -692,6 +707,25 @@ def _run_driver(extra_env=None, driver=None):
     env["PYTHONPATH"] = _CODE_DIR + os.pathsep + env.get("PYTHONPATH", "")
     env["PYTHONUNBUFFERED"] = "1"
     env["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
+    # THE NO-SPEND BACKSTOP, and it does not depend on a stand-in working --
+    # the same rule tests/test_runner_sigterm_shutdown.py applies to its
+    # children, from the same owner, which is where the argument for
+    # hard-setting rather than filling a hole lives. The driver below stubs the
+    # Qdrant client, the
+    # cross-encoder and the OpenAI client through oncotriage.agent.deps, so no
+    # billed call should be reachable; "should" is the word this variable
+    # exists to remove.
+    #
+    # MEASURED with a recorder that logged and REFUSED every outbound attempt
+    # it intercepted -- what it saw in these processes, not total egress:
+    # before this line the driver made 10 connection attempts to the Qdrant
+    # Cloud endpoint, ALL of them in the child -- `match_patient_to_trials` ->
+    # `utils.resolve_qdrant_collection`, which stamps the resolved collection
+    # onto the result and is NOT covered by the client stub, because it runs
+    # before the stub's first use and takes its own client. Nothing failed and
+    # nothing was billed; the cost was a live dependency in a file whose
+    # subject is that stdout stays empty.
+    _harness.isolate_qdrant(env)
     env.update(extra_env or {})
     return subprocess.run([sys.executable, "-c", driver or _DRIVER],
                           capture_output=True, text=True, cwd=_CODE_DIR,

@@ -109,6 +109,37 @@ except ImportError:
         raise
     del _candidate, _how
 
+# THIS FILE REACHES THE PRODUCTION QDRANT ENDPOINT AND ITS NEGATIVE CONTROL IS
+# WHY, so the endpoint is redirected rather than the control weakened.
+#
+# MEASURED with a recorder that logged and REFUSED every outbound attempt it
+# intercepted -- what it saw in this process, not total egress: ONE
+# connection attempt to the production Qdrant Cloud host, from the check that
+# asserts `deps.get_qdrant_client() is _stub_qdrant` is FALSE once the override
+# is cleared. That check is correct and load-bearing -- without it, the two
+# checks around it are satisfied by a seam that ignores overrides entirely --
+# and satisfying it means RESOLVING the real client, which constructs
+# `QdrantClient(url=...)` and probes the server's version.
+#
+# So the fix is not to drop the control. It is to make "the real client" a
+# client pointed at a closed port: the control still discriminates, because a
+# QdrantClient built from the endpoint is still not the stub, and it reaches
+# nothing. The rule and the argument for hard-setting live in
+# `tests/_control_harness.isolate_qdrant`, which four callers share.
+#
+# ABOVE THE FIRST `oncotriage` IMPORT, because `oncotriage/config.py` caches the
+# resolved endpoint for the life of the process.
+_TESTS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _TESTS_DIR not in sys.path:
+    sys.path.insert(0, _TESTS_DIR)
+import _control_harness as _harness                                # noqa: E402
+
+_ISOLATION_NOTE = _harness.qdrant_isolation_note(
+    os.environ, os.path.basename(__file__))
+_harness.isolate_qdrant(os.environ)
+if _ISOLATION_NOTE:
+    print(_ISOLATION_NOTE)
+
 from oncotriage.agent import deps
 from oncotriage.agent import evaluation as _agent_evaluation
 from oncotriage.agent.retrieval import node_hybrid_retrieval

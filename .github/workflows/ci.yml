@@ -305,6 +305,30 @@ jobs:
         # no trial corpus, no inference database and no credential is created.
         run: python .github/scripts/provision_ci_paths.py --root "$GITHUB_WORKSPACE"
 
+      - name: Pre-warm the local model cache
+        # THE ONE NETWORK ACCESS THE TEST STEPS ARE ALLOWED TO DEPEND ON, AND
+        # IT HAPPENS HERE RATHER THAN INSIDE A TEST.
+        #
+        # tests/test_agent_retrieval_observability.py SECTION A measures the
+        # REAL FastEmbed Qdrant/bm25 model on purpose: `sparse_token_count("the
+        # of and a an is to") == 0` asserts that the model HAS a stopword list
+        # and APPLIES it, which is a fact about the downloaded asset and not
+        # about any code here. A stub would make that check agree with itself.
+        #
+        # A hosted runner starts with a cold cache, so before this step that
+        # download happened inside the test step -- while the bucket-A entry for
+        # that file said it "makes no live call". This moves it, and then PROVES
+        # the move: the script checks every snapshot entry resolves to a
+        # readable file (a dangling link does NOT stop the model loading; it
+        # silently stops one stopword list being applied) and re-loads the model
+        # in a FRESH interpreter under HF_HUB_OFFLINE=1.
+        #
+        # ONCOTRIAGE_MAIN_PATH is required: the cache root is resolved through
+        # oncotriage/paths.py, under the skeleton the previous step created.
+        env:
+          ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+        run: python .github/scripts/prewarm_model_cache.py
+
       - name: Check the test classification is complete
         # Fails when a tests/test_*.py is unclassified, and when bucket B here
         # disagrees with tests/run_serial_tests.py's collision matrix.
@@ -322,6 +346,13 @@ jobs:
       - name: Bucket A — parallel-safe tests
         env:
           ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+          # OFFLINE IS ENFORCED, NOT HOPED FOR. Without this, "the tests do not
+          # download anything" is a property of the cache happening to be warm:
+          # a test that needed an un-warmed asset would quietly fetch it and
+          # still pass. With it, huggingface_hub refuses to reach the network,
+          # so such a test FAILS and names the asset. The pre-warm step above is
+          # what makes this safe, and it verifies exactly this variable.
+          HF_HUB_OFFLINE: '1'
         run: python .github/scripts/ci_test_buckets.py --run A
 
       - name: Bucket B — serial preconditions
@@ -334,6 +365,7 @@ jobs:
         if: always()
         env:
           ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+          HF_HUB_OFFLINE: '1'
         # The report goes to RUNNER_TEMP, never into the checkout: bucket B's
         # last member copytree()s the package and scans the tree, and a stray
         # file dropped in by the harness is the kind of thing that turns into a
@@ -352,6 +384,7 @@ jobs:
         if: always() && steps.serial.outputs.serial_ready == 'true'
         env:
           ONCOTRIAGE_MAIN_PATH: ${{ github.workspace }}
+          HF_HUB_OFFLINE: '1'
         run: make serial-tests
 
       - name: Bucket B — report why the serial suite did not run

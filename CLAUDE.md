@@ -549,7 +549,7 @@ python tests/test_registries_mesh_pan_cancer_resolution.py         #  58
 python tests/test_registries_cancer_codes_and_stage_extraction.py  # 136
 python tests/test_agent_ablation_flag_passthrough.py               #  53 (was 39; the MedCPT seam pass added Test 4b and the scorer half of Test 0. It is also 5x faster -- 6.4s to 1.3s -- and makes ZERO outbound calls, where it made 4 to huggingface.co on a warm cache and 15 on a cold one)
 python tests/test_storage_inference_logging_contract.py            # 101 (was 79 when this line was written, then 98; the token-persistence pass added Test 2's three scoping/spread checks)
-python tests/test_agent_retrieval_observability.py                 # 104
+python tests/test_agent_retrieval_observability.py                 # 104 passed / 0 failed / 1 SKIPPED (MEASURED 2026-09-10). THE SKIP IS THE POINT AND IS NEW: SECTION E's live-Qdrant probe used to default to `deps.get_qdrant_client()` -- the production endpoint -- when ONCOTRIAGE_QDRANT_PROBE_URL was unset, and made 2 connection attempts to it on every run of a file whose bucket-A entry said it made none. It is opt-in now and records a COUNTED skip naming the variable, on tests/test_package_invariants.py's skip() precedent, printed even at zero. The pass count did not move. The file also went 3.5s -> 1.1s, because the 3.5s included that live round trip
 python tests/test_fhir_birth_date_and_demographics.py              # 172
 python tests/test_fhir_ecog_surfacing.py                           # 113 (was 108; the pre-diagnosis ECOG pass made section 7's present-but-unusable assertion name the FAMILY rather than one member -- the scratch corpus's only unusable path is now all_before_primary_diagnosis and all_after_reference_date occurs zero times there, so the old one-member check was about to fail for a reason unrelated to what it tests. This line said 105, and the file has not reported that since the ECOG-surfacing checks were extended; MEASURED 2026-08-20); needs 04-'s scratch corpus
 python tests/test_storage_ecog_logging.py                          # 155 (this line said 104 and was stale by 51; MEASURED 2026-08-20). Needs 04-'s scratch corpus too
@@ -1145,7 +1145,7 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 # past-tense account keeps its wording.
 
 # Version state, CURRENT rather than as of any pass below, and MEASURED from
-# source on 2026-09-03 rather than carried forward. Every pass account in this
+# source on 2026-09-10 rather than carried forward. Every pass account in this
 # file states the versions IT shipped and keeps that wording, so this block is
 # the only place to read the live numbers:
 #
@@ -1154,12 +1154,12 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 #     config.matching_call_mode()         'per_trial'
 #     config.MATCHING_TEMPERATURE         0.0   -> sent, capability 'supported'
 #     config.MATCHING_PER_TRIAL_EMPTY_RETRIES  1
-#     config.MATCHING_OUTPUT_TOKENS_PER_TRIAL  2500  (INTERIM -- see below)
+#     config.MATCHING_OUTPUT_TOKENS_PER_TRIAL  3950  (INTERIM -- see below)
 #     config.CAMPAIGN_COHORT_SIZE         500, STRATIFIED by cancer group
 #     config.MEDCPT_SCORE_FLOOR           -11.6265
-#     agent.prompts.PROMPT_VERSION        '1.10.0'
-#     run_fingerprint.FINGERPRINT_VERSION 7   (12 gated fields)
-#     database_logger.SCHEMA_USER_VERSION 12
+#     agent.prompts.PROMPT_VERSION        '1.11.0'
+#     run_fingerprint.FINGERPRINT_VERSION 8   (13 gated fields)
+#     database_logger.SCHEMA_USER_VERSION 15
 #     fixtures.capture.SCHEMA_VERSION     8
 #     boto3 / botocore pin                1.42.42 / 1.42.42
 #
@@ -15114,6 +15114,168 @@ the repository was written.
    to, and then grows a `patients - started` assertion later: there is no scan
    that reads an expectation and decides whether it depends on submission
    completeness, and inventing one would be a guess about arithmetic.
+
+### Bucket A was reaching the live index (the test-isolation pass)
+
+**FIVE BUCKET-A FILES REACHED THE PRODUCTION QDRANT CLOUD ENDPOINT, IN A BUCKET
+WHOSE DEFINITION IS "no network, no keys, no spend".** MEASURED with a recorder
+that logged and REFUSED every outbound attempt it intercepted -- so the census
+cost no egress -- and that instrument reports what it saw in those processes;
+**TOTAL EGRESS FROM A RUN WAS NOT INDEPENDENTLY MEASURED**, then or now.
+
+| file | attempts | where they came from |
+|---|---:|---|
+| `test_runner_crash_record_and_db_unification.py` | 26 | in-process: `run_fingerprint._resolve_collection` -> `utils.resolve_qdrant_collection`, and `readiness.probe_index` |
+| `test_observability_logging.py` | 10 | in its CHILD driver: `match_patient_to_trials` -> `resolve_qdrant_collection`, which the client stub does not cover |
+| `test_agent_retrieval_observability.py` | 2 | SECTION E's probe defaulting to `deps.get_qdrant_client()` |
+| `test_docker_qdrant_override_and_readiness.py` | 2 | `TestClient.__enter__` running `lifespan` BEFORE its own stub was installed |
+| `test_storage_inference_logging_contract.py` | 1 | the negative control that resolves the REAL client to prove the seam discriminates |
+| **total** | **41** | |
+
+**THE FIRST CENSUS OF THIS PASS SAID 38 AND WAS WRONG TWICE.** It totalled
+three of its four rows (2 + 26 + 10) while printing a table of four, so its own
+rows summed to 40; and it omitted the storage file entirely, because the only
+measurement ever taken of that file was taken with `ONCOTRIAGE_QDRANT_URL`
+already pointed at the closed port -- an isolated run reported as a baseline.
+Both are recorded here rather than corrected silently: a census that cannot be
+added up is the shape this project removes.
+
+**FOUR MECHANISMS, AND THE FOURTH IS THE ONE THAT MAKES THE OTHER THREE
+DURABLE.**
+
+- **THE RUNNER DECIDES WHERE A TEST TALKS.**
+  `.github/scripts/ci_test_buckets.py:_run_one` built each child from
+  `dict(os.environ)`, so an exported `ONCOTRIAGE_QDRANT_URL` -- the documented
+  override that beats the .env -- reached every test. It is HARD-SET to the
+  closed port and the API key is POPPED (`get_qdrant_api_key()` returns None
+  when the URL was overridden without one, so an isolated child carries no
+  credential). **Hard-set rather than refusing an external override**, decided
+  after reading the one test whose subject IS that variable:
+  `test_docker_qdrant_override_and_readiness.py`'s `_resolve_in_subprocess`
+  pops the name per case by its own design, so it is immune -- verified by
+  running, 127/127 unchanged. A refusal would make the safety property
+  conditional on somebody acting on it, and would fail a whole bucket over a
+  variable absent in every legitimate CI environment. **It is announced** when
+  it overrode something, which is the only real objection to hard-setting.
+- **THREE FILES CARRY THEIR OWN GUARD**, because the runner's covers a run
+  THROUGH the runner and each of these is routinely launched by hand. The rule
+  and its argument live in `tests/_control_harness.isolate_qdrant`, which four
+  callers share; a first version had it hard-set in one file and `setdefault`
+  in another, and that asymmetry is gone -- **a file whose own header says it
+  makes no live call must not have that be conditional on the invoking shell.**
+  The ORDERING is load-bearing and silent when wrong: `oncotriage/config.py`
+  caches the resolved endpoint in `_QDRANT_ENDPOINT_CACHE` for the life of the
+  process, so a guard one import too late does nothing and nothing says so.
+- **SECTION E's LIVE PROBE IS OPT-IN.** It fell back to the pipeline's own
+  client when `ONCOTRIAGE_QDRANT_PROBE_URL` was unset -- and that section
+  asserts nothing (its own header: "Reported, never asserted"), so the fallback
+  bought a printed line at the cost of a live dependency in the file that runs
+  first in bucket A. It records a COUNTED skip naming the variable now, on
+  `tests/test_package_invariants.py`'s `skip()` precedent, printed even at zero.
+- **`tests/test_ci_qdrant_isolation.py` IS WHAT KEEPS ALL OF IT TRUE.** The
+  three mechanisms were verified once, by hand, and **a property nothing
+  enforces is a property that rots.** 49 checks, ~3.5 s, bucket A, using the
+  repository's own socket recorder rather than a new general instrument. Its
+  own probes go to TWO LOOPBACK ADDRESSES and its clients are built with
+  `check_compatibility=False`, because the first version pointed one at a
+  `.invalid` NAME and that constructor's background thread connected AFTER the
+  guard had disarmed -- caught by a full bucket-A run under an independent
+  recorder, as one unguarded outbound attempt from the file written to stop
+  exactly that. Each
+  check has a control that FIRES, and the whole file was shown to go RED under
+  seven separate reverts of the production code (9 of 9 including the clean
+  control and the restore).
+
+**THE MODEL ASSET IS REAL AND THE DOWNLOAD MOVED TO CI SETUP.** SECTION A of
+the retrieval test measures the REAL FastEmbed `Qdrant/bm25` model on purpose:
+`sparse_token_count("the of and a an is to") == 0` asserts that the model HAS a
+stopword list and APPLIES it, which is a fact about `english.txt` in the
+snapshot and which a stub could only make agree with itself. On a cold cache
+that reaches `huggingface.co`, and a hosted runner starts cold -- so every CI
+run was downloading a model inside the test step while that file's entry said
+it made no live call. `.github/scripts/prewarm_model_cache.py` fetches it
+through the ONE construction site, checks every snapshot entry resolves, and
+re-loads it in a FRESH interpreter under `HF_HUB_OFFLINE=1`; the three test
+steps then export that variable, so a missing asset FAILS instead of
+downloading.
+
+**THE INTEGRITY CHECK IS THE LOAD-BEARING HALF AND A CONTROL FOUND IT.** With
+`english.txt`'s blob removed the model still constructs, still embeds, makes no
+outbound attempt the recorder saw and raises nothing, while
+`query_embed("the of and a an is to")` goes from **0 terms to 7** -- the
+stopword list it could not read is simply not applied. The first version of the
+inventory tested `os.path.isfile` and `continue`d, which SKIPS a dangling
+symlink, so a damaged cache produced a shorter inventory that read exactly like
+a smaller model. **What is still NOT caught is stated at the code**: a blob
+present but silently WRONG. The revision cannot be pinned -- `SparseTextEmbedding`
+takes no `revision=` -- so it is REPORTED with a per-file sha256 instead.
+
+**A MEASURED FACT ABOUT qdrant-client, RECORDED BECAUSE IT EXPLAINS ONE OF THE
+FIVE.** `QdrantClient(url=...)` records **zero** attempts at the moment it
+returns, **one** about two seconds later, and **two** after a query: the
+compatibility check runs on a BACKGROUND THREAD. That is why
+`deps.get_qdrant_client()` alone leaked one connection out of the storage test
+with no query made. `tests/test_ci_qdrant_isolation.py` asserts the property on
+a QUERY, which is synchronous, and records the threaded finding without
+asserting it -- a check whose outcome depends on how long a thread took goes red
+on a loaded runner for a reason unrelated to its subject.
+
+```bash
+# The test-isolation pass. Same shape, same directory. NO KEYS, NO SPEND, no
+# live Qdrant -- section 1's only round trips go to a host that does not
+# resolve and to a closed loopback port, both through the repository's own
+# socket recorder, which RAISES on every outbound attempt and records the
+# calling frame. It patches subprocess.run inside the runner and SPAWNS NOTHING
+# for (a); parses source and runs one short subprocess for a premise in (b);
+# runs tests/test_agent_retrieval_observability.py twice for (c) -- shipped,
+# then a REVERTED COPY in a tempfile.mkdtemp it removes and asserts gone --
+# which is the only way to get a firing BEHAVIOURAL control for a branch in
+# another file, and which is why this file needs the FastEmbed cache the
+# pre-warm step provides. It EXECS NOTHING and loads no module by location.
+# NOT in the collision matrix. Bucket A, ~3.5 s.
+python tests/test_ci_qdrant_isolation.py                            #  49
+
+# The CI-setup model pre-warm. NOT a test and not in any bucket: it is the ONE
+# network access the test steps are allowed to depend on, and it refuses to run
+# with HF_HUB_OFFLINE=1 or ONCOTRIAGE_DEFER_LOCAL_MODELS=1 set, by name.
+python .github/scripts/prewarm_model_cache.py
+```
+
+**COUNTS, ALL MEASURED 2026-09-10 rather than derived.**
+`test_agent_retrieval_observability.py` **104 passed / 1 SKIPPED** (the pass
+count did not move; the file went 3.5s -> 1.1s),
+`test_runner_crash_record_and_db_unification.py` **65**,
+`test_observability_logging.py` **82**,
+`test_storage_inference_logging_contract.py` **101**,
+`test_docker_qdrant_override_and_readiness.py` **127**,
+`test_ci_qdrant_isolation.py` **49** (new). Bucket A is **111 files**; the
+classification check reports **130 test files**. `renderer_digest`,
+`PROMPT_VERSION` and `FINGERPRINT_VERSION` are byte-identical to HEAD -- this
+pass changes no model input.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE PRE-WARM'S ACTUAL DOWNLOAD PATH HAS NEVER EXECUTED.** No egress was
+   permitted while building it, so what is verified is warm-succeeds,
+   cold-blocked-fails, damaged-fails, and both refusals. "Download succeeds" is
+   unverified; the downloading call is `embedding.get_bm25_sparse_model()`, the
+   pipeline's own construction site, and the new surface is only the try/except
+   and the reporting. **The first hosted CI run is the test.**
+2. **BUCKET B IS NOT QDRANT-ISOLATED.** `tests/run_serial_tests.py:1398` spawns
+   with no `env=`, so its children inherit the shell verbatim. Measured **0
+   external attempts today** from the two members that reference Qdrant at all,
+   so the gap is structural rather than live. `HF_HUB_OFFLINE=1` DOES reach
+   them, because it is set at step level and inherited.
+3. **NOTHING MEASURES TOTAL EGRESS**, and no claim in this pass should be read
+   as doing so.
+4. **A PRESENT-BUT-CORRUPT BLOB IS NOT CAUGHT** by the pre-warm (only a
+   dangling one). The retrieval test's behavioural checks would catch it later,
+   as a test failure rather than a cache failure.
+5. **THE PRE-WARM COVERS FastEmbed ONLY.** Measured: the other two bucket-A
+   files that name a MedCPT accessor without setting `ONCOTRIAGE_DEFER_LOCAL_
+   MODELS` install an override instead, and both pass on a COLD cache with zero
+   external attempts. A future test that drops its override fails loudly under
+   the offline switch rather than downloading, which is the right direction.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

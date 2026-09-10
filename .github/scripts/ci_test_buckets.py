@@ -73,6 +73,52 @@ _TESTS_DIR = os.path.join(_CODE_DIR, "tests")
 # ===========================================================================
 # THE SERIAL MEMBERSHIP COMES FROM THE RUNNER, NOT FROM HERE
 # ===========================================================================
+# THE TEST DESTINATION HAS ONE OWNER, AND IT IS NOT THIS FILE
+# ===========================================================================
+# `tests/_control_harness.py` owns ``CLOSED_PORT_URL`` because five test files
+# were each writing "http://127.0.0.1:1" out by hand, and five copies of a
+# magic string is five chances to typo one into a port something is LISTENING
+# on -- with the symptom being a test that quietly makes a real request. A
+# sixth copy here would be that same defect, in the one place that decides the
+# destination for EVERY test rather than for one.
+#
+# Importing across into tests/ is this file's own established shape, not a new
+# one: `_serial_members()` immediately below does it for exactly the reason
+# quoted there. `_control_harness` imports only os/threading/time -- nothing
+# from the project -- so this costs no import graph.
+_HARNESS = None
+
+
+def _harness():
+    """tests/_control_harness.py, which owns the isolation rule and its value.
+
+    Memoized: `_run_one` calls this once per test file from a thread pool, and
+    the alternative is a check-then-insert on `sys.path` from several threads
+    for a module that cannot change during a run. The import itself is
+    idempotent; the memo is about not touching `sys.path` sixty times.
+    """
+    global _HARNESS
+    if _HARNESS is not None:
+        return _HARNESS
+    if _TESTS_DIR not in sys.path:
+        sys.path.insert(0, _TESTS_DIR)
+    try:
+        import _control_harness
+    except ImportError as exc:                       # pragma: no cover
+        raise RuntimeError(
+            f"cannot import tests/_control_harness.py, which owns "
+            f"CLOSED_PORT_URL and the isolation rule -- the destination every "
+            f"test child is pointed at so no request can succeed: {exc}"
+        ) from exc
+    _HARNESS = _control_harness
+    return _HARNESS
+
+
+def _closed_port_url():
+    """The loopback port nothing listens on, from its one owner."""
+    return _harness().CLOSED_PORT_URL
+
+
 # tests/run_serial_tests.py owns the collision matrix; it derived it from the
 # code and it is what `make serial-tests` executes. Re-typing those five names
 # here would be a second declaration that can disagree with the one that runs.
@@ -188,6 +234,35 @@ BUCKETS = {
         "sha256-compared at the end (one of them, config.py, IS rewritten by "
         "tests/test_config_snapshot_date_rot.py, so an interleaved serial run "
         "is visible rather than silent)."),
+    "test_ci_qdrant_isolation.py": (
+        _A, None,
+        "ran green in 3.5s, 49 checks, against the developer tree: the three "
+        "mechanisms that keep bucket A off the live index, each with a control "
+        "that fires. NO KEYS, NO SPEND, no live Qdrant, and NOTHING IT DOES "
+        "CAN LEAVE THE MACHINE -- section 1's only round trips go to TWO "
+        "LOOPBACK ADDRESSES (127.0.0.2 and the closed port), through the "
+        "repository's own socket recorder "
+        "(tests/test_dashboard_run_health.py's pattern), which RAISES on every "
+        "outbound attempt and records the calling frame. Its clients are built "
+        "with check_compatibility=False, which removes the background "
+        "version-check thread -- an earlier version pointed one probe at a "
+        "`.invalid` NAME and that thread connected AFTER the guard had "
+        "disarmed, which a full bucket-A run under an independent recorder "
+        "caught as one unguarded outbound attempt from this very file. It patches "
+        "subprocess.run inside the runner and SPAWNS NOTHING for check (a); it "
+        "parses source and runs one short subprocess for a premise in (b); it "
+        "runs tests/test_agent_retrieval_observability.py twice for (c) -- "
+        "shipped, then a REVERTED COPY in a tempfile.mkdtemp it removes and "
+        "asserts gone -- which is the only way to get a firing BEHAVIOURAL "
+        "control for a branch in another file, and which is why this file "
+        "needs the FastEmbed cache the pre-warm step provides. It EXECS "
+        "NOTHING and loads no module by location: every control is an "
+        "attribute rebound inside try/finally with the restore asserted BY "
+        "IDENTITY, an ast walk over an in-memory copy, or a copy run as a "
+        "subprocess. NOT in the collision matrix -- it writes only inside that "
+        "temp directory, and the four repository files it reads are written by "
+        "neither of the suite's two writers; the one it runs is sha256-compared "
+        "before and after"),
     "test_compose_shutdown_grace.py": (
         _A, None,
         "ran green in 0.8s, 30 checks, against ONLY the directory skeleton: "
@@ -592,7 +667,35 @@ BUCKETS = {
         "tests/test_config_snapshot_date_rot.py rewrites in place -- so an "
         "interleaved serial run is visible rather than silent"),
     "test_agent_retrieval_observability.py": (
-        _A, None, "ran green in 3.5s; needs .env to EXIST, makes no live call"),
+        _A, None,
+        "ran green in 1.1s (was 3.5s: SECTION E no longer makes a live round "
+        "trip); needs .env to EXIST. IT DOES NOT 'MAKE NO LIVE CALL', WHICH IS "
+        "WHAT THIS ENTRY USED TO SAY AND WAS FALSE TWICE. MEASURED with a "
+        "recorder that logged and REFUSED every outbound attempt it "
+        "intercepted -- that instrument reports what it saw in these "
+        "processes, and total egress was not independently measured: (i) "
+        "SECTION E's live probe defaulted to `deps.get_qdrant_client()` when "
+        "ONCOTRIAGE_QDRANT_PROBE_URL was unset -- the pipeline's own client, "
+        "i.e. the production Qdrant Cloud endpoint on any machine with a "
+        "credentials file -- and made 2 connection attempts to it. That probe "
+        "is opt-in now and records a counted SKIP by name when the variable is "
+        "unset. (ii) SECTION A measures the REAL FastEmbed Qdrant/bm25 model, "
+        "deliberately -- `sparse_token_count(\"the of and a an is to\") == 0` "
+        "asserts that the model has a stopword list and applies it, which is a "
+        "fact about the downloaded asset and which a stub could only make agree "
+        "with itself. On a COLD cache that reaches huggingface.co. The honest "
+        "property is therefore: the asset is fetched at CI SETUP and the test "
+        "step is run with the hub's offline switch set -- "
+        "`.github/scripts/prewarm_model_cache.py` fetches it, checks every "
+        "snapshot entry resolves, and proves a fresh interpreter loads it "
+        "under HF_HUB_OFFLINE=1; the test steps then export that variable, so "
+        "a missing asset FAILS instead of downloading. The runner "
+        "additionally points every child at the closed port and drops the "
+        "Qdrant key (see `_isolate_qdrant`). THAT THIS FILE RUNS OFFLINE IS "
+        "NOT A MEASUREMENT OF TOTAL EGRESS: it rests on "
+        "tests/test_ci_qdrant_isolation.py, which asserts the three "
+        "mechanisms with controls that fire, plus the hosted CI run under "
+        "HF_HUB_OFFLINE=1"),
     "test_agent_stage5_input_packing.py": (
         _A, None,
         "ran green in 1.8s, 109 checks, against ONLY the directory skeleton, "
@@ -2140,11 +2243,82 @@ def serial_preconditions():
     return all(present for _, _, present in rows), rows
 
 
+# THE RUNNER DECIDES WHERE A TEST TALKS, AND IT IS NOT NEGOTIABLE
+# ===========================================================================
+# HARD-SET, NOT `setdefault`, AND THE DIFFERENCE IS THE WHOLE POINT. `_run_one`
+# builds each child from `dict(os.environ)`, so before this every variable the
+# invoking shell exported reached every test -- including
+# ONCOTRIAGE_QDRANT_URL, which `oncotriage/config.py` documents as THE
+# deliberate override that beats the .env. A `setdefault` fills a hole and
+# leaves that export standing, which is the one case that matters: a developer
+# or a runner with a cloud endpoint exported puts every unstubbed Qdrant reach
+# in bucket A on the wire. MEASURED before this change, with every outbound
+# attempt recorded and refused: four bucket-A files made 38 connection attempts
+# to the production Qdrant Cloud host between them.
+#
+# WHY HARD-SET RATHER THAN REFUSING AN EXTERNAL OVERRIDE, decided after reading
+# the one test whose subject IS this variable's resolution:
+#
+#   1. The safety property becomes unconditional. A refusal makes "no test
+#      reaches the network" depend on somebody reading the refusal and acting;
+#      hard-setting makes it true of every invocation, including the one nobody
+#      is watching.
+#   2. tests/test_docker_qdrant_override_and_readiness.py is immune BY ITS OWN
+#      DESIGN. Its `_resolve_in_subprocess` pops QDRANT_URL, QDRANT_API_KEY and
+#      both ONCOTRIAGE_* names out of the child environment before every case,
+#      commented "Start from a clean slate so the developer's own shell cannot
+#      decide a case" -- so section 1 still resolves the .env and still asserts
+#      a real https endpoint. VERIFIED BY RUNNING, not read: that file reports
+#      127 passed / 0 failed with this variable hard-set, unchanged, and its
+#      OWN two cloud attempts (`api/server.py` lifespan -> `serving_readiness`
+#      -> `probe_index`, in the parent, where no stub is installed yet) become
+#      six loopback attempts. The lifespan is explicit that it "does NOT
+#      raise", so pointing it at a closed port costs nothing.
+#   3. A refusal would fail an entire bucket over a variable that is simply
+#      absent in every legitimate CI environment -- turning a safety mechanism
+#      into an availability risk, for no gain over (1).
+#
+# IT IS NOT SILENT, which is the only real objection to hard-setting: an
+# external value that DIFFERS is announced by name, once, with both values, so
+# an operator who exported one sees that the runner overrode it rather than
+# wondering why it had no effect.
+#
+# THE API KEY IS POPPED RATHER THAN SET. `config.get_qdrant_api_key()` returns
+# None when the URL was overridden without one -- "does not fall back to the
+# .env", its own docstring -- so removing the name is what makes an isolated
+# child carry no credential at all, rather than carrying one addressed to a
+# port nothing answers.
+def _isolate_qdrant(env):
+    """Point `env` at the closed port and strip the key, through the one owner.
+
+    THE RULE IS NOT WRITTEN HERE. `tests/_control_harness.isolate_qdrant` owns
+    it, because four places apply it -- this runner and three test files -- and
+    the argument for hard-setting rather than filling a hole belongs beside the
+    value rather than in four copies of it.
+
+    Pure with respect to output: the announcement is `_isolation_note()`, which
+    `run_bucket` prints ONCE on the main thread. Printing here would interleave
+    one identical line per test file through a pool's results.
+    """
+    return _harness().isolate_qdrant(env)
+
+
+def _isolation_note():
+    """What to tell an operator whose exported endpoint was overridden.
+
+    None when there is nothing to say, which is every CI environment and every
+    developer shell that did not export one -- so the ABSENCE of this line is
+    not evidence that the isolation did not happen.
+    """
+    return _harness().qdrant_isolation_note(os.environ, "the CI bucket runner")
+
+
 def _run_one(name, root):
     path = os.path.join("tests", name)
     env = dict(os.environ)
     if root:
         env["ONCOTRIAGE_MAIN_PATH"] = root
+    _isolate_qdrant(env)
     start = time.time()
     completed = subprocess.run([sys.executable, path], cwd=_CODE_DIR, env=env,
                                capture_output=True, text=True)
@@ -2194,6 +2368,14 @@ def run_bucket(letter, root=None, workers=None):
     print("=" * 74)
     print(f"BUCKET {letter} — {len(names)} test files, {workers} at a time")
     print("=" * 74)
+    # THE DESTINATION IS STATED, EVERY RUN. A reader of this log can see where
+    # the children were pointed without reading the source, and the override
+    # note below is what stops the hard-set being silent.
+    print(f"  Qdrant destination for every child: {_closed_port_url()} "
+          f"(closed port; {_harness().QDRANT_API_KEY_ENV} removed)")
+    _note = _isolation_note()
+    if _note:
+        print(f"  NOTE  {_note}")
     for name in skipped:
         print(f"  NOT RUN  {name}\n           needs: {BUCKETS[name][1]}")
     if skipped:
