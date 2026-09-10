@@ -66,7 +66,17 @@ loaded before its own first line.
 """
 
 import os
+import threading
 import time
+
+
+_SUBMIT_LOCK = threading.Lock()
+"""Serializes appends to the submission ledger.
+
+The batch runner submits from one thread, so this is not load-bearing today; it
+is what keeps the ledger correct if a future caller ever submits from several,
+and it costs one uncontended acquire per submission.
+"""
 
 
 CLOSED_PORT_URL = "http://127.0.0.1:1"
@@ -201,6 +211,110 @@ def wait_for(predicate, seconds, alive=None, interval=0.02):
             return predicate()
         time.sleep(interval)
     return predicate()
+
+
+# --- the submission ledger --------------------------------------------------
+
+ENV_SUBMITTED = "ONC_SUBMITTED"
+"""Where the child records one line per future the batch pool has accepted.
+
+WHY IT EXISTS, MEASURED RATHER THAN ARGUED. The park protocol above lets a
+parent wait until the pool is SATURATED, which establishes that the queue is
+non-empty -- and three of these harnesses' checks need a strictly stronger fact:
+that the submit loop has FINISHED, so the queue holds every remaining patient.
+``run_batch`` submits every future up front, but the parent has no way to see
+that from outside: the runner prints nothing per submission, and a worker can
+only start once its own future exists, so the started count saturates at
+MAX_WORKERS and says nothing about the rest.
+
+WITHOUT THE DISTINCTION THE COUNTS MEASURE THE SCHEDULER. A signal or a sentinel
+delivered while the main thread is still inside the submit loop reaches a pool
+holding only the futures created so far: the pre-fix drain then drains THOSE and
+the check that expects the whole corpus fails, and the cancelled-count strings
+report `len(futures) - MAX_WORKERS` where the check expects
+`corpus - MAX_WORKERS`. MEASURED on this project: with a 4 ms delay injected
+into the submit loop, six consecutive runs recorded 40, 14, 13, 40, 14 and 16
+futures -- and in EVERY one the number of patients that ran equalled the number
+of futures submitted, exactly. A hosted CI runner produced 15. The drain was
+never at fault; the precondition was never waited for.
+"""
+
+
+def submit_env(path):
+    """The parent's half: the one variable a counting pool reads.
+
+    Returned as a dict to merge into the child's environment, for ``park_env``'s
+    own reason -- several children per test, each with its own ledger file, and
+    mutating ``os.environ`` here would leak one scenario's path into the next.
+    """
+    return {ENV_SUBMITTED: str(path)}
+
+
+def record_submission(path):
+    """The child's half: append one line for a future that now EXISTS.
+
+    CALLED AFTER the real ``submit`` returns, never before, so the file can
+    under-report a submission in flight and can never claim one that failed to
+    be created. The parent's predicate is ``>=``, so under-reporting costs a
+    little more waiting and never a false precondition.
+
+    Opened and closed per line rather than held open: the parent reads this file
+    by polling, and a buffered handle in the child would make a submission
+    invisible until something happened to flush it -- which is the whole failure
+    this ledger exists to remove.
+    """
+    with _SUBMIT_LOCK:
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write("1\n")
+
+
+def count_submitted(path):
+    """The parent's half: how many futures the pool has accepted so far.
+
+    A missing file is 0 rather than an error: it does not exist until the first
+    submission, and "none yet" is the honest reading of that.
+    """
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return sum(1 for line in handle if line.strip())
+    except OSError:
+        return 0
+
+
+def counting_executor(real_cls, path):
+    """A ``ThreadPoolExecutor`` subclass that records each accepted submission.
+
+    Args:
+        real_cls: the executor class the module under test would otherwise use,
+            passed IN rather than imported -- this file imports nothing from the
+            project (see the module docstring) and must not start.
+        path: the ledger file, from ``ENV_SUBMITTED``.
+
+    IT IS A PURE OBSERVER. ``submit`` delegates to ``super()`` with the
+    arguments untouched and returns the same future, on the same thread, in the
+    same order; the only addition is one append per call. Nothing about
+    scheduling, cancellation or shutdown changes, which is what lets the
+    harnesses claim the pool under test is still the real one.
+
+    ``*args, **kwargs`` RATHER THAN THE REAL SIGNATURE, deliberately:
+    ``Executor.submit`` is ``(self, fn, /, *args, **kwargs)`` and restating it
+    here would be a second copy of a signature that has already changed once
+    across Python versions. Delegating wholesale cannot get it wrong.
+
+    THE APPEND IS THE ONLY COST AND IT FALLS ON THE SUBMITTING THREAD, which
+    makes the submit loop marginally slower -- so a harness that FORGOT to wait
+    for the ledger is marginally more likely to lose the race, not less. That is
+    the safe direction for an instrument whose absence is the defect it detects.
+    """
+
+    class _CountingExecutor(real_cls):
+
+        def submit(self, *args, **kwargs):
+            future = super().submit(*args, **kwargs)
+            record_submission(path)
+            return future
+
+    return _CountingExecutor
 
 
 #------------------------------------------------------------------------------

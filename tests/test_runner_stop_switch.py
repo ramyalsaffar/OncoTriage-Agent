@@ -66,6 +66,16 @@ the real `main()`, `run_batch`, `run_resample`, `_on_done`, `save_checkpoint`,
 `reconcile_writes`, both crash handlers, and the real `__main__` guard of
 `25- Batch Runner.py`.
 
+THE THREAD POOL IS THE REAL ONE, WRAPPED IN A PURE OBSERVER. Its `submit`
+delegates to the real `ThreadPoolExecutor`'s unchanged and returns the same
+future on the same thread in the same order; the only addition is one appended
+line per accepted submission, which is what lets a main-pass scenario wait for
+the submit loop to FINISH before it writes the sentinel or sends the signal.
+The submit loop polls the sentinel too, so without that wait 2b-c and 2c-b read
+a cancellation count of `len(futures) - MAX_WORKERS` where they expect the
+corpus's -- see `check_submission_complete` and
+`tests/_control_harness.py:ENV_SUBMITTED`.
+
 WHY `run_fingerprint.current` IS A STAND-IN and the other four are not: this
 file's stand-in patients SUCCEED (they must, or no patient is ever completed and
 the resample pass is unreachable, which is the gap the sigterm file's own
@@ -173,6 +183,10 @@ import _control_harness as _harness                            # noqa: E402
 
 
 _T_START = time.time()
+
+# EVERY `drive()` RESULT, IN ORDER, so the end of the file can refuse to pass
+# when a scenario armed the submission gate and never asserted it. See 10f.
+_DRIVES = []
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(oncotriage.__file__)))
 _RUNNER_PATH = os.path.abspath(_runner.__file__)
@@ -933,6 +947,19 @@ assert os.path.realpath(R.__file__).startswith(
 R.build_bm25_index_from_qdrant = lambda *a, **k: (object(), ["NCT1"])
 R.build_matching_graph = lambda *a, **k: object()
 
+# THE SUBMISSION LEDGER, AND IT IS THE ONE STAND-IN THAT CHANGES NO BEHAVIOUR.
+# `run_batch` submits every future up front and reports nothing per submission,
+# so the parent cannot otherwise tell "the pool is saturated" (which the park
+# protocol establishes) from "the submit loop has FINISHED". The sentinel is
+# polled by the submit loop as well as by the done-callbacks, so a sentinel
+# written mid-submit leaves the pass reporting `stop_unsubmitted` patients
+# never submitted and a cancellation count that is len(futures) - MAX_WORKERS
+# rather than the corpus's -- which is what 2b-c and 2c-b name. The subclass
+# delegates `submit` unchanged and appends one line; see
+# tests/_control_harness.py:counting_executor and ENV_SUBMITTED.
+R.ThreadPoolExecutor = _h.counting_executor(R.ThreadPoolExecutor,
+                                            os.environ[_h.ENV_SUBMITTED])
+
 
 class _Tracking:
     def start_run(self, **kw): pass
@@ -1070,6 +1097,10 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
     cp = os.path.join(root, "cp")
     os.makedirs(cp, exist_ok=True)
     started = os.path.join(root, f"started_{len(os.listdir(root))}.txt")
+    # One line per future the pool has ACCEPTED -- see _control_harness. Named
+    # off `started` like every other per-invocation file here, so a scenario and
+    # its resume do not share one ledger.
+    submitted = os.path.join(root, f"submitted_{os.path.basename(started)}")
     ready = os.path.join(root, f"ready_{os.path.basename(started)}")
     release = os.path.join(root, f"release_{os.path.basename(started)}")
     log = os.path.join(root, f"console_{os.path.basename(started)}.log")
@@ -1092,6 +1123,7 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
         # THE NO-SPEND BACKSTOP that does not depend on the hook working.
         "ONCOTRIAGE_QDRANT_URL": _harness.CLOSED_PORT_URL,
     })
+    env.update(_harness.submit_env(submitted))
     env.update(_harness.park_env(park, ready, release, cap=150))
     env.pop("PYTHONNOUSERSITE", None)
 
@@ -1120,6 +1152,16 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
     saturated = None
     acted = False
     handler_entered = None
+    # None means "not asked" -- see the wait below for the two phases and why
+    # only one of them has an assertion that needs it. False means asked and
+    # NOT established, which a check fails on rather than absorbing.
+    submitted_all = None
+    # CAPTURED AT THE MOMENT OF ACTING, never at the end of the run. Scenario
+    # D's swallow control reaches the RESAMPLE pass, which submits
+    # min(RESAMPLE_COUNT, completed) futures of its own into the same ledger --
+    # so an end-of-run reading would be a number about two passes, and the
+    # precondition is about the queue the pool held when the sentinel landed.
+    submitted_seen = None
     stop_file = os.path.join(cp, _runner.STOP_FILENAME)
 
     with open(log, "w", encoding="utf-8") as _sink:
@@ -1132,6 +1174,33 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
                 _wait(lambda: os.path.exists(ready), 120)
                 want = min(MAX_WORKERS, patients)
                 saturated = _wait(lambda: _count(park) >= want, 90)
+                # 2b: EVERY REMAINING PATIENT HAS A FUTURE -- MAIN PASS ONLY.
+                #
+                # Saturation says the queue is not empty; it does NOT say the
+                # submit loop has finished, because a worker can only start
+                # once its own future exists and the started count therefore
+                # stops at MAX_WORKERS however far the loop has got. The submit
+                # loop polls the sentinel too, so a sentinel written mid-submit
+                # produces `stop_unsubmitted` patients never submitted and a
+                # sweep that cancels only len(futures) - MAX_WORKERS -- which
+                # is exactly what 2b-c and 2c-b read out of the console. See
+                # _control_harness.ENV_SUBMITTED for the measurement.
+                #
+                # NOT INSTALLED FOR park="resample", and that is a decision
+                # rather than an omission. This ledger counts submissions
+                # across BOTH passes, so a target of `patients` is reached
+                # during the main pass and would gate nothing; the resample
+                # pass's own target is min(RESAMPLE_COUNT, completed), which
+                # would be a SECOND copy of a derivation the runner already
+                # owns and one more thing to drift. Nothing in scenarios C or
+                # C5 asserts a count that depends on it: 5c and 5b-e are
+                # min(MAX_WORKERS, patients) and the main pass's own
+                # completion, both of which hold however far a submit loop got.
+                if park == "main":
+                    submitted_all = _wait(
+                        lambda: _harness.count_submitted(submitted) >= patients,
+                        90)
+                    submitted_seen = _harness.count_submitted(submitted)
                 if proc.poll() is None:
                     if action == "stop":
                         with open(stop_file, "w", encoding="utf-8") as handle:
@@ -1182,13 +1251,15 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
         except (OSError, ValueError) as exc:                    # noqa: BLE001
             checkpoint = {"<unreadable>": str(exc)}
 
-    return {
+    result = {
         "exit": proc.returncode,
         "out": _log_text(),
         "hook": os.path.exists(hook_marker),
         "saturated": saturated,
         "acted": acted,
         "handler_entered": handler_entered,
+        "submitted_all": submitted_all,
+        "submitted": submitted_seen,
         "main": [l for l in started_lines if l.startswith("main\t")],
         "resample": [l for l in started_lines if l.startswith("resample\t")],
         "runs": runs,
@@ -1197,10 +1268,49 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
         "db": db,
         "cp": cp,
         "patients": patients,
+        # THE SCENARIO AND THE INVOCATION, because a root is driven more than
+        # once (a stop and then its resume) and "started_2.txt" alone would
+        # name neither. 10f prints these, so they have to identify the arm.
+        "drive_name": f"{os.path.basename(root)}/{os.path.basename(started)}",
+        "submission_checked": False,
     }
+    _DRIVES.append(result)
+    return result
 
 
 #------------------------------------------------------------------------------
+
+
+def check_submission_complete(label, run):
+    """Assert this arm's MAIN-PASS submit loop had FINISHED before it acted.
+
+    THE SECOND PRECONDITION, AND IT IS NOT THE ONE THE PARK PROTOCOL
+    ESTABLISHES. Saturation says MAX_WORKERS patients are parked and the queue
+    is not empty. It does NOT say the queue holds the whole remainder -- a
+    worker can only start once its own future exists, so the started count
+    stops at MAX_WORKERS however far the submit loop has got.
+
+    WHAT DEPENDS ON IT HERE. 2b-c reads "[STOP] {corpus - started} queued
+    patients cancelled" out of the console and 2c-b reads the same number out
+    of the pass tally. Both are statements about `len(futures)`: the submit
+    loop polls the sentinel too, so a sentinel written mid-submit breaks the
+    loop, reports `stop_unsubmitted` patients never submitted, and leaves the
+    sweep cancelling only what had been queued. MEASURED on this project: with
+    a 4 ms delay injected into the submit loop, both checks fail while the
+    stop itself works perfectly.
+
+    IT FAILS RATHER THAN WAITING FOREVER OR PASSING BY TIMEOUT. `drive` bounds
+    the wait and returns whether it was established; this turns a timeout into
+    a named failure -- "the sentinel was written while the submit loop was
+    still running" -- instead of a mystery in whichever count happens to be
+    short.
+    """
+    check(label + " every patient had a future BEFORE this scenario acted, so "
+          "the queue the pool was holding was the whole remainder rather than "
+          "however far the submit loop had got",
+          (run["submitted_all"], run["submitted"]),
+          (True, run["patients"]))
+    run["submission_checked"] = True
 
 
 # ===========================================================================
@@ -1224,6 +1334,7 @@ check("2a  the pool was saturated and the sentinel was written before any "
       "statement about cancellation rather than about scheduling luck",
       (_A["saturated"], _A["acted"], _A["handler_entered"]),
       (True, True, True))
+check_submission_complete("2a-s", _A)
 check("2b  the switch announced itself, naming the file and the operator's "
       "note",
       (_MARK_STOP in _A["out"],
@@ -1668,6 +1779,7 @@ check("6a  the pool was saturated, the signal was delivered, and the pool's "
       "own handler was provably ENTERED before any queued patient could start",
       (_D["saturated"], _D["acted"], _D["handler_entered"]),
       (True, True, True))
+check_submission_complete("6a-s", _D)
 check("6b  exactly the in-flight patients ran; the queue was cancelled",
       (_D_MAIN, _D_MAIN < _D["patients"]),
       (min(MAX_WORKERS, _D["patients"]), True))
@@ -1794,6 +1906,7 @@ else:
           ("[INTERRUPTED] Waiting for active threads to finish"
            in _CTRL["out"], _CTRL["saturated"]),
           (True, True))
+    check_submission_complete("7c-s", _CTRL)
     check("7d  *** THE PRE-FIX FORM BILLS AFTER THE INTERRUPT. *** The "
           "resample pass runs and makes one live Stage 5 call per re-run "
           "patient -- here one per patient the main pass had completed -- all "
@@ -2060,6 +2173,30 @@ check("10d the production inferences path was never resolved in this process, "
 
 shutil.rmtree(_TMP, ignore_errors=True)
 check("10e the scratch tree was removed", os.path.exists(_TMP), False)
+
+# --- THE GATE IS NOT OPTIONAL, AND THIS IS WHAT MAKES THAT TRUE -------------
+#
+# `check_submission_complete` is a call a scenario has to remember to make, and
+# a main-pass-parked scenario that forgot it is exactly the arm this pass was
+# written about: it would read a cancellation count off the console while the
+# pool may have held less than the corpus. So every drive that ARMED the gate
+# records whether it was asserted, and the file refuses to end without them.
+#
+# IT IS SCOPED TO DRIVES THAT ARMED IT (`submitted_all is not None`), which is
+# the main-pass-parked ones: an unparked scenario and a resample-parked one
+# have no such precondition, and demanding one would be a check about nothing.
+_UNCHECKED = [d["drive_name"] for d in _DRIVES
+              if d["submitted_all"] is not None and not d["submission_checked"]]
+check("10f every drive that waited for the submit loop also ASSERTED it -- "
+      "without this the gate is a call a future scenario can silently omit, "
+      "which is precisely the omission that produced the failure this file was "
+      f"repaired for (armed: {sum(1 for d in _DRIVES if d['submitted_all'] is not None)})",
+      _UNCHECKED, [])
+check("10g ...and that scan is not vacuous: drives were recorded and at least "
+      "one of them armed the gate",
+      (len(_DRIVES) > 0,
+       any(d["submitted_all"] is not None for d in _DRIVES)),
+      (True, True))
 
 
 #------------------------------------------------------------------------------

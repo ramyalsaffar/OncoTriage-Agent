@@ -76,9 +76,21 @@ index, the graph and the tracking module are stand-ins. EVERYTHING ELSE IS THE
 REAL THING: the real ``main()``, the real ``run_batch``, the real ``_on_done``,
 the real ``flush_health``, the real ``start_run_record`` /
 ``finalize_run_record``, the real crash handlers, and the real ``__main__``
-guard of ``25- Batch Runner.py``, reached through ``runpy`` so the handler under
-test is the shipped one. NO BILLED CALL IS REACHABLE: the graph object is never
+guard of ``25- Batch Runner.py``, RUN AS A SCRIPT IN A SUBPROCESS so the handler
+under test is the shipped one. (It said "reached through ``runpy``" and had
+since the runpy form was removed -- see the note above the hook, which explains
+in the same file why ``runpy`` is forbidden here.) NO BILLED CALL IS REACHABLE: the graph object is never
 invoked.
+
+THE THREAD POOL IS THE REAL ONE, WRAPPED IN A PURE OBSERVER, and that is the one
+thing in this file that is neither a stand-in nor untouched. Its ``submit``
+delegates to the real ``ThreadPoolExecutor``'s with the arguments unchanged and
+returns the same future on the same thread in the same order; the only addition
+is one appended line per accepted submission, which is what lets the parent wait
+for the submit loop to FINISH before it signals. Without that the counts below
+measure how far the loop happened to get on a loaded machine -- see
+``check_submission_complete`` and ``tests/_control_harness.py:ENV_SUBMITTED``
+for the six-run measurement and for the hosted-CI reading that produced it.
 
 It DOES use subprocesses and signals, which is the point -- a signal cannot be
 delivered to the process that is asserting about it, and an in-process
@@ -173,6 +185,10 @@ import _control_harness as _harness                            # noqa: E402
 
 
 _T_START = time.time()
+
+# EVERY `drive()` RESULT, IN ORDER, so the end of the file can refuse to pass
+# when an arm armed the submission gate and never asserted it. See section 5e.
+_DRIVES = []
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(oncotriage.__file__)))
 _RUNNER_PATH = os.path.abspath(_runner.__file__)
@@ -517,9 +533,16 @@ if _handler_fn is not None:
 # same reasoning is written at the sibling stand-ins in that file and in
 # tests/test_storage_run_metrics_flush.py.
 #
-# THE ENTRY POINT IS REACHED THROUGH runpy WITH run_name="__main__", so the
-# handler under test is the shipped one in the shipped file rather than a copy
-# of it in this test.
+# THE ENTRY POINT IS RUN AS A SCRIPT IN A SUBPROCESS -- `subprocess.Popen([
+# sys.executable, _ENTRY_PATH])` in `drive` -- so `__name__` really is
+# "__main__" and the handler under test is the shipped one in the shipped file
+# rather than a copy of it in this test.
+#
+# THIS PARAGRAPH USED TO SAY "REACHED THROUGH runpy WITH run_name='__main__'"
+# AND CONTRADICTED THE ONE DIRECTLY BELOW IT, which records that the runpy form
+# was removed because test_package_invariants.py section 1c forbids loading a
+# module by location -- unconditionally, with `runpy` in its marker list. The
+# code has been a subprocess since; only the sentence stayed.
 
 # THE STAND-INS ARRIVE THROUGH `usercustomize`, NOT THROUGH runpy OR exec, AND
 # THAT IS AN INVARIANT OF THIS REPOSITORY RATHER THAN A PREFERENCE.
@@ -581,6 +604,17 @@ R.build_matching_graph = lambda *a, **k: object()
 R.load_results = lambda *a, **k: []
 R.clear_checkpoint = lambda *a, **k: None
 R.load_checkpoint = lambda *a, **k: set()
+
+# THE SUBMISSION LEDGER, AND IT IS THE ONE STAND-IN THAT CHANGES NO BEHAVIOUR.
+# `run_batch` submits every future up front and reports nothing per submission,
+# so the parent cannot otherwise tell "the pool is saturated" (which the park
+# protocol establishes) from "the submit loop has FINISHED" -- and the drain
+# control and both cancelled-count strings need the second. The subclass
+# delegates `submit` to the real one, unchanged, and appends one line; see
+# tests/_control_harness.py:counting_executor for why it is an observer rather
+# than a stand-in, and ENV_SUBMITTED for what went wrong without it.
+R.ThreadPoolExecutor = _h.counting_executor(R.ThreadPoolExecutor,
+                                            os.environ[_h.ENV_SUBMITTED])
 
 
 class _Tracking:
@@ -712,6 +746,8 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
     cp = os.path.join(root, "cp")
     os.makedirs(cp, exist_ok=True)
     started = os.path.join(root, "started.txt")
+    # One line per future the pool has ACCEPTED -- see _control_harness.
+    submitted = os.path.join(root, "submitted.txt")
     # One line per parked worker at the moment it was RELEASED, recording
     # whether Stage 5 had been told to stop by then. See the hook.
     shutdown_log = os.path.join(root, "stage5_shutdown.txt")
@@ -741,6 +777,7 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
         # is never read.
         "ONCOTRIAGE_QDRANT_URL": _harness.CLOSED_PORT_URL,
     })
+    env.update(_harness.submit_env(submitted))
     env.update(_harness.park_env(_harness.PARK_ALL, ready, release))
     env.pop("PYTHONNOUSERSITE", None)
 
@@ -750,6 +787,9 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
                 return sum(1 for line in handle if line.strip())
         except OSError:
             return 0
+
+    def _count_submitted():
+        return _harness.count_submitted(submitted)
 
     def _log_text():
         try:
@@ -768,6 +808,15 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
     signalled = False
     handler_entered = None
     saturated = None
+    # None means "not asked" -- the unsignalled arm releases immediately and
+    # has no precondition to establish. False means asked and NOT established,
+    # which a check below fails on rather than absorbing.
+    submitted_all = None
+    # CAPTURED AT THE MOMENT OF ACTING, never at the end of the run: what the
+    # precondition is about is the queue the pool was holding WHEN the signal
+    # landed. A later pass that submits more of its own would otherwise make
+    # the reading arithmetic about two passes.
+    submitted_seen = None
     with open(log, "w", encoding="utf-8") as _sink:
         # THE REAL ENTRY POINT, RUN AS A SCRIPT -- so its `__main__` guard, and
         # therefore the shipped SIGTERM handler, is what runs.
@@ -780,6 +829,25 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
                 _wait(lambda: os.path.exists(ready), 90)
                 want = min(MAX_WORKERS, patients)
                 saturated = _wait(lambda: _count_started() >= want, 60)
+                # 2b: EVERY REMAINING PATIENT HAS A FUTURE. Saturation says the
+                # queue is not empty; it does NOT say the submit loop has
+                # finished, because a worker can only start once its own future
+                # exists -- so the started count saturates at MAX_WORKERS and
+                # says nothing about the other 28. A signal delivered mid-submit
+                # reaches a pool holding only what was created so far: the drain
+                # control then drains THOSE and reports a short count, and the
+                # cancelled-count strings report len(futures) - MAX_WORKERS. See
+                # _control_harness.ENV_SUBMITTED for the six-run measurement and
+                # for the hosted-runner reading that produced it.
+                #
+                # BOUNDED, AND A TIMEOUT IS A RECORDED FAILURE rather than a
+                # pass: the result is returned and every signalled arm asserts
+                # it below. 60s is the saturation wait's own budget -- 40
+                # submissions are microseconds of work, so anything approaching
+                # it means the loop is not running at all.
+                submitted_all = _wait(
+                    lambda: _count_submitted() >= patients, 60)
+                submitted_seen = _count_submitted()
                 # 3: the signal.
                 if proc.poll() is None:
                     proc.send_signal(sig)
@@ -842,14 +910,48 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
             shutdown_seen = [line.rstrip("\n").split("\t")
                              for line in handle if line.strip()]
 
-    return {"exit": proc.returncode, "out": out, "signalled": signalled,
+    result = {"exit": proc.returncode, "out": out, "signalled": signalled,
             "hook": os.path.exists(hook_marker),
             "saturated": saturated, "handler_entered": handler_entered,
+            "submitted_all": submitted_all, "submitted": submitted_seen,
             "started": [n for n in started_names if n],
             # (patient, "True"/"False", reason) per parked worker, read at the
             # moment it was released -- see the hook.
             "stage5_shutdown": shutdown_seen,
-            "runs": runs, "metrics": metrics, "patients": patients, "db": db}
+            "runs": runs, "metrics": metrics, "patients": patients, "db": db,
+            "drive_name": name, "submission_checked": False}
+    _DRIVES.append(result)
+    return result
+
+
+def check_submission_complete(label, run):
+    """Assert this arm's submit loop had FINISHED before the signal was sent.
+
+    THE SECOND PRECONDITION, AND IT IS NOT THE ONE THE PARK PROTOCOL
+    ESTABLISHES. Saturation says MAX_WORKERS patients are parked and the queue
+    is not empty. It does NOT say the queue holds the whole remainder -- a
+    worker can only start once its own future exists, so the started count
+    stops at MAX_WORKERS however far the submit loop has got.
+
+    EVERY COUNT BELOW IS ABOUT THE QUEUE THE POOL WAS HOLDING. The drain
+    control asserts that the pre-fix form runs the WHOLE corpus, and both
+    cancelled-count lines name `corpus - MAX_WORKERS` patients; all three are
+    statements about `len(futures)`, and all three are false of a pool that was
+    signalled at future 15 of 40. Measured, six runs with a 4 ms submit delay:
+    40, 14, 13, 40, 14, 16 futures, and in every one the patients that ran
+    equalled the futures submitted, exactly. A hosted runner produced 15.
+
+    IT FAILS RATHER THAN WAITING FOREVER OR PASSING BY TIMEOUT. `drive` bounds
+    the wait and returns whether it was established; this turns a timeout into
+    a named failure -- "the signal was sent while the submit loop was still
+    running" -- instead of a mystery in whichever count happens to be short.
+    """
+    check(label + " every patient had a future BEFORE the signal was sent, so "
+          "the queue the pool was holding was the whole remainder rather than "
+          "however far the submit loop had got",
+          (run["submitted_all"], run["submitted"]),
+          (True, run["patients"]))
+    run["submission_checked"] = True
 
 
 #------------------------------------------------------------------------------
@@ -873,6 +975,7 @@ check("2a  the pool was saturated, the signal was delivered, and the handler "
       "about scheduling luck",
       (_TERM["saturated"], _TERM["signalled"], _TERM["handler_entered"]),
       (True, True, True))
+check_submission_complete("2a-s", _TERM)
 check("2b  the process exits 128 + SIGTERM, not the reconciliation verdict",
       _TERM["exit"], 128 + int(signal.SIGTERM))
 check("2c  the handler announced itself, so the crash blocks below it have a "
@@ -961,6 +1064,7 @@ print("\n=== 2b. a second SIGTERM terminates ===")
 _TWICE = drive("sigterm-twice", sig=signal.SIGTERM, double=True)
 
 check("2b-0 the stand-in hook installed", _TWICE["hook"], True)
+check_submission_complete("2b-s", _TWICE)
 check("2b-1 the process was TERMINATED BY THE SIGNAL rather than exiting "
       "through the handler a second time (a negative returncode is the signal "
       "number)",
@@ -1018,6 +1122,7 @@ check("3a  the pool was saturated, the signal was delivered, and the pool's "
       "own interrupt handler was provably entered",
       (_INT["saturated"], _INT["signalled"], _INT["handler_entered"]),
       (True, True, True))
+check_submission_complete("3a-s", _INT)
 check("3b  the pool still announces the teardown, unchanged",
       "[INTERRUPTED] Waiting for active threads to finish" in _INT["out"], True)
 # THE OLD LINE IS ASSERTED ABSENT, not merely replaced. "Checkpoint saved. Safe
@@ -1364,6 +1469,7 @@ else:
                   f"{_STARTED_CTRL} of {_CTRL['patients']} patients started")
             check("4c-0 the stand-in hook installed in the control too",
                   _CTRL["hook"], True)
+            check_submission_complete("4c-s", _CTRL)
             check("4d  the pre-fix form DRAINS: every queued patient runs "
                   "before the process can exit, at one live billed Stage 5 "
                   "call each in production",
@@ -1476,6 +1582,7 @@ else:
           ("[INTERRUPTED] Waiting for active threads to finish" in _RR["out"],
            _RR["saturated"], _RR["handler_entered"]),
           (True, True, True))
+    check_submission_complete("4b-s", _RR)
     check("4b-e THE PRE-FIX FORM RECORDS THE INTERRUPTED RUN AS ENDED "
           "NORMALLY -- FAILED here (every stand-in patient errors), never "
           "KILLED. This is the defect: an interrupted campaign and a completed "
@@ -1516,6 +1623,31 @@ check("5c  ...and those comparisons are not tautologies: both files are "
 
 shutil.rmtree(_TMP, ignore_errors=True)
 check("5d  the scratch tree was removed", os.path.exists(_TMP), False)
+
+# --- THE GATE IS NOT OPTIONAL, AND THIS IS WHAT MAKES THAT TRUE -------------
+#
+# `check_submission_complete` is a call a scenario has to remember to make, and
+# an arm that forgot it is exactly the arm this pass was written about: it
+# would assert a count against the corpus while the pool may have held less.
+# So every drive that ARMED the gate records whether it was asserted, and the
+# file refuses to end without them.
+#
+# IT IS SCOPED TO DRIVES THAT ARMED IT (`submitted_all is not None`), because
+# an unsignalled arm has no precondition to establish and demanding one would
+# be a check about nothing.
+_UNCHECKED = [d["drive_name"] for d in _DRIVES
+              if d["submitted_all"] is not None and not d["submission_checked"]]
+check("5e  every drive that waited for the submit loop also ASSERTED it -- "
+      "without this the gate is a call a future arm can silently omit, which "
+      "is precisely the omission that produced the failure this file was "
+      f"repaired for (armed: {sum(1 for d in _DRIVES if d['submitted_all'] is not None)})",
+      _UNCHECKED, [])
+check("5e-b ...and that scan is not vacuous: drives were recorded and at least "
+      "one of them armed the gate",
+      (len(_DRIVES) > 0,
+       any(d["submitted_all"] is not None for d in _DRIVES)),
+      (True, True))
+
 
 
 #------------------------------------------------------------------------------

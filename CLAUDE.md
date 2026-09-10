@@ -844,7 +844,7 @@ python tests/test_runner_crash_record_and_db_unification.py         #  65
 # than about scheduling -- the first version slept instead and was measured
 # FLAKY under bucket-A load. NOT in the collision matrix. It EXECS NOTHING: the
 # one control is a copy of the package in a temp directory. Bucket A, ~6 s.
-python tests/test_runner_sigterm_shutdown.py                        #  87 (was 86; the consolidation pass rewrote 3b-j's walk to cover BOTH modules -- `cancel_queued` moved to oncotriage/control.py, so a walk over the runner alone found two of four, reported an empty list and PASSED -- and added 3b-j2, its non-degeneracy probe. Before that 75; the pre-migration pass added section 3b, which reads the Stage 5 shutdown flag FROM INSIDE A LIVE WORKER -- the only place the question can be asked -- with an uninterrupted arm as its non-degeneracy control)
+python tests/test_runner_sigterm_shutdown.py                        #  94 (was 87; the submitted-corpus pass added one precondition check per SIGNALLED arm -- the submit loop had FINISHED before the signal landed, which is the fact the drain control and both cancelled-count strings rest on and which nothing had ever waited for -- plus 5e/5e-b, which refuse to let the file end when an arm ARMED that gate and never asserted it. Before that 87, was 86; the consolidation pass rewrote 3b-j's walk to cover BOTH modules -- `cancel_queued` moved to oncotriage/control.py, so a walk over the runner alone found two of four, reported an empty list and PASSED -- and added 3b-j2, its non-degeneracy probe. Before that 75; the pre-migration pass added section 3b, which reads the Stage 5 shutdown flag FROM INSIDE A LIVE WORKER -- the only place the question can be asked -- with an uninterrupted arm as its non-degeneracy control)
 
 # The stop-switch pass. Same shape, same directory. No network, no keys, NO
 # SPEND, no live Qdrant, no model load, no corpus, no git history, no live
@@ -856,7 +856,7 @@ python tests/test_runner_sigterm_shutdown.py                        #  87 (was 8
 # unreachable and the money case cannot be measured), and a successful patient
 # makes the real save_checkpoint resolve the stamp over the wire. NOT in the
 # collision matrix. It EXECS NOTHING. Bucket A, ~14 s.
-python tests/test_runner_stop_switch.py                             # 140 (was 138; the consolidation pass added 1m-x/1m-y over the batch switch's REFUSAL to be armed -- the shared base offers `arm` for the study, and an inherited no-op would replace an AttributeError with a caller believing the switch watched a file it did not). Before that 133; the operator-control pass added the read-only-directory diagnosis and the three-member clear vocabulary. Before that 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
+python tests/test_runner_stop_switch.py                             # 145 (was 140; the submitted-corpus pass added one precondition check per MAIN-PASS-PARKED scenario -- the submit loop had FINISHED before the sentinel was written, without which 2b-c and 2c-b read a cancellation count of len(futures) - MAX_WORKERS -- plus 10f/10g, the same completeness guard. Before that 140, was 138; the consolidation pass added 1m-x/1m-y over the batch switch's REFUSAL to be armed -- the shared base offers `arm` for the study, and an inherited no-op would replace an AttributeError with a caller believing the switch watched a file it did not). Before that 133; the operator-control pass added the read-only-directory diagnosis and the three-member clear vocabulary. Before that 122; the pre-migration pass reversed scenario C -- a stop that lands in the RESAMPLE pass is FINISHED, not STOPPED -- and added section 5b, its control)
 
 # The pre-migration pass. Same shape, same directory. No network, no keys, NO
 # SPEND, no live Qdrant, no model load, no corpus, no git history, no live
@@ -7717,6 +7717,35 @@ CONCURRENTLY BY THEMSELVES -- measured at HEAD in a `git worktree`, before any
 of this pass's edits, at 112/10 and a failing sigterm arm. Both drive 40-patient
 subprocesses with `MAX_WORKERS` threads each; the machine saturates and the
 signal lands after the corpus has run. Not caused here and not fixed here.
+
+> **CURRENT STATE, 2026-09-09 -- THIS PARAGRAPH DESCRIBES TWO DIFFERENT THINGS
+> AND NEITHER IS WHAT IT SAYS.** It is kept as written; read its last clause as
+> the hypothesis it was.
+>
+> * **THE CONCURRENT-PAIR READING IS AN ARTIFACT OF HOW THE PAIR WAS
+>   LAUNCHED, not a property of the code.** POSIX requires a shell to set
+>   SIGINT and SIGQUIT to `SIG_IGN` for a command in an asynchronous list
+>   (`cmd &`), children INHERIT that, and CPython does not override an
+>   inherited `SIG_IGN` at startup -- **the lesson this project already
+>   wrote down for `tests/test_ablation_stop_and_lock.py`, which closes it in
+>   its own `usercustomize` hook and ASSERTS the resulting disposition. These
+>   two files do neither.** So every SIGINT arm of a `&`-launched pair is DEAF
+>   to its own signal. MEASURED at HEAD, same tree, same machine, minutes
+>   apart: launched with `&` the pair reports **70/17 and 130/10** with
+>   `SIGINT: 40 of 40 patients started`; launched from a Python driver whose
+>   `Popen` children inherit `default_int_handler` it reports **87/0 and
+>   140/0, three pairs of three**. The failure is real and its cause is the
+>   launcher. **CI is unaffected**: `ci_test_buckets.py --run A` uses
+>   `subprocess.run` from Python.
+> * **THE HOSTED-CI FAILURE IS A DIFFERENT AND REAL DEFECT**, and it is NOT
+>   "the signal lands after the corpus has run" -- that was the SLEEP-based
+>   harness's failure, which the park protocol had already fixed. The signal
+>   lands too EARLY relative to SUBMISSION: the parent waited for the pool to
+>   be SATURATED, which says the queue is not empty, and three checks needed
+>   the stronger fact that the submit loop had FINISHED. Diagnosed, fixed and
+>   measured -- see "A saturated pool is not a submitted corpus" at the end of
+>   this file.
+
 
 ### The prompt cache has a reader, and per-trial mode was verified as a whole (the cache-reader pass)
 
@@ -14873,6 +14902,30 @@ note that they "run green in CI bucket A's pool" is stale on this machine** --
 it is left as written, per the rule that a past-tense account keeps its
 wording, and the current reading is recorded here instead.
 
+> **CURRENT STATE, 2026-09-09 -- TWO OF THE THREE ARE FIXED AND THE THIRD IS
+> NOT.** The paragraph above is kept as written. `test_runner_stop_switch.py`
+> and `test_runner_sigterm_shutdown.py` no longer depend on the scheduler for
+> the SUBMISSION precondition: that cause was measured (a signal or sentinel
+> delivered while the submit loop was still running) and closed, and both now
+> hold under a slowdown that reproduced it deterministically -- 20 consecutive
+> runs each, 0 failures. Their documented counts moved with the repair:
+> **145 and 94**. **THE "IN THE POOL" READING ABOVE IS SEPARATELY EXPLAINED
+> AND IS NOT THIS CAUSE**: measured at HEAD, the pair passes 3/3 concurrently
+> when launched from a Python driver and fails 70/17 + 130/10 when launched
+> with a shell `&`, because an asynchronous list sets `SIG_IGN` for SIGINT and
+> the children inherit it. Whatever a bucket-A pool reading was, it was not
+> measured with `&` -- CI's runner is `subprocess.run` -- so a residue there is
+> still unexplained and is NOT closed by this pass. `test_ablation_stop_and_lock.py` is untouched and its
+> under-load flakiness is still open -- and it is NOT this cause, audited by
+> reading rather than assumed: its 6g asserts a BOUND
+> (`<= MAX_WORKERS` and `>= 1`) with the reason written beside it -- "which of
+> them had started is a scheduling fact" -- and 6h/6i/6j read run rows and a
+> checkpoint rather than a count derived from the sample size. Nothing there
+> compares against `sample - started`, so a sentinel landing mid-submit changes
+> no expectation it holds. See "A saturated pool is not a submitted corpus"
+> below.
+
+
 **WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
 
 1. **THE MODULE DOES NOT RUN THE SHAPE CHECK ITSELF.** It names it. Running it
@@ -14897,6 +14950,170 @@ wording, and the current reading is recorded here instead.
    not read as an omission.
 
 
+
+### A saturated pool is not a submitted corpus (the submitted-corpus pass)
+
+**THE HOSTED CI `tests` JOB FAILED ON ONE CHECK AND THE DOCUMENTED HYPOTHESIS
+WAS WRONG.** `tests/test_runner_sigterm_shutdown.py` check **4d** -- "the
+pre-fix form DRAINS: every queued patient runs before the process can exit" --
+reported **expected 40, actual 15** on a GitHub shared runner (86/1, 42.03 s).
+Two accounts in this file called that pair load-flaky, and the pre-migration
+pass's guess was that "the machine saturates and the signal lands AFTER the
+corpus has run". That was the SLEEP-based harness's failure and the park
+protocol had already fixed it. **The real mechanism is the opposite: the signal
+lands BEFORE the corpus has been SUBMITTED.**
+
+**MEASURED, NOT ARGUED, AND THE MEASUREMENT IS AN IDENTITY.** A 4 ms delay
+injected into `run_batch`'s submit loop in a package copy, six consecutive runs:
+
+| run | futures submitted | patients that ran |
+|---|---|---|
+| 1 | 40 | 40 |
+| 2 | 14 | 14 |
+| 3 | 13 | 13 |
+| 4 | 40 | 40 |
+| 5 | 14 | 14 |
+| 6 | 16 | 16 |
+
+**In every one the number of patients that ran equalled the number of futures
+submitted, exactly.** CI's 15 is 12 workers plus 3 queued -- a member of that
+family. **The drain was never at fault**: `shutdown(wait=True)` drains 100% of
+what it was given, and the shipped `cancel_futures=True` cancels 100% of what
+is pending, whichever it is.
+
+**WHAT WAS ACTUALLY BROKEN IS A PRECONDITION NOTHING WAITED FOR.** `drive()`
+waits for the pool to be SATURATED -- MAX_WORKERS patients parked -- which
+establishes that the queue is NOT EMPTY. Three checks need a strictly stronger
+fact: that the submit loop has FINISHED, so the queue holds the WHOLE
+remainder. It is not derivable from the started count, because a worker can
+only start once its own future exists, so that count stops at MAX_WORKERS
+however far the loop has got. `run_batch` prints nothing per submission, so
+from outside the process there was nothing to see.
+
+**FIVE CHECKS WERE EXPOSED, ACROSS BOTH FILES, AND ALL FIVE WERE FOUND BY
+DRIVING RATHER THAN BY READING** -- the brief named one:
+
+| file | check | expects | why it breaks |
+|---|---|---|---|
+| sigterm | **4d** | control ran all 40 | the drain drains `len(futures)`, not the corpus |
+| sigterm | **4e** | shipped started strictly fewer | `12 < 12` is False when the control truncates |
+| sigterm | **3f-b** | `", 28 cancelled (never attempted)"` | cancelled is `len(futures) - 12` |
+| stop switch | **2b-c** | `"[STOP] 28 queued patients cancelled"` | same, and the submit loop polls the sentinel too, so it also breaks early and reports `stop_unsubmitted` |
+| stop switch | **2c-b** | the same number in the pass tally | same |
+
+**THE REPAIR IS A SUBMISSION LEDGER AND A BOUNDED WAIT, NOT A LONGER SLEEP.**
+`tests/_control_harness.py` gains `ENV_SUBMITTED`, `submit_env`,
+`record_submission`, `count_submitted` and `counting_executor` -- one protocol
+and one vocabulary, which is the reason that module exists. The child's hook
+rebinds `runner.ThreadPoolExecutor` to a subclass whose `submit` delegates to
+the real one unchanged and appends one line; the parent then waits for
+`count_submitted() >= patients` before it signals or writes the sentinel.
+
+**IT IS A PURE OBSERVER AND THE COST FALLS IN THE SAFE DIRECTION.** `submit`
+returns the same future on the same thread in the same order; nothing about
+scheduling, cancellation or shutdown moves. The one append per call makes the
+submit loop marginally SLOWER, so a harness that forgot to wait is marginally
+MORE likely to lose the race -- which is the right direction for an instrument
+whose absence is the defect it detects. It is recorded AFTER the real `submit`
+returns, so the ledger can under-report a submission in flight and can never
+claim one that failed to be created.
+
+**THE WAIT IS BOUNDED AND A TIMEOUT IS A NAMED FAILURE, NEVER A PASS.**
+`check_submission_complete` asserts `(submitted_all, submitted) == (True,
+patients)` per arm. **DEMONSTRATED TWICE**: at 3 s per submit -- submission
+needs 120 s against a 60 s budget -- `2a-s` fails `expected (True, 40) /
+actual (False, 31)` while `2a` (saturation, delivery, handler entered) still
+PASSES, which is the two preconditions correctly kept apart; and with the
+counting pool removed entirely the ledger reads 0 and it fails `(False, 0)`.
+
+**WHAT WAS DELIBERATELY NOT GATED, AND WHY.** `park="resample"` in the
+stop-switch file. That ledger counts submissions across BOTH passes, so a
+target of `patients` is reached during the main pass and would gate nothing;
+the resample pass's own target is `min(RESAMPLE_COUNT, completed)`, which would
+be a SECOND copy of a derivation the runner already owns. **Nothing in
+scenarios C or C5 asserts a count that depends on it** -- 5c is
+`min(MAX_WORKERS, patients)` and 5b-e is the main pass's own completion, both
+of which hold however far a submit loop got. The reading is captured AT THE
+MOMENT OF ACTING rather than at the end of the run, because scenario D's
+swallow control reaches the resample pass and submits `min(RESAMPLE_COUNT,
+completed)` futures of its own into the same file.
+
+**THE REVERT MATRIX, EVERY ARM RUN UNDER THE SLOWDOWN THAT REPRODUCED CI.**
+
+| revert | caught by |
+|---|---|
+| the shipped `cancel_futures=True` removed from `run_batch` | 2j, 3f, 3f-b, 3f-e, 4e -- 5 recorded failures |
+| the CONTROL's plant neutered, so the "pre-fix" copy is not pre-fix | 4c, 4d, 4e -- **the 4d control semantics survive** |
+| **this pass's submission gate removed** | 4d with the control at **16 of 40**, plus 3f-b -- the CI failure reproduced from HEAD |
+| the counting pool observer removed | `2a-s` `(False, 0)` |
+| the stop-switch gate removed | 2b-c and 2c-b, 3 runs of 3 |
+| 3 s per submit against the 60 s budget | `2a-s` `(False, 31)` |
+| **a gate CALL omitted from one arm** | `5e` naming `['control']`; `10f` naming `['A/started_2.txt']` |
+
+**AND A SECOND FINDING THE BRIEF DID NOT ASK FOR: THE "CONCURRENT PAIR" FLAKE
+THIS FILE RECORDS TWICE IS THE LAUNCHER, NOT THE CODE.** POSIX requires a shell
+to set SIGINT and SIGQUIT to `SIG_IGN` for a command in an asynchronous list
+(`cmd &`); children inherit it and CPython does not override an inherited
+`SIG_IGN` at startup. `tests/test_ablation_stop_and_lock.py` already closes
+exactly this in its own `usercustomize` hook and asserts the child's
+disposition; **these two files do neither**, so a `&`-launched pair is deaf to
+its own SIGINT. Measured at HEAD, same tree, same machine, minutes apart:
+
+| launcher | sigterm | stop switch | reading |
+|---|---|---|---|
+| shell `cmd &` | **70/17** | **130/10** | `SIGINT: 40 of 40 patients started` |
+| Python `Popen` | **87/0** | **140/0** | `SIGINT: 12 of 40`, 3 pairs of 3 |
+
+**CI IS NOT AFFECTED** -- `ci_test_buckets.py --run A` launches with
+`subprocess.run` -- so this is not what failed the `tests` job, and it is
+NOT fixed here: restoring a disposition a launcher deliberately set is a
+behaviour change to a signal test and needs its own verification. It is
+recorded because it produced a wrong entry in this file twice, and it is the
+top-ranked follow-up.
+
+**WHAT WAS VERIFIED BY RUNNING.** Both files green alone at their new counts
+(**94** and **145**); **3 concurrent pairs at HEAD and 3 at the fix, launched
+signal-correctly, all clean**; **20 consecutive runs of each under the 4 ms
+submit-slowdown with every package copy slowed -- including the control's own,
+which passes `repo=` explicitly and which a default-only slowdown would have
+left at full speed**; the revert matrix above; CI bucket A; `static_checks.py`;
+and the staged secret gate. No billed call, no AWS call, no schema change, no
+migration: the production `inferences.db` was never opened and nothing outside
+the repository was written.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE OBSERVER IS THE ONE THING IN THESE FILES THAT IS NEITHER A STAND-IN
+   NOR UNTOUCHED**, and both docstrings now say so rather than continuing to
+   claim the pool is simply the real one. A reader auditing "EVERYTHING ELSE IS
+   THE REAL THING" is entitled to that.
+2. **THE 60 s AND 90 s BUDGETS ARE INHERITED, NOT CALIBRATED** -- they are the
+   saturation waits' own numbers. 40 submissions are microseconds of work, so
+   anything near them means the loop is not running; nobody has measured what a
+   genuinely slow runner needs.
+3. **`test_ablation_stop_and_lock.py` IS NOT FIXED AND IS NOT THIS CAUSE.**
+   Audited by reading: its counts are bounds by construction. Whatever makes it
+   flaky under load is a separate finding.
+3a. **ONE PRE-EXISTING DOCUMENTATION DEFECT WAS FOUND AND CORRECTED IN
+   PASSING**: `tests/test_runner_sigterm_shutdown.py`'s docstring and its
+   pre-hook note both said the entry point is "reached through `runpy`", while
+   `drive` has spawned it with `subprocess.Popen([sys.executable, _ENTRY_PATH])`
+   ever since the runpy form was removed -- and the note thirty lines BELOW the
+   second one records that removal and why check 1c forbids runpy. The file
+   contradicted itself. Prose only; no behaviour.
+3b. **THE SIGINT DISPOSITION IS NOT RESTORED IN THESE TWO FILES**, and the
+   ablation file's `usercustomize` hook plus its 6b disposition check is the
+   pattern that would close it. Until it is, a `&`-launched run of either file
+   fails with a misleading diagnosis rather than with "this launcher made the
+   child deaf to SIGINT". It FAILS rather than passing, which is why it is a
+   follow-up and not a defect shipped here.
+4. **THE GATE IS ENFORCED, THE ASSERTION IT PROTECTS IS NOT.** `5e` / `10f`
+   refuse to let a file end when an arm ARMED the gate and never asserted it,
+   with a control that fires naming the arm -- so a forgotten CALL is caught.
+   What is still not caught is a NEW arm that neither arms the gate nor needs
+   to, and then grows a `patients - started` assertion later: there is no scan
+   that reads an expectation and decides whether it depends on submission
+   completeness, and inventing one would be a guess about arithmetic.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is
