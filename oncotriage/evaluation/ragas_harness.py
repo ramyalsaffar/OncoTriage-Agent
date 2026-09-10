@@ -123,6 +123,24 @@ judge_independence.assert_import_time_independence(
     DEFAULT_JUDGE_MODEL,
     "oncotriage/evaluation/ragas_harness.py::DEFAULT_JUDGE_MODEL")
 
+OMIT_REASONING_EFFORT = "omit"
+"""The one ``--reasoning-effort`` value that sends no effort at all.
+
+WRITTEN OUT HERE RATHER THAN IMPORTED FROM ``rater``, and the reason is the
+import graph rather than taste: this module imports ``judge_independence`` and
+``spend_journal`` and NOT ``rater``, while ``rater`` imports ``spend_journal``
+-- so reaching for the rater's copy would add a 7,600-line Batch-API harness to
+the import graph of a module that shares none of it. It is the same answer
+``spend_journal.STATE_BASENAMES`` gives for the same question, and the same
+mitigation applies: ``tests/test_resume_capture_and_ragas.py`` asserts the two
+constants equal rather than trusting them to stay so.
+
+IT REPLACES THREE LITERAL ``"omit"``s -- the argparse choices, the manifest's
+normalisation and ``main``'s -- which is the ``CROSS_ENCODER_MODEL`` shape:
+nothing raises when two copies of a sentinel disagree, and the only symptom is
+a flag that is accepted and reaches nothing.
+"""
+
 DEFAULT_REASONING_EFFORT = "medium"
 """``reasoning_effort`` for the judge. See the rater's copy for the argument.
 
@@ -1794,9 +1812,43 @@ PARTIAL_KIND = "ragas_partial_scores"
 #
 # THE RUN DIRECTORY IS IN HERE AND IS STILL NOT SUFFICIENT, which is why
 # ``pair_fingerprint`` exists: a path is not the text at that path.
+#
+# ══ ``judge_reasoning_effort`` WAS MISSING AND IT IS THE LIVE ONE OF THE SET.
+#
+# The list above was written for a NON-REASONING judge and every member of it
+# is still right. What it did not have is the knob the port added: ``--reasoning
+# -effort`` reaches ``build_judge`` (which REFUSES if the installed ragas cannot
+# carry it, so it is never silently dropped), it is sent on every request, and
+# ``build_manifest`` already records it as ``judge_reasoning_effort``. It was
+# recorded and compared by NOTHING.
+#
+# **AND IT IS THE ONE THAT BITES, WHICH IS AN ASYMMETRY WORTH STATING.**
+# ``judge_temperature`` is in this list and is INERT on the shipped judge --
+# ``config.MATCHING_TEMPERATURE``'s probe recorded a 400 for any value but the
+# default, so the ragas default is 0.0 and an operator who moves it gets a
+# refusal from the provider rather than a different score. Effort is the
+# opposite: every value in ``REASONING_EFFORTS`` is accepted, each one changes
+# how long the model thinks before answering, and the rater's own
+# ``DEFAULT_REASONING_EFFORT`` block says in as many words that this is a
+# decision about what the judge spends. So the covered knob cannot move a score
+# and the uncovered one moves every score.
+#
+# WHAT IT COST BEFORE THIS ENTRY: a run scored at ``--reasoning-effort high``,
+# interrupted, and resumed at the default ``medium`` PROCEEDED. The high-effort
+# rows were merged with medium-effort ones, ``ragas_results.json`` reported one
+# set, and ``ragas_manifest.json`` recorded ``judge_reasoning_effort:
+# "medium"`` over both halves. Nothing raised, no pair was dropped and no
+# counter moved -- the mean was simply over two judges' worth of thinking,
+# reported as one. That is the defect this whole list exists to prevent,
+# reached through the only field it did not name.
+#
+# ``omit`` NORMALISES TO ``None`` HERE, exactly as ``build_manifest`` does it,
+# so a run that sent no effort at all and a run that sent one are not made to
+# look alike by a sentinel string. The two spellings are the same fact and this
+# list compares facts.
 RESUME_IDENTITY_KEYS = ("packages", "judge_model", "judge_temperature",
-                        "judge_max_tokens", "embedding_model",
-                        "response_field", "run_dir")
+                        "judge_max_tokens", "judge_reasoning_effort",
+                        "embedding_model", "response_field", "run_dir")
 
 
 def partial_path(out_dir, response_field=DEFAULT_RESPONSE_FIELD):
@@ -1812,6 +1864,19 @@ def partial_path(out_dir, response_field=DEFAULT_RESPONSE_FIELD):
     return os.path.join(out_dir, f"{PARTIAL_BASENAME}{suffix}.json")
 
 
+def normalize_reasoning_effort(requested):
+    """The effort as a FACT: a member of ``REASONING_EFFORTS`` or ``None``.
+
+    ``--reasoning-effort omit`` and "the caller named nothing" are the same
+    thing on the wire -- ``build_judge`` sends no ``reasoning_effort`` for
+    either -- so they must compare equal here. ``build_manifest`` already did
+    this normalisation inline; this is that expression with a name, called by
+    both, so the identity a resume refuses on and the effort the manifest
+    reports are one derivation rather than two copies of it.
+    """
+    return None if requested == OMIT_REASONING_EFFORT else requested
+
+
 def resume_identity(run, args, environment):
     """The environment two runs must share before their scores may be merged."""
     return {
@@ -1819,6 +1884,13 @@ def resume_identity(run, args, environment):
         "judge_model": args.judge_model,
         "judge_temperature": args.temperature,
         "judge_max_tokens": args.max_tokens,
+        # NORMALISED THROUGH THE ONE FUNCTION `build_manifest` USES, so the
+        # identity a resume compares and the effort the manifest reports cannot
+        # spell the same fact two ways. `getattr` with a default, because this
+        # is also called from `print_resume_preview` on the free path and a
+        # caller's stub args object need not carry every flag.
+        "judge_reasoning_effort": normalize_reasoning_effort(
+            getattr(args, "reasoning_effort", None)),
         "embedding_model": args.embedding_model,
         "response_field": run.response_field,
         "run_dir": os.path.realpath(run.run_dir),
@@ -2167,7 +2239,7 @@ async def _score_one(metric_name, metric, sample, dataset, semaphore):
 
 
 async def score_all(run, metrics, max_workers, active, progress=True,
-                    journal=None, reuse=None):
+                    journal=None, reuse=None, spend_checkpoint=None):
     """Every (sample, metric) pair, concurrently, in a deterministic order.
 
     Progress is reported as pairs COMPLETE rather than as they are dispatched.
@@ -2193,6 +2265,19 @@ async def score_all(run, metrics, max_workers, active, progress=True,
     writes is therefore the whole set so far, not the increment, so a run
     interrupted twice resumes from one file rather than needing every earlier
     one.
+
+    ``spend_checkpoint`` is called with the ledger's measured total after each
+    completed pair -- a ``RunSpendCheckpointer.checkpoint``, which writes only
+    when enough has accumulated. It is called at the SAME point
+    ``journal.record`` is, and the two are the same guarantee about different
+    things: that one makes a killed run's SCORES recoverable and this one makes
+    its SPEND recorded. A run whose scores survive a kill and whose spend does
+    not is a run the next session gets a fresh budget for.
+
+    IT IS CALLED AFTER ``journal.record`` AND NOT BEFORE, because the pair's
+    charge is already in the ledger by then -- ``_score_one`` has returned --
+    and recording spend for a pair whose score is not yet on disk would be the
+    only ordering that can over-record.
     """
     import asyncio
 
@@ -2235,6 +2320,12 @@ async def score_all(run, metrics, max_workers, active, progress=True,
                                  dataset, semaphore)
         if journal is not None:
             journal.record(score, pair_fingerprint(metric_name, sample))
+        if spend_checkpoint is not None:
+            # NEVER RAISES -- `RunSpendCheckpointer.checkpoint` counts every
+            # failure into JOURNAL_FAULTS -- so a journal that cannot be
+            # written cannot discard the judging it is about. Same rule as
+            # `journal.record` on the line above.
+            spend_checkpoint(spend.SPEND_LEDGER.measured)
         done["n"] += 1
         if progress:
             elapsed = time.monotonic() - started
@@ -2738,9 +2829,11 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
         # `getattr` WITH A DEFAULT, because this function is also called with
         # a fabricated args object that predates the flag. A missing attribute
         # is "not recorded", which is what None already means here.
-        "judge_reasoning_effort": (
-            None if getattr(args, "reasoning_effort", None) == "omit"
-            else getattr(args, "reasoning_effort", None)),
+        # THROUGH THE ONE OWNER, so what the manifest reports and what
+        # `resume_identity` refuses on are the same derivation rather than two
+        # copies of it -- see `normalize_reasoning_effort`.
+        "judge_reasoning_effort": normalize_reasoning_effort(
+            getattr(args, "reasoning_effort", None)),
         "judge_reasoning_billed_as": "output tokens",
         "judge_omitted_parameters": ["temperature", "top_p"],
         "judge_omitted_parameters_reason": (
@@ -3009,7 +3102,8 @@ def _parse_args(argv=None):
                         "judge request. Supplying one is honoured rather than "
                         "silently dropped, and will fail.")
     p.add_argument("--reasoning-effort", default=DEFAULT_REASONING_EFFORT,
-                   choices=("minimal", "low", "medium", "high", "omit"),
+                   choices=("minimal", "low", "medium", "high",
+                            OMIT_REASONING_EFFORT),
                    help=f"judge reasoning effort (default "
                         f"{DEFAULT_REASONING_EFFORT!r}; 'omit' sends none). "
                         f"Reasoning tokens bill as OUTPUT and count against "
@@ -3283,8 +3377,7 @@ def main(argv=None):
                         f"{independence['judge_family']} models. Every score "
                         f"this run produces is partly FAMILY agreement. It is "
                         f"recorded in the manifest. ***")
-        _effort = (None if args.reasoning_effort == "omit"
-                   else args.reasoning_effort)
+        _effort = normalize_reasoning_effort(args.reasoning_effort)
         llm = build_judge(args.judge_model, args.temperature, args.max_tokens,
                           tally, args.max_retries, reasoning_effort=_effort)
         # No EMBEDDER is CONSTRUCTED unless a selected metric needs one, and
@@ -3341,14 +3434,45 @@ def main(argv=None):
     # so a re-run into the SAME output directory under the same stamp appends
     # nothing and a genuinely new invocation appends its own.
     _journal_unit = _utc_now()
+    # ── AND SEGMENTED, SO A HARD KILL DOES NOT LOSE THE SPEND ────────────
+    #
+    # The `finally` below covers everything that UNWINDS -- a clean return, a
+    # spend stop, a KeyboardInterrupt -- and covers nothing that does not. A
+    # SIGKILL, an OOM kill and a power loss leave tens of minutes of billed
+    # judging unrecorded, so the next session's cap reads as though this one
+    # never ran. `record_run`'s own docstring names that gap; the checkpointer
+    # closes it by writing DELTAS as the run proceeds, and `finalize` writes
+    # the remainder. The deltas sum to `measured` by construction, which is why
+    # the entry below is a remainder rather than the whole run: writing both
+    # would double count, and `total()` sums.
+    _checkpointer = spend_journal.RunSpendCheckpointer(
+        spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
+        out_dir, _journal_unit, args.judge_model)
     try:
         scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
-                                       journal=journal, reuse=reuse))
+                                       journal=journal, reuse=reuse,
+                                       spend_checkpoint=_checkpointer.checkpoint))
     finally:
-        spend_journal.record_run(
-            spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
-            out_dir, _journal_unit,
-            spend.SPEND_LEDGER.measured, args.judge_model)
+        # STILL IN A `finally`, and it is not made redundant by the
+        # checkpoints: they fire on a threshold, so an invocation that
+        # unwinds always has a tail they did not reach, and an invocation that
+        # spent nothing has no checkpoint at all and still has to leave a
+        # terminal entry.
+        #
+        # IT VERIFIES AGAINST THE FILE and reports any residual itself, loudly.
+        # The line below is the same fact in this harness's own closing block,
+        # because the finalize's warning is emitted mid-`finally` and scrolls
+        # away above the spend report an operator actually reads.
+        _checkpointer.finalize(spend.SPEND_LEDGER.measured)
+        if (_checkpointer.residual_usd or 0.0) > 0:
+            console.out(
+                f"  NOTE: ${_checkpointer.residual_usd:.6f} of this run's "
+                f"spend is NOT in the cross-process journal -- "
+                f"{len(_checkpointer.pending)} delta(s) pending, "
+                f"{len(_checkpointer.conflicted)} in conflict. The next "
+                f"session's cumulative cap will not see it. This run's own "
+                f"cost report below is unaffected: it is computed from the "
+                f"responses, not from the journal.")
     wall_seconds = time.monotonic() - started
 
     summary = summarize(scores, run, active)

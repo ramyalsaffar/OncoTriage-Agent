@@ -4447,6 +4447,24 @@ _DECORATOR_INVENTORY = {
     # derived readings over fields already present, so they cannot disagree with
     # the tuple the way a second stored field could.
     "oncotriage/spend.py::LedgerSeed.is_floor": ["property"],
+    # ── THE CHECKPOINTER'S READ-ONLY VIEWS, and none of them has a setter
+    #    deliberately: the only thing allowed to move any of these is a
+    #    CONFIRMED write, so a caller that could assign one could make the
+    #    journal and the checkpointer disagree about what is still owed --
+    #    which is the defect the confirmed-write repair exists to remove.
+    #
+    #    `recorded` is what the file is known to hold; `issued` is every delta
+    #    ever cut; `unconfirmed` is the gap, and it is the number `finalize`
+    #    reports loudly. `pending` and `conflicted` are the deltas behind that
+    #    gap, exposed as TUPLES so a caller cannot mutate the lists the retry
+    #    walks.
+    "oncotriage/spend_journal.py::RunSpendCheckpointer.recorded": ["property"],
+    "oncotriage/spend_journal.py::RunSpendCheckpointer.issued": ["property"],
+    "oncotriage/spend_journal.py::RunSpendCheckpointer.unconfirmed":
+        ["property"],
+    "oncotriage/spend_journal.py::RunSpendCheckpointer.pending": ["property"],
+    "oncotriage/spend_journal.py::RunSpendCheckpointer.conflicted":
+        ["property"],
     "oncotriage/spend.py::SpendLedger.measured": ["property"],
     "oncotriage/spend.py::SpendLedger.calls": ["property"],
     "oncotriage/spend.py::SpendLedger.seeded": ["property"],

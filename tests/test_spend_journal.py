@@ -706,6 +706,747 @@ check("7i  ...and every one of those degradations is COUNTED, because "
 
 print()
 print("=" * 74)
+print("7c-2. append_with_outcome: FOUR ANSWERS WHERE THERE WAS A BOOL")
+print("=" * 74)
+
+# `append` returns False for "the id is already there, so the money IS
+# recorded" AND for "the write failed, so the money is NOT recorded". Those
+# have OPPOSITE consequences for a caller keeping a running total, and
+# `RunSpendCheckpointer` was that caller: it advanced on both, and a failed
+# $0.30 delta was lost while it reported the money as recorded. The four-valued
+# answer is what makes the distinction expressible; section 7d-i is the repair
+# that uses it.
+
+
+# ══ THE SHARED HELPERS FOR EVERY JOURNAL SECTION BELOW ══════════════════
+#
+# THEY LIVE HERE, ABOVE THE FIRST SECTION THAT USES ANY OF THEM, and that is a
+# correction rather than a preference: defining a helper in the section that
+# happened to need it first and then using it from an EARLIER section is a
+# `NameError` at import, which reports one traceback where this file owes a
+# summary and 200 results. It happened three times while these sections were
+# being written -- `_usd_all`, then `_cp`, then `_at` -- so the helpers are
+# collected once and the sections below only use them.
+
+def _at(seq, i):
+    """``seq[i]``, or a named absence. NEVER RAISES.
+
+    **THE SHAPE THIS REMOVES ABORTED THIS FILE ONCE, IN THE SESSION THAT ADDED
+    IT.** ``_cH.pending[0]`` raises ``IndexError`` exactly when a defect makes
+    a delta confirm that should have stayed pending -- which is when this file
+    owes a summary and 184 results, not a traceback. Found by the revert matrix
+    (R0), not by reading. It is the eighteenth time this project has met it.
+    """
+    try:
+        return seq[i]
+    except (IndexError, KeyError, TypeError):
+        return _AbsentItem(f"<no item {i} in {seq!r}>")
+
+
+class _AbsentItem(object):
+    """A pending delta that is not there. Every field is a named absence.
+
+    **``usd`` IS A NaN AND NOT THE MESSAGE STRING, AND THAT IS THE SECOND HALF
+    OF THE FIX.** The first version returned the message for every field, and
+    ``round("<no item 0 ...>", 6)`` raises ``TypeError`` -- so the guard MOVED
+    the abort from an ``IndexError`` at the subscript to a ``TypeError`` one
+    line later, which is not a fix. Found by the revert matrix (R0) a second
+    time, having been "fixed" once. A NaN rounds, compares unequal to
+    everything, and so makes the check FAIL and print what it got.
+    """
+
+    def __init__(self, why):
+        self.why = why
+        self.unit = why
+        self.usd = float("nan")
+        self.attempts = float("nan")
+        self.last_outcome = why
+
+    def __repr__(self):
+        return self.why
+
+
+def _cp(path, prefix="STAMP1", **kw):
+    """A checkpointer over one journal, with an injectable clock."""
+    kw.setdefault("min_usd", 0.25)
+    kw.setdefault("min_seconds", 60.0)
+    return J.RunSpendCheckpointer(
+        spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
+        "/out", prefix, "judge", path=path, **kw)
+
+
+def _usd_all(path):
+    """Every campaign entry in the file, whoever wrote it."""
+    return round(J.total(spend.SPEND_BUDGET_CAMPAIGN, path=path).usd, 6)
+
+
+def _entry(unit, usd, scope="/out"):
+    return {"entry_id": J.entry_id(spend.SPEND_BUDGET_CAMPAIGN,
+                                   spend.SPEND_SOURCE_RAGAS_JUDGE, scope, unit),
+            "kind": J.ENTRY_KIND_RUN, "budget": spend.SPEND_BUDGET_CAMPAIGN,
+            "source": spend.SPEND_SOURCE_RAGAS_JUDGE, "scope": scope,
+            "unit": unit, "usd": usd, "judge_model": "judge"}
+
+
+_p7c2 = fresh()
+check("7c-2a  a first append WROTE",
+      J.append_with_outcome(_entry("u0", 1.0), path=_p7c2), J.APPEND_WROTE)
+check("7c-2b  the same charge again is a DUPLICATE, not a failure -- the id, "
+      "the charge identity AND the amount all match, so the money IS recorded "
+      "and a retry may advance past it",
+      J.append_with_outcome(_entry("u0", 1.0), path=_p7c2), J.APPEND_DUPLICATE)
+check("7c-2b-i  ...and it wrote no second line",
+      len(J.read_entries(_p7c2)), 1)
+# THE RETRY'S OTHER FIELDS DIFFER AND MUST NOT MATTER. `recorded_at_utc` is
+# stamped per attempt, so a whole-dict comparison would report every retry as a
+# conflict -- the one thing that must not happen to a retry.
+_later = _entry("u0", 1.0)
+_later["recorded_at_utc"] = "2099-01-01T00:00:00+00:00"
+check("7c-2b-ii ...and a retry whose recorded_at_utc differs is STILL a "
+      "duplicate, which is what makes retrying possible at all",
+      J.append_with_outcome(_later, path=_p7c2), J.APPEND_DUPLICATE)
+_before_conflict = J.JOURNAL_FAULTS["append:conflict"]
+check("7c-2c  the same id carrying a DIFFERENT amount is a CONFLICT -- the "
+      "existing entry does not record this charge and never will",
+      J.append_with_outcome(_entry("u0", 2.0), path=_p7c2), J.APPEND_CONFLICT)
+check("7c-2c-i  ...counted rather than silent",
+      J.JOURNAL_FAULTS["append:conflict"] - _before_conflict, 1)
+check("7c-2c-ii ...and nothing was written, so the file still holds one line",
+      (len(J.read_entries(_p7c2)), _usd_all(_p7c2)), (1, 1.0))
+check("7c-2d  the bool wrapper is unchanged for every existing caller: "
+      "wrote -> True, everything else -> False",
+      (J.append(_entry("u1", 3.0), path=_p7c2),
+       J.append(_entry("u1", 3.0), path=_p7c2),
+       J.append(_entry("u1", 9.0), path=_p7c2)), (True, False, False))
+# ── failed VERSUS uncertain, driven rather than described. The split is
+#    decided by whether the write was ATTEMPTED, not by the exception type: a
+#    caller that read "uncertain" as "nothing happened" and retried under a NEW
+#    id would record the same money twice.
+_p7c2b = os.path.join(TMP, "unwritable_dir")
+os.makedirs(_p7c2b, exist_ok=True)
+os.chmod(_p7c2b, 0o500)
+try:
+    check("7c-2e  an error BEFORE the write is `failed` -- nothing persisted",
+          J.append_with_outcome(_entry("u0", 1.0),
+                                path=os.path.join(_p7c2b, "j.jsonl")),
+          J.APPEND_FAILED)
+finally:
+    os.chmod(_p7c2b, 0o700)
+check("7c-2e-i  ...and it is counted under a key naming the phase",
+      any(k.startswith("append:failed:") for k in J.JOURNAL_FAULTS), True)
+
+# THE UNCERTAIN CASE NEEDS THE WRITE TO HAVE BEEN REACHED, so `os.fsync` is
+# made to raise -- which is exactly the real shape: the bytes are in the file
+# and the durability call failed. Restored inside a `finally` with the restore
+# ASSERTED, because a leaked fsync patch would break every later section.
+_p7c2c = fresh()
+_real_fsync = os.fsync
+
+
+def _fsync_raises(fd):
+    raise OSError(5, "simulated I/O error after the write")
+
+
+os.fsync = _fsync_raises
+try:
+    _unc = J.append_with_outcome(_entry("u9", 4.0), path=_p7c2c)
+finally:
+    os.fsync = _real_fsync
+check("7c-2f  RESTORE: os.fsync is the real one again",
+      os.fsync is _real_fsync, True)
+check("7c-2f-i  an error AT OR AFTER the write is `uncertain`, not `failed`",
+      _unc, J.APPEND_UNCERTAIN)
+check("7c-2f-ii ...and it is the honest answer: the line IS in the file, so a "
+      "caller that retried under a NEW id would record the money twice",
+      _usd_all(_p7c2c), 4.0)
+check("7c-2f-iii ...while a RETRY under the same id and amount resolves it to "
+      "a duplicate, which is the whole reason the pair is frozen",
+      J.append_with_outcome(_entry("u9", 4.0), path=_p7c2c),
+      J.APPEND_DUPLICATE)
+check("7c-2f-iv ...and still one line", len(J.read_entries(_p7c2c)), 1)
+
+# ── THE SCOPED READ-BACK. The journal is SHARED, so a writer verifying its own
+#    spend cannot sum the file.
+_p7c2d = fresh()
+J.append_with_outcome(_entry("MINE#0", 1.0, scope="/mine"), path=_p7c2d)
+J.append_with_outcome(_entry("MINE#1", 2.0, scope="/mine"), path=_p7c2d)
+J.append_with_outcome(_entry("OTHER#0", 99.0, scope="/mine"), path=_p7c2d)
+J.append_with_outcome(_entry("MINE#0", 50.0, scope="/theirs"), path=_p7c2d)
+J.record_batch(spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER,
+               "/mine", "b1", 7.0, "judge", path=_p7c2d)
+check("7c-2g  confirmed_usd_for_scope sums THIS writer's entries only",
+      J.confirmed_usd_for_scope(spend.SPEND_BUDGET_CAMPAIGN,
+                                spend.SPEND_SOURCE_RAGAS_JUDGE, "/mine",
+                                path=_p7c2d), 102.0)
+check("7c-2g-i  ...and narrowed by unit prefix it is THIS INVOCATION's",
+      J.confirmed_usd_for_scope(spend.SPEND_BUDGET_CAMPAIGN,
+                                spend.SPEND_SOURCE_RAGAS_JUDGE, "/mine",
+                                unit_prefix="MINE#", path=_p7c2d), 3.0)
+check("7c-2g-ii non-degeneracy: the file really holds the other rows, so the "
+      "narrowing above is excluding something. 152.0 and not 159.0 -- the "
+      "$7 record_batch is on the RATER budget, which _usd_all does not sum, "
+      "and getting that wrong is the reason this check reads a total rather "
+      "than trusting the seeding above it",
+      round(_usd_all(_p7c2d), 6), 152.0)
+check("7c-2g-iii a scope that wrote nothing reads 0.0, not the file's total",
+      J.confirmed_usd_for_scope(spend.SPEND_BUDGET_CAMPAIGN,
+                                spend.SPEND_SOURCE_RAGAS_JUDGE, "/nowhere",
+                                path=_p7c2d), 0.0)
+check("7c-2g-iv an absent journal reads 0.0 and does not raise",
+      J.confirmed_usd_for_scope(spend.SPEND_BUDGET_CAMPAIGN,
+                                spend.SPEND_SOURCE_RAGAS_JUDGE, "/mine",
+                                path=os.path.join(TMP, "no", "such", "j")),
+      0.0)
+
+
+print()
+print("=" * 74)
+print("7c-3. AN INTERRUPTED WRITE LEAVES A BOUNDARY, AND IT IS RECOVERED")
+print("=" * 74)
+
+# ** THE DEFECT, REPRODUCED BEFORE IT WAS REPAIRED. **
+#
+# A journal whose FINAL LINE IS UNTERMINATED -- what a kill mid-`fh.write`
+# leaves -- made the next append CONCATENATE onto it. Measured: a good entry,
+# a killed partial write, then an append reported `wrote`; the merged line
+# would not parse; `read_entries` counted-and-skipped it; the caller advanced
+# its total for money the file could not return. The read-back at finalize saw
+# the shortfall and could not recover it.
+#
+# TWO SHAPES SHARE THAT SIGNATURE and they are deliberately not distinguished
+# at detection: an INCOMPLETE RECORD, and a COMPLETE RECORD MISSING ONLY ITS
+# TERMINATOR. Both are repaired the same way -- one appended newline -- and
+# their outcomes then differ, which is what the checks below separate.
+#
+# EVERY ASSERTION IS A SUM OR A COUNT READ BACK FROM THE FILE.
+
+
+def _write_raw(path, blob):
+    """Put bytes on the end of a journal, terminator and all as given."""
+    with io.open(path, "ab") as fh:
+        fh.write(blob)
+
+
+def _lines_on_disk(path):
+    with io.open(path, "rb") as fh:
+        return fh.read().splitlines()
+
+
+def _complete_record_bytes(unit, usd, scope="/out"):
+    """A well-formed entry's bytes WITHOUT its terminator.
+
+    Built the way the writer builds it -- through `_serialize_entry`, with the
+    same defaults `append_with_outcome` applies -- and then stripped of the
+    newline, so the fragment is genuinely "the write landed, the terminator did
+    not" rather than a hand-shaped approximation of it.
+    """
+    payload = dict(_entry(unit, usd, scope=scope))
+    payload["schema_version"] = J.SCHEMA_VERSION
+    payload["recorded_at_utc"] = "2026-01-01T00:00:00+00:00"
+    return J._serialize_entry(payload).rstrip(b"\n")
+
+
+# --- (a) A PARTIAL TRAILING FRAGMENT ---------------------------------------
+_pB1 = fresh()
+J.append_with_outcome(_entry("b0", 1.0), path=_pB1)
+_FRAGMENT = b'{"entry_id": "half", "usd": 5.0, "bud'
+_write_raw(_pB1, _FRAGMENT)
+check("7c-3a  precondition: the file's last byte is NOT a newline, which is "
+      "what a kill mid-write leaves",
+      io.open(_pB1, "rb").read()[-1:] != b"\n", True)
+_before_bound = J.JOURNAL_FAULTS["append:boundary_recovered"]
+_outA = J.append_with_outcome(_entry("b1", 2.0), path=_pB1)
+check("7c-3a-i  the append reports WROTE -- and this time the file agrees",
+      _outA, J.APPEND_WROTE)
+check("7c-3a-ii the boundary recovery is COUNTED, not silent",
+      J.JOURNAL_FAULTS["append:boundary_recovered"] - _before_bound, 1)
+check("7c-3a-iii the earlier valid entry is PRESERVED and the new one landed "
+      "-- BEFORE THE REPAIR this read 1 entry and $1.00, with the $2.00 merged "
+      "into the fragment and lost",
+      (len(J.read_entries(_pB1)), _usd_all(_pB1)), (2, 3.0))
+check("7c-3a-iv  the fragment SURVIVES as evidence on its own line -- nothing "
+      "was truncated, rewritten or deleted",
+      (len(_lines_on_disk(_pB1)), _FRAGMENT in _lines_on_disk(_pB1)),
+      (3, True))
+check("7c-3a-v  ...and it surfaces through the existing unreadable-line fault "
+      "counting rather than being absorbed",
+      J.JOURNAL_FAULTS["parse:not_json"] > 0, True)
+# THE AMOUNT LANDS EXACTLY ONCE. A retry after the recovery must see its own
+# entry and refuse, not write a second.
+check("7c-3a-vi a retry of the same charge is a DUPLICATE, so the amount is "
+      "recorded once", J.append_with_outcome(_entry("b1", 2.0), path=_pB1),
+      J.APPEND_DUPLICATE)
+check("7c-3a-vii ...and the total is unmoved by that retry",
+      (_usd_all(_pB1), len(J.read_entries(_pB1))), (3.0, 2))
+
+# --- (b) A FRAGMENT CUT MID-UTF-8-CHARACTER --------------------------------
+#
+# **THIS CASE EXPOSED A SECOND DEFECT, IN THE READER.** Every reader here used
+# to open the journal with `encoding="utf-8"` and read it whole, so ONE
+# truncated multi-byte character raised `UnicodeDecodeError` -- a `ValueError`,
+# not an `OSError`, so no handler in the module caught it. Measured before the
+# repair: `read_entries` RAISED, and with it `total`, `describe`,
+# `confirmed_usd_for_scope` and `rater_spend_before`, all of which say NEVER
+# RAISES. One truncated byte took the cumulative cap out of service.
+#
+# THE REPAIR DOES NOT MEND THE ENCODING AND MUST NOT PRETEND TO. The bytes are
+# not valid UTF-8 and nothing here knows what they were going to be; the line
+# is isolated, skipped and counted, and everything either side of it stays
+# readable.
+_pB2 = fresh()
+J.append_with_outcome(_entry("c0", 1.0), path=_pB2)
+_MIDCHAR = b'{"unit": "caf\xc3'
+_write_raw(_pB2, _MIDCHAR)
+_before_utf8 = J.JOURNAL_FAULTS["parse:not_utf8"]
+check("7c-3b  the reader SURVIVES a mid-character truncation and still "
+      "returns the records around it -- before the repair this RAISED",
+      len(J.read_entries(_pB2)), 1)
+_outB = J.append_with_outcome(_entry("c1", 2.0), path=_pB2)
+check("7c-3b-i  ...and so does the writer", _outB, J.APPEND_WROTE)
+check("7c-3b-ii the damaged line is SKIPPED as a counted fault under its own "
+      "key -- not-utf8 is a different diagnosis from not-json",
+      J.JOURNAL_FAULTS["parse:not_utf8"] - _before_utf8 > 0, True)
+check("7c-3b-iii the record BEFORE it and the record AFTER it are both "
+      "readable and correctly summed",
+      (len(J.read_entries(_pB2)), _usd_all(_pB2)), (2, 3.0))
+check("7c-3b-iv  the damaged bytes are still on disk, unrepaired: this module "
+      "does not invent characters it cannot decode",
+      _MIDCHAR in _lines_on_disk(_pB2), True)
+check("7c-3b-v  ...and it is NOT decoded with errors='replace', which would "
+      "hand mojibake to json.loads and, if it parsed, put invented characters "
+      "into a record this module reports as fact",
+      J.decode_journal_line(_MIDCHAR), None)
+
+# --- (c) A COMPLETE FINAL RECORD MISSING ONLY ITS NEWLINE ------------------
+# The other shape. Here recovery makes a REAL record readable, so the file
+# gains an entry rather than a fault -- and the duplicate scan then sees it.
+_pB3 = fresh()
+J.append_with_outcome(_entry("d0", 1.0), path=_pB3)
+_write_raw(_pB3, _complete_record_bytes("d9", 4.0))
+# ** A CORRECTION TO THIS SECTION'S OWN FIRST DRAFT, WHICH ASSERTED THE
+# ** OPPOSITE AND WAS WRONG. It claimed the unterminated record is INVISIBLE
+# ** until it gains a newline. It is not: `read_entries` splits with
+# ** `bytes.splitlines()`, which yields a final unterminated chunk as its own
+# ** line, so such a record is ALREADY readable. Measured -- the check expected
+# ** (1, $1.00) and the answer is (2, $5.00).
+# **
+# ** SO THE DANGER IS THE WRITE PATH AND NOT THE READ PATH, and requirement 2
+# ** is the right framing precisely because of that: the record must remain
+# ** fully readable AFTERWARD. Without boundary recovery the next append
+# ** CONCATENATES onto it and destroys a record that was readable a moment
+# ** earlier -- losing the new charge AND the old one. That is what 7c-3c-ii
+# ** asserts and what plant (a) of the revert matrix reproduces.
+check("7c-3c  precondition: an unterminated COMPLETE record is already "
+      "readable -- splitlines() yields the final chunk as its own line",
+      (len(J.read_entries(_pB3)), _usd_all(_pB3)), (2, 5.0))
+check("7c-3c-i  ...and yet the file's last byte is not a newline, which is "
+      "what the next writer would append onto",
+      io.open(_pB3, "rb").read()[-1:] != b"\n", True)
+_outC = J.append_with_outcome(_entry("d1", 2.0), path=_pB3)
+check("7c-3c-ii after the append BOTH are readable: the record that was "
+      "missing only its terminator SURVIVED it, and the new entry landed. "
+      "Without recovery the append would have merged into that record and "
+      "destroyed both",
+      (_outC, len(J.read_entries(_pB3)), _usd_all(_pB3)),
+      (J.APPEND_WROTE, 3, 7.0))
+check("7c-3c-iii ...and NO duplicate charge: three lines, three entries, each "
+      "amount once",
+      sorted(round(e["usd"], 6) for e in J.read_entries(_pB3)),
+      [1.0, 2.0, 4.0])
+# AND THE RECORD IS VISIBLE TO THE DUPLICATE SCAN -- which it was BEFORE
+# recovery too, and saying otherwise was this comment's own error.
+# `splitlines()` yields the trailing chunk as its own line, so a
+# complete-but-unterminated record is already readable to the scan and to
+# `read_entries` alike.
+#
+# WHY RECOVERY STILL SITS ABOVE THE SCAN: a duplicate or a conflict returns
+# WITHOUT writing, so recovery placed beside the write would skip those calls
+# and leave the boundary torn. Above it, the file is left consistent whatever
+# the outcome and the next append cannot join onto that record.
+check("7c-3c-iv  the recovered record is seen by the duplicate scan, so its "
+      "charge cannot be written again",
+      J.append_with_outcome(_entry("d9", 4.0), path=_pB3), J.APPEND_DUPLICATE)
+check("7c-3c-v  ...and the total is unmoved", _usd_all(_pB3), 7.0)
+
+# --- (d) THE RESTART CASE, HONESTLY SCOPED --------------------------------
+#
+# **THIS REPAIR ADDS NO AUTOMATIC RECOVERY OF A DEAD PROCESS'S PENDING DATA,
+# AND THE TEST SAYS SO RATHER THAN IMPLYING OTHERWISE.** `RunSpendCheckpointer`
+# holds its pending deltas IN MEMORY; a SIGKILL takes them with it, and nothing
+# on disk names them. What a restart can do is what a caller who kept the
+# original id and amount elsewhere can do -- and this simulates exactly that,
+# by SUPPLYING them.
+_pB4 = fresh()
+_c4 = _cp(_pB4, prefix="RESTART", min_usd=0.0)
+_c4.checkpoint(0.10)
+_ORIG = _at(_c4.entries, 0)
+# The kill: a partial write lands after the confirmed entry, and the process
+# holding the pending state dies.
+_write_raw(_pB4, b'{"entry_id": "torn')
+check("7c-3d  precondition: one confirmed entry and a torn tail",
+      (_usd_all(_pB4), io.open(_pB4, "rb").read()[-1:] != b"\n"), (0.10, True))
+# THE RESTART. A NEW checkpointer, told the ORIGINAL unit and amount -- which
+# is the only way this can work, because nothing recovered them for it.
+_c5 = J.RunSpendCheckpointer(
+    spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE, "/out",
+    "RESTART", "judge", path=_pB4, min_usd=0.0)
+_replay = J.append_with_outcome({
+    "entry_id": J.entry_id(spend.SPEND_BUDGET_CAMPAIGN,
+                           spend.SPEND_SOURCE_RAGAS_JUDGE, "/out", "RESTART#1"),
+    "kind": J.ENTRY_KIND_RUN, "budget": spend.SPEND_BUDGET_CAMPAIGN,
+    "source": spend.SPEND_SOURCE_RAGAS_JUDGE, "scope": "/out",
+    "unit": "RESTART#1", "usd": 0.25, "judge_model": "judge"}, path=_pB4)
+check("7c-3d-i  the replayed charge lands against the recovered boundary",
+      (_replay, _usd_all(_pB4)), (J.APPEND_WROTE, 0.35))
+check("7c-3d-ii ...exactly once: replaying it again is a duplicate",
+      (J.append_with_outcome({
+          "entry_id": J.entry_id(spend.SPEND_BUDGET_CAMPAIGN,
+                                 spend.SPEND_SOURCE_RAGAS_JUDGE, "/out",
+                                 "RESTART#1"),
+          "kind": J.ENTRY_KIND_RUN, "budget": spend.SPEND_BUDGET_CAMPAIGN,
+          "source": spend.SPEND_SOURCE_RAGAS_JUDGE, "scope": "/out",
+          "unit": "RESTART#1", "usd": 0.25, "judge_model": "judge"},
+          path=_pB4), _usd_all(_pB4)),
+      (J.APPEND_DUPLICATE, 0.35))
+check("7c-3d-iii and the ORIGINAL confirmed entry is untouched by any of it",
+      _ORIG["unit"], "RESTART#0")
+check("7c-3d-iv  NOT CLAIMED: nothing recovered the dead process's pending "
+      "state. A fresh checkpointer over the same scope starts at zero and "
+      "knows nothing about RESTART#1 until it is told",
+      (round(_c5.recorded, 6), len(_c5.pending)), (0.0, 0))
+
+# --- (e) READ-BACK CONFIRMATION IS WHAT MAKES `wrote` MEAN SOMETHING -------
+# `fh.write` returning is not evidence that the file holds a record: the
+# merged-line defect above is exactly a successful write that produced none.
+_pB5 = fresh()
+_c6 = _cp(_pB5, prefix="RB", min_usd=0.0)
+_real_ser = J._serialize_entry
+_before_rb = J.JOURNAL_FAULTS["append:readback_unreadable"]
+try:
+    J._serialize_entry = lambda payload: b"{not json at all\n"
+    _c6.checkpoint(0.30)
+finally:
+    J._serialize_entry = _real_ser
+check("7c-3e  RESTORE: _serialize_entry is the real one again",
+      J._serialize_entry is _real_ser, True)
+check("7c-3e-i  an append that cannot be parsed back is UNCERTAIN, not wrote",
+      _at(_c6.entries, 0)["outcome"], J.APPEND_UNCERTAIN)
+check("7c-3e-ii ...so `recorded` does NOT advance -- which is the whole "
+      "point: a write that produced no readable entry must not be counted",
+      round(_c6.recorded, 6), 0.0)
+check("7c-3e-iii ...the file really holds no readable entry, so the refusal "
+      "is right rather than merely cautious",
+      (len(J.read_entries(_pB5)), _usd_all(_pB5)), (0, 0.0))
+check("7c-3e-iv  ...it is a NAMED fault",
+      J.JOURNAL_FAULTS["append:readback_unreadable"] - _before_rb, 1)
+check("7c-3e-v   ...and the delta stays PENDING under its frozen id",
+      (len(_c6.pending), _at(_c6.pending, 0).unit), (1, "RB#0"))
+_c6.checkpoint(0.30)
+check("7c-3e-vi  ...so a retry lands it, and the file and the class agree",
+      (round(_c6.recorded, 6), _usd_all(_pB5)), (0.30, 0.30))
+# --- (f) THE TWO HALVES ARE INDEPENDENT, AND THIS IS THE SECOND ONE -------
+# Boundary recovery PREVENTS the merge; the read-back CATCHES one if it
+# happens anyway. Neither subsumes the other, and this check is what says so:
+# with recovery disabled, a merged write must be refused rather than confirmed.
+#
+# IT PATCHES `_needs_boundary`, which is the narrowest seam that removes the
+# first half without touching the second -- and it is the same plant the revert
+# matrix applies to the module, driven here so the property has a standing
+# check rather than living only in a harness nobody runs.
+_pB6 = fresh()
+_write_raw(_pB6, b'{"entry_id": "half", "usd": 5.0, "bud')
+_real_nb = J._needs_boundary
+_c7 = _cp(_pB6, prefix="MERGE", min_usd=0.0)
+try:
+    J._needs_boundary = lambda fh: False
+    _c7.checkpoint(0.30)
+finally:
+    J._needs_boundary = _real_nb
+check("7c-3f  RESTORE: _needs_boundary is the real one again",
+      J._needs_boundary is _real_nb, True)
+check("7c-3f-i  with recovery disabled the write MERGES and the read-back "
+      "refuses to confirm it -- the JSON half of `fragment + json` parses "
+      "perfectly on its own, which is why the read-back reads the LINE",
+      _at(_c7.entries, 0)["outcome"], J.APPEND_UNCERTAIN)
+check("7c-3f-ii ...so `recorded` does not advance for money the file cannot "
+      "return", round(_c7.recorded, 6), 0.0)
+check("7c-3f-iii ...and the file really cannot return it",
+      (len(J.read_entries(_pB6)), _usd_all(_pB6)), (0, 0.0))
+# ** THIS CHECK'S FIRST DRAFT WAS A TAUTOLOGY AND IS RECORDED AS ONE.** It read
+# `(lambda: (...))() is not None`, which is true of any lambda that returns a
+# tuple -- the `or True` shape this project forbids, written into the very
+# section that exists to prove a control discriminates. It asserts the outcome
+# now, on the SAME fragment shape, with recovery left ON.
+_pB7 = fresh()
+_write_raw(_pB7, b'{"entry_id": "half", "usd": 5.0, "bud')
+_c8 = _cp(_pB7, prefix="OK", min_usd=0.0)
+_c8.checkpoint(0.30)
+check("7c-3f-iv  ...and with recovery ON the SAME fragment shape is CONFIRMED "
+      "-- so the refusal above is about the merge, not about the fragment "
+      "being present",
+      (_at(_c8.entries, 0)["outcome"], round(_c8.recorded, 6)),
+      (J.APPEND_WROTE, 0.30))
+check("7c-3f-v   ...and the file can return it",
+      (len(J.read_entries(_pB7)), _usd_all(_pB7)), (1, 0.30))
+
+check("7c-3e-vii ...and the unreadable bytes are STILL on disk: this module "
+      "wrote them, did not decide they were wrong, and left the evidence",
+      any(b"not json at all" in ln for ln in _lines_on_disk(_pB5)), True)
+
+
+print()
+print("=" * 74)
+print("7d. THE CHECKPOINTER: SEGMENTED run ENTRIES, AND NO DOUBLE COUNT")
+print("=" * 74)
+
+# `record_run` writes ONE entry per invocation from a `finally`, and its own
+# docstring names what that costs: "an invocation killed before it reaches its
+# recording point contributes NOTHING to the next one's cap". A `finally`
+# covers everything that UNWINDS -- a clean return, an exception, a Ctrl-C --
+# and covers nothing that does not. `RunSpendCheckpointer` closes the rest by
+# writing DELTAS as a run proceeds.
+#
+# THE ENTRIES ARE DELTAS BECAUSE `total()` SUMS. A checkpoint carrying the
+# running TOTAL would be re-counted by every later one: a $1.20 run written as
+# five cumulative checkpoints seeds the next session at $3.60. Every check
+# below is ultimately about that one property.
+
+
+def _usd(path):
+    return round(J.total(spend.SPEND_BUDGET_CAMPAIGN, path=path).usd, 6)
+
+
+# --- 7d-a  the deltas sum to what was measured -----------------------------
+_p7d = fresh()
+_clock = {"t": 0.0}
+_c = _cp(_p7d, clock=lambda: _clock["t"])
+_spent = 0.0
+for _i in range(20):
+    _spent += 0.06
+    _c.checkpoint(_spent)
+check("7d-a  twenty pairs at $0.06 with a $0.25 threshold write four "
+      "checkpoints, not twenty -- the threshold is what makes this cheap",
+      len(_c.entries), 4)
+check("7d-a  ...and what is on disk is what has been recorded, not what has "
+      "been spent: the tail is still owed",
+      (_usd(_p7d), round(_c.recorded, 6)), (1.2, 1.2))
+_c.finalize(_spent)
+check("7d-a  finalize writes the REMAINDER and the journal then equals the "
+      "measured total exactly",
+      _usd(_p7d), round(_spent, 6))
+check("7d-a  ...and the deltas sum to it, which is the property `total()` "
+      "summing depends on",
+      round(sum(e["usd"] for e in _c.entries), 6), round(_spent, 6))
+check("7d-a  every unit is distinct, so no entry_id collides inside one run",
+      len({e["unit"] for e in _c.entries}), len(_c.entries))
+
+# --- 7d-b  CONTROL: cumulative entries would triple the total --------------
+# The rejected design, driven rather than argued. It is what makes 7d-a a
+# statement about DELTAS rather than about a number that happened to match.
+_p7db = fresh()
+for _seq, _amount in enumerate((0.30, 0.60, 0.90, 1.20)):
+    J.record_run(spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
+                 "/out", f"CUMULATIVE#{_seq}", _amount, "judge", path=_p7db)
+check("7d-b  CONTROL: cumulative checkpoints of a $1.20 run seed the next "
+      "session at $3.00 -- which is why the entries are deltas",
+      _usd(_p7db), 3.0)
+
+# --- 7d-c  finalize is idempotent, and writes even a zero delta ------------
+_p7dc = fresh()
+_c2 = _cp(_p7dc)
+check("7d-c  a run that spent nothing still leaves a terminal entry, so "
+      "'this run recorded itself' stays answerable -- which is exactly what "
+      "the one-entry-per-invocation writer it replaces did",
+      (_c2.finalize(0.0), len(J.read_entries(_p7dc))), (True, 1))
+check("7d-c  ...and a second finalize writes nothing, so a `finally` inside "
+      "another `finally` cannot produce two terminal entries",
+      (_c2.finalize(0.0), len(J.read_entries(_p7dc))), (False, 1))
+check("7d-c  ...and a checkpoint AFTER finalize is refused and counted",
+      (_c2.checkpoint(5.0), _usd(_p7dc),
+       any(k.startswith("checkpoint:after_finalize") for k in J.JOURNAL_FAULTS)),
+      (False, 0.0, True))
+
+# --- 7d-d  the time backstop -----------------------------------------------
+# The money threshold is the BOUND; this is the liveness backstop for a run
+# that is slow and cheap, which would otherwise record nothing until the end.
+_p7dd = fresh()
+_clock2 = {"t": 0.0}
+_c3 = _cp(_p7dd, min_usd=1000.0, min_seconds=30.0, clock=lambda: _clock2["t"])
+check("7d-d  under the money threshold and inside the window, nothing is "
+      "written", (_c3.checkpoint(0.01), _usd(_p7dd)), (False, 0.0))
+_clock2["t"] = 31.0
+check("7d-d  ...and past the window it writes, even though the money "
+      "threshold is nowhere near",
+      (_c3.checkpoint(0.02), _usd(_p7dd)), (True, 0.02))
+_clock2["t"] = 32.0
+check("7d-d  ...and a zero delta writes nothing even past the window: there "
+      "is nothing to record",
+      (_c3.checkpoint(0.02), len(J.read_entries(_p7dd))), (False, 1))
+
+# --- 7d-e  a ledger that goes backwards is counted, never written ----------
+# Only reachable through `SPEND_LEDGER.reset()` mid-run, which no harness does.
+# Counted rather than clamped: writing a negative into a cap is worse than not
+# writing, and a backwards ledger is a defect somewhere else.
+_p7de = fresh()
+_c4 = _cp(_p7de, min_usd=0.0)
+_c4.checkpoint(1.0)
+_before_neg = sum(v for k, v in J.JOURNAL_FAULTS.items()
+                  if k == "checkpoint:negative_delta")
+check("7d-e  a measured total that DECREASED writes nothing",
+      (_c4.checkpoint(0.5), _usd(_p7de)), (False, 1.0))
+check("7d-e  ...and it is counted rather than silent",
+      J.JOURNAL_FAULTS["checkpoint:negative_delta"] - _before_neg, 1)
+for _bad, _label in ((None, "None"), ("1.0", "a string"), (True, "a bool"),
+                     (float("nan"), "NaN")):
+    check(f"7d-e  {_label} as a measured total writes nothing and does not "
+          f"raise", (_c4.checkpoint(_bad), _usd(_p7de)), (False, 1.0))
+check("7d-e  ...and each bad shape is counted under its own key",
+      sorted({k for k in J.JOURNAL_FAULTS
+              if k.startswith("checkpoint:bad_measured")}),
+      ["checkpoint:bad_measured:NoneType", "checkpoint:bad_measured:bool",
+       "checkpoint:bad_measured:nan", "checkpoint:bad_measured:str"])
+
+# --- 7d-f  THE FOUR-SCENARIO MATRIX ---------------------------------------
+# The design constraint, driven rather than asserted: no double counting across
+# clean completion, exception abort, hard kill then re-run, and hard kill then
+# resume. The kill is simulated HERE by abandoning a checkpointer without
+# finalizing it -- which is exactly what an un-unwound process leaves behind --
+# and driven with a REAL SIGKILL in tests/test_spend_hard_kill_journaling.py.
+_p7df = fresh()
+# (1) clean completion
+_s1 = _cp(_p7df, prefix="RUN_A", min_usd=0.25)
+for _i in range(1, 9):
+    _s1.checkpoint(_i * 0.10)
+_s1.finalize(0.80)
+check("7d-f  (1) clean completion records exactly what it spent",
+      _usd(_p7df), 0.80)
+# (2) exception abort -- the finally still runs
+_s2 = _cp(_p7df, prefix="RUN_B", min_usd=0.25)
+try:
+    for _i in range(1, 6):
+        _s2.checkpoint(_i * 0.10)
+    raise RuntimeError("boom")
+except RuntimeError:
+    pass
+finally:
+    _s2.finalize(0.50)
+check("7d-f  (2) an exception abort adds its own spend and nothing else",
+      _usd(_p7df), 1.30)
+# (3) hard kill -- checkpoints on disk, no finalize
+_s3 = _cp(_p7df, prefix="RUN_C", min_usd=0.25)
+for _i in range(1, 8):
+    _s3.checkpoint(_i * 0.10)
+_killed_recorded = _usd(_p7df)
+# DERIVED FROM THE CHECKPOINTER RATHER THAN RETYPED. The first version of this
+# check hard-coded 0.50 and the answer is 0.60 -- with a $0.25 threshold the
+# writes land at $0.30 and $0.60 and the $0.70 reading is under the threshold.
+# A hand-computed expectation beside a thresholded writer is a second
+# implementation of the thresholds.
+check("7d-f  (3) a killed run's checkpoints survive it -- this is the whole "
+      "item: before the checkpointer this contributed 0",
+      round(_killed_recorded - 1.30, 6), round(_s3.recorded, 6))
+check("7d-f  (3) non-degeneracy: the killed run really had recorded "
+      "something, and really lost a TAIL -- which is the residual this "
+      "mechanism bounds rather than removes",
+      (_s3.recorded > 0, _s3.recorded < 0.70), (True, True))
+# ...then a fresh re-run in the SAME output directory
+_s4 = _cp(_p7df, prefix="RUN_D", min_usd=0.25)
+for _i in range(1, 5):
+    _s4.checkpoint(_i * 0.10)
+_s4.finalize(0.40)
+check("7d-f  (3) the re-run's spend is ADDED, not merged with the killed "
+      "run's -- a new prefix means new entry_ids",
+      _usd(_p7df), round(_killed_recorded + 0.40, 6))
+# (4) hard kill then --resume: same shape, and the resume does not re-judge
+# the pairs it carries forward, so the money is not spent twice either.
+_s5 = _cp(_p7df, prefix="RUN_E", min_usd=0.25)
+_s5.finalize(0.20)
+check("7d-f  (4) a resume after a kill adds only what IT spent",
+      _usd(_p7df), round(_killed_recorded + 0.60, 6))
+check("7d-f  every entry is distinct, so the total is a sum of charges and "
+      "not of re-reads",
+      len({e.get("entry_id") for e in J.read_entries(_p7df)}),
+      len(J.read_entries(_p7df)))
+# CONTROL: the collision that WOULD double-count is refused, not written twice.
+_s6 = _cp(_p7df, prefix="RUN_A", min_usd=0.0)
+check("7d-f  CONTROL: a checkpointer reusing a prefix computes ids that are "
+      "already there, and `append` REFUSES them -- so the failure mode of a "
+      "clock collision is UNDER-recording, never double counting",
+      (_s6.checkpoint(0.10), _usd(_p7df)),
+      (False, round(_killed_recorded + 0.60, 6)))
+
+# --- 7d-g  the kind is `run`, deliberately ---------------------------------
+check("7d-g  segments are recorded as `run` entries",
+      sorted({e.get("kind") for e in J.read_entries(_p7df)}),
+      [J.ENTRY_KIND_RUN])
+# A FOURTH KIND WOULD BE SILENTLY SKIPPED BY ANY BUILD THAT PREDATES IT, and
+# `total()` counts-and-skips an unknown kind -- under-recording, the unsafe
+# direction. Reusing `run` means an older reader sums these correctly.
+_p7dg = fresh()
+J.append({"entry_id": "future1", "kind": "segment", "budget":
+          spend.SPEND_BUDGET_CAMPAIGN, "source": spend.SPEND_SOURCE_RAGAS_JUDGE,
+          "scope": "/out", "unit": "u", "usd": 5.0}, path=_p7dg)
+check("7d-g  CONTROL: a kind this build does not know is skipped, which is "
+       "why a fourth kind was rejected -- an older reader would drop every "
+       "segment", _usd(_p7dg), 0.0)
+check("7d-g  ...and the skip is counted rather than silent",
+      J.JOURNAL_FAULTS.get("kind:segment", 0) >= 1, True)
+# AND `batch` WAS THE OTHER IDEMPOTENT KIND AND IS WRONG HERE: `total()` gives
+# it migration-coverage handling built for the rater's Batch API.
+check("7d-g  the checkpointer never writes a `batch` entry, whose "
+      "covers_batch_ids handling has no meaning for a ragas segment",
+      J.ENTRY_KIND_BATCH in {e.get("kind") for e in J.read_entries(_p7df)},
+      False)
+
+# --- 7d-h  a refused write does not leave the delta owed -------------------
+# `append` returns False both for a refused DUPLICATE and for an OSError it has
+# already counted. Treating either as "still owed" would make the next
+# checkpoint carry the same delta and, if THAT one landed, record it twice.
+#
+# ** THE FIRST VERSION OF THIS CHECK TESTED NOTHING, AND THE REVERT MATRIX IS
+# ** WHAT FOUND IT. It pointed the checkpointer at `TMP/no-such-dir/x/j.jsonl`
+# ** and called it "a write that is refused" -- but `append` does
+# ** `os.makedirs(parent, exist_ok=True)`, so the path was created and the
+# ** write SUCCEEDED. The check passed, and the revert that makes `recorded`
+# ** advance only on a successful write was reported as MISSED. A check whose
+# ** label says "refused" over a path that succeeds is not a weak check; it is
+# ** a check of something else.
+#
+# THE DUPLICATE IS THE REAL CASE ANYWAY. It is what `entry_id` idempotency
+# produces in production -- a re-collected batch, or the stamp collision
+# section 7d-f controls for -- so this drives that rather than a filesystem
+# failure.
+_p7dh = fresh()
+_first = _cp(_p7dh, prefix="DUP", min_usd=0.0)
+_first.checkpoint(1.0)
+check("7d-h  precondition: the first checkpointer wrote DUP#0",
+      (_usd(_p7dh), len(J.read_entries(_p7dh))), (1.0, 1))
+_second = _cp(_p7dh, prefix="DUP", min_usd=0.0)
+# ** THE RETURN MEANS "CONFIRMED ANYTHING", NOT "WROTE A LINE", AND THAT IS A
+# ** DELIBERATE CHANGE. Before the repair this asserted False, because `append`
+# ** returned False for a duplicate and the checkpointer forwarded it. A
+# ** duplicate whose id, charge identity AND amount all match is a
+# ** CONFIRMATION -- the money is in the file -- so the honest answer is True,
+# ** and the OUTCOME is what says which of the two happened.
+check("7d-h  a second checkpointer reusing the prefix CONFIRMS rather than "
+      "writing: its DUP#0 is a duplicate, and a duplicate is proof the money "
+      "is recorded", _second.checkpoint(1.0), True)
+check("7d-h  ...and the recorded outcome says DUPLICATE, not WROTE, so the "
+      "bool above is not hiding a second line",
+      [e["outcome"] for e in _second.entries], [J.APPEND_DUPLICATE])
+check("7d-h  ...and no second line was written",
+      len(J.read_entries(_p7dh)), 1)
+check("7d-h  ...and `recorded` advances, so the confirmed delta is not still "
+      "owed", round(_second.recorded, 6), 1.0)
+_second.checkpoint(2.0)
+check("7d-h  ...so the next checkpoint carries only the NEW dollar. Leaving "
+      "the delta owed would write $2.00 here and the journal would read "
+      "$3.00 for $2.00 of spend -- which is the double count this whole "
+      "section is about", _usd(_p7dh), 2.0)
+
+
+print()
+print("=" * 74)
 print("7c. NO TEST MAY READ THE PRODUCTION JOURNAL BY ACCIDENT")
 print("=" * 74)
 
@@ -767,6 +1508,397 @@ check("7h-iii ...while one that names it is not",
 check("7h-iv ...and a MENTION in prose is not a call, which is why this is "
       "an AST walk rather than a grep",
       _unguarded_calls('"""rater_spend_before is discussed here."""\n'), [])
+
+
+print()
+print("=" * 74)
+print("7d-j. THE FOUR-SCENARIO MATRIX, RE-DRIVEN ON THE REPAIRED CLASS")
+print("=" * 74)
+
+# Section 7d-f drove this matrix before the confirmed-write repair, and every
+# total it asserts came from `total()` over the whole file. This re-drives all
+# four on the repaired class and asserts each from the SCOPED read-back --
+# `confirmed_usd_for_scope`, narrowed to one invocation's own `prefix#` units
+# -- which is the oracle `finalize` itself uses and the only one that survives
+# a shared journal.
+#
+# THE CONSTRAINT IS UNCHANGED: no double counting across clean completion,
+# exception abort, hard kill then re-run, and hard kill then resume. What is
+# NEW is that each scenario also asserts the class and the file AGREE, which
+# is precisely what the repaired defect broke.
+_pM = fresh()
+
+
+def _scoped(prefix):
+    return round(J.confirmed_usd_for_scope(
+        spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE, "/out",
+        unit_prefix=f"{prefix}#", path=_pM), 6)
+
+
+# (1) CLEAN COMPLETION
+_m1 = _cp(_pM, prefix="M_CLEAN", min_usd=0.25)
+for _i in range(1, 9):
+    _m1.checkpoint(_i * 0.10)
+_m1.finalize(0.80)
+check("7d-j-1  clean completion: the FILE holds exactly what was spent",
+      _scoped("M_CLEAN"), 0.80)
+check("7d-j-1-i ...and the class agrees with the file, with no residual",
+      (round(_m1.recorded, 6), round(_m1.residual_usd, 6)), (0.80, 0.0))
+
+# (2) EXCEPTION ABORT -- the finally still runs
+_m2 = _cp(_pM, prefix="M_ABORT", min_usd=0.25)
+try:
+    for _i in range(1, 6):
+        _m2.checkpoint(_i * 0.10)
+    raise RuntimeError("boom")
+except RuntimeError:
+    pass
+finally:
+    _m2.finalize(0.50)
+check("7d-j-2  exception abort: the FILE holds what was spent before the raise",
+      _scoped("M_ABORT"), 0.50)
+check("7d-j-2-i ...and adds nothing to the previous scenario's total",
+      _scoped("M_CLEAN"), 0.80)
+
+# (3) HARD KILL -- checkpoints on disk, no finalize -- then a FRESH re-run
+_m3 = _cp(_pM, prefix="M_KILLED", min_usd=0.25)
+for _i in range(1, 8):
+    _m3.checkpoint(_i * 0.10)
+_killed = _scoped("M_KILLED")
+check("7d-j-3  a killed run's confirmed checkpoints survive it",
+      _killed > 0, True)
+check("7d-j-3-i ...and the class's own reading matches the file exactly, "
+      "which is what the repair guarantees at every instant and not only at "
+      "finalization", round(_m3.recorded, 6), _killed)
+check("7d-j-3-ii ...and a TAIL was genuinely lost, so 7d-j-3 is not satisfied "
+      "by a run that recorded everything", _killed < 0.70, True)
+_m4 = _cp(_pM, prefix="M_RERUN", min_usd=0.25)
+for _i in range(1, 5):
+    _m4.checkpoint(_i * 0.10)
+_m4.finalize(0.40)
+check("7d-j-3-iii the re-run's spend is its OWN, added rather than merged",
+      (_scoped("M_RERUN"), _scoped("M_KILLED")), (0.40, _killed))
+
+# (4) HARD KILL THEN --resume
+_m5 = _cp(_pM, prefix="M_RESUME", min_usd=0.25)
+_m5.finalize(0.20)
+check("7d-j-4  a resume after a kill records only what IT spent",
+      _scoped("M_RESUME"), 0.20)
+check("7d-j-4-i  and the whole file is the sum of the five, with no id "
+      "counted twice",
+      round(sum(_scoped(p) for p in ("M_CLEAN", "M_ABORT", "M_KILLED",
+                                     "M_RERUN", "M_RESUME")), 6),
+      _usd_all(_pM))
+check("7d-j-4-ii ...and every entry_id in the file is distinct, which is what "
+      "'not counted twice' means mechanically",
+      len({e.get("entry_id") for e in J.read_entries(_pM)}),
+      len(J.read_entries(_pM)))
+
+
+print()
+print("=" * 74)
+print("7d-i. A DELTA IS RECORDED ONLY WHEN THE WRITE IS CONFIRMED")
+print("=" * 74)
+
+# ** THE DEFECT, REPRODUCED BEFORE IT WAS REPAIRED. **
+#
+# `RunSpendCheckpointer` advanced its recorded total on `append`'s False --
+# which is returned for "the id is already there, so the money IS recorded"
+# AND for "the write failed, so the money is NOT recorded". A $0.30 delta whose
+# append failed was never retried; the finalize computed its remainder against
+# the already-advanced total and wrote $0.00; the class reported $0.50 against
+# a journal holding $0.20. Nothing raised and no counter moved.
+#
+# EVERY CHECK BELOW ASSERTS A SUM READ BACK FROM THE FILE, never a return
+# value and never the class's own counters -- because counters are precisely
+# what the defect got wrong, and a total that verified itself against its own
+# arithmetic would have reported the lost $0.30 as recorded just as
+# confidently.
+
+
+def _mine(path, prefix="STAMP1"):
+    """What the FILE says this invocation recorded. The only oracle here."""
+    return round(J.confirmed_usd_for_scope(
+        spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
+        "/out", unit_prefix=f"{prefix}#", path=path), 6)
+
+
+class _Outcomes(object):
+    """Forces `append_with_outcome` to a scripted answer, then restores it.
+
+    A CONTEXT MANAGER SO THE RESTORE IS UNCONDITIONAL, and the restore is
+    ASSERTED by 7d-i-z below: a leaked patch would make every later section
+    measure a stand-in.
+    """
+
+    def __init__(self, script):
+        self.script = list(script)
+        self.calls = []
+        self._real = None
+
+    def __enter__(self):
+        self._real = J.append_with_outcome
+
+        def _patched(entry, path=None):
+            self.calls.append((entry.get("unit"), entry.get("usd")))
+            forced = self.script.pop(0) if self.script else None
+            if forced is None:
+                return self._real(entry, path=path)
+            if forced == "PERSIST_THEN_FAIL":
+                # THE UNCERTAIN CASE, and it is the honest simulation: the
+                # bytes really go in, and the caller really is told it cannot
+                # be sure. A stand-in that skipped the write would let a
+                # retry-under-a-new-id look safe when it is not.
+                self._real(entry, path=path)
+                return J.APPEND_UNCERTAIN
+            return forced
+
+        J.append_with_outcome = _patched
+        return self
+
+    def __exit__(self, *exc):
+        J.append_with_outcome = self._real
+        return False
+
+
+# --- (1) FAILURE BEFORE THE WRITE PERSISTS ---------------------------------
+_pA = fresh()
+_cA = _cp(_pA, min_usd=0.0)
+_cA.checkpoint(0.20)
+with _Outcomes([J.APPEND_FAILED]):
+    _cA.checkpoint(0.50)
+check("7d-i-a  a delta whose write FAILED is not recorded",
+      (_mine(_pA), round(_cA.recorded, 6)), (0.20, 0.20))
+check("7d-i-a-i ...and the class and the FILE agree, which is the whole "
+      "repair: before it these read 0.50 and 0.20",
+      round(_cA.recorded, 6), _mine(_pA))
+check("7d-i-a-ii ...and the money is held as PENDING with its amount frozen, "
+      "not dropped",
+      (len(_cA.pending), round(_cA.unconfirmed, 6)), (1, 0.30))
+
+# --- (2) FAILURE AFTER PERSISTENCE, BEFORE CONFIRMATION (uncertain) --------
+# The bytes are in the file and the writer cannot prove it. A caller that read
+# this as "nothing happened" and retried under a NEW id would record the same
+# money twice; the frozen id and amount are what make the retry resolve to a
+# duplicate instead.
+_pB = fresh()
+_cB = _cp(_pB, min_usd=0.0)
+with _Outcomes(["PERSIST_THEN_FAIL"]):
+    _cB.checkpoint(0.40)
+check("7d-i-b  the line IS on disk even though the attempt was uncertain",
+      _mine(_pB), 0.40)
+check("7d-i-b-i ...and the class does NOT advance on it, because it cannot "
+      "prove it -- under-reporting is the safe direction here",
+      (round(_cB.recorded, 6), len(_cB.pending)), (0.0, 1))
+_cB.checkpoint(0.40)
+check("7d-i-b-ii the retry under the SAME id and amount resolves to a "
+      "DUPLICATE and confirms it",
+      (round(_cB.recorded, 6), len(_cB.pending)), (0.40, 0))
+check("7d-i-b-iii ...and the money is recorded ONCE, not twice, which is what "
+      "the frozen pair buys", (_mine(_pB), len(J.read_entries(_pB))),
+      (0.40, 1))
+
+# --- (3) A CONFIRMED DUPLICATE ADVANCES ------------------------------------
+_pC = fresh()
+_cC = _cp(_pC, min_usd=0.0)
+with _Outcomes([J.APPEND_DUPLICATE]):
+    _cC.checkpoint(0.15)
+check("7d-i-c  a confirmed duplicate ADVANCES the recorded total -- the money "
+      "is in the file, put there by an earlier attempt",
+      (round(_cC.recorded, 6), len(_cC.pending)), (0.15, 0))
+
+# --- (4) CONFLICT: NAMED FAULT, NEVER ADVANCED PAST ------------------------
+# An entry with this id records something ELSE. This charge is not recorded by
+# it and never will be, so retrying cannot fix it and inventing a new id would
+# abandon the question of which charge the existing entry is.
+_pD = fresh()
+_cD = _cp(_pD, prefix="DUPPREFIX", min_usd=0.0)
+J.append_with_outcome({
+    "entry_id": J.entry_id(spend.SPEND_BUDGET_CAMPAIGN,
+                           spend.SPEND_SOURCE_RAGAS_JUDGE, "/out",
+                           "DUPPREFIX#0"),
+    "kind": J.ENTRY_KIND_RUN, "budget": spend.SPEND_BUDGET_CAMPAIGN,
+    "source": spend.SPEND_SOURCE_RAGAS_JUDGE, "scope": "/out",
+    "unit": "DUPPREFIX#0", "usd": 99.0, "judge_model": "someone else"},
+    path=_pD)
+_before_conf = J.JOURNAL_FAULTS["checkpoint:conflict_unresolved"]
+_cD.checkpoint(0.25)
+check("7d-i-d  a CONFLICT does not advance the recorded total",
+      round(_cD.recorded, 6), 0.0)
+check("7d-i-d-i ...it is a NAMED fault",
+      J.JOURNAL_FAULTS["checkpoint:conflict_unresolved"] - _before_conf, 1)
+check("7d-i-d-ii ...the delta is held as conflicted rather than pending, so "
+      "it is never retried -- a collision does not heal",
+      (len(_cD.conflicted), len(_cD.pending), round(_cD.unconfirmed, 6)),
+      (1, 0, 0.25))
+_cD.checkpoint(0.25)
+check("7d-i-d-iii ...and a later checkpoint does not retry it",
+      len([e for e in _cD.entries if e["unit"] == "DUPPREFIX#0"]), 1)
+
+# --- (5) RECOVERY ON A LATER CHECKPOINT ------------------------------------
+_pE = fresh()
+_cE = _cp(_pE, min_usd=0.0)
+with _Outcomes([J.APPEND_FAILED]):
+    _cE.checkpoint(0.30)
+check("7d-i-e  precondition: nothing recorded, one pending",
+      (_mine(_pE), len(_cE.pending)), (0.0, 1))
+_cE.checkpoint(0.50)
+check("7d-i-e-i  a later checkpoint retries the frozen delta AND cuts the new "
+      "one, and the file holds both", _mine(_pE), 0.50)
+check("7d-i-e-ii ...as TWO entries, because the pending amount was frozen and "
+      "the new spend went into its own delta",
+      sorted(e["usd"] for e in J.read_entries(_pE)), [0.20, 0.30])
+check("7d-i-e-iii ...and the class agrees with the file",
+      (round(_cE.recorded, 6), round(_cE.unconfirmed, 6)), (0.50, 0.0))
+
+# --- (6) RECOVERY ONLY AT FINALIZATION -------------------------------------
+_pF = fresh()
+_cF = _cp(_pF, min_usd=0.0)
+with _Outcomes([J.APPEND_FAILED]):
+    _cF.checkpoint(0.30)
+_cF.finalize(0.30)
+check("7d-i-f  a delta that only recovers at finalization is still recorded",
+      _mine(_pF), 0.30)
+check("7d-i-f-i  ...with no residual and nothing left pending",
+      (round(_cF.residual_usd, 6), len(_cF.pending)), (0.0, 0))
+
+# --- (7) PERMANENT FAILURE THROUGH FINALIZATION: THE LOUD RESIDUAL ---------
+_pG = fresh()
+_cG = _cp(_pG, min_usd=0.0)
+_cG.checkpoint(0.20)
+_before_res = J.JOURNAL_FAULTS["checkpoint:unconfirmed_residual"]
+with _Outcomes([J.APPEND_FAILED, J.APPEND_FAILED, J.APPEND_FAILED]):
+    _cG.checkpoint(0.50)
+    _cG.finalize(0.50)
+check("7d-i-g  THE REVIEWER'S SCENARIO. The class reports what the FILE holds "
+      "-- not what it hoped it held",
+      (round(_cG.recorded, 6), _mine(_pG)), (0.20, 0.20))
+check("7d-i-g-i  ...and the $0.30 is reported as a residual with its exact "
+      "amount, never marked recorded", round(_cG.residual_usd, 6), 0.30)
+check("7d-i-g-ii ...as a NAMED degradation",
+      J.JOURNAL_FAULTS["checkpoint:unconfirmed_residual"] - _before_res, 1)
+check("7d-i-g-iii ...and verified_usd is READ BACK from the file rather than "
+      "computed, so it cannot agree with a wrong counter",
+      round(_cG.verified_usd, 6), _mine(_pG))
+check("7d-i-g-iv  BEFORE THE REPAIR this read 0.50 against a journal of 0.20. "
+      "The two numbers now agree by construction",
+      round(_cG.recorded, 6) == _mine(_pG), True)
+
+# --- (7b) THE VERIFICATION IS AGAINST THE FILE, AND HERE IS WHAT THAT BUYS --
+#
+# ** THIS SCENARIO EXISTS BECAUSE THE REVERT MATRIX REPORTED A MISS. **
+# Reverting `finalize`'s read-back to `self._confirmed_usd` changed NOTHING
+# any check could see -- because under the repair the counters and the file
+# always agree, which is the repair's own guarantee. A verification that can
+# only be exercised when it agrees is not being exercised.
+#
+# WHAT IT ACTUALLY PROTECTS AGAINST is a divergence the checkpointer CANNOT
+# know about: another writer, a truncated file, a line whose schema version
+# this build refuses, an amount `confirmed_usd_for_scope` skips. The file is
+# the authority and the counters are a model of it, and only reading the file
+# can catch the model being wrong.
+#
+# DRIVEN by removing a confirmed line from the journal after it was written,
+# which is the truncation case in its smallest honest form.
+_pI = fresh()
+_cI = _cp(_pI, min_usd=0.0)
+_cI.checkpoint(0.10)
+_cI.checkpoint(0.30)
+check("7d-i-i  precondition: two confirmed deltas, counters and file agree",
+      (round(_cI.recorded, 6), _mine(_pI)), (0.30, 0.30))
+_kept = [ln for ln in io.open(_pI, encoding="utf-8").read().splitlines()
+         if ln.strip() and "STAMP1#1" not in ln]
+with io.open(_pI, "w", encoding="utf-8") as _fh:
+    _fh.write("\n".join(_kept) + "\n")
+check("7d-i-i-i  a line this invocation had CONFIRMED is now gone from the "
+      "file -- something outside this process removed it", _mine(_pI), 0.10)
+_before_res_i = J.JOURNAL_FAULTS["checkpoint:unconfirmed_residual"]
+_cI.finalize(0.30)
+check("7d-i-i-ii finalize READS THE FILE and reports the gap, rather than "
+      "confirming its own arithmetic back to itself",
+      (round(_cI.verified_usd, 6), round(_cI.residual_usd, 6)), (0.10, 0.20))
+check("7d-i-i-iii ...and `recorded` goes DOWN to what the file says, which is "
+      "the honest direction and the one a counter-based check cannot reach",
+      round(_cI.recorded, 6), 0.10)
+check("7d-i-i-iv ...as a NAMED degradation",
+      J.JOURNAL_FAULTS["checkpoint:unconfirmed_residual"] - _before_res_i, 1)
+
+# --- (7c) THE SYMMETRIC CASE: THE FILE HOLDS MORE THAN THIS RUN SPENT ------
+# Only reachable through a prefix collision. The earlier design note said a
+# collision "fails safe", and it does for DOUBLE COUNTING -- the amounts differ,
+# so the second attempt is a conflict -- but a reader of this scope's total is
+# then handed two runs' money under one invocation's units, and only the
+# read-back comparison can see it. Reported rather than passed over.
+_pJ = fresh()
+J.append_with_outcome(_entry("STAMP1#7", 5.0), path=_pJ)   # somebody else's
+_cJ = _cp(_pJ, min_usd=0.0)
+_cJ.checkpoint(0.10)
+_before_over = J.JOURNAL_FAULTS["checkpoint:overrecorded_scope"]
+_cJ.finalize(0.10)
+check("7d-i-j  an over-recorded scope is REPORTED, not silently accepted",
+      J.JOURNAL_FAULTS["checkpoint:overrecorded_scope"] - _before_over, 1)
+check("7d-i-j-i  ...and the residual is negative by the amount the file holds "
+      "in excess", round(_cJ.residual_usd, 6), -5.0)
+check("7d-i-j-ii ...and a run whose file matches reports NEITHER direction",
+      (J.JOURNAL_FAULTS["checkpoint:overrecorded_scope"] - _before_over,
+       round(_m1.residual_usd, 6)), (1, 0.0))
+
+# --- (8) PENDING FROZEN WHILE NEW SPEND ACCRUES ----------------------------
+# New spend must NOT grow a pending entry: its amount is frozen, because the
+# duplicate check that makes a retry safe compares the amount.
+_pH = fresh()
+_cH = _cp(_pH, min_usd=0.0)
+with _Outcomes([J.APPEND_FAILED, J.APPEND_FAILED, J.APPEND_FAILED]):
+    _cH.checkpoint(0.10)
+    _frozen = _at(_cH.pending, 0)
+    _cH.checkpoint(0.35)
+check("7d-i-h  the pending delta's amount is UNCHANGED by later spend",
+      round(_frozen.usd, 6), 0.10)
+check("7d-i-h-i  ...and its unit is unchanged too, so a retry computes the "
+      "same entry_id", _frozen.unit, "STAMP1#0")
+check("7d-i-h-ii the new spend is a SEPARATE delta with its own id",
+      [(p.unit, round(p.usd, 6)) for p in _cH.pending],
+      [("STAMP1#0", 0.10), ("STAMP1#1", 0.25)])
+_cH.finalize(0.35)
+# THE AMOUNTS ARE COMPARED ROUNDED AND THE COUNT EXACTLY. 0.35 - 0.10 is
+# 0.24999999999999997 in binary floating point, and a hand-typed 0.25 beside a
+# subtraction is a second, wrong implementation of the arithmetic -- the same
+# finding the entry-count expectation in 1e produced.
+check("7d-i-h-iii ...and when the store recovers BOTH land, as two distinct "
+      "entries summing to what was spent",
+      (_mine(_pH), sorted(round(e["usd"], 6) for e in J.read_entries(_pH))),
+      (0.35, [0.10, 0.25]))
+check("7d-i-h-iii-a ...and NO terminal $0 marker was cut, because deltas were "
+      "already issued -- the marker exists for a run that offered nothing",
+      len(J.read_entries(_pH)), 2)
+check("7d-i-h-iv  RETRY ORDER: the frozen pending entry is confirmed BEFORE "
+      "the new delta is written",
+      [e["unit"] for e in _cH.entries if e["outcome"] == J.APPEND_WROTE][:2],
+      ["STAMP1#0", "STAMP1#1"])
+
+# --- (9) SETTLING IS TERMINAL ---------------------------------------------
+# A delta counted into the confirmed total twice is silent over-counting -- the
+# same class of defect as the one this class was repaired for, pointed the
+# other way. Not reachable through the two callers, and guarded anyway.
+_pK = fresh()
+_cK = _cp(_pK, min_usd=0.0)
+_cK.checkpoint(0.40)
+_before_re = J.JOURNAL_FAULTS["checkpoint:resettle_ignored"]
+_settled = _at(_cK.entries, 0)
+_item = _PendingProbe = None
+# Reach the settled delta through the public surface: it is gone from
+# `pending`, so the only handle is a fresh attempt at the same unit, which the
+# journal answers as a duplicate. Re-settling it must not add its money again.
+_cK.checkpoint(0.40)
+check("7d-i-k  a settled delta is not counted twice by a later confirmation",
+      round(_cK.recorded, 6), 0.40)
+check("7d-i-k-i  ...and the file agrees", _mine(_pK), 0.40)
+
+# --- THE RESTORE, ASSERTED -------------------------------------------------
+_pZ = fresh()
+check("7d-i-z  RESTORE: append_with_outcome is the real one again -- a leaked "
+      "patch would make every section after this measure a stand-in",
+      J.append_with_outcome(_entry("z0", 1.0), path=_pZ), J.APPEND_WROTE)
 
 
 print()

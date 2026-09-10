@@ -4380,33 +4380,34 @@ def require_state_for_resume(state, resume, state_path):
     """Refuse ``--resume <id>`` against a directory that records nothing.
 
     **A BATCH ID WITH NO STATE FILE BYPASSES EVERY GUARD BELOW, BY
-    CONSTRUCTION RATHER THAN BY OVERSIGHT.** ``require_state_mode``,
-    ``require_state_subset``, ``require_state_shape`` and
-    ``require_state_rubric`` each open with ``if not state: return`` -- which
-    is correct for a FIRST SUBMIT, where there is nothing recorded yet and
-    nothing to disagree with. On a resume the same absence means the opposite
-    thing: the batch exists, it was paid for, and this directory holds no
-    record of what mode, what decision subset, what request shape or what
-    rubric produced it. So all four guards fall silent on exactly the
-    invocation that needs them most, and the session proceeds to poll, parse
-    and write three artifacts whose recorded mode, subset, shape and rubric are
-    TODAY'S -- attributed to answers this module cannot establish anything
-    about.
+    CONSTRUCTION RATHER THAN BY OVERSIGHT.** Every guard that compares a
+    ``STATE_PROVENANCE_KEYS`` field opens with ``if not state: return`` --
+    which is correct for a FIRST SUBMIT, where there is nothing recorded yet
+    and nothing to disagree with. On a resume the same absence means the
+    opposite thing: the batch exists, it was paid for, and this directory holds
+    no record of anything that produced it. So all of them fall silent on
+    exactly the invocation that needs them most, and the session proceeds to
+    poll, parse and write three artifacts whose recorded provenance is TODAY'S
+    -- attributed to answers this module cannot establish anything about.
 
     Measured before it was closed: ``--resume batch_x`` against an empty
     ``--output-dir`` reached the poll with every one of those guards having
     returned without comparing anything.
 
+    **THE MESSAGE RENDERS ``STATE_PROVENANCE_KEYS`` RATHER THAN LISTING THEM,
+    AND THAT IS A CORRECTION.** It used to name four, hand-written, and stayed
+    at four when ``require_state_model`` was added -- so for two passes the
+    refusal that tells an operator what is unknown did not mention the JUDGE.
+
     **THE REMEDY IS THE DIRECTORY, AND THERE IS DELIBERATELY NO OVERRIDE.**
     ``submit_batches`` writes the state file BEFORE the first batch is polled
     and re-writes it after every one, so a batch this harness created has a
-    state file somewhere -- naming it, naming its mode, its subset, its shape
-    and its rubric. Resuming from that directory is the whole remedy. A flag
+    state file somewhere -- naming it and naming every STATE_PROVENANCE_KEYS field. Resuming from that directory is the whole remedy. A flag
     admitting an unverified resume was considered and rejected: it would put
-    artifacts on disk whose four provenance fields are unbacked while looking
+    artifacts on disk whose provenance fields are unbacked while looking
     exactly like artifacts whose fields were checked, which is the one outcome
     this family of guards exists to make impossible. A refusal needs no second
-    evidence source; an admission would need four.
+    evidence source; an admission would need one per field.
 
     An UNREADABLE state file lands here too, because ``read_state`` reports a
     decode failure as ``None``, and so does one that parses to an empty or
@@ -4450,8 +4451,9 @@ def require_state_for_resume(state, resume, state_path):
         f"--resume names batch(es) {resume!r} but the state file at "
         f"{state_path!r} {why}, so nothing about those batches is recorded "
         f"here. Every provenance guard this module has reads that file: "
-        f"without it the mode, the {INCLUDE_KEYS_STATE_KEY} subset, the "
-        f"{STATE_SHAPE_KEY} and the {RUBRIC_SHA_KEY} of the batches being "
+        f"without it the "
+        + ", ".join(STATE_PROVENANCE_KEYS)
+        + f" of the batches being "
         f"joined are all unknown, and this session would write a "
         f"rater_manifest.json, a ratings.json and a summary.json recording "
         f"TODAY'S values over answers produced by something else. Resume from "
@@ -4553,6 +4555,43 @@ a key that does not exist is worse than no remedy. It is also the name the
 three written artifacts use for the same fact, so an operator comparing a
 refusal against the ``rater_manifest.json`` beside it is comparing one spelling
 rather than two.
+"""
+
+
+STATE_MAX_TOKENS_KEY = "max_tokens"
+"""The key a state file records its reply ceiling under.
+
+A module constant on ``STATE_MODEL_KEY``'s footing, and the same name the
+manifest already uses for the same fact, so a refusal and the
+``rater_manifest.json`` beside it are compared as one spelling.
+"""
+
+
+STATE_PROVENANCE_KEYS = ("mode", INCLUDE_KEYS_STATE_KEY, STATE_SHAPE_KEY,
+                         RUBRIC_SHA_KEY, STATE_MODEL_KEY,
+                         STATE_MAX_TOKENS_KEY)
+"""Every state-file field a provenance guard compares, in guard order.
+
+**DERIVED RATHER THAN RETYPED, BECAUSE THE HAND-WRITTEN LIST HAD ALREADY GONE
+STALE.** ``require_state_for_resume``'s refusal enumerated four of these and
+its docstring counted to four in three separate sentences -- written when there
+were four guards. ``require_state_model`` was added afterwards and neither the
+list nor the count moved, so the message that tells an operator what an
+unverified resume leaves unknown OMITTED THE JUDGE: the widest of the five, and
+the one whose own docstring says a resume across it "attributes one model's
+answers to another". Nothing failed, because a message is not a check.
+
+Found while adding a sixth. A prose list of a set that grows every pass is a
+guaranteed staleness site -- this project's own rule, from the
+``_EXEC_ALLOWLIST`` membership note -- so the message renders this tuple and
+the docstrings say "every provenance guard" instead of counting.
+
+IT IS NOT A REGISTRY AND DOES NOT DISPATCH. The guards are called explicitly
+and in an argued order at the call site; this is the list that order is
+DESCRIBED by, so a guard added without an entry here produces a refusal that
+under-reports rather than a guard that does not run. ``tests/
+test_evaluation_rater.py`` closes that gap by deriving the guard set from the
+module and requiring the two to agree.
 """
 
 
@@ -5038,6 +5077,180 @@ def require_state_model(state, model, state_path):
         f"this configuration can resume: --output-dir is the only way "
         f"forward.)",
         code="state_model_mismatch")
+
+
+
+def require_state_max_tokens(state, max_tokens, state_path):
+    """Refuse a state file whose batches were submitted at a DIFFERENT ceiling.
+
+    The provenance trio above guards WHICH INSTRUMENT built the requests, WHAT
+    THEY WERE JUDGED AGAINST and WHO ANSWERED. This guards HOW MUCH THE JUDGE
+    WAS GIVEN TO ANSWER IN, and it is the fourth field of the same kind:
+    ``max_completion_tokens`` is a serialized field of every request body, so
+    two ceilings are two request bodies and the answers they produce are not
+    one population.
+
+    **AND IT IS NOT ONLY A LABELLING DEFECT, WHICH IS WHAT SEPARATES IT FROM
+    THE OTHER THREE.** A resume REBUILDS ``index.requests`` at THIS session's
+    ceiling and the retry pass builds from that index --
+    ``req = json.loads(json.dumps(by_id[cid]))`` and then, for a truncation,
+    ``args.max_tokens * 2``. So a resume across ceilings does not merely
+    mis-record: it SUBMITS AND PAYS FOR retry requests at a ceiling the primary
+    batch never used. A batch submitted at 300 and resumed today retries its
+    truncations at 8192, and ``ratings.json`` carries both populations under
+    one ``max_tokens``.
+
+    **WHY THIS IS NOT THE 300 IN THE TEST HELPER.** ``DEFAULT_MAX_TOKENS`` is
+    4096 and has been since the OpenAI port; the surviving 300 is a literal
+    ``tests/test_evaluation_rater.py`` hands ``build_requests`` so that 8a's
+    historical hash stays producible, and it governs no paid request. The
+    0.63% of anchored decisions lost to truncation is a MEASUREMENT OF SIX
+    2026-08-12 RUNS, and no constant moved today un-loses them. What was
+    actually missing is this guard.
+
+    **ABSENT REFUSES, AND THE SURVEY SAYS THE MARGINAL COST OF THAT IS ZERO.**
+    Counted rather than assumed, over the nineteen state files under
+    ``09- Testing/Evaluation Runs/``: ``model`` 19/19, ``rubric_sha256`` 19/19,
+    ``mode`` 11/19, ``include_keys_sha256`` 10/19, ``spend_usd`` 7/19,
+    ``request_shape_version`` **0/19** and this field **0/19**. So the absent
+    population is not "some legacy files" -- it is every state file that
+    exists, which is the population ``require_state_shape`` already refuses,
+    for its own reason, ABOVE this guard. Every file this refusal could strand
+    is stranded already; adding it costs no resumable session.
+
+    That measurement is what makes refusing affordable. What makes it CORRECT
+    is that an absent ceiling cannot be read as today's default: the absent
+    population demonstrably contains 300-ceiling and 600-ceiling batches (the
+    six ``rater_pack_validation_20260812`` runs and
+    ``eval_run_20260811_093337``), so "absent means ``DEFAULT_MAX_TOKENS``"
+    would attribute answers produced at 300 to a 4096 session -- and then
+    retry them at 8192. It is ``require_state_shape``'s argument with the
+    populations named.
+
+    **THE ADOPTION IS EVIDENCE-CONDITIONED, ON THAT GUARD'S PATTERN, AND HERE
+    THE EVIDENCE IS BETTER THAN IT IS THERE.** The shape has to be inferred
+    from the presence of a marker in a system message; the ceiling is a NAMED
+    NUMERIC FIELD on every request line of the uploaded input file, so the
+    check is a read rather than a deduction and there is no user-parts
+    false-negative to warn about. Where no batch carries an ``input_file_id``
+    the invitation is WITHDRAWN rather than softened, exactly as it is there: a
+    number hand-written into this field on a recollection is adopted as fact by
+    every artifact of every later resume, and by the retry pass, which spends.
+
+    Returns the ceiling the recorded batches were submitted at, which past this
+    point equals ``max_tokens`` by construction -- see the call site for why
+    nothing downstream reads it.
+    """
+    if not state:
+        # NOT A DISAGREEMENT. First submit, and -- for as long as
+        # `require_state_for_resume` is what runs above this -- unreachable on
+        # a resume. See the call site.
+        return None
+    found = state.get(STATE_MAX_TOKENS_KEY)
+    # ── ABSENT, THEN TYPE, THEN VALUE, on ``require_state_model``'s structure
+    #    RATHER THAN ``require_state_shape``'s, AND THE REASON IS A BUG THIS
+    #    GUARD SHIPPED FOR ONE DRAFT.
+    #
+    # The shape guard funnels every non-int into its MISMATCH branch and argues
+    # that ``{found!r}`` rendering ``True`` / ``1.0`` is the tell. That is
+    # sound THERE because its message only quotes the value. This message does
+    # ARITHMETIC on it -- the retry pass doubles the ceiling, so the refusal
+    # states what would be resubmitted at -- and ``{} * 2`` is a ``TypeError``.
+    # Measured: a state file recording ``"max_tokens": {}`` turned this refusal
+    # into an uncaught traceback out of ``main()``'s ``except RaterRefusal``,
+    # which is the abort-instead-of-refuse shape this project has shipped
+    # eighteen times. It was found by driving every JSON type through it rather
+    # than by reading.
+    #
+    # A SEPARATE CODE IS THE BETTER ANSWER ANYWAY, not merely a safe one: "this
+    # field holds an object" and "the ceiling changed" are different faults
+    # with different remedies, and only one of them is repairable with
+    # ``--max-tokens``.
+    #
+    # ``bool`` AND ``float`` ARE EXCLUDED HERE AND NEITHER IS FASTIDIOUSNESS.
+    # This refusal invites a hand edit, so a hand-edited file is exactly where a
+    # JSON ``true`` or ``300.0`` turns up, and ``True == 1`` and
+    # ``300.0 == 300`` are both True in Python -- either would be ADOPTED by a
+    # bare comparison, which is a resume proceeding on a claim nobody made.
+    # ``resolve_max_tokens`` refuses the same two shapes on the way in, so this
+    # is that rule read back out.
+    if found is None:
+        _files = state_input_file_ids(state)
+        _ids = [b.get("id") for b in (state.get("batches") or [])
+                if isinstance(b, dict) and b.get("id")]
+        _without = [b for b in _ids if b not in _files]
+        if _files:
+            _how = (
+                f"THE CHECK, batch by batch. This file records an uploaded "
+                f"input file for "
+                + ", ".join(f"{b} -> {f}" for b, f in sorted(_files.items()))
+                + f". Retrieve that file from the account's storage "
+                f"(`client.files.content(<input_file_id>)`; it is a download, "
+                f"not a completion, so it bills nothing) and read the "
+                f"`params.max_completion_tokens` field of any request line in "
+                f"it -- every line carries it, because that is the ceiling the "
+                f"request was sent with. Having read it, record it by adding "
+                f"\"{STATE_MAX_TOKENS_KEY}\": <that number> to that file. The "
+                f"rater_manifest.json beside this file is corroboration and "
+                f"not a substitute: it records the ceiling of the session that "
+                f"wrote it and no batch ids."
+                + (f" {len(_without)} recorded batch(es) carry no "
+                   f"input_file_id and cannot be checked this way: "
+                   + ", ".join(sorted(_without)) + ". If the batch you are "
+                   f"resuming is one of those, submit afresh with "
+                   f"--output-dir instead." if _without else ""))
+        else:
+            _how = (
+                f"THERE IS NO EVIDENCE TO ADOPT FROM, so this refusal offers "
+                f"no way to record the ceiling by hand. None of the "
+                f"{len(_ids)} batch(es) this file records carries an "
+                f"input_file_id -- that field arrived with the OpenAI port, "
+                f"and it is the only handle on the requests that were actually "
+                f"sent, because nothing local records them. Submit afresh with "
+                f"--output-dir.")
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records no "
+            f"{STATE_MAX_TOKENS_KEY}, so the reply ceiling its batches were "
+            f"submitted at cannot be established from it. An absent ceiling is "
+            f"NOT read as this session's {max_tokens!r}: the files that predate "
+            f"this field include batches submitted at 300 and at 600, so "
+            f"guessing would attribute their answers to a ceiling that did not "
+            f"produce them -- and the retry pass would then resubmit their "
+            f"truncations at {max_tokens * 2}, which is real money spent under "
+            f"a request shape the primary batch never used. {_how}",
+            code="state_max_tokens_absent")
+    if not isinstance(found, int) or isinstance(found, bool):
+        raise RaterRefusal(
+            f"the state file at {state_path!r} records "
+            f"{STATE_MAX_TOKENS_KEY} as {found!r}, which is a "
+            f"{type(found).__name__} and not a token count. A reply ceiling is "
+            f"a positive integer -- `resolve_max_tokens` refuses anything else "
+            f"on the way in -- so this file cannot be read as a record of what "
+            f"its batches were submitted at. Note that a JSON `true` or "
+            f"`{max_tokens}.0` is refused here rather than adopted: `True == 1` "
+            f"and `{max_tokens}.0 == {max_tokens}` are both true in Python, so "
+            f"a bare comparison would take either as a claim that was never "
+            f"made. Correct the value in that file if you can establish it, or "
+            f"submit afresh with --output-dir.",
+            code="state_max_tokens_malformed")
+    if found == max_tokens:
+        return found
+    raise RaterRefusal(
+        f"the state file at {state_path!r} records reply ceiling {found!r} and "
+        f"this session is running {max_tokens!r}. `max_completion_tokens` is a "
+        f"serialized field of every request body, so resuming across them "
+        f"joins answers the judge produced with {found!r} tokens to answer in "
+        f"onto a session whose rater_manifest.json, ratings.json and "
+        f"summary.json all record {max_tokens!r} -- and every truncation "
+        f"statistic in them is a statement about a ceiling, so one computed "
+        f"across two is a number about neither. It is not only a label: the "
+        f"retry pass rebuilds from THIS session's requests and would resubmit "
+        f"any truncation at {max_tokens * 2} rather than at {found * 2}, which "
+        f"is money spent at a ceiling the primary batch never used. Resume "
+        f"with --max-tokens {found!r}, which makes the artifacts record the "
+        f"ceiling that was actually sent, or use --output-dir to keep the two "
+        f"apart.",
+        code="state_max_tokens_mismatch")
 
 
 def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
@@ -7028,6 +7241,26 @@ def main(argv=None):
         # when a response echoes none -- are reporting the model those
         # batches were actually submitted to.
         require_state_model(state, args.model, state_path)
+        # ── AND HOW MUCH THEY WERE GIVEN TO ANSWER IN ─────────────────
+        #
+        # The fourth provenance field, and it runs LAST of the four for the
+        # reason the comment above gives: its remedy is a flag
+        # (`--max-tokens`), so meeting it before the shape or the rubric --
+        # faults no flag repairs -- would be one refusal spent on the narrow
+        # fault and another on the wide one. It is BELOW `--model` on the same
+        # widest-first rule: a different judge is a wider fault than a
+        # different ceiling, and `--model` cannot repair a ceiling.
+        #
+        # IT IS THE ONE OF THE FOUR WHOSE MISMATCH ALSO SPENDS. The other
+        # three mislabel a session; this one reaches the retry pass, which
+        # rebuilds from `index.requests` -- built at THIS session's ceiling --
+        # and resubmits truncations at `args.max_tokens * 2`.
+        #
+        # ITS RETURN IS NOT READ, for the reason the three above give: past
+        # this line the recorded ceiling and `args.max_tokens` are EQUAL, so
+        # the manifest's copy and the retry's doubling are both about the
+        # ceiling those batches were actually submitted at.
+        require_state_max_tokens(state, args.max_tokens, state_path)
         # LAST OF THE SIX, because it is the only one that reads a file this
         # session did not write. It was at the resume fork, ~150 lines and one
         # network round trip below here, where it surfaced after the visibility
@@ -7125,6 +7358,19 @@ def main(argv=None):
                   # value `require_state_shape` has just proved equal, so it
                   # is a no-op there rather than a silent adoption.
                   STATE_SHAPE_KEY: index.shape_version,
+                  # THE CEILING, RECORDED AT SUBMISSION TIME, on the shape's
+                  # own footing and for its reason: this dict is applied before
+                  # the first `write_state` -- which happens inside
+                  # `submit_batches`, after the first batch id exists -- so no
+                  # state file can name a batch without also naming the ceiling
+                  # it was submitted at. `args.max_tokens` and not
+                  # `resolve_max_tokens(...)`: `_prepare` already resolved it
+                  # and wrote it back precisely so the four sites that read it
+                  # cannot report a ceiling the wire never carried, and this is
+                  # the fifth. On a resume it re-writes a value
+                  # `require_state_max_tokens` has just proved equal, so it is
+                  # a no-op there rather than a silent adoption.
+                  STATE_MAX_TOKENS_KEY: args.max_tokens,
                   RUBRIC_SHA_KEY:
                       index.rubric_meta[RUBRIC_SHA_KEY]})
 

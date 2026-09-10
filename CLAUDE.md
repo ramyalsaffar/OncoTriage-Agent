@@ -675,7 +675,7 @@ python tests/test_docker_qdrant_override_and_readiness.py           # 127 (was 1
 # collision matrix. It DOES exec -- one in-memory copy of
 # oncotriage/fixtures/capture.py with the --resume gate reverted to "the file
 # exists, skip it", argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_resume_capture_and_ragas.py                       # 211 (was 210; the allowlist pass PINS this file to the OpenAI arm through tests/_provider_pin.py -- it drives the REAL capture.main(), which REFUSES at the shipped provider and returns 1 before reading a bundle, so without the pin the whole file measures the refusal instead of the resume plan -- and counts the pin's release. Before that 210, was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
+python tests/test_resume_capture_and_ragas.py                       # 229 (this line said 211 and was stale before this pass reached it; the evaluation-safeguards pass added section 6g-i over the ragas resume identity's judge_reasoning_effort and the omit-sentinel owner, and guarded section 9's artifact reads so a REFUSED resume reports its failures instead of aborting on a bare json.load. MEASURED 2026-09-10. Before that 211, was 210; the allowlist pass PINS this file to the OpenAI arm through tests/_provider_pin.py -- it drives the REAL capture.main(), which REFUSES at the shipped provider and returns 1 before reading a bundle, so without the pin the whole file measures the refusal instead of the resume plan -- and counts the pin's release. Before that 210, was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
 
 # The MCP pass. Same shape, same directory. No keys and NO SPEND -- the judging
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
@@ -15276,6 +15276,268 @@ pass changes no model input.
    MODELS` install an override instead, and both pass on a COLD cache with zero
    external attempts. A future test that drops its override fails loudly under
    the offline switch rather than downloading, which is the right direction.
+
+### The evaluation safeguards, and the two repairs the reviews forced (the evaluation-safeguards pass, the confirmed-write pass, the boundary-recovery pass)
+
+**THREE PASSES, ONE SUBJECT: A NUMBER A CONSUMER BELIEVES AND THE ARTIFACT
+CANNOT RETURN.** The first added three safeguards; the two reviews after it
+found that the mechanism the third one shipped reported money as recorded that
+was not. **NO PAID CALL IN ANY OF THE THREE**, and no provider client of any
+kind is constructed on the paths they drive -- every judge is a stub installed
+through a seam. Where a file carries a socket guard
+(`tests/test_evaluation_rater.py` section 9q) it recorded and blocked what it
+intercepted; **TOTAL EGRESS WAS NOT INDEPENDENTLY MEASURED**, and no claim here
+should be read as saying otherwise.
+The production
+`inferences.db` (`ab1403e3...`) and the production spend journal (19 entries,
+18 migration + 1 batch, **$7.3390**, sha `a9682eb9...`) are byte-unchanged, and
+`PROMPT_VERSION` 1.11.0, `FINGERPRINT_VERSION` 8 and
+`llm_classifier_renderer_digest` `5ea2c6cc...` are identical to HEAD -- the
+classifier input is untouched by all of it.
+
+**TWO OF THE FIRST PASS'S THREE PREMISES WERE FALSE, AND VERIFYING BEFORE
+EDITING IS WHAT FOUND THEM.**
+
+| asked for | what the tree actually held |
+|---|---|
+| raise "the anchored arm's 300-token ceiling, which loses 0.63% of decisions" | `DEFAULT_MAX_TOKENS` is **4096** and has been since the OpenAI port; 9m pins it. The surviving 300 is a LITERAL `tests/test_evaluation_rater.py`'s `built()` hands `build_requests` so 8a's historical hash stays producible, and 8a HASHES it -- raising it BREAKS the pin. The 0.63% is a measurement of six pre-port `rater_pack_validation_20260812` runs; no constant moved today un-loses them |
+| "ragas lacks the rater's resume PROVENANCE guard" | it HAS one. `RESUME_IDENTITY_KEYS` already covered `judge_model`, `identity_disagreement` already read a missing key as a disagreement, and the refusal already ran offline before any client was built |
+| the ragas run entry is written once, in a `finally`, so only a hard kill loses it | correct, and `record_run`'s own docstring already named the gap |
+
+#### What the live halves turned out to be
+
+**THE CEILING IS REQUEST IDENTITY AND NOTHING RECORDED IT.**
+`require_state_max_tokens` is the sixth provenance guard, and it is **the one
+whose mismatch also SPENDS**: a resume rebuilds `index.requests` at THIS
+session's ceiling and the retry pass builds from that index, so a batch
+submitted at 300 and resumed today would resubmit its truncations at
+`args.max_tokens * 2` = **8192**. The other five mislabel a session; this one
+pays for requests at a shape the primary batch never used.
+
+**ABSENT REFUSES, AND THE SURVEY IS WHAT MADE THAT AFFORDABLE.** Counted over
+the nineteen state files under `09- Testing/Evaluation Runs/`: `model` 19/19,
+`rubric_sha256` 19/19, `mode` 11/19, `include_keys_sha256` 10/19, `spend_usd`
+7/19, `request_shape_version` **0/19**, `max_tokens` **0/19**. So the absent
+population is every state file that exists -- which `require_state_shape`
+already refuses, above this guard, for its own reason. **Every file this
+refusal could strand is stranded already.** The adoption is
+evidence-conditioned on `require_state_shape`'s pattern, and here the evidence
+is BETTER: the ceiling is a named numeric field on every line of the uploaded
+input file, so the check is a read rather than a deduction.
+
+**AND `require_state_for_resume`'s REMEDY HAD BEEN STALE FOR TWO PASSES.** It
+hand-listed FOUR provenance keys and its docstring counted to four in three
+sentences -- written when there were four guards. `require_state_model` was
+added afterwards and neither moved, so **the message that tells an operator
+what an unverified resume leaves unknown did not mention the JUDGE**, the
+widest of them. Nothing failed, because a message is not a check.
+`STATE_PROVENANCE_KEYS` is derived now and the refusal renders it;
+`tests/test_evaluation_rater.py` 9q additionally requires the pinned guard list
+to EQUAL every `require_state_*` the module defines, so a guard added without an
+entry fails rather than going unchecked.
+
+**RAGAS' IDENTITY WAS MISSING THE ONE KNOB THAT BITES.**
+`judge_reasoning_effort` reaches `build_judge`, is sent on every request and is
+recorded in the manifest -- and was compared by nothing. A run scored at `high`,
+interrupted and resumed at the default `medium` PROCEEDED, merged both, and
+recorded `"medium"` over the lot. **The asymmetry is the argument**:
+`judge_temperature` IS in that list and is INERT on the shipped judge (probed
+live, the model 400s any value but its default), so the covered knob cannot
+move a score at all -- a value other than the default fails the request -- while
+the uncovered one is ACCEPTED on every request and COULD CHANGE SCORES. **WHAT
+IS MEASURED IS THAT IT WAS UNGUARDED, NOT WHAT IT DID TO ANY SCORE**: no run
+compared two efforts over one population, and this pass did not make one.
+
+`normalize_reasoning_effort` is
+the one owner of the `omit -> None` derivation, and `OMIT_REASONING_EFFORT`
+replaces three literal `"omit"`s -- written out rather than imported from
+`rater`, because ragas imports `judge_independence` and `spend_journal` and NOT
+`rater` -- and because importing `rater` from
+`tests/test_resume_capture_and_ragas.py` RAISES, which is a fact about THAT
+FILE rather than about the shipped configuration: it pins the OpenAI arm, so
+the classifier is OpenAI too and `assert_import_time_independence` sees a
+same-family pair. **AT THE SHIPPED DEFAULTS THE PAIR IS CROSS-FAMILY** -- a
+`gpt-5.6-terra` judge against an `us.anthropic.claude-sonnet-4-6` classifier --
+so that layer CHECKS AND PASSES; it refuses only an invocation that configures
+a same-family judge without the override.
+**SURVEYED, NOT ASSUMED: there are ZERO `ragas_partial*.json` files on disk**,
+so the absent population is empty and the existing absent-refuses behaviour is
+free.
+
+**AND THE JOURNAL ENTRY IS SEGMENTED.** `RunSpendCheckpointer` writes DELTAS as
+a run proceeds and `finalize` writes the remainder. **DELTAS AND NOT CUMULATIVE
+READINGS, FORCED BY `total()`, WHICH SUMS**: a $1.20 run written as five
+cumulative checkpoints would seed the next session at $3.00 -- driven as a
+control rather than argued. `ENTRY_KIND_RUN` and not a fourth kind, because
+`ENTRY_KINDS` is CLOSED and `total()` counts-and-skips a kind it does not know,
+so a build predating a new kind would silently drop every segment --
+under-recording, the unsafe direction.
+
+#### The first review: a delta was recorded on an UNCONFIRMED write
+
+**REPRODUCED EXACTLY, AND WORSE THAN REPORTED.** `append` returns `False` for
+"the id is already there, so the money IS recorded" AND for "the write failed,
+so the money is NOT recorded", and the checkpointer advanced on both -- under a
+comment arguing for it, correct about duplicates and false about failures. A
+$0.30 delta whose append failed was never retried, `finalize` computed its
+remainder against the already-advanced total and wrote **$0.00**, and the class
+reported `recorded` of **$0.50** against a journal holding **$0.20**.
+
+`append_with_outcome` is what makes the distinction expressible --
+`APPEND_OUTCOMES` is a closed five-member vocabulary, with `failed` and
+`uncertain` decided by a flag set immediately before `fh.write` rather than by
+exception type, because a caller that read "uncertain" as "nothing happened"
+and retried under a NEW id would record the money twice. `append` is now a thin
+wrapper whose bool is unchanged for every existing caller, and `conflict` --
+which it used to report as a silent duplicate -- is COUNTED.
+
+**A PENDING DELTA'S ID AND AMOUNT ARE FROZEN**, because the duplicate check
+that makes a retry safe compares both; new spend goes into a SEPARATE delta with
+its own id. `finalize` flushes pending and then VERIFIES against
+`confirmed_usd_for_scope` -- the file, narrowed to this budget, source, scope
+and this invocation's own `prefix#` units -- **never against its own counters**,
+which are precisely what the defect got wrong. `recorded` is set to what the
+file says and can therefore go DOWN, which is the honest direction, and any
+residual is `checkpoint:unconfirmed_residual` with the exact amount.
+`checkpoint:overrecorded_scope` reports the symmetric case, which the earlier
+"a collision fails safe" note did not cover: it fails safe for double-counting
+and hands a reader two runs' money under one invocation's units.
+
+**THE BOUND THE CLASS CLAIMED WAS WRONG IN BOTH HALVES.** It promised "one
+threshold plus the pair in flight". `checkpoint` is NOT a timer -- it runs on
+pair completion inside the event loop, so `RUN_CHECKPOINT_SECONDS` is evaluated
+only at the next completion and a stalled run's loss is unbounded IN TIME. And
+concurrent pairs are outside any threshold: the ledger is charged when a
+RESPONSE arrives and the checkpoint runs when a PAIR completes. **MEASURED at
+`max_workers=4`, $0.10/pair, threshold $0.20: charged $0.70, journalled $0.20,
+LOST $0.50** -- against the $0.30 the old claim promised.
+
+#### The second review: an interrupted write, and a reader that raised
+
+**A JOURNAL WHOSE FINAL LINE IS UNTERMINATED MADE THE NEXT APPEND CONCATENATE
+ONTO IT.** Reproduced: a good entry, a killed partial write, then an append
+reported `wrote`, the merged line would not parse, the reader counted-and-skipped
+it, and the caller advanced for money the file could not return.
+
+**AND PROBING THE MID-UTF-8 CASE SURFACED A WORSE, ADJACENT DEFECT.** Every
+reader here opened the journal with `encoding="utf-8"` and read it whole, so ONE
+truncated multi-byte character raised `UnicodeDecodeError` -- a `ValueError`,
+NOT an `OSError`, so no handler in the module caught it. Measured: **both
+`read_entries` and `append_with_outcome` RAISED**, and with `read_entries` go
+`total`, `describe`, `confirmed_usd_for_scope` and `rater_spend_before`, all
+documented NEVER RAISES. **One truncated byte took the cumulative cap out of
+service and would refuse to start a judge session.** `decode_journal_line` is
+the fix; a line that cannot be decoded is skipped and counted under
+`parse:not_utf8`, deliberately NOT decoded with `errors="replace"` -- mojibake
+reaching `json.loads` could put invented characters into a record this module
+reports as fact.
+
+`_needs_boundary` asks for the last BYTE (a text read would raise on the very
+file it repairs) and one `b"\n"` is appended. **NOTHING IS TRUNCATED, REWRITTEN
+OR DELETED.**
+
+**WHAT AN UNTERMINATED COMPLETE RECORD IS, PRECISELY -- BECAUSE THE FIRST DRAFT
+OF THIS SECTION AND OF ITS TEST BOTH GOT IT WRONG.** Such a record is ALREADY
+READABLE: `splitlines()` yields the final chunk as its own line, so the reader
+and the duplicate scan both see it (measured -- a check written expecting
+`(1, $1.00)` got `(2, $5.00)`). **THE DEFECT IS NOT THAT IT IS INVISIBLE. IT IS
+THAT THE NEXT APPEND JOINS ONTO IT**, so a record that was readable a moment
+earlier stops being one and takes the new charge down with it. Recovery is what
+keeps both readable, and the table below is where that is measured.
+
+Recovery runs ABOVE the duplicate scan rather than beside the write for a
+separate reason: it then also runs on a call that turns out to be a duplicate or
+a conflict, so the file is left consistent whatever the outcome. The corruption
+is there regardless, one byte repairs it, and the next writer would otherwise
+have to.
+
+**AND CONFIRMATION IS READABILITY, NOT WRITE SUCCESS.** The appended LINE is
+re-read under the same lock, decoded, parsed and compared for entry id AND
+charge identity AND amount. **THE WORD "LINE" IS LOAD-BEARING AND THE FIRST
+VERSION GOT IT WRONG**: it re-read the bytes it had just serialized, and the
+JSON half of `fragment + json` parses perfectly if you start at the `{`, so it
+confirmed every merge. Found by the revert matrix, not by reading.
+
+| revert | outcome | readable | journal | recorded |
+|---|---|---|---|---|
+| clean | `wrote` | 1 | $0.30 | $0.30 |
+| boundary recovery removed ALONE | **`uncertain`** | 0 | $0.00 | **$0.00** |
+| read-back removed ALONE | `wrote` | 1 | $0.30 | $0.30 |
+| BOTH removed | **`wrote`** | **0** | **$0.00** | **$0.30** |
+
+The middle two are what say each half is INDEPENDENTLY load-bearing: with
+recovery off the read-back refuses the merge, and with the read-back off the
+merge cannot occur so only the forced-unreadable control fires. The last row is
+the reviewer's exact shape.
+
+```bash
+# The cross-process spend journal. Same shape, same directory. No network, no
+# keys, NO SPEND -- no provider client of any kind is built and no request is
+# issued. NOT in the collision matrix; every journal is a temp file and section
+# 8a hashes the PRODUCTION journal before and after. Bucket A.
+python tests/test_spend_journal.py                                  # 233 (this file had NO CLAUDE.md entry at all until this pass, which is why no count was ever stale -- it was never written down. 86 before the three passes; the confirmed-write repair added sections 7c-2, 7d-i and 7d-j and the boundary repair added 7c-3. MEASURED 2026-09-10)
+
+# The hard-kill journaling pass. Same shape, same directory. No network, no
+# keys, NO SPEND -- the judge is a stub metric that charges the ledger and
+# issues no request, build_judge is never called and no provider client of any
+# kind is constructed. NO MODEL LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the
+# imports, in this process and in every child), no live Qdrant, no corpus, no
+# database, no git history, no live server. It DOES use real subprocesses and a
+# REAL SIGKILL, which is the point: a signal a process can observe is not the
+# signal under test, and no in-process construction reproduces "no finally
+# ran". Every child is handed ONCOTRIAGE_SPEND_JOURNAL pointed inside a
+# tempfile.mkdtemp it removes and asserts gone. NOT in the collision matrix. It
+# EXECS NOTHING and loads no module by location -- the child is a SCRIPT
+# written into the temp tree and run with sys.executable. Bucket A, ~8 s.
+python tests/test_spend_hard_kill_journaling.py                     #  45
+```
+
+**WHAT WAS VERIFIED BY RUNNING.** CI bucket A **112 ran, 0 failed**;
+`tests/test_package_invariants.py` **261/0/0** -- unchanged, and that is not
+luck: check 2i is ONE aggregate dict comparison, so declaring the five new
+`RunSpendCheckpointer` properties moves no count, and it FIRED twice during
+these passes until they were declared. `static_checks.py` compiles **293**;
+`ci_test_buckets.py --check` consistent at **131 test files, 112 in bucket A**.
+`tests/test_evaluation_rater.py` **592**, `tests/test_resume_capture_and_ragas.py`
+**229**, `tests/test_degradation_counter_readers.py` **160**,
+`tests/test_spend_gate.py` **164**, `tests/test_spend_budget_split.py` **79**,
+`tests/test_spend_coverage.py` **165**. **THE REVERT MATRICES: 18 caught / 0
+missed for the first pass, 11 / 0 for the confirmed-write repair, 3 / 0 for the
+boundary repair**, every clean control green and every plant asserting its own
+occurrence count.
+
+**WHAT WAS READ AND NOT RUN:** the ragas `main()` path against a live judge, and
+`record_batch` through the repaired append -- its behaviour follows from sharing
+the path, and nothing drives it there.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **NO STARTUP RECONCILIATION, AND THE PENDING STATE IS IN MEMORY.** A SIGKILL
+   takes a checkpointer's pending deltas with it and nothing on disk names them.
+   The restart check in `tests/test_spend_journal.py` 7c-3d says so explicitly
+   rather than implying otherwise: it SUPPLIES the original id and amount,
+   which is the only way a replay can work, and asserts that a fresh
+   checkpointer over the same scope starts at zero knowing nothing.
+2. **BOUNDARY RECOVERY IS ONLY REACHED WHEN SOMETHING APPENDS.** A journal left
+   torn and never written to again stays torn.
+3. **`RUN_CHECKPOINT_USD = 0.25` AND `RUN_CHECKPOINT_SECONDS = 60.0` ARE
+   UNCALIBRATED HOLDING VALUES**, labelled so, with the reference run's
+   arithmetic at the constants ($9.29 over 414 s). Nobody has measured what a
+   kill costs in practice, and the second is not a timer at all.
+4. **THE RESIDUAL HAS NO DURABLE HOME.** It is a console line plus a counter; the
+   AMOUNT survives only in scrollback, so a later session cannot see that an
+   earlier one under-recorded -- which is what the cumulative cap is for.
+5. **`record_batch` SHARES THE CONFLATION THE CHECKPOINTER WAS REPAIRED FOR**:
+   one charge, one `append`, a `False` that means either thing. It is money
+   already spent on a Batch API submission.
+6. **`bootstrap_from_state_files` READS STATE FILES WITH `json.load`** and would
+   raise on a torn one, from a function called before the first billed call. The
+   journal is byte-safe now; the state files it migrates from are not.
+7. **THE CEILING GUARD MAKES A RESUME HONEST AND NOT A SESSION.** Within one
+   session the retry still doubles `args.max_tokens` and records that nowhere,
+   so a session's ratings can mix primary and retry ceilings with no column
+   saying which.
+
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

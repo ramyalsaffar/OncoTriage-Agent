@@ -1115,6 +1115,11 @@ class _Args(object):
         self.judge_model = "claude-sonnet-4-6"
         self.temperature = 0.0
         self.max_tokens = 4096
+        # THE FLAG THE CLI HAS. It was missing here, so every identity built in
+        # this file fell through `resume_identity`'s `getattr(..., None)` and
+        # the effort read as "not named" on both sides of every comparison --
+        # which is a real value, and one that agrees with itself.
+        self.reasoning_effort = rh.DEFAULT_REASONING_EFFORT
         self.embedding_model = "text-embedding-3-small"
         self.max_workers = 4
         self.max_retries = 5
@@ -1243,6 +1248,21 @@ for label, key, value in (
         ("max tokens", "judge_max_tokens", 8192),
         ("the embedding model", "embedding_model", "text-embedding-3-large"),
         ("the response field", "response_field", "assessment_draft"),
+        # ── THE ONE THAT WAS MISSING, AND THE ONE THAT BITES ─────────────
+        # `judge_reasoning_effort` reaches `build_judge`, is sent on every
+        # request and is recorded in the manifest -- and was compared by
+        # NOTHING. A run scored at `high`, interrupted and resumed at the
+        # default `medium` PROCEEDED: the two efforts' rows were merged, the
+        # results file reported one set and the manifest recorded `"medium"`
+        # over both halves. Nothing raised and no pair was dropped.
+        #
+        # AND IT IS LIVE WHERE ITS NEIGHBOUR IS INERT. `judge_temperature` is
+        # in this list and cannot move a score on the shipped judge -- probed
+        # live, the model 400s any value but its default -- while every member
+        # of `REASONING_EFFORTS` is accepted and each changes how long the
+        # model thinks. The covered knob could not move a score; the uncovered
+        # one moved every score.
+        ("the reasoning effort", "judge_reasoning_effort", "high"),
         ("the run directory", "run_dir", "/runs/eval_2")):
     moved = dict(IDENT, **{key: value})
     changed = rh.identity_disagreement(IDENT, moved)
@@ -1257,6 +1277,144 @@ check("6g  a partial that records NO identity is a disagreement, not a pass",
 check("6g  ...and so is one that omits a single key",
       len(rh.identity_disagreement(
           {k: v for k, v in IDENT.items() if k != "judge_model"}, IDENT)) == 1)
+
+# --- 6g-i  the effort is normalised through ONE owner ------------------------
+# `--reasoning-effort omit` and "the caller named nothing" are the same thing on
+# the wire -- `build_judge` sends no `reasoning_effort` for either -- so they
+# must compare EQUAL here. `build_manifest` already normalised inline; the
+# identity has to use the same derivation or a resume across the two spellings
+# would refuse for a difference that does not exist on the wire.
+# ** EVERY CHECK BELOW IS IN THIS FILE'S OWN BOOLEAN FORM, and the first draft
+# ** of this block was not, which is a defect worth recording.
+#
+# `check(label, condition, detail)` here takes a BOOLEAN; the rater's file uses
+# `check(label, actual, expected)`. Written in the rater's form, three of these
+# FAILED (a correct `None` result is falsy) and -- worse -- the ones that
+# happened to return a truthy value PASSED WITHOUT COMPARING ANYTHING:
+# `check("...", normalize("high"), "high")` was satisfied by `"high"` being
+# truthy, not by it equalling `"high"`. A check that passes on truthiness is
+# not a check. Found by running, not by reading.
+check("6g-i  'omit' normalises to None, which is what the wire carries",
+      rh.normalize_reasoning_effort(rh.OMIT_REASONING_EFFORT) is None,
+      rh.normalize_reasoning_effort(rh.OMIT_REASONING_EFFORT))
+check("6g-i  ...and a real effort is carried through unchanged",
+      rh.normalize_reasoning_effort("high") == "high",
+      rh.normalize_reasoning_effort("high"))
+check("6g-i  ...and a caller that named nothing is already None",
+      rh.normalize_reasoning_effort(None) is None,
+      rh.normalize_reasoning_effort(None))
+_OMIT_IDENT = rh.resume_identity(RUN, _Args(reasoning_effort="omit"), ENVSTAMP)
+_NONE_IDENT = rh.resume_identity(RUN, _Args(reasoning_effort=None), ENVSTAMP)
+check("6g-i  a partial written with 'omit' and a resume that named nothing "
+      "are NOT a disagreement -- they sent the same request",
+      rh.identity_disagreement(_OMIT_IDENT, _NONE_IDENT) == [],
+      rh.identity_disagreement(_OMIT_IDENT, _NONE_IDENT))
+_LOW_IDENT = rh.resume_identity(RUN, _Args(reasoning_effort="low"), ENVSTAMP)
+check("6g-i  ...but 'omit' against a real effort IS one",
+      len(rh.identity_disagreement(_OMIT_IDENT, _LOW_IDENT)) == 1,
+      rh.identity_disagreement(_OMIT_IDENT, _LOW_IDENT))
+check("6g-i  non-degeneracy: the identity really carries the field, so the "
+      "two comparisons above are not agreeing on an absent key",
+      "judge_reasoning_effort" in _OMIT_IDENT
+      and _LOW_IDENT["judge_reasoning_effort"] == "low",
+      sorted(_OMIT_IDENT))
+
+import ast as _ast6g                                              # noqa: E402
+
+# THE SENTINEL HAS ONE OWNER PER MODULE AND THE TWO ARE ASSERTED EQUAL rather
+# than trusted: ragas may not import `rater` (that would put a 7,600-line Batch
+# API harness in this module's import graph), so the constant is written out in
+# both -- `spend_journal.STATE_BASENAMES`' answer to the same question, with
+# the same mitigation.
+#
+# ** AND THE COMPARISON READS `rater.py` AS TEXT RATHER THAN IMPORTING IT,
+# ** WHICH IS FORCED RATHER THAN STYLISTIC. `rater` runs
+# ** `judge_independence.assert_import_time_independence` AT MODULE SCOPE, and
+# ** at the shipped defaults the judge and the classifier are both OpenAI
+# ** models -- so `from oncotriage.evaluation import rater` raises
+# ** `JudgeIndependenceError` and takes this whole file down. Measured, not
+# ** predicted: the first version of this check did exactly that, and the
+# ** traceback landed after six passing checks. Reading the assignment out of
+# ** the source is also the stronger instrument for a pin whose subject is
+# ** "these two files write the same literal".
+def _rater_constant(name):
+    """One module-scope string constant, read from ``rater.py``'s source."""
+    src = os.path.join(os.path.dirname(os.path.dirname(
+        os.path.abspath(rh.__file__))), "evaluation", "rater.py")
+    tree = _ast6g.parse(io.open(src, encoding="utf-8").read())
+    for node in tree.body:
+        if isinstance(node, _ast6g.Assign) and len(node.targets) == 1 \
+                and getattr(node.targets[0], "id", None) == name \
+                and isinstance(node.value, _ast6g.Constant):
+            return node.value.value
+    return None
+
+
+_RATER_OMIT = _rater_constant("OMIT_REASONING_EFFORT")
+check("6g-i  non-degeneracy: the rater's constant was FOUND, so the "
+      "comparison below is not None against None",
+      _RATER_OMIT is not None, _RATER_OMIT)
+check("6g-i  the omit sentinel is the same string in both judge harnesses",
+      rh.OMIT_REASONING_EFFORT == _RATER_OMIT,
+      (rh.OMIT_REASONING_EFFORT, _RATER_OMIT))
+
+_RH_SRC = _ast6g.parse(io.open(rh.__file__, encoding="utf-8").read())
+_RH_FN = {n.name: n for n in _ast6g.walk(_RH_SRC)
+          if isinstance(n, (_ast6g.FunctionDef, _ast6g.AsyncFunctionDef))}
+
+
+def _literal_omits(name):
+    """Bare ``"omit"`` constants inside one function, docstring excluded.
+
+    AST AND NOT GREP, for this project's recurring reason: the prose that
+    argues for the constant contains the string, so a text search reports the
+    argument as the offender. ``None`` when the function is absent, which the
+    non-degeneracy check below is what distinguishes from ``[]``.
+    """
+    fn = _RH_FN.get(name)
+    if fn is None:
+        return None
+    doc = _ast6g.get_docstring(fn, clean=False)
+    body = fn.body[1:] if doc is not None else fn.body
+    out = []
+    for stmt in body:
+        for n in _ast6g.walk(stmt):
+            if isinstance(n, _ast6g.Constant) and n.value == "omit":
+                out.append(n.value)
+    return out
+
+
+def _calls_owner(name):
+    fn = _RH_FN.get(name)
+    return fn is not None and any(
+        isinstance(n, _ast6g.Call)
+        and getattr(n.func, "id", None) == "normalize_reasoning_effort"
+        for n in _ast6g.walk(fn))
+
+
+check("6g-i  non-degeneracy: every function this block scans was found in the "
+      "module source, so the scans below are not passing over an empty walk",
+      all(_RH_FN.get(f) is not None
+          for f in ("build_manifest", "resume_identity",
+                    "normalize_reasoning_effort", "main")),
+      sorted(f for f in ("build_manifest", "resume_identity",
+                         "normalize_reasoning_effort", "main")
+             if _RH_FN.get(f) is None))
+# THE MANIFEST, THE IDENTITY AND main() READ ONE DERIVATION. Three copies of an
+# `== "omit"` test is the shape that lets a resume refuse on a spelling the
+# manifest calls equal -- and two of the three is what shipped: `build_manifest`
+# and `main` each compared the literal inline, and `resume_identity` did not
+# compare the field at all.
+for _fn in ("build_manifest", "resume_identity", "main"):
+    check(f"6g-i  {_fn} carries no bare 'omit' literal -- it normalises "
+          f"through the one owner", _literal_omits(_fn) == [],
+          _literal_omits(_fn))
+check("6g-i  ...and the sentinel's value is still 'omit', so the scans above "
+      "are not passing over a module that renamed it out of reach",
+      rh.OMIT_REASONING_EFFORT == "omit", rh.OMIT_REASONING_EFFORT)
+check("6g-i  build_manifest and resume_identity both CALL the owner",
+      _calls_owner("build_manifest") and _calls_owner("resume_identity"),
+      (_calls_owner("build_manifest"), _calls_owner("resume_identity")))
 
 # --- 6h  the merged set is indistinguishable from a single-pass one ----------
 import asyncio
@@ -1605,6 +1763,47 @@ check("9a  ...that loads and holds the pairs it finished",
       _p is not None and 0 < _DONE <= 5, (_why, _DONE))
 check("9a  ...and writes NO results file", not os.path.exists(DRIVE_RESULTS))
 
+# ── EVERY ARTIFACT READ IN SECTION 9 GOES THROUGH THIS ──────────────────
+#
+# **THE SHAPE THIS REMOVES ABORTED THIS FILE, AND IT WAS FOUND BY A REVERT
+# MATRIX RATHER THAN BY READING.** Section 9 drives the real `main()` and then
+# reads the artifacts it wrote with a bare `json.load(io.open(...))`. A
+# `main()` that REFUSES writes no artifacts -- so any defect that makes a
+# ragas resume refuse turns this file into a `FileNotFoundError` traceback at
+# line 1773 instead of a report, discarding the fifteen recorded failures that
+# had already named the defect. That is the abort-instead-of-fail shape this
+# project has shipped eighteen times.
+#
+# It became REACHABLE when the resume identity gained a field: a planted defect
+# in `resume_identity` now refuses the resume in 9b, which is exactly the case
+# the section exists to exercise. The shape was always here.
+#
+# The stand-in is a dict, so every `_x["key"]` below returns a NAMED ABSENCE
+# and every check FAILS and says so, rather than vanishing.
+class _Missing(dict):
+    """A read that did not happen. Falsy, subscriptable, and says which file."""
+
+    def __init__(self, path, why):
+        dict.__init__(self)
+        self.path = path
+        self.why = why
+
+    def __getitem__(self, key):
+        return f"<{self.why}: {os.path.basename(self.path)}[{key}]>"
+
+    def __repr__(self):
+        return f"<unreadable {os.path.basename(self.path)}: {self.why}>"
+
+
+def read_artifact(path):
+    """One JSON artifact, or a `_Missing` that cannot abort the caller."""
+    try:
+        with io.open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError) as exc:
+        return _Missing(path, type(exc).__name__)
+
+
 # --- 9b  --resume finishes it, and pays only for the remainder ---------------
 _KILL_AFTER["n"] = None
 code, txt = drive_ragas_main(["--resume"], DRIVE_RUN)
@@ -1612,10 +1811,10 @@ check("9b  the resumed run exits 0", code == 0, (code, txt[-300:]))
 check("9b  ...judging only the pairs it did not carry",
       _TOTAL_SCORED["n"] == TOTAL_PAIRS - _DONE,
       (_TOTAL_SCORED["n"], TOTAL_PAIRS, _DONE))
-_res_resumed = json.load(io.open(DRIVE_RESULTS, encoding="utf-8"))
+_res_resumed = read_artifact(DRIVE_RESULTS)
 check("9b  the results hold every pair of the plan",
       len(_res_resumed["scores"]) == TOTAL_PAIRS, len(_res_resumed["scores"]))
-_man = json.load(io.open(DRIVE_MANIFEST, encoding="utf-8"))
+_man = read_artifact(DRIVE_MANIFEST)
 check("9b  the manifest records resumed=true and what it resumed from",
       _man["resumed"] is True
       and _man["resumed_from"]["reused_pairs"] == _DONE, _man.get("resumed_from"))
@@ -1630,7 +1829,7 @@ check("9b  ...and the post-checks passed over the merged set",
 # --- 9c  and the result is indistinguishable from a single pass --------------
 shutil.rmtree(DRIVE_OUT, ignore_errors=True)
 code, txt = drive_ragas_main(["--overwrite"], DRIVE_RUN)
-_res_single = json.load(io.open(DRIVE_RESULTS, encoding="utf-8"))
+_res_single = read_artifact(DRIVE_RESULTS)
 check("9c  a single pass scores every pair",
       code == 0 and _TOTAL_SCORED["n"] == TOTAL_PAIRS,
       (code, _TOTAL_SCORED["n"]))
@@ -1639,8 +1838,18 @@ check("9c  a single pass scores every pair",
 def _rows_modulo_timing(payload):
     # `seconds` is wall time and cannot match between two runs; everything else
     # in a row must. Compared as a LIST, so row ORDER is part of the claim.
+    #
+    # GUARDED FOR `read_artifact`'S STAND-IN, on its own argument: a `main()`
+    # that refused wrote no artifact, so `payload["scores"]` is a NAMED
+    # ABSENCE rather than a list -- and iterating it raises `'str' object has
+    # no attribute 'items'` from inside a `check` argument, which is the abort
+    # the stand-in exists to prevent, one frame further out. Measured: the
+    # first version of that stand-in moved the abort from line 1773 to here.
+    rows = payload["scores"] if isinstance(payload, dict) else None
+    if not isinstance(rows, list):
+        return [f"<unreadable: {rows!r}>"]
     return [{k: v for k, v in row.items() if k != "seconds"}
-            for row in payload["scores"]]
+            for row in rows if isinstance(row, dict)]
 
 
 check("9c  a resumed results file is IDENTICAL to a single-pass one, row for "
@@ -1648,7 +1857,7 @@ check("9c  a resumed results file is IDENTICAL to a single-pass one, row for "
       _rows_modulo_timing(_res_resumed) == _rows_modulo_timing(_res_single))
 check("9c  ...and that comparison is not vacuous",
       len(_rows_modulo_timing(_res_single)) == TOTAL_PAIRS)
-_man_single = json.load(io.open(DRIVE_MANIFEST, encoding="utf-8"))
+_man_single = read_artifact(DRIVE_MANIFEST)
 check("9c  a single pass records resumed=false and the whole-run cost scope",
       _man_single["resumed"] is False
       and _man_single["cost_scope"] == "the whole run")

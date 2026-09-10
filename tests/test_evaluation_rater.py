@@ -3979,9 +3979,21 @@ try:
     # cross-mode scenario and the non-degeneracy control below both refused at
     # the model guard instead of reaching what they were written to measure.
     # A fixture that a shipped guard rejects is not a control.
+    # AND IT RECORDS A CEILING, FOR THE REASON THE PARAGRAPH ABOVE GIVES ABOUT
+    # THE MODEL, one field over. `require_state_max_tokens` refuses a file that
+    # records none, so without this every scenario below would refuse at the
+    # ceiling guard instead of reaching what it was written to measure -- which
+    # is exactly what happened when that guard was added: three checks here
+    # went red, and they were the guard working rather than a defect.
+    #
+    # DERIVED FROM THE MODE, never `DEFAULT_MAX_TOKENS_BLIND` written out: the
+    # fixture is a blind state file, `resolve_max_tokens` is what main() will
+    # compare against, and a literal here would silently stop matching the day
+    # the blind ceiling moves.
     _GOOD9q = {"mode": R.MODE_BLIND, "include_keys_sha256": None,
                R.STATE_SHAPE_KEY: R.REQUEST_SHAPE_VERSION,
                R.STATE_MODEL_KEY: R.DEFAULT_MODEL,
+               R.STATE_MAX_TOKENS_KEY: R.resolve_max_tokens(R.MODE_BLIND),
                "batches": [{"id": "batch_9q"}]}
 
     # (a) THE ITEM-1 REFUSAL, at the entry point, offline.
@@ -4052,6 +4064,32 @@ try:
     #     file, which is the one guard that consults a file this session did
     #     not write -- and it used to sit ~150 lines and one round trip below
     #     the visibility check, at the resume fork.
+    # (g) THE CEILING GUARD, offline. A state file whose batches were
+    # submitted at a DIFFERENT reply ceiling. It is the one provenance fault
+    # that also SPENDS if it is missed -- the retry pass rebuilds from this
+    # session's index and would resubmit truncations at this session's ceiling
+    # doubled -- so the message is required to name both numbers and the flag.
+    _write_state9q(dict(_GOOD9q, rubric_sha256=_LIVE_SHA,
+                        **{R.STATE_MAX_TOKENS_KEY: 300}))
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file recording a DIFFERENT reply ceiling: 1, zero "
+          "network, and the message names both ceilings and the flag",
+          (_rc, _n, "300" in _txt,
+           str(R.resolve_max_tokens(R.MODE_BLIND)) in _txt,
+           "--max-tokens" in _txt), (1, 0, True, True, True))
+    # AND A FILE THAT RECORDS NO CEILING AT ALL IS REFUSED RATHER THAN READ AS
+    # THIS SESSION'S. Every one of the nineteen state files on disk is in that
+    # population, and the ones that predate the field include batches submitted
+    # at 300 and at 600 -- so "absent means today's default" would attribute
+    # their answers to a ceiling that did not produce them.
+    _write_state9q({k: v for k, v in dict(_GOOD9q,
+                                          rubric_sha256=_LIVE_SHA).items()
+                    if k != R.STATE_MAX_TOKENS_KEY})
+    _rc, _n, _txt = _run_main9q(_argv9q("--resume", "batch_9q"))
+    check("9q  a state file with no recorded ceiling: 1, zero network, and it "
+          "is NOT read as this session's",
+          (_rc, _n, "no max_tokens" in _txt), (1, 0, True))
+
     # THE LIVE DIGEST, not built()'s planted one: main() lifts the real
     # rulebook, so a planted digest here makes the rubric guard refuse first
     # and this check measure that instead of the cross-mode one.
@@ -4069,7 +4107,7 @@ try:
           (_rc, _n, "was submitted by a 'anchored' run" in _txt),
           (1, 0, True))
 
-    # THE NON-DEGENERACY CONTROL FOR ALL SIX. An invocation whose state file is
+    # THE NON-DEGENERACY CONTROL FOR ALL OF THEM. An invocation whose state file is
     # entirely in order must get PAST every local guard and only then touch the
     # network -- otherwise "zero attempts" above would be satisfied by a main()
     # that refuses everything for some unrelated reason.
@@ -4086,7 +4124,7 @@ try:
         else:
             _os9k.environ["OPENAI_API_KEY"] = _prev_key
     check("9q  CONTROL: a state file in order gets PAST every local guard and "
-          "reaches the network -- so the six zeros above are the guards "
+          "reaches the network -- so the zeros above are the guards "
           "firing, not main() refusing for something else",
           (_n > 0, "REFUSED" in _txt), (True, True))
     check("9q  ...and what it reaches the network FOR is the visibility check, "
@@ -4103,7 +4141,26 @@ check("9q  the temp directory is gone", _os9k.path.isdir(_tmp9q), False)
 _LOCAL_GUARDS9q = ("require_state_for_resume", "require_state_mode",
                    "require_state_subset", "require_state_shape",
                    "require_state_rubric", "require_state_model",
+                   "require_state_max_tokens",
                    "refuse_batch_from_other_mode")
+# AND THE LIST IS CHECKED AGAINST THE MODULE, which is what stops the pin
+# under-reporting rather than failing. The check below asks "is every guard in
+# this tuple above the network"; a guard added to the module and NOT to the
+# tuple is simply not asked about, so the pin goes on passing while covering
+# less -- the corpus-that-silently-shrinks shape, and it is not hypothetical:
+# `require_state_max_tokens` was added and every check here stayed green until
+# this comparison was written.
+_MODULE_GUARDS9q = tuple(sorted(
+    n for n in dir(R)
+    if n.startswith("require_state_") and callable(getattr(R, n, None))))
+check("9q  the pinned guard list IS every require_state_* the module defines "
+      "-- so a guard added without an entry here fails rather than going "
+      "unchecked",
+      sorted(g for g in _LOCAL_GUARDS9q if g.startswith("require_state_")),
+      list(_MODULE_GUARDS9q))
+check("9q  non-degeneracy: the module really defines several of them, so the "
+      "comparison above is not two empty lists",
+      len(_MODULE_GUARDS9q) >= 6, True)
 
 
 def _first_at9q(needle):
@@ -4337,6 +4394,177 @@ check("9r  the collection-time divergence report survives, so the two "
       "measurements -- what was ASKED and what ANSWERED -- both remain",
       ("ANSWERING MODEL(S) differ" in _MAIN_TXT,
        "answering_models" in _MAIN_TXT), (True, True))
+
+# --- 9s -- THE REPLY CEILING IS PROVENANCE TOO ----------------------------
+#
+# ** THE ITEM THIS SECTION CLOSES WAS NOT THE ONE IT WAS ASKED TO CLOSE, AND
+# ** THE DIFFERENCE IS THE FINDING.
+#
+# The ask was to raise "the anchored comparison arm's 300-token ceiling, which
+# permanently loses 0.63% of decisions to truncation". Verified first, and the
+# premise does not hold of this tree:
+#
+#   * `R.DEFAULT_MAX_TOKENS` is 4096 and has been since the OpenAI port. 9m
+#     pins it, and pins that it is at least 4x the pre-port 300.
+#   * The surviving 300 is a literal `built()` in this file hands
+#     `build_requests`, so that 8a's historical hash stays PRODUCIBLE. It
+#     governs no paid request, and 9m's own control pins that it does not move.
+#     Raising it would BREAK 8a -- `_as_anthropic_body` emits it as
+#     `max_tokens` and the pin hashes it -- which is the opposite of the ask.
+#   * The 0.63% is a measurement of six `rater_pack_validation_20260812` runs
+#     submitted at 300, before the port. It is history; no constant moved today
+#     un-loses those decisions.
+#
+# WHAT WAS ACTUALLY MISSING IS A GUARD, and it is the live half of the same
+# thought: the ceiling IS part of the request identity -- `max_completion_
+# tokens` is a serialized field of every request body -- and nothing recorded
+# or compared it. `main()` wrote mode, subset, shape, rubric and model into the
+# state file and not this.
+#
+# AND IT IS THE ONE PROVENANCE FIELD WHOSE MISMATCH ALSO SPENDS. The other four
+# mislabel a session. This one reaches the retry pass, which rebuilds from
+# `index.requests` -- built at THIS session's ceiling -- and resubmits
+# truncations at `args.max_tokens * 2`. A batch submitted at 300 and resumed
+# today retries at 8192.
+_MT_STATE = {R.STATE_MAX_TOKENS_KEY: 300, "batches": [{"id": "b1"}]}
+_MT_FID = {R.STATE_MAX_TOKENS_KEY: None,
+           "batches": [{"id": "b1", "input_file_id": "file_x"}]}
+_R9s = _R9o                     # the same by-name accessor sections 9o/9r use
+
+check("9s  a first submit is not a disagreement -- no state file, nothing to "
+      "compare", drive(_R9s("require_state_max_tokens"), {}, 4096, "/s"), None)
+check("9s  the same ceiling passes and returns it",
+      drive(_R9s("require_state_max_tokens"),
+            {R.STATE_MAX_TOKENS_KEY: 4096}, 4096, "/s"), 4096)
+check("9s  a DIFFERENT ceiling refuses",
+      refusal_code(_R9s("require_state_max_tokens"), dict(_MT_STATE), 4096,
+                   "/s"), "state_max_tokens_mismatch")
+check("9s  an ABSENT ceiling refuses rather than being read as this "
+      "session's -- the files that predate the field include 300- and "
+      "600-ceiling batches",
+      refusal_code(_R9s("require_state_max_tokens"),
+                   {"batches": [{"id": "b1"}]}, 4096, "/s"),
+      "state_max_tokens_absent")
+# ── THE THREE CODES ARE DISTINCT, because their remedies are: adopt from
+#    evidence, correct a malformed value, or pass --max-tokens.
+check("9s  absent, malformed and mismatch are three codes, not one",
+      len({refusal_code(_R9s("require_state_max_tokens"),
+                        {"batches": [{"id": "b1"}]}, 4096, "/s"),
+           refusal_code(_R9s("require_state_max_tokens"),
+                        {R.STATE_MAX_TOKENS_KEY: {}}, 4096, "/s"),
+           refusal_code(_R9s("require_state_max_tokens"),
+                        dict(_MT_STATE), 4096, "/s")}), 3)
+# ── EVERY JSON TYPE IS DRIVEN, AND THIS IS THE CHECK THAT FOUND A REAL BUG IN
+#    THE GUARD. Its first draft followed `require_state_shape` and funnelled
+#    every non-int into the MISMATCH branch -- which is sound there, because
+#    that message only QUOTES the value. This one does ARITHMETIC on it (the
+#    refusal states what the retry would resubmit at, which is `found * 2`),
+#    and `{} * 2` is a TypeError. A state file recording an object turned the
+#    refusal into an uncaught traceback out of main()'s `except RaterRefusal`
+#    -- the abort-instead-of-refuse shape this project has shipped eighteen
+#    times. Found by driving every type, not by reading.
+for _bad, _label in (({}, "an object"), ([], "a list"), ("4096", "a string"),
+                     (4096.0, "a float"), (True, "a bool")):
+    check(f"9s  {_label} is a NAMED refusal and not a traceback",
+          refusal_code(_R9s("require_state_max_tokens"),
+                       {R.STATE_MAX_TOKENS_KEY: _bad}, 4096, "/s"),
+          "state_max_tokens_malformed")
+# ── bool AND float SPECIFICALLY, because `True == 1` and `4096.0 == 4096`.
+#    This refusal invites a hand edit, so a hand-edited file is exactly where
+#    they turn up, and a bare comparison would ADOPT either as a claim nobody
+#    made. `resolve_max_tokens` refuses the same two on the way in.
+check("9s  a bool is not adopted as 1 even when the session ceiling IS 1",
+      refusal_code(_R9s("require_state_max_tokens"),
+                   {R.STATE_MAX_TOKENS_KEY: True}, 1, "/s"),
+      "state_max_tokens_malformed")
+check("9s  ...and a float is not adopted as the equal int",
+      refusal_code(_R9s("require_state_max_tokens"),
+                   {R.STATE_MAX_TOKENS_KEY: 4096.0}, 4096, "/s"),
+      "state_max_tokens_malformed")
+# ── THE ADOPTION IS EVIDENCE-CONDITIONED, on `require_state_shape`'s pattern:
+#    an input_file_id is the ONLY handle on what was sent, so where there is
+#    none the invitation is WITHDRAWN rather than softened.
+_MT_NOEV = str(drive(lambda: _R9s("require_state_max_tokens")(
+    {"batches": [{"id": "b1"}]}, 4096, "/s")))
+_MT_EV = str(drive(lambda: _R9s("require_state_max_tokens")(
+    dict(_MT_FID, **{R.STATE_MAX_TOKENS_KEY: None}), 4096, "/s")))
+check("9s  with no input_file_id the refusal offers NO way to hand-write the "
+      "ceiling and directs to --output-dir",
+      ("NO EVIDENCE TO ADOPT FROM" in _MT_NOEV,
+       "--output-dir" in _MT_NOEV,
+       "max_completion_tokens" in _MT_NOEV), (True, True, False))
+check("9s  ...and with one it names the file, the field to read and the key "
+      "to record",
+      all(w in _MT_EV for w in ("file_x", "max_completion_tokens",
+                                "client.files.content",
+                                R.STATE_MAX_TOKENS_KEY)), True)
+check("9s  non-degeneracy: the two messages really differ, so the pair above "
+      "is not one message compared with itself", _MT_NOEV != _MT_EV, True)
+# ── THE MISMATCH MESSAGE NAMES THE SPEND, which is what separates this guard
+#    from the other four.
+_MT_MSG = str(drive(lambda: _R9s("require_state_max_tokens")(
+    dict(_MT_STATE), 4096, "/s")))
+check("9s  the mismatch message states BOTH ceilings, what the retry would "
+      "resubmit at, and the flag that repairs it",
+      all(w in _MT_MSG for w in ("300", "4096", "8192", "--max-tokens",
+                                 "--output-dir")), True)
+check("9s  ...and it says the retry SPENDS, not merely that a label is wrong",
+      "money" in _MT_MSG, True)
+# ── THE BRANCH ORDER, on 9r's pin and for its reason: absent, then type, then
+#    value. Put the equality first and a non-int is a mismatch; put the type
+#    check above the absent one and `None` is reported as malformed.
+_MT_SRC = _ast9k.unparse(next(
+    (n for n in _ast9k.walk(_MAIN_SRC)
+     if isinstance(n, _ast9k.FunctionDef)
+     and n.name == "require_state_max_tokens"),
+    _ast9k.parse("def _m(): pass")))
+_MTORD = {c: _MT_SRC.find(c)
+          for c in ("state_max_tokens_absent", "state_max_tokens_malformed",
+                    "found == max_tokens", "state_max_tokens_mismatch")}
+check("9s  the guard tests absent, then type, then value -- in that order, so "
+      "no branch is unreachable",
+      (all(v >= 0 for v in _MTORD.values()),
+       _MTORD["state_max_tokens_absent"] < _MTORD["state_max_tokens_malformed"]
+       < _MTORD["found == max_tokens"] < _MTORD["state_max_tokens_mismatch"]),
+      (True, True))
+# ── AND THE CEILING IS WRITTEN, without which the guard can only ever refuse.
+check("9s  main() records the ceiling in the state file under the module's "
+      "own key constant",
+      "STATE_MAX_TOKENS_KEY: args.max_tokens" in _MAIN_TXT, True)
+check("9s  ...and it is `args.max_tokens`, which `_prepare` already resolved "
+      "and wrote back -- not a second resolve that could name a ceiling the "
+      "wire never carried",
+      "STATE_MAX_TOKENS_KEY: resolve_max_tokens(" in _MAIN_TXT, False)
+
+# --- 9s -- THE PROVENANCE KEY LIST IS DERIVED, NOT RETYPED ----------------
+#
+# `require_state_for_resume`'s refusal used to enumerate FOUR provenance keys
+# by hand and its docstring counted to four in three sentences. It was written
+# when there were four guards; `require_state_model` was added afterwards and
+# neither moved -- so for two passes the message that tells an operator what an
+# unverified resume leaves unknown DID NOT MENTION THE JUDGE, the widest of
+# them. Nothing failed, because a message is not a check.
+check("9s  STATE_PROVENANCE_KEYS names one key per require_state_* guard that "
+      "compares a field (every guard except the resume gate itself, which "
+      "compares nothing)",
+      len(R.STATE_PROVENANCE_KEYS),
+      len([g for g in _MODULE_GUARDS9q if g != "require_state_for_resume"]))
+check("9s  ...and every member is the module's own key constant, so a refusal "
+      "cannot name a key that does not exist",
+      sorted(R.STATE_PROVENANCE_KEYS),
+      sorted({"mode", R.INCLUDE_KEYS_STATE_KEY, R.STATE_SHAPE_KEY,
+              R.RUBRIC_SHA_KEY, R.STATE_MODEL_KEY, R.STATE_MAX_TOKENS_KEY}))
+_RESUME_MSG = str(drive(lambda: R.require_state_for_resume(
+    {}, "batch_x", "/s")))
+check("9s  the resume refusal RENDERS that tuple, so every provenance field "
+      "is named -- including the judge, which the hand-written list omitted",
+      [k for k in R.STATE_PROVENANCE_KEYS if k not in _RESUME_MSG], [])
+check("9s  non-degeneracy: the refusal really was produced (an empty message "
+      "would satisfy the check above vacuously)",
+      "resume_without_state" in str(
+          drive(lambda: refusal_code(R.require_state_for_resume, {},
+                                     "batch_x", "/s"))), True)
+
 
 
 print()

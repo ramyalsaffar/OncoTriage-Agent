@@ -78,6 +78,8 @@ import hashlib
 import io
 import json
 import os
+import threading
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
@@ -209,14 +211,47 @@ def entry_id(budget, source, scope, unit):
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
 
 
+def decode_journal_line(raw):
+    """One line's bytes as text, or ``None`` having COUNTED why not.
+
+    **THE JOURNAL IS A BYTE STREAM AND A KILL CAN CUT A LINE MID-CHARACTER.**
+    Every reader here used to open the file with ``encoding="utf-8"`` and read
+    it whole, so one truncated multi-byte character raised ``UnicodeDecodeError``
+    -- which is a ``ValueError`` and NOT an ``OSError``, so no handler in this
+    module caught it. Measured: a journal ending in a half-written ``\xc3``
+    made ``read_entries`` RAISE, and with it ``total``, ``describe``,
+    ``confirmed_usd_for_scope`` and ``rater_spend_before`` -- so a single
+    truncated byte took the cumulative cap out of service and refused to start
+    a judge session, from three functions whose docstrings all say NEVER
+    RAISES.
+
+    A line that cannot be decoded is SKIPPED and COUNTED, exactly as one that
+    cannot be parsed already was. It is not decoded with ``errors="replace"``:
+    a mojibake line would then reach ``json.loads``, and on the off chance it
+    parsed it would put invented characters into a record this module reports
+    as fact. The bytes stay on disk as evidence either way.
+    """
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        JOURNAL_FAULTS["parse:not_utf8"] += 1
+        return None
+
+
 def read_entries(path=None):
     """Every well-formed entry, in file order. NEVER RAISES.
 
     An absent file is an empty list, which is the correct reading: nothing has
-    been recorded yet. A line that will not parse, or that carries a schema
-    version this build does not know, is COUNTED into ``JOURNAL_FAULTS`` and
-    SKIPPED -- summing a line whose shape is unknown would put an unverified
-    number into a cap.
+    been recorded yet. A line that cannot be DECODED, that will not parse, or
+    that carries a schema version this build does not know, is COUNTED into
+    ``JOURNAL_FAULTS`` and SKIPPED -- summing a line whose shape is unknown
+    would put an unverified number into a cap.
+
+    **IT READS BYTES AND SPLITS ON LINES ITSELF**, rather than opening the file
+    as text. A truncated multi-byte character is a real state for a file that
+    is appended to under a kill, and decoding the whole file makes ONE such
+    byte unreadable EVERYTHING -- including every record written before it and
+    every record written after. See ``decode_journal_line``.
 
     THE UNDER-READING DIRECTION IS THE UNSAFE ONE HERE AND IT IS NOT HIDDEN:
     a skipped entry is money the next session will not be charged for, so every
@@ -226,7 +261,7 @@ def read_entries(path=None):
     if p is None:
         return []
     try:
-        with io.open(p, "r", encoding="utf-8") as fh:
+        with io.open(p, "rb") as fh:
             raw = fh.read()
     except FileNotFoundError:
         return []
@@ -236,8 +271,11 @@ def read_entries(path=None):
                     f"{type(exc).__name__}: {exc}")
         return []
     out = []
-    for lineno, line in enumerate(raw.splitlines(), 1):
-        if not line.strip():
+    for lineno, rawline in enumerate(raw.splitlines(), 1):
+        if not rawline.strip():
+            continue
+        line = decode_journal_line(rawline)
+        if line is None:
             continue
         try:
             entry = json.loads(line)
@@ -259,63 +297,403 @@ def read_entries(path=None):
     return out
 
 
-def append(entry, path=None):
-    """Append one entry unless its ``entry_id`` is already recorded.
+APPEND_WROTE = "wrote"
+APPEND_DUPLICATE = "duplicate"
+APPEND_CONFLICT = "conflict"
+APPEND_FAILED = "failed"
+APPEND_UNCERTAIN = "uncertain"
 
-    Returns True when a line was written and False when the id was already
-    there. NEVER RAISES: it is called after money has already been spent, and
-    a record that could not be written must not discard the collection it is
-    about. Every failure is counted.
+APPEND_OUTCOMES = (APPEND_WROTE, APPEND_DUPLICATE, APPEND_CONFLICT,
+                   APPEND_FAILED, APPEND_UNCERTAIN)
+"""What one attempt to append can have done. CLOSED, and the split between
+the last four is the whole reason this exists.
 
-    THE READ AND THE WRITE ARE UNDER ONE EXCLUSIVE ``flock``. The decision to
-    write depends on what the file already holds, so releasing the lock between
-    the two would let a second process append the same id in the window.
+``append`` answers a two-valued question -- did a line get written -- and
+callers used it as if it answered a four-valued one. It returns ``False`` for
+"the id is already there, so the money IS recorded" AND for "the write failed,
+so the money is NOT recorded", and those have OPPOSITE consequences for a
+caller keeping a running total.
+
+**MEASURED, NOT ARGUED.** ``RunSpendCheckpointer`` advanced its recorded total
+on that ``False``. A $0.30 delta whose append failed was never retried,
+finalization then computed its remainder against the already-advanced total and
+wrote **$0.00**, and the checkpointer reported ``recorded`` of $0.50 against a
+journal holding $0.20. The $0.30 was lost permanently and nothing said so.
+
+  ``wrote``      the line is in the file and fsynced.
+  ``duplicate``  an entry with this id is already there AND names the same
+                 charge AND the same amount -- so the money is recorded and a
+                 caller may advance past it. This is what makes a RETRY safe.
+  ``conflict``   an entry with this id is there and does NOT match. Two
+                 different charges derived one id, or the file was edited. The
+                 money this attempt carries is NOT recorded by that entry and a
+                 caller must never advance past it.
+  ``failed``     nothing was persisted, to the best of this process's
+                 knowledge: the error happened before the write was attempted.
+  ``uncertain``  the error happened at or after the write. The line may or may
+                 not be in the file. A caller must RETRY under the SAME id and
+                 the SAME amount, which is exactly the case ``duplicate``
+                 resolves.
+
+``failed`` and ``uncertain`` are kept apart even though a caller treats both as
+"not confirmed", because they are different diagnoses: one says the store is
+unreachable and the other says the store may hold a line this process cannot
+see the result of.
+"""
+
+# THE AMOUNTS ARE COMPARED WITH A TOLERANCE, and it is small enough to be an
+# equality for every value this project writes. A charge is dollars with at
+# most six decimals (`round(..., 6)` at the rater's own writer), so 1e-9 is
+# three orders below the smallest meaningful difference and cannot make two
+# genuinely different charges look alike. Exact `==` would be correct for the
+# checkpointer -- it re-serializes the SAME float, and Python's float repr
+# round-trips -- and would be brittle for any other caller that recomputes.
+_AMOUNT_EPSILON = 1e-9
+
+
+def _same_charge(existing, payload):
+    """Does an entry already in the file record the SAME charge as ``payload``?
+
+    Compares the four fields ``entry_id`` is DERIVED from plus the amount --
+    "charge identity AND amount". It deliberately does NOT compare the whole
+    dict: ``recorded_at_utc`` differs on every attempt, so a whole-dict
+    comparison would report every retry as a conflict, which is the one thing
+    that must not happen to a retry.
+    """
+    for field in ("budget", "source", "scope", "unit"):
+        if existing.get(field) != payload.get(field):
+            return False
+    a, b = existing.get("usd"), payload.get("usd")
+    if isinstance(a, bool) or isinstance(b, bool):
+        return a is b
+    if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
+        return a == b
+    if a != a or b != b:                                        # NaN
+        return False
+    return abs(float(a) - float(b)) <= _AMOUNT_EPSILON
+
+
+def _serialize_entry(payload):
+    """One entry as the bytes that go on the wire, terminator included.
+
+    A NAMED FUNCTION RATHER THAN AN INLINE EXPRESSION, and the reason is that
+    the read-back confirmation below has to be exercisable: a control needs a
+    way to make one append produce a line that cannot be parsed back, and
+    patching this is the narrowest seam that does it. It is also the one place
+    the newline is appended, which is the fact the boundary recovery is about.
+    """
+    return (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+
+
+def _needs_boundary(fh):
+    """Is the file non-empty and NOT terminated by a newline?
+
+    **THE STATE THIS DETECTS IS A KILL MID-WRITE**, and it has two shapes that
+    are indistinguishable from here and must be: an INCOMPLETE RECORD (the
+    process died part-way through ``fh.write``) and a COMPLETE RECORD MISSING
+    ONLY ITS TERMINATOR (the bytes landed, the newline did not). Both leave the
+    same signature -- a final line with no ``\n`` -- and both cause the next
+    append to CONCATENATE onto it.
+
+    IT ASKS FOR THE LAST BYTE AND NOT THE LAST CHARACTER. The file is a byte
+    stream and the fragment may be cut mid-character; a text-mode read to find
+    the terminator would raise on exactly the file this exists to repair.
+    """
+    fh.seek(0, os.SEEK_END)
+    size = fh.tell()
+    if not size:
+        return False
+    fh.seek(size - 1)
+    return fh.read(1) != b"\n"
+
+
+def append_with_outcome(entry, path=None):
+    """Append one entry and say WHICH of ``APPEND_OUTCOMES`` happened.
+
+    NEVER RAISES, for ``append``'s reason: it is called after money has already
+    been spent, and a record that could not be written must not discard the
+    collection it is about.
+
+    THE READ AND THE WRITE ARE UNDER ONE EXCLUSIVE ``flock``, and so are the
+    boundary recovery and the read-back. The decision to write depends on what
+    the file already holds, so releasing the lock between any of them would let
+    a second process append in the window.
+
+    ═══ BOUNDARY RECOVERY, BEFORE ANYTHING ELSE ═══
+
+    **THE DEFECT: A JOURNAL WHOSE FINAL LINE IS UNTERMINATED MADE THE NEXT
+    APPEND CONCATENATE ONTO IT.** Reproduced -- a good entry, then a killed
+    partial write, then an append: the helper reported ``wrote``, the merged
+    line would not parse, ``read_entries`` counted-and-skipped it, and the
+    caller advanced its total for money the file could not return. The
+    read-back at finalize saw the shortfall and could not recover it.
+
+    So a missing terminator is RESTORED FIRST: one ``\n`` is appended, which
+    makes whatever is there its own isolated line. **NOTHING IS TRUNCATED,
+    REWRITTEN OR DELETED** -- the bytes on disk are evidence of a kill and this
+    module is not entitled to decide what they were going to say.
+
+    The two shapes then diverge, which is the point of not distinguishing them
+    here:
+
+      * an INCOMPLETE FRAGMENT becomes its own unparseable line, stays on disk,
+        and surfaces through ``read_entries``' existing fault counting;
+      * a COMPLETE RECORD MISSING ITS NEWLINE becomes fully readable -- it
+        gains the terminator it was denied, and the very next thing this
+        function does is scan for duplicates, so if it names the same charge
+        the append is correctly refused as one.
+
+    RECOVERY RUNS ABOVE THE DUPLICATE SCAN AND NOT BESIDE THE WRITE, AND NOT
+    FOR THE REASON THIS PARAGRAPH USED TO GIVE. It claimed a
+    complete-but-unterminated record would be invisible to the scan below it,
+    and that is FALSE: the scan reads the file with ``splitlines()``, which
+    yields the trailing chunk as its own line, so such a record is ALREADY
+    READABLE to the scan and to ``read_entries`` alike, terminator or not.
+
+    THE REAL REASON IS THAT THE SCAN CAN RETURN EARLY. A duplicate or a
+    conflict returns without writing, so recovery placed beside the write would
+    not run on those calls and the torn boundary would survive them. Above the
+    scan it runs whatever the outcome, which leaves the file consistent and
+    means the NEXT append cannot join onto that record either. The corruption
+    is there regardless, one byte repairs it, and the next writer would
+    otherwise have to.
+
+    ═══ CONFIRMATION IS READABILITY, NOT WRITE SUCCESS ═══
+
+    ``fh.write`` returning is not evidence that the file now holds a record.
+    The merged-line defect above is exactly a successful write that produced no
+    readable entry, and boundary recovery is not the only way that can happen.
+    So the appended bytes are READ BACK under the same lock, decoded, parsed,
+    and compared for entry id AND charge identity AND amount. Only that is
+    ``wrote``; anything else is ``uncertain``, which leaves the caller's delta
+    PENDING under its frozen id -- and a retry then resolves against whatever
+    is really on disk.
     """
     p = resolved_journal_path(path)
     if p is None:
-        return False
+        return APPEND_FAILED
     payload = dict(entry)
     payload.setdefault("schema_version", SCHEMA_VERSION)
     payload.setdefault("recorded_at_utc", _utc_now())
     eid = payload.get("entry_id")
     if not eid:
         JOURNAL_FAULTS["append:no_entry_id"] += 1
-        return False
+        return APPEND_FAILED
+    attempted = {"write": False}
     try:
         parent = os.path.dirname(p)
         if parent and not os.path.isdir(parent):
             os.makedirs(parent, exist_ok=True)
-        # "a+" AND NOT "a": the read has to happen through the same handle the
-        # lock is held on. Opening a second handle to read would be the
+        # BINARY, AND THAT IS FORCED RATHER THAN STYLISTIC. The terminator
+        # check is a question about the last BYTE, and the existing content may
+        # be cut mid-character -- so a text-mode handle would raise
+        # `UnicodeDecodeError` on precisely the file this function exists to
+        # repair, out of a function documented NEVER RAISES.
+        #
+        # "a+b" AND NOT "ab": the read has to happen through the same handle
+        # the lock is held on. Opening a second handle to read would be the
         # check-then-act split the lock exists to close.
-        with io.open(p, "a+", encoding="utf-8") as fh:
+        with io.open(p, "a+b") as fh:
             fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
             try:
+                if _needs_boundary(fh):
+                    # ONE BYTE, APPENDED. Not a truncation and not a rewrite.
+                    fh.seek(0, os.SEEK_END)
+                    fh.write(b"\n")
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                    JOURNAL_FAULTS["append:boundary_recovered"] += 1
+                    console.out(
+                        f"  [Spend journal] RECOVERED a missing line boundary "
+                        f"in {p}: the final line carried no terminator, which "
+                        f"a kill mid-write leaves behind. A newline was "
+                        f"appended so it stands alone; nothing was truncated "
+                        f"or rewritten. If it was an incomplete record it "
+                        f"stays as evidence and is counted as unreadable.")
                 fh.seek(0)
-                for line in fh:
-                    if not line.strip():
+                before = fh.read()
+                for rawline in before.splitlines():
+                    if not rawline.strip():
+                        continue
+                    line = decode_journal_line(rawline)
+                    if line is None:
                         continue
                     try:
                         existing = json.loads(line)
                     except ValueError:
                         continue
-                    if isinstance(existing, dict) \
-                            and existing.get("entry_id") == eid:
-                        return False
+                    if not isinstance(existing, dict) \
+                            or existing.get("entry_id") != eid:
+                        continue
+                    if _same_charge(existing, payload):
+                        return APPEND_DUPLICATE
+                    JOURNAL_FAULTS["append:conflict"] += 1
+                    console.out(
+                        f"  [Spend journal] CONFLICT at {p}: entry_id {eid} "
+                        f"already records a DIFFERENT charge "
+                        f"(${existing.get('usd')} for "
+                        f"{existing.get('scope')}/{existing.get('unit')}) than "
+                        f"the one being appended (${payload.get('usd')} for "
+                        f"{payload.get('scope')}/{payload.get('unit')}). "
+                        f"Nothing was written and this charge is NOT recorded.")
+                    return APPEND_CONFLICT
+                blob = _serialize_entry(payload)
                 fh.seek(0, os.SEEK_END)
-                fh.write(json.dumps(payload, sort_keys=True) + "\n")
+                attempted["write"] = True
+                fh.write(blob)
                 fh.flush()
                 os.fsync(fh.fileno())
+                # ── THE READ-BACK, UNDER THE SAME LOCK ──────────────────
+                #
+                # ** IT READS BACK THE LINE, NOT THE BYTES, AND THE DIFFERENCE
+                # ** IS THE WHOLE CHECK. **
+                #
+                # The first version seeked to the pre-write offset and parsed
+                # what it found there -- which is exactly the bytes this
+                # function just serialized, so it parsed every time. Measured:
+                # with boundary recovery disabled, a merged write still
+                # reported `wrote`, because the JSON half of
+                # `fragment + json` parses perfectly when you start reading at
+                # the `{`. The read-back was confirming its own argument.
+                #
+                # The entry's LINE begins after the last newline in the file as
+                # it stood BEFORE this write -- which the duplicate scan has
+                # already read, so this costs nothing. On a clean file that is
+                # the write offset; on an unrecovered torn tail it is the start
+                # of the fragment, and the merged line then fails to parse,
+                # which is the honest answer.
+                fh.seek(before.rfind(b"\n") + 1)
+                if not _reads_back_as(fh.read(), payload, eid, p):
+                    return APPEND_UNCERTAIN
             finally:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     except OSError as exc:
-        JOURNAL_FAULTS[f"append:{type(exc).__name__}"] += 1
+        phase = "uncertain" if attempted["write"] else "failed"
+        JOURNAL_FAULTS[f"append:{phase}:{type(exc).__name__}"] += 1
         console.out(f"  [Spend journal] could not record ${payload.get('usd')} "
-                    f"to {p}: {type(exc).__name__}: {exc}. The next session's "
-                    f"cap will not see it.")
-        return False
+                    f"to {p}: {type(exc).__name__}: {exc}. "
+                    + ("The line MAY have been written; a retry under the same "
+                       "entry_id will resolve it."
+                       if attempted["write"]
+                       else "Nothing was written."))
+        return APPEND_UNCERTAIN if attempted["write"] else APPEND_FAILED
     log.info("spend_journal.append", reason=payload.get("kind"))
-    return True
+    return APPEND_WROTE
+
+
+def _reads_back_as(written, payload, eid, p):
+    """Does the LINE the entry landed on parse back as THIS charge? NEVER RAISES.
+
+    ``written`` is the file from the start of that line to EOF -- not the bytes
+    this module serialized. The distinction is the check: the JSON half of
+    ``fragment + json`` parses perfectly if you start reading at the ``{``, so
+    a version that re-read its own bytes confirmed every write including a
+    merged one. Measured, by disabling boundary recovery: it reported ``wrote``.
+
+    ``fh.write`` returning is not evidence that the file holds a record --
+    the merged-line defect is a successful write that produced none. A
+    ``wrote`` this function has not confirmed would advance a caller's total
+    for money the file cannot return, which is the whole failure.
+
+    A line that fails here is left ON DISK deliberately, exactly as a fragment
+    is: it is what was written, this module did not decide it was wrong, and a
+    retry under the frozen id resolves against whatever is really there.
+    """
+    for rawline in written.splitlines():
+        if not rawline.strip():
+            continue
+        line = decode_journal_line(rawline)
+        if line is None:
+            break
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            break
+        if not isinstance(parsed, dict) or parsed.get("entry_id") != eid:
+            break
+        if not _same_charge(parsed, payload):
+            break
+        return True
+    JOURNAL_FAULTS["append:readback_unreadable"] += 1
+    console.out(
+        f"  [Spend journal] WROTE BUT COULD NOT READ BACK ${payload.get('usd')} "
+        f"at {p}: the bytes appended for entry_id {eid} do not parse back as "
+        f"that charge. This is reported as UNCERTAIN rather than written, so "
+        f"the caller keeps the delta pending under the same id and a retry "
+        f"resolves it against what is really on disk.")
+    return False
+
+
+def append(entry, path=None):
+    """Append one entry unless its ``entry_id`` is already recorded.
+
+    Returns True when a line was written and False otherwise. NEVER RAISES.
+
+    **A THIN WRAPPER OVER ``append_with_outcome``, AND THE BOOL IS UNCHANGED
+    FOR EVERY EXISTING CALLER.** ``wrote`` was True and everything else was
+    False before this split, and that is still exactly the mapping -- including
+    ``conflict``, which this function used to report as a silent duplicate and
+    which is now COUNTED. That is new information and no changed return.
+
+    IT IS KEPT RATHER THAN REPLACED because a bool is the right answer for
+    ``record_batch``, ``record_run`` and the migration: each records one charge
+    once and has nothing to retry. Only a caller that keeps a RUNNING TOTAL
+    needs the four-valued answer, and there is exactly one of those.
+    """
+    return append_with_outcome(entry, path=path) == APPEND_WROTE
+
+
+def entries_for_scope(budget, source, scope, unit_prefix=None, path=None):
+    """Every well-formed entry recorded for one writer. NEVER RAISES.
+
+    **READ BACK FROM THE FILE, WHICH IS THE POINT.** The journal is SHARED --
+    other runs, other budgets and eighteen migration entries live in it -- so a
+    caller verifying its own spend cannot sum the file and cannot trust its own
+    counters either. This is the narrow reading: the entries whose budget,
+    source and scope are this writer's, and whose ``unit`` begins with
+    ``unit_prefix`` when one is given, which is what makes it THIS INVOCATION
+    rather than every invocation that ever wrote to this scope.
+
+    Duplicate ``entry_id``s are yielded ONCE, first occurrence winning, on
+    ``total()``'s rule and for its reason: a file that has been hand-edited or
+    concatenated is what produces them, and summing both would over-report.
+    """
+    out, seen = [], set()
+    for e in read_entries(path):
+        if e.get("budget") != budget or e.get("source") != source \
+                or e.get("scope") != scope:
+            continue
+        if unit_prefix is not None \
+                and not str(e.get("unit", "")).startswith(unit_prefix):
+            continue
+        eid = e.get("entry_id")
+        if eid in seen:
+            continue
+        seen.add(eid)
+        out.append(e)
+    return out
+
+
+def confirmed_usd_for_scope(budget, source, scope, unit_prefix=None,
+                            path=None):
+    """What the FILE says one writer recorded. NEVER RAISES.
+
+    Amounts this build cannot read as money are SKIPPED and counted rather
+    than coerced -- ``total()``'s rule. The direction of that skip is
+    under-reporting, which for a verification means a residual is reported that
+    may not be real; the opposite would be a residual hidden.
+    """
+    usd = 0.0
+    for e in entries_for_scope(budget, source, scope, unit_prefix, path=path):
+        amount = e.get("usd")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            JOURNAL_FAULTS[f"verify:bad_amount:{type(amount).__name__}"] += 1
+            continue
+        if amount != amount or amount < 0:
+            JOURNAL_FAULTS[f"verify:bad_amount:{amount!r}"] += 1
+            continue
+        usd += float(amount)
+    return usd
 
 
 def _covered_batch_ids(entries, budget):
@@ -435,6 +813,499 @@ def record_run(budget, source, scope, unit, usd, judge_model, path=None):
         "scope": scope, "unit": str(unit), "usd": float(usd),
         "judge_model": judge_model,
     }, path=path)
+
+
+RUN_CHECKPOINT_USD = 0.25
+"""How much unrecorded spend a run may carry before it checkpoints.
+
+**THE BOUND IS A MONEY BOUND, AND THAT IS THE DESIGN RATHER THAN A DEFAULT.**
+What ``RunSpendCheckpointer`` exists to limit is the spend a HARD KILL loses,
+which is a dollar quantity -- so the primary threshold is dollars and
+``RUN_CHECKPOINT_SECONDS`` is a liveness backstop for a run that is slow and
+cheap, never the guarantee.
+
+**UNCALIBRATED, AND LABELLED ONE.** It is a holding value with an arithmetic
+behind it rather than a measurement: the reference ragas run spent $9.29 over
+414 seconds, so $0.25 is ~37 entries for that run and ~2.7% of it at risk. Both
+ends of that matter -- a smaller value writes a line and takes an exclusive
+lock per pair, which is exactly what ``record_run``'s docstring declines to do,
+and a larger one is more money lost to a kill. Nothing has measured the right
+number because nothing has measured what a kill actually costs in practice.
+"""
+
+RUN_CHECKPOINT_SECONDS = 60.0
+"""How long a run may go without checkpointing, whatever it has spent.
+
+The backstop, not the bound. A run that is judging slowly and cheaply would
+otherwise sit under ``RUN_CHECKPOINT_USD`` for its whole length and record
+nothing until the end, which is the state this whole mechanism removes. It
+cannot make the money bound worse -- an extra checkpoint only ever records
+MORE of what has been spent.
+"""
+
+
+class _PendingDelta(object):
+    """One issued charge whose write is not CONFIRMED. Frozen, both fields.
+
+    **THE FREEZE IS THE MECHANISM, NOT HOUSEKEEPING.** A retry can only be made
+    safe by the duplicate check, and that check compares the entry id AND the
+    amount -- so an entry retried under a new id would record the same money
+    twice if the first attempt had in fact landed, and an entry retried under
+    the same id with a DIFFERENT amount would be reported as a conflict and
+    never confirm. New spend arriving while this is pending therefore goes into
+    a SEPARATE delta with its own id; it never grows this one.
+    """
+
+    __slots__ = ("unit", "usd", "attempts", "last_outcome", "settled")
+
+    def __init__(self, unit, usd):
+        self.unit = unit
+        self.usd = usd
+        self.attempts = 0
+        self.last_outcome = None
+        # TERMINAL ONCE SET. A delta counted into the confirmed total twice is
+        # silent double-counting -- the failure this whole class exists to
+        # prevent, arrived at from the other side -- so the flag is what makes
+        # `_settle` idempotent rather than an argument about its callers.
+        self.settled = None
+
+    def __repr__(self):
+        return (f"<pending {self.unit} ${self.usd:.6f} "
+                f"attempts={self.attempts} last={self.last_outcome}>")
+
+
+class RunSpendCheckpointer(object):
+    """Segmented ``run`` entries for a harness that has no batch to key on.
+
+    **THE GAP THIS CLOSES IS NAMED IN ``record_run``'S OWN DOCSTRING:** "an
+    invocation killed before it reaches its recording point contributes NOTHING
+    to the next one's cap". A ``finally`` covers a clean exit, an exception and
+    a Ctrl-C, because all three unwind; a SIGKILL, an OOM kill and a power loss
+    do not, and a ragas invocation is tens of minutes of billed judging behind
+    one entry written at the end of it.
+
+    ═══ THE ENTRIES ARE DELTAS, AND THAT IS FORCED BY ``total()`` ═══
+
+    ``total()`` SUMS every entry it has not already seen. So a checkpoint
+    carrying the running TOTAL would be counted again by each later checkpoint
+    that also carries it -- a $9 run written as five cumulative checkpoints
+    would seed the next session's cap at $27. Each entry therefore records only
+    what has been spent SINCE the last one, and the sum over an invocation's
+    entries is that invocation's spend by construction.
+
+    The alternative -- cumulative entries plus a ``max()`` in ``total()`` --
+    was rejected: it would make the reader's arithmetic depend on the KIND of
+    the entry it is summing, and ``total()`` is the one function every budget
+    in this project is compared against.
+
+    ═══ A DELTA IS RECORDED ONLY WHEN THE WRITE IS CONFIRMED ═══
+
+    **THIS IS A REPAIR, AND THE DEFECT IT REPLACES WAS SHIPPED WITH AN ARGUMENT
+    FOR IT.** The first version advanced the recorded total whether or not the
+    line landed, under a comment reasoning that a REFUSED DUPLICATE must
+    advance -- otherwise the next checkpoint re-offers the same delta and, if
+    that one lands, records it twice. That reasoning is correct about
+    duplicates and false about failures, and ``append`` returns ``False`` for
+    both. Reproduced: a $0.30 delta whose append failed was never retried, the
+    finalize computed its remainder against the already-advanced total and
+    wrote **$0.00**, and this class reported ``recorded`` of $0.50 against a
+    journal holding $0.20. Nothing raised and no counter moved.
+
+    ``append_with_outcome`` is what makes the distinction expressible, and each
+    of its outcomes gets the only treatment that is true of it:
+
+      * ``wrote`` and ``duplicate`` -- CONFIRMED. The money is in the file,
+        either because this attempt put it there or because an earlier one did
+        and the id, the charge identity and the amount all match. Advance.
+      * ``conflict`` -- an entry with this id records something ELSE. This
+        charge is not recorded by it and never will be, so the delta is moved
+        to ``conflicted`` and is NEVER advanced past. It is a named fault and
+        it stays unresolved: retrying cannot fix a collision, and inventing a
+        new id would abandon the question of which charge the existing entry
+        is.
+      * ``failed`` / ``uncertain`` -- PENDING. The delta keeps its id and its
+        amount and is retried at the next checkpoint and at finalization.
+
+    ═══ WHY NO DOUBLE COUNT, IN THE FOUR CASES THAT MATTER ═══
+
+    ``entry_id`` is ``sha256(budget, source, scope, unit)``, so two appends
+    collide exactly when all four agree. ``unit`` here is
+    ``f"{prefix}#{seq}"`` with ``prefix`` an invocation stamp taken once at
+    start and ``seq`` a counter, so within an invocation every entry is
+    distinct and across invocations every prefix is.
+
+      * **clean completion** -- checkpoints at d1..dk, then ``finalize``
+        writes ``measured - issued``. The sum is ``measured``. Each unit is
+        written once because each is distinct.
+      * **exception abort** -- identical, because ``finalize`` is called from
+        the caller's ``finally``. The sum is what was spent before the raise.
+      * **hard kill, then a fresh run** -- the killed invocation's entries are
+        on disk and sum to its last confirmed checkpoint. The new invocation
+        takes a NEW prefix, so no id collides and nothing is re-summed.
+      * **hard kill, then ``--resume``** -- the same, plus the resume does not
+        re-judge the pairs it carries forward, so the money is not spent twice
+        for the ledger to record twice.
+
+    **AND THE ONE COLLISION THAT IS LEFT FAILS SAFE.** Two invocations sharing
+    an output directory AND a microsecond-resolution UTC stamp would compute
+    the same ids -- unreachable for a harness whose invocations are minutes
+    long. It is no longer silently absorbed either: the second attempt's amount
+    will not match, so it reports ``conflict`` and is counted rather than being
+    read as "already recorded".
+
+    ═══ WHY ``ENTRY_KIND_RUN`` AND NOT A FOURTH KIND ═══
+
+    These are segments of a run rather than whole runs, so a fourth kind is the
+    tidy answer and it is the wrong one. ``ENTRY_KINDS`` is CLOSED and
+    ``total()`` COUNTS AND SKIPS a kind it does not know -- so a build that
+    predates the new kind would silently drop every segment, which is
+    under-recording, the unsafe direction. Reusing ``run`` means an older
+    reader sums these correctly without knowing they are segments. What makes
+    an entry idempotent is the derived ``entry_id``, which is kind-independent.
+
+    ``ENTRY_KIND_BATCH`` is deliberately NOT used even though it is the other
+    idempotent kind: ``total()`` gives it special handling -- an entry whose
+    unit is inside a migration's ``covers_batch_ids`` for the same scope is
+    skipped -- which is machinery for the rater's Batch API and has no meaning
+    for a ragas segment.
+
+    ═══ WHAT THE BOUND ACTUALLY IS, WHICH IS NOT WHAT THIS SAID ═══
+
+    **THE EARLIER CLAIM WAS THAT A KILL LOSES AT MOST ONE THRESHOLD PLUS THE
+    PAIR IN FLIGHT. THAT IS WRONG IN TWO WAYS AND BOTH WERE MEASURED.**
+
+    ``checkpoint`` IS NOT A TIMER. It runs when the caller calls it, which in
+    ``score_all`` is on PAIR COMPLETION inside the event loop. So
+    ``RUN_CHECKPOINT_SECONDS`` is not a wall-clock backstop at all: it is
+    evaluated only at the next completion, and a run whose pairs are all
+    hanging records nothing further no matter how long it waits. The
+    unrecorded spend of a stalled run is unbounded IN TIME.
+
+    AND CONCURRENT PAIRS ARE OUTSIDE ANY THRESHOLD. The ledger is charged when
+    a RESPONSE arrives, inside the judge's own recording seam; the checkpoint
+    runs when a PAIR completes. At ``--max-workers N`` up to N responses can be
+    charged between two completions, so the unconfirmed amount at any instant
+    is ``min_usd`` plus whatever those in-flight pairs have already been
+    charged -- which is proportional to N and to the price of a pair, and is
+    NOT bounded by ``RUN_CHECKPOINT_USD``.
+
+    **WHAT IT DOES PROMISE**, which is smaller and true: every completed pair's
+    spend is offered to the journal at the first completion after the running
+    delta reaches ``RUN_CHECKPOINT_USD``, and once offered it is retried until
+    confirmed or until finalization reports it. What a kill loses is the spend
+    that was never offered -- the sub-threshold remainder plus the in-flight
+    charges -- and ``tests/test_spend_hard_kill_journaling.py`` section 6
+    MEASURES that at the configured worker count rather than bounding it by
+    argument.
+
+    ═══ WHAT IT COSTS ═══
+
+    One small append under one exclusive ``flock``, at most once per
+    ``RUN_CHECKPOINT_USD`` of spend, plus one retry attempt per pending delta.
+    Pending deltas only accumulate while writes are FAILING, and each retry is
+    one failed ``open`` -- so the O(n^2) that implies is bounded by
+    ``run spend / RUN_CHECKPOINT_USD`` attempts and is microseconds. In ragas
+    it is called from inside an asyncio coroutine, so it blocks the event loop
+    for the length of that write -- the same trade ``ScoreJournal.flush``
+    already makes and argues, and strictly rarer than it.
+    """
+
+    def __init__(self, budget, source, scope, prefix, judge_model,
+                 path=None, min_usd=None, min_seconds=None, clock=None):
+        self.budget = budget
+        self.source = source
+        self.scope = scope
+        self.prefix = str(prefix)
+        self.judge_model = judge_model
+        self.path = path
+        self.min_usd = RUN_CHECKPOINT_USD if min_usd is None else float(min_usd)
+        self.min_seconds = (RUN_CHECKPOINT_SECONDS if min_seconds is None
+                            else float(min_seconds))
+        # INJECTABLE SO THE BACKSTOP CAN BE DRIVEN. A test that had to sleep 60
+        # seconds to exercise a time threshold would not be run; one that
+        # advances a fake clock measures the same branch.
+        self._clock = clock or time.monotonic
+        # A LOCK ALTHOUGH ITS ONE CALLER IS SINGLE-THREADED, on
+        # `fhir/clean.py`'s stated precedent: the accounting below is a
+        # read-modify-write over several fields and `spend.SpendLedger` -- the
+        # thing this reads -- documents itself thread-safe, so a checkpointer
+        # over it that was not would be a trap for whoever calls this from the
+        # rater's pool next.
+        self._lock = threading.Lock()
+        # ── THE THREE TOTALS, AND THEY ARE AMOUNTS RATHER THAN LEVELS ──
+        # An amount is order-independent: a pending delta that confirms late
+        # adds its own money wherever it lands. A "level" (a measured reading
+        # each entry advances to) is not, and would make a late confirmation
+        # either skip or re-cover the deltas issued after it.
+        self._confirmed_usd = 0.0     # in the file, verified by outcome
+        self._issued_usd = 0.0        # every delta ever cut, confirmed or not
+        self._pending = []            # _PendingDelta, frozen id and amount
+        self._conflicted = []         # _PendingDelta that can never confirm
+        self._seq = 0
+        self._last = self._clock()
+        self.entries = []             # one record per attempt, for the tests
+        self.finalized = False
+        self.verified_usd = None      # set by finalize, READ BACK from disk
+        self.residual_usd = None      # measured - verified_usd, at finalize
+
+    @property
+    def recorded(self):
+        """The spend CONFIRMED in the journal. Never advanced on a failure."""
+        return self._confirmed_usd
+
+    @property
+    def issued(self):
+        """Every delta cut so far, whether or not its write is confirmed."""
+        return self._issued_usd
+
+    @property
+    def unconfirmed(self):
+        """Money this invocation cut a delta for and cannot prove is recorded.
+
+        Pending plus conflicted. It is the number ``finalize`` reports loudly
+        when it is non-zero, and it is deliberately NOT folded into
+        ``recorded``: a caller asking what is on disk must not be told about
+        money that is not.
+        """
+        return self._issued_usd - self._confirmed_usd
+
+    @property
+    def pending(self):
+        """The frozen deltas awaiting confirmation, oldest first."""
+        return tuple(self._pending)
+
+    @property
+    def conflicted(self):
+        """Deltas whose id names a DIFFERENT charge. Never retried."""
+        return tuple(self._conflicted)
+
+    def _delta(self, measured):
+        """Unrecorded spend not yet cut into a delta, or ``None``, counted.
+
+        **SEPARATE FROM THE THRESHOLD TEST, AND THAT IS A FIX RATHER THAN A
+        FACTORING.** An earlier version validated inside the writer and let
+        ``checkpoint`` decide "is it due" first -- so a ``None``, a ``NaN`` or
+        a ledger that went backwards produced ``due = False``, fell into the
+        time gate, and returned without ever reaching the code that counts it.
+
+        IT IS MEASURED AGAINST ``_issued_usd`` AND NOT ``_confirmed_usd``, which
+        is what stops a pending delta being cut twice: money already carried by
+        a frozen entry has been accounted for even though it is not yet on disk.
+        """
+        if not isinstance(measured, (int, float)) or isinstance(measured, bool):
+            JOURNAL_FAULTS[f"checkpoint:bad_measured:"
+                           f"{type(measured).__name__}"] += 1
+            return None
+        measured = float(measured)
+        if measured != measured:                                    # NaN
+            JOURNAL_FAULTS["checkpoint:bad_measured:nan"] += 1
+            return None
+        delta = measured - self._issued_usd
+        if delta < 0:
+            # ONLY REACHABLE THROUGH `SPEND_LEDGER.reset()` MID-RUN, which no
+            # harness does. Counted rather than clamped: a ledger that went
+            # backwards under a checkpointer is a defect somewhere else, and
+            # writing a negative into a cap would be worse than not writing.
+            JOURNAL_FAULTS["checkpoint:negative_delta"] += 1
+            return None
+        return delta
+
+    def _attempt(self, item):
+        """One append attempt for one frozen delta. Returns its outcome.
+
+        Records the attempt in ``entries`` whatever happened -- a test that can
+        see only the successful attempts cannot tell a retry from a first try.
+        """
+        item.attempts += 1
+        outcome = append_with_outcome({
+            "entry_id": entry_id(self.budget, self.source, self.scope,
+                                 item.unit),
+            "kind": ENTRY_KIND_RUN, "budget": self.budget,
+            "source": self.source, "scope": self.scope, "unit": item.unit,
+            "usd": item.usd, "judge_model": self.judge_model,
+        }, path=self.path)
+        item.last_outcome = outcome
+        self._last = self._clock()
+        self.entries.append({"unit": item.unit, "usd": item.usd,
+                             "outcome": outcome, "attempt": item.attempts})
+        return outcome
+
+    def _settle(self, item, outcome):
+        """Move ``item`` to confirmed, conflicted or pending. Returns True on
+        CONFIRMED, which is the only outcome that advances the total."""
+        if item.settled is not None:
+            # ALREADY TERMINAL. Not reachable through `_flush_pending` or
+            # `_cut`, each of which settles an item once -- and guarded anyway,
+            # because the cost of being wrong is a total that silently
+            # over-counts, which is the same class of defect as the one this
+            # class was repaired for.
+            JOURNAL_FAULTS["checkpoint:resettle_ignored"] += 1
+            return item.settled == APPEND_WROTE \
+                or item.settled == APPEND_DUPLICATE
+        if outcome in (APPEND_WROTE, APPEND_DUPLICATE):
+            item.settled = outcome
+            self._confirmed_usd += item.usd
+            if item in self._pending:
+                self._pending.remove(item)
+            return True
+        if outcome == APPEND_CONFLICT:
+            item.settled = outcome
+            if item in self._pending:
+                self._pending.remove(item)
+            if item not in self._conflicted:
+                self._conflicted.append(item)
+            JOURNAL_FAULTS["checkpoint:conflict_unresolved"] += 1
+            return False
+        if item not in self._pending:
+            self._pending.append(item)
+        JOURNAL_FAULTS[f"checkpoint:{outcome}"] += 1
+        return False
+
+    def _flush_pending(self):
+        """Retry every pending delta, oldest first. Returns how many confirmed.
+
+        OLDEST FIRST AND ALL OF THEM. The order is the order the money was
+        spent in, which is what a reader of the file expects; and one failing
+        delta does not stop the others, because each carries its own id and its
+        own money and skipping the rest would lose more than it protects.
+        """
+        confirmed = 0
+        for item in list(self._pending):
+            if self._settle(item, self._attempt(item)):
+                confirmed += 1
+        return confirmed
+
+    def _cut(self, usd):
+        """Freeze a new delta under the next sequence number and attempt it."""
+        item = _PendingDelta(f"{self.prefix}#{self._seq}", usd)
+        self._seq += 1
+        self._issued_usd += usd
+        self._settle(item, self._attempt(item))
+        return item
+
+    def checkpoint(self, measured):
+        """Record a delta if enough has accumulated. NEVER RAISES.
+
+        Returns True when this call CONFIRMED anything -- a new delta or a
+        pending one. Safe to call as often as the caller likes; the thresholds
+        are what make it cheap.
+
+        A PENDING DELTA MAKES THE CALL DUE WHATEVER THE THRESHOLDS SAY. Money
+        already cut is money this process is trying to prove it recorded, and
+        deferring that behind a spend threshold would leave it unproved for as
+        long as the run is cheap.
+        """
+        with self._lock:
+            if self.finalized:
+                JOURNAL_FAULTS["checkpoint:after_finalize"] += 1
+                return False
+            delta = self._delta(measured)
+            if delta is None:               # counted in `_delta`
+                return False
+            due = (bool(self._pending)
+                   or (delta > 0 and delta >= self.min_usd)
+                   or (delta > 0
+                       and (self._clock() - self._last) >= self.min_seconds))
+            if not due:
+                return False
+            confirmed = self._flush_pending()
+            if delta > 0:
+                item = self._cut(delta)
+                if item.last_outcome in (APPEND_WROTE, APPEND_DUPLICATE):
+                    confirmed += 1
+            return confirmed > 0
+
+    def finalize(self, measured):
+        """Flush everything, then VERIFY against the file. NEVER RAISES.
+
+        Idempotent: a second call does nothing, because a caller with a
+        ``finally`` inside another ``finally`` must not produce a second
+        terminal entry.
+
+        **IT WRITES EVEN A ZERO DELTA**, which keeps this a strict superset of
+        the behaviour it replaces: ``record_run`` in a ``finally`` left exactly
+        one entry per invocation, including for an invocation that spent
+        nothing, so an operator could ask "did this run record itself" and get
+        an answer. A finalize that skipped a zero delta would make a $0 run and
+        a run whose journaling was never wired up look identical.
+
+        **AND THE VERIFICATION IS READ BACK FROM THE FILE, NOT FROM THESE
+        COUNTERS.** Counters are what the defect this class was repaired for
+        got wrong; a total that verified itself against its own arithmetic
+        would have reported the lost $0.30 as recorded just as confidently. The
+        journal is SHARED -- other runs, other budgets and the migration
+        entries live in it -- so the reading is narrowed to this budget, this
+        source, this scope and this invocation's own ``prefix#`` units.
+
+        A residual is REPORTED, never absorbed: ``recorded`` is set to what the
+        file says, so it can go DOWN here, which is the honest direction.
+        """
+        with self._lock:
+            if self.finalized:
+                return False
+            self._flush_pending()
+            delta = self._delta(measured)
+            if delta is None:
+                # A BAD SHAPE STILL TERMINATES THE RUN. `_delta` has counted
+                # it; cutting a $0 delta keeps "this invocation recorded
+                # itself" answerable, which is why finalize forces.
+                delta = 0.0
+            # THE TERMINAL $0 MARKER IS GUARDED ON ``_seq`` AND NOT ON
+            # ``entries``, and the difference is real: ``entries`` records
+            # ATTEMPTS, so a run whose every write failed has entries and no
+            # issued delta would be skipped. ``_seq`` counts deltas CUT, which
+            # is the question -- "did this invocation ever offer anything to
+            # the journal" -- and it is what keeps "did this run record itself"
+            # answerable for a run that spent nothing.
+            if delta > 0 or self._seq == 0:
+                self._cut(delta)
+            wrote = bool(self.entries)
+
+            # ── THE VERIFICATION ──────────────────────────────────────
+            verified = confirmed_usd_for_scope(
+                self.budget, self.source, self.scope,
+                unit_prefix=f"{self.prefix}#", path=self.path)
+            self.verified_usd = verified
+            self._confirmed_usd = verified
+            target = measured if isinstance(measured, (int, float)) \
+                and not isinstance(measured, bool) and measured == measured \
+                else self._issued_usd
+            residual = float(target) - verified
+            self.residual_usd = residual
+            if residual < -_AMOUNT_EPSILON:
+                # THE FILE HOLDS MORE FOR THIS INVOCATION THAN IT SPENT, which
+                # is only reachable through a PREFIX COLLISION -- another
+                # invocation of the same scope under the same microsecond UTC
+                # stamp. Reported rather than passed over: the earlier design
+                # note said a collision "fails safe", and it does for
+                # DOUBLE-COUNTING (the amounts differ, so the second attempt is
+                # a conflict) -- but a reader of this scope's total is being
+                # handed two runs' money under one invocation's units, and only
+                # this comparison can see it.
+                JOURNAL_FAULTS["checkpoint:overrecorded_scope"] += 1
+                console.out(
+                    f"  [Spend journal] OVER-RECORDED: the journal at "
+                    f"{resolved_journal_path(self.path)} holds "
+                    f"${verified:.6f} under units {self.prefix}#* for scope "
+                    f"{self.scope!r} and this invocation charged only "
+                    f"${float(target):.6f}. Another invocation almost "
+                    f"certainly shares this prefix; the cap will over-count "
+                    f"by ${-residual:.6f}.")
+            if residual > _AMOUNT_EPSILON:
+                JOURNAL_FAULTS["checkpoint:unconfirmed_residual"] += 1
+                console.out(
+                    f"  [Spend journal] UNCONFIRMED SPEND: this invocation "
+                    f"charged ${float(target):.6f} and the journal at "
+                    f"{resolved_journal_path(self.path)} records "
+                    f"${verified:.6f} for it -- ${residual:.6f} IS NOT "
+                    f"RECORDED and the next session's cap will not see it. "
+                    f"{len(self._pending)} delta(s) still pending, "
+                    f"{len(self._conflicted)} in conflict. Scope "
+                    f"{self.scope!r}, units {self.prefix}#*.")
+                log.error("spend_journal.unconfirmed_residual",
+                          reason=f"{residual:.6f}")
+            self.finalized = True
+            return wrote
 
 
 STATE_BASENAMES = ("rater_state.json", "rater_state_blind.json")

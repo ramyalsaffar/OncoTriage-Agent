@@ -1972,6 +1972,28 @@ BUCKETS = {
         "and are sha256-compared at the end. It DOES exec: six in-memory "
         "copies of agent/evaluation.py, one plant each, argued at "
         "_EXEC_ALLOWLIST."),
+    "test_spend_hard_kill_journaling.py": (
+        _A, None,
+        "ran green in 5.1s, 28 checks, against ONLY the provisioned CI "
+        "skeleton (MEASURED against a provision_ci_paths.py root, not "
+        "assumed): a run killed with SIGKILL still reports the money it "
+        "spent. No network, no keys, NO SPEND -- the judge is a stub metric "
+        "that charges the ledger and issues no request, build_judge is never "
+        "called and no provider client of any kind is constructed. NO MODEL "
+        "LOAD (ONCOTRIAGE_DEFER_LOCAL_MODELS above the imports, in this "
+        "process and in every child), no live Qdrant, no corpus, no database, "
+        "no git history, no live server. It DOES use real subprocesses and a "
+        "REAL SIGKILL, which is the point: a signal a process can observe is "
+        "not the signal under test, and no in-process construction reproduces "
+        "'no finally ran'. Every child is handed ONCOTRIAGE_SPEND_JOURNAL "
+        "pointed inside a tempfile.mkdtemp the file removes and asserts gone, "
+        "and section 4 hashes the production journal before and after. NOT in "
+        "the collision matrix: the two repository files it reads "
+        "(spend_journal.py, evaluation/ragas_harness.py) are written by "
+        "neither of the suite's two writers and are sha256-compared at the "
+        "end. It EXECS NOTHING and loads no module by location -- the child "
+        "is a SCRIPT written into the temp tree and run with sys.executable, "
+        "and the control is that same script given a flag."),
     "test_spend_journal.py": (
         _A, None,
         "ran green in 6.4s, 63 checks, against ONLY the provisioned CI "
