@@ -168,6 +168,7 @@ from oncotriage.storage.database_logger import (
     RUN_METRIC_META_COUNTERS_NONZERO,
     RUN_METRIC_META_COUNTERS_REGISTERED,
     CAMPAIGN_RESUMABLE_STATUSES,
+    DRIFT_METRIC_COLUMN_ADDITIONS,
     RUN_FINGERPRINT_COLUMNS,
     RUN_RECORD_STATUS_RUNNING,
     RUN_RECORD_TERMINAL_STATUSES,
@@ -3749,6 +3750,15 @@ ADDITIVE_COLUMNS = {
                   | frozenset(RENAMED_INFERENCE_COLUMNS),
     "trial_matches": frozenset(TRIAL_MATCH_COLUMN_ADDITIONS),
     "runs": frozenset(RUN_COLUMN_ADDITIONS),
+    # `drift_metrics` GAINED ITS FIRST ADDITIVE COLUMNS AT ERA 16 -- the two
+    # state axes and their provenance. NO REGISTERED QUERY NAMES THAT TABLE
+    # TODAY, so this entry changes nothing that runs; it is here so the FIRST
+    # query that does declares `requires_columns` and is skipped on an older
+    # database, rather than discovering item 38's defect for itself. The entry
+    # is what `derive_requires_columns` consults, so declaring the table is the
+    # difference between that derivation being able to see a missing
+    # declaration and being unable to.
+    "drift_metrics": frozenset(DRIFT_METRIC_COLUMN_ADDITIONS),
 }
 
 _SQL_TABLE_REF = re.compile(

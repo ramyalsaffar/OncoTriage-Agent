@@ -373,10 +373,14 @@ _FRESH = fresh_db("fresh.db")
 # that saw that environment. EXACT rather than a subset test, deliberately:
 # exact is what makes this fail when a table is introduced under any name,
 # which is how this line came to be edited.
-check("a fresh database carries all six tables",
+check("a fresh database carries all seven tables",
       tables_of(_FRESH),
-      ["drift_metrics", "inferences", "run_environment", "run_metrics", "runs",
-       "trial_matches"])
+      ["drift_metrics", "drift_reference", "inferences", "run_environment",
+       "run_metrics", "runs", "trial_matches"])
+# THE SEVENTH IS `drift_reference`, added at schema era 16 by the drift
+# redesign, and this EXACT pin is how it came to be declared rather than
+# arriving unremarked -- which is the reason the comment above gives for the
+# pin being exact rather than a subset test.
 
 check("run_metrics carries exactly the narrow shape, plus its id",
       sorted(r["name"] for r in rows(_FRESH, "PRAGMA table_info(run_metrics)")),

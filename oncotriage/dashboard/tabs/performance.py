@@ -141,8 +141,20 @@ def _render_ecog_availability(df):
 
     result = ecog_unavailable_rate(df)
     rate = result["metric_value"]
-    denominator = result["denominator"]
-    pre_migration = result["rows_pre_migration"] or 0
+    # THE DESCRIPTIVE COUNTS COME FROM THE METRIC'S OWN `counts` SLOT (the
+    # drift redesign). They used to be top-level keys -- `denominator`,
+    # `numerator`, `rows_pre_migration` -- that only THIS metric carried, so a
+    # consumer had to know which metric produced a dict to know its keys. Every
+    # result now has the same shape, and the metric-specific numbers live in
+    # one slot that is `{}` where there are none.
+    #
+    # STILL NOT REIMPLEMENTED HERE. The alternative to a `counts` slot was this
+    # tab deriving the numerator as `rate * sample_size`, which is a float
+    # round trip rather than a count -- and the comment at the top of this file
+    # forbids a second copy of the definition for the reason it gives.
+    counts = result["counts"]
+    denominator = result["sample_size"] or 0
+    pre_migration = counts.get("no_selection_path_recorded") or 0
 
     col1, col2, col3, col4 = st.columns(4)
 
@@ -154,8 +166,13 @@ def _render_ecog_availability(df):
         st.metric(
             "ECOG Unavailable Rate",
             f"{rate * 100:.1f}%" if rate is not None else "n/a",
+            # `alert` IS `None` AND NOT `0` when the two state axes say the
+            # reading has not earned a verdict, so this test is `== 1` rather
+            # than truthiness -- which happens to give the same answer today
+            # and states the intent rather than relying on both falsy values
+            # meaning the same thing.
             delta=(f"alert: > {ECOG_UNAVAILABLE_RATE_THRESHOLD * 100:.0f}%"
-                   if result["alert"] else None),
+                   if result["alert"] == 1 else None),
             delta_color="inverse",
             help="Of the rows that REPORT an ECOG selection path, the fraction "
                  "that had an observation on file which could not be used. "
@@ -178,7 +195,7 @@ def _render_ecog_availability(df):
         )
 
     with col3:
-        _unusable = result["numerator"]
+        _unusable = counts.get("unusable")
         st.metric(
             "Observation Present but Unusable",
             f"{_unusable:,}" if _unusable is not None else "n/a",

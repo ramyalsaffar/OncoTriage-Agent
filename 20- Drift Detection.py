@@ -34,21 +34,43 @@ namespace first. Run directly, it died on ``PSI_BINS`` at the first ``def``
 statement -- while the ``__main__`` block below told the user to run exactly
 that command, and the dashboard's drift tab told them the same.
 
-THREE THINGS THE MODULE'S DOCSTRING ARGUES IN FULL: ``log_drift_metrics`` and
-``get_baseline_and_current_data`` take ``db_path`` (File 41 rebound the global
-instead, which a module function cannot see -- it was the last writer in the
-repository that did); ``log_drift_metrics`` returns the path it wrote to, so an
-isolation test can assert on it; and ``SCIPY_AVAILABLE`` is a real
-``ImportError`` guard rather than a ``NameError`` guard on somebody else's
-namespace.
+THREE THINGS THE MODULE'S DOCSTRING ARGUES IN FULL: every reader and writer
+takes ``db_path`` (File 41 rebound the global instead, which a module function
+cannot see -- it was the last writer in the repository that did);
+``log_drift_metrics`` returns the path it wrote to, so an isolation test can
+assert on it; and ``SCIPY_AVAILABLE`` is a real ``ImportError`` guard rather
+than a ``NameError`` guard on somebody else's namespace.
 
 DELIBERATELY NOT THE 01/02 EXEC BOOTSTRAP, and it never was. Running drift
 detection must not import torch, transformers, streamlit, matplotlib and
 langgraph, and must not build an OpenAI and a Qdrant client, in order to run
 three statistical tests over a SQLite table.
 
+THE REFERENCE IS DESIGNATED, NOT INFERRED FROM A DATE (the drift redesign).
+``get_baseline_and_current_data`` is gone: it took the earliest rows in the
+table as the baseline and the latest as the comparison, so which rows the
+pipeline was measured against was decided by insertion order -- and a baseline
+captured AFTER something went wrong read as no drift at all. An operator now
+chooses the reference campaign explicitly and the choice is recorded with its
+run ids, its row ids and a content digest.
+
+THE COMPARISON CAMPAIGN IS CHOSEN EXPLICITLY, AND THERE IS NO DEFAULT. The
+engine used to resolve ``MAX(runs.id)`` itself, so which campaign was measured
+was decided by insertion order -- the same defect the reference designation
+replaced, surviving on the other side of the comparison. ``--comparison`` is
+REQUIRED for a detection run: a run id, or the literal ``latest``, which is an
+explicit opt-in and is RECORDED as one on every row.
+
 Run from terminal:
-    python "20- Drift Detection.py"
+    python "20- Drift Detection.py" --comparison <run_id>  # run the detection
+    python "20- Drift Detection.py" --comparison latest    # ...on whatever ran last
+    python "20- Drift Detection.py" --show-reference       # what is designated
+    python "20- Drift Detection.py" --designate-reference <run_id> [--label L]
+    python "20- Drift Detection.py" --clear-reference      # retire the active one
+
+Every subcommand accepts ``--db PATH``. It is READ-ONLY except for the
+designation commands and the drift rows the detection writes; nothing here
+calls a model and nothing costs money.
 """
 
 import os
@@ -89,22 +111,39 @@ except ImportError:
 
 if __name__ == "__main__":
     """
-    Run drift detection when script is executed directly.
+    Run drift detection, or manage the reference designation.
 
     Usage:
-        python "20- Drift Detection.py"
+        python "20- Drift Detection.py" --comparison <run_id>
+        python "20- Drift Detection.py" --comparison latest
+        python "20- Drift Detection.py" --show-reference
+        python "20- Drift Detection.py" --designate-reference <run_id>
+        python "20- Drift Detection.py" --clear-reference
 
-    This will:
-        1. Load last 30 days as baseline
-        2. Load last 7 days as comparison
-        3. Detect drift across all categories
-        4. Log results to drift_metrics table
-        5. Print detailed analysis
+    A BARE INVOCATION NO LONGER RUNS THE DETECTION. It exits 2 naming
+    ``--comparison``, which is a CONTRACT CHANGE stated as one: a bare
+    invocation used to measure whatever campaign happened to be last, and a
+    default is exactly what that argument exists to remove. The three reference
+    subcommands do not take it -- they read or write a designation and measure
+    nothing.
 
     THIS COMMAND WORKS NOW. It did not before item 20c pass 3b, for the reason
     written at the top of this file: File 20 had no imports and resolved only
     inside somebody else's exec namespace. The instruction above was wrong for
     as long as it has been written down.
+
+    THE ARGUMENT PARSER LIVES IN THIS GUARD, not in ``drift.main()``. Same
+    reason "05- FHIR Clean Data.py" puts ``--dry-run`` here: ``main()`` takes no
+    arguments, an embedder calls it programmatically, and a ``main()`` that
+    started reading ``sys.argv`` would ``SystemExit(2)`` inside somebody else's
+    process. A bare invocation is unchanged; an unrecognised flag exits 2 with
+    usage, which it did not before -- nothing read ``sys.argv`` at all, so a
+    mistyped flag silently ran the detection.
+
+    DESIGNATION IS A SEPARATE COMMAND AND NOT A FLAG ON THE RUN. It writes, it
+    is deliberate, and an operator who typed it meant it; folding it into the
+    run would make "detect drift" a command that can silently change what drift
+    is measured against.
     """
 
     # Imported inside the guard, not at module scope. oncotriage.monitoring.drift
@@ -113,9 +152,88 @@ if __name__ == "__main__":
     # remaining job is one call, and a module-scope import would be a name in
     # this namespace that nothing but the call reads -- which after pass 20e is
     # the one thing this file is not allowed to have.
-    from oncotriage.monitoring.drift import main
+    import argparse
 
-    main()
+    from oncotriage.monitoring import drift as _drift
+    from oncotriage.monitoring.drift_reference import DesignationError
+
+    _parser = argparse.ArgumentParser(
+        description="Drift detection, and the reference it is measured "
+                    "against.")
+    _parser.add_argument(
+        "--db", default=None,
+        help="Database to read and write. Defaults to the configured "
+             "production inferences database.")
+    _group = _parser.add_mutually_exclusive_group()
+    _group.add_argument(
+        "--designate-reference", metavar="RUN_ID", type=int, default=None,
+        help="Designate the campaign containing RUN_ID as THE drift "
+             "reference. The whole campaign is resolved from it, resumes "
+             "included, and its row ids and content digest are recorded.")
+    _group.add_argument(
+        "--show-reference", action="store_true",
+        help="Resolve and print the active designation. Runs nothing else.")
+    _group.add_argument(
+        "--clear-reference", action="store_true",
+        help="Retire the active designation. It is deactivated, never "
+             "deleted: drift rows already written name it.")
+    _parser.add_argument(
+        "--comparison", default=None, metavar="RUN_ID|latest",
+        help="WHICH campaign to measure: a run id, or the literal 'latest' "
+             "as an explicit opt-in to whatever ran last. REQUIRED for a "
+             "detection run; there is no default, and which of the two was "
+             "used is recorded on every row in "
+             "drift_metrics.comparison_selection.")
+    _parser.add_argument(
+        "--label", default=None,
+        help="A short name for the designation, carried into every caption. "
+             "Only meaningful with --designate-reference.")
+    _parser.add_argument(
+        "--note", default=None,
+        help="Free text recorded with the designation. Only meaningful with "
+             "--designate-reference.")
+    _args = _parser.parse_args()
+
+    if _args.designate_reference is not None:
+        try:
+            _drift.designate_reference(_args.designate_reference,
+                                       db_path=_args.db, label=_args.label,
+                                       note=_args.note)
+        except DesignationError as _exc:
+            # EXIT 1 AND NOT A TRACEBACK. A designation that cannot name a
+            # campaign is an operator-facing refusal with a remedy in its
+            # message, and a traceback buries the message under a stack.
+            print(f"✗ Could not designate a reference: {_exc}",
+                  file=sys.stderr)
+            sys.exit(1)
+    elif _args.show_reference:
+        _drift.show_reference(db_path=_args.db)
+    elif _args.clear_reference:
+        _drift.clear_reference(db_path=_args.db)
+    else:
+        # THE REFUSAL IS HERE RATHER THAN IN `main()`, and it is argparse's own
+        # exit 2 rather than a raise: an operator who typed no comparison gets
+        # the usage text naming the flag, which is what a missing required
+        # argument is supposed to look like. `main()` still takes it as a
+        # REQUIRED positional, so an embedder cannot omit it either.
+        if _args.comparison is None:
+            _parser.error(
+                "--comparison is required for a detection run: a run id, or "
+                "'latest' as an explicit opt-in to whatever ran last. There "
+                "is no default -- which campaign a drift run measures is a "
+                "decision, and a tool that picked one silently is the defect "
+                "the reference designation already removed from the other "
+                "side of the comparison.")
+        if _args.comparison == _drift.COMPARISON_LATEST:
+            _comparison = _drift.COMPARISON_LATEST
+        else:
+            try:
+                _comparison = int(_args.comparison)
+            except ValueError:
+                _parser.error(
+                    f"--comparison {_args.comparison!r} is neither an integer "
+                    f"run id nor {_drift.COMPARISON_LATEST!r}.")
+        _drift.main(_comparison, db_path=_args.db)
 
 
 #------------------------------------------------------------------------------

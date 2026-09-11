@@ -15900,6 +15900,486 @@ restore asserted. R5 now fires two checks.
    this correction.
 
 
+### The drift baseline is designated, and a metric says what it DID (the drift redesign)
+
+**TWO DEFECTS, BOTH SILENT, AND THE SECOND ONE MADE THE FIRST UNNOTICEABLE.**
+No paid call, no network egress, no commit: everything is in the working tree.
+The renderer digest (`5ea2c6cc…`), `PROMPT_VERSION` 1.11.0 and
+`FINGERPRINT_VERSION` 8 are **byte-identical to HEAD**, measured in a `git
+worktree`, so no model-visible classifier input moved; the production
+`inferences.db` is byte-unchanged (`ab1403e3…`, 90,185,728 bytes) and was never
+opened by anything this pass added.
+
+**1. THE BASELINE WAS SELECTED BY TIME WINDOW.**
+`get_baseline_and_current_data` took the EARLIEST rows in `inferences` as the
+baseline and the LATEST as the comparison. Which rows the pipeline was measured
+against was decided by insertion order; the two windows could straddle a prompt
+bump, a re-index or a model flip, so every configuration difference arrived as
+drift; and -- the fatal one -- **a baseline captured AFTER the thing went wrong
+reads as no drift at all.** That is the exact failure `ecog_unavailable_rate`
+already refuses to be exposed to, in as many words, by being a threshold rather
+than a comparison. This pass is that argument applied to the comparisons.
+
+**2. EVERY METRIC THAT COULD NOT RUN WROTE `alert = 0`.** A PSI over a column of
+NaNs, a KS test with one sample a side, a z-score whose baseline had no
+variance, a metric whose column the database does not have -- every early return
+of every metric wrote the same byte a healthy reading writes, and the dashboard
+rendered all of them as a green tick. "Measured and fine" and "never measured"
+were one value.
+
+| module | holds |
+|---|---|
+| `oncotriage/monitoring/drift_states.py` | the TWO AXES. `METRIC_STATUSES` (13, closed), `ALERT_POLICIES` (3, closed), `alert_is_meaningful` -- the ONE owner of "alert is meaningful only when policy is alerting AND status is computed" -- `resolve_alert`, and `display_state` / `display_label`, which the console and the dashboard BOTH read so they cannot disagree. **Imports nothing from the project** |
+| `oncotriage/monitoring/drift_reference.py` | the DESIGNATION STORE and the row membership. `designate_reference` / `resolve_reference` / `clear_reference`, `content_digest` + `DIGEST_COLUMNS`, `campaign_rows` (layer 1), `eligible_row_ids` + `ROW_RULES` (layer 2), `pair_rows` + `PAIR_OUTCOMES`, `stratum_for` |
+| `oncotriage/storage/database_logger.py` | schema **era 16**: the `drift_reference` table, four additive `drift_metrics` columns (`status`, `alert_policy`, `reference_id`, `stratum`) with the first migration loop that table has ever had, and `campaign_run_ids` -- the stitch rule walked in BOTH directions |
+
+**THE DESIGNATION RECORDS ENOUGH THAT THE CHOICE CAN BE CHECKED LATER**: the
+anchor run, EVERY run of that campaign (resumes included, so a campaign that
+crashed twice is not measured as a third of a cohort), the full fingerprint, the
+run's `tunables`, the IMMUTABLE row id list, the row and patient counts, and a
+**content digest over the columns the metrics read**. Resolution re-checks the
+ids AND the digest every time.
+
+**THE DIGEST IS THE HALF THAT IS EASY TO LEAVE OUT, AND IT IS THE ONLY THING
+THAT CAN SEE AN UPDATE.** Ids and counts cannot: a reference whose `age` column
+was edited in place has the same ids, the same count and a different meaning.
+Measured in the standing test -- one row updated, all 30 ids still present, and
+the resolution goes `ok` -> `reference_mutated`. **`DIGEST_COLUMNS` is the
+INPUTS and not the whole row**: a digest over `SELECT *` would report MUTATED
+for a cost field re-priced or a provenance column backfilled, and an operator
+would be sent to re-designate over a change that cannot move a number.
+`timestamp` is deliberately absent -- it is when a row was written, not an input
+-- so a re-import of the same data does not read as a mutation.
+
+**FIVE DISTINCT REFUSALS, NEVER A FALLBACK**, because each names a different
+remedy: `reference_absent` (designate one), `reference_unresolvable` (find out
+what happened to the rows), `reference_mutated` (re-designate, or find what
+edited it), `no_run_identity` (migrate the database) and `read_failure` (fix the
+file).
+
+**ROW MEMBERSHIP IS LAYERED AND THE ORDER IS THE DESIGN.** Layer 1 is the FIRST
+ATTEMPT per patient (`MIN(id)`), **applied BEFORE any success filtering** --
+dedup-after-filtering silently promotes a patient's SECOND attempt to "first"
+whenever the first errored, so the population that exists to report failures
+would be exactly the population with no failures in it. That is not subtle: the
+resample pass re-runs completed patients at full price, so a campaign's
+duplicate rows are its SUCCESSES by construction. Layer 2 is per-metric:
+`ROW_RULE_ALL` (availability, the error-rate family, the underfill reporters --
+**failures included, because a failed patient must be visible to the metrics
+that exist to see failures**) and `ROW_RULE_STAGE5` (`COALESCE(error,'')=''
+AND candidates_evaluated>0`).
+
+**TWO METRICS WOULD BE IDENTICALLY WRONG UNDER THE OTHER RULE, and the test
+drives both.** `error_rate_z_score` MUST use the ALL rule -- under the Stage-5
+rule every surviving row has a clean error by construction, so the metric that
+exists to see failures would report 0.0 for a run that errored on half its
+cohort. `match_quality_z_score` MUST use the Stage-5 rule -- its denominator is
+`candidates_evaluated`, and the shipped code substituted 0 for a zero
+denominator with `np.where`, pulling the mean toward zero for every
+no-candidates patient and reporting that as a quality drop.
+
+**THE ID/TIMESTAMP ORDER IS CHECKED AND REPORTED, NEVER ACTED ON.** The `id`
+answer is used -- it is the one with a guarantee behind it -- and a disagreement
+is carried out to the console and to the designation record.
+
+**THE PAIR RULE IS `patient_data_hash`, AND THE MIDDLE OUTCOME IS THE POINT.**
+Verified (both recorded and equal), UNVERIFIED (NULL or empty on either side --
+the check could not be RUN, its own count, excluded from verified comparisons)
+and incomparable (both recorded and different: the patient's input changed).
+Unverified is folded into neither: calling it verified asserts a check that did
+not happen, and calling it incomparable asserts a difference nobody observed.
+Surviving pairs, unverified pairs and both unpaired leftovers are reported with
+every result.
+
+**AVAILABILITY COMPUTES AND LOGS BEFORE ANY REFERENCE IS RESOLVED, AND THAT IS A
+PROPERTY OF THE CALL GRAPH RATHER THAN OF LINE ORDER.**
+`select_comparison_population` takes NO reference argument -- it used to, which
+made resolving the reference a PREREQUISITE of selecting the comparison. It is
+logged in its OWN TRANSACTION, which is the half that makes the ordering worth
+anything: **measured, with the resolver made to RAISE (which it is documented
+never to do), the availability reading is on disk and nothing else is.** The
+`no comparison population` path moved into `_refuse_every_metric` for the same
+reason -- inline, its report-only `resolve_reference` call sat lexically above
+the availability computation and the property stopped being checkable from
+source.
+
+**EVERY COMPARISON METRIC SHIPS `reporting_only` BY RULING.** Their thresholds
+are industry defaults calibrated against nothing in this pipeline, and an
+uncalibrated threshold produces alerts an operator learns to ignore. What is
+RETAINED is stated at each declaration: the statistic, both sample sizes, the
+p-value for KS, and the reference mean and standard deviation for every z-score
+-- which are the two numbers a reader compares by eye when the z is deferred.
+The thresholds are still STORED beside every reading. **The only alerting family
+is `data_availability`, whose policy is `baseline_independent`** -- a separate
+member from `alerting` precisely so that "a reference failure downgrades only
+reference-consuming metrics" is checkable on the stored row.
+
+**THE THREE REPORTING-ONLY RETRIEVAL METRICS, AND THE DENOMINATOR IS THE RUN'S
+OWN.** `retrieval_underfill` divides by `RRF_POOL_SIZE` **from that row's run's
+recorded `tunables`** -- per ROW and not per campaign, because `tunables` is
+deliberately NOT a fingerprint field and two runs of one campaign may
+legitimately differ. `rerank_underfill` divides by `min(candidates_retrieved,
+TOP_K_CANDIDATES)`: using the constant alone would report a patient with 3
+retrieved trials as 92.5% underfilled when their rerank was complete, and **a
+zero denominator is EXCLUDED and COUNTED, never divided** -- 0.0 would read as a
+full rerank and 1.0 as one that dropped everything.
+
+**`trials_lost` SHIPS BOTH AN INDICATOR AND A FRACTION, because a sound
+denominator DOES exist in recorded data.** Quoted from the code that records it:
+`node_hybrid_retrieval` builds `trials` from `ranked_nct_ids` and increments
+`trials_lost` for every ranked-in trial whose payload could not be recovered,
+and `terminal.py` records `candidates_retrieved = len(hybrid_results)` --
+`len(trials)`. Every ranked id therefore ends in exactly one of the two, so
+**`ranked_in = candidates_retrieved + retrieval_trials_lost` is an IDENTITY of
+the recording code** rather than an estimate. The metric uses the sum as the
+denominator, which stays correct even if a future edit breaks the identity.
+
+**NOTHING IS EVER DIVIDED BY A DENOMINATOR THAT IS ZERO, ABSENT OR
+UNVERIFIABLE**, and the five `EXCLUSION_REASONS` are reported with the value --
+`zero_denominator` on `rerank_underfill` means retrieval returned nothing for
+that patient, which is the most interesting thing the row has to say and would
+be invisible as a silent skip. Missing or malformed tunables are
+`unverified_inputs` and never a fraction over today's config.
+
+**EVERY READING IS STRATIFIED BY CANCER GROUP, AND THE UNKNOWN STRATUM IS
+EXPLICIT.** One row per stratum plus one overall row (`stratum` NULL). A row
+whose `primary_condition` was never recorded lands in
+`CANCER_GROUP_UNRESOLVED` and **not** in `other` -- `cancer_group_key(None)`
+answers `other`, which is right for its own contract and wrong here: such a row
+has not been classified as `other`, it has not been classified at all. The
+strata are derived from the population rather than from the vocabulary, so a
+campaign that ran one cancer type does not get fifteen `no_data` rows.
+
+**THE DASHBOARD.** The fourth category and tile (`data_availability` was written
+by the shipped code and rendered by NOTHING -- three tiles, a three-member
+filter); both axes rendered beside the value as `Status` / `Computation` /
+`Alert policy`; the reference identity, campaign runs, row count and digest in
+the caption; a pre-era-16 row rendered `NOT COMPUTED` **and never OK**, because
+it carries `alert = 0` whether or not anything was measured and there is no
+evidence in it from which to recover which; `connectgaps=False` plus grey axis
+ticks for the runs where a metric did not compute; and the historical statistics
+computed over the runs that DID compute, with the count stated.
+
+```bash
+# The drift redesign. Same shape, same directory. No network, no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus, no git history, no live
+# server. Every database is built by the project's own initialize_database()
+# inside a tempfile.mkdtemp it removes and asserts gone, and paths._RESOLVED is
+# seeded so nothing can resolve to the production tree -- the one place a
+# default could reach it (resolve_drift_db_path(None)) is RESOLVED and never
+# connected to, which that function's contract allows and which the file
+# asserts. It EXECS NOTHING and loads no module by location: section 12's six
+# failure controls are copytree COPIES with PYTHONPATH pointed at them, a
+# sitecustomize stripping the editable install's MetaPathFinder, and a realpath
+# preflight inside the child -- eleven of them after the drift repair
+# pass, whose C10 and C11 are in-process attribute rebinds instead,
+# with the restore asserted BY IDENTITY. It DOES render the real tab
+# through AppTest.
+# NOT in the collision matrix; the five package files it reads are
+# sha256-compared at the end. Bucket A.
+python tests/test_monitoring_drift_redesign.py                      # 325 (was 230; the drift repair pass added sections 11b, 11c and controls C7-C11, and rewrote section 6 for the restored pair rule. MEASURED 2026-09-10)
+
+# The operator commands. READ-ONLY except for the designation and the drift
+# rows; nothing here calls a model and nothing costs money.
+python "20- Drift Detection.py"                                     # run it
+python "20- Drift Detection.py" --show-reference                    # what is designated
+python "20- Drift Detection.py" --designate-reference <run_id> --label baseline
+python "20- Drift Detection.py" --clear-reference                   # retire the active one
+```
+
+**SIX TARGETED FAILURE CONTROLS, SIX CAUGHT, EACH WITH A CLEAN CONTROL FIRST.**
+C1 the digest comparison removed (a mutated reference reports OK and the
+comparison metrics compute against rows nobody designated); C2 the error-rate
+metric moved onto the Stage-5 rule; C3 availability moved onto the Stage-5 rule
+(the metric still says `computed` and **its denominator shrinks by exactly the
+two failed patients**); C4 the alert gate removed (rows that measured nothing
+store a verdict -- the shipped defect, byte for byte); C5/C5b the early
+availability write removed (the run still completes, and a raise in the
+reference machinery then leaves the reading OFF DISK); C6 the shipped two-state
+renderer restored in a copy of the tab and driven through AppTest (a refusal and
+a not-computed reading both render as a green OK -- the defect, on the page).
+
+**TWO CONFIG CONSTANTS DELETED.** `BASELINE_WINDOW_DAYS` and
+`COMPARISON_WINDOW_DAYS` sized the window that no longer exists; they go rather
+than lingering as documented knobs that move nothing, on `BATCH_SIZE`'s
+precedent. `drift_metrics.baseline_window_days` and `.comparison_window_days`
+SURVIVE as columns (the schema is additive-only) and are **NULL from era 16 on**
+-- which is also what separates a row written by the window selector from one
+written by the designation selector, without parsing a timestamp.
+
+**FOUR EXACT PINS FIRED AND EACH WAS THE PIN WORKING**: the six-table set in
+`test_storage_run_identity.py`, `test_storage_run_metrics_flush.py` and
+`test_agent_bedrock_adapter.py` (now seven, with `drift_reference` declared and
+argued -- it is NOT a lookup table for `matching_provider`, which is what that
+third assertion is about), and the exact index set in
+`test_storage_schema_guards.py`.
+
+**AND `tests/test_run_tunables_record.py`'s 6f WAS NARROWED RATHER THAN
+RELAXED.** It claimed "one place, and it is a WRITE -- no reader loads it to
+branch on", which folded two properties into one: that nothing GATES on the
+column (which `runs.tunables`' declaration promises) and that nothing reads it
+at all (which was true only because nothing had needed it yet). The drift
+denominators read it -- that is the column's declared purpose -- and they DECIDE
+nothing: an unreadable `tunables` makes the metric report `unverified_inputs`
+and decline to divide. The set stays EXACT at two, with 6f-ii..6f-v added for
+the property that must stay true.
+
+**EIGHT DEFECTS IN THIS PASS'S OWN WORK WERE FOUND BY RUNNING, NOT BY
+READING**, and the last two by probing the finished code rather than by any
+test written for it.
+
+1. **THE TWO WRITES STAMPED TWO DIFFERENT TIMESTAMPS.** Availability is logged
+   in its own transaction and everything else afterwards; with each call taking
+   its own `now()`, the two batches differed by microseconds and **every
+   consumer that groups a run by `MAX(timestamp)` -- which the dashboard does,
+   to find the latest run -- saw ONE run as two, with the alerting family in the
+   half it then discards.** The tile this redesign exists to add rendered over
+   nothing. `log_drift_metrics` takes a `timestamp` argument and the runner
+   stamps once.
+2. **`sample_size` MEANT TWO DIFFERENT THINGS.** It was the denominator on the
+   computed branch and `len(df)` on two refusal branches -- a key a consumer
+   would have to know the branch to read, which is the shape `metric()` exists
+   to remove.
+3. **THE PERFORMANCE TAB BROKE, AND THE DASHBOARD INTEGRATION TEST CAUGHT IT.**
+   It read `result["denominator"]`, `["numerator"]` and `["rows_pre_migration"]`
+   -- keys only the ECOG metric carried. That is what `counts` is for: a
+   descriptive slot every metric has (`{}` where there are none), so the tab
+   gets its numerator from THE ONE OWNER rather than re-deriving it as
+   `rate * sample_size`, which is a float round trip rather than a count.
+4. **AN `ast.walk` ORDERING CHECK READ BREADTH-FIRST ORDER AS SOURCE ORDER** and
+   reported a correctly-ordered function as wrong. Sorted by `(lineno,
+   col_offset)` now.
+5. **THE TEST FIXTURE COULD NOT EXPRESS A NULL HASH.** `patient_data_hash=None`
+   was indistinguishable from "not supplied", so every pair meant to be
+   UNVERIFIED got a synthesised hash. The default is keyed on ABSENCE now.
+6. **A TEXT GREP REPORTED AN ARGUMENT AS A USE OF THE THING IT ARGUES ABOUT.**
+   6f-iii grepped `run_fingerprint.py` for "tunables" -- which names it four
+   times in prose, arguing that the tunables are deliberately OUT of the stamp.
+   **Sixth time in this project**, and in the very file that records having hit
+   it forty lines above. It is an `ast` walk with a non-degeneracy probe now.
+
+7. **A ROW WHOSE AXES PERMIT AN ALERT AND WHOSE ALERT IS NULL RENDERED AS A
+   GREEN OK.** `resolve_alert` cannot produce that pair, so nothing this
+   project WRITES reaches it -- what does is a pandas frame, where an INTEGER
+   column holding NULLs reads back as float64 and a NULL arrives as `nan`, and
+   `DISPLAY_ALERT if alert else DISPLAY_OK` takes the falsy path. **The shipped
+   defect, arriving through the database instead of through the code**, in the
+   module written to remove it. `display_state` refuses to assert a verdict it
+   has not been given.
+8. **A ROW EXCEEDING ITS OWN DENOMINATOR REPORTED `no_data`.** The exclusion
+   was counted correctly from the first version and the STATUS it resolved to
+   was the wrong one: those rows ARE there and they contradict the code that
+   records them, which is `malformed_inputs` and a different remedy from "run
+   the pipeline again". Found by probing the three fraction metrics with
+   impossible values -- a retrieved count above the pool, a reranked count
+   above its cap, a negative and a textual `retrieval_trials_lost` -- none of
+   which any test had asked for.
+
+**AND TWO CONTROLS OF MINE WERE STRENGTHENED AFTER THEY WENT GREEN**, because
+they asserted the plant changed NOTHING -- a check that passes by construction
+and demonstrates no safeguard. C3 now asserts the availability denominator
+SHRINKS by exactly two, and C5 asserts the run's own record of whether it wrote
+early.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **ALERT CALIBRATION IS DEFERRED BY RULING AND NOTHING HERE CHOOSES A
+   THRESHOLD.** The reporting-only metrics are the instrument that would make
+   such a choice possible; making it is a separate act with its own measurement.
+2. **THE COMPARISON CAMPAIGN IS "THE ONE THAT RAN LAST" AND IS NOT
+   DESIGNATED.** That is deliberate -- requiring an operator to designate the
+   comparison too would mean the answer could never be obtained automatically
+   after a campaign -- but it means a drift run cannot be pointed at an
+   arbitrary historical campaign without a new flag.
+3. **A FINGERPRINT DIFFERENCE BETWEEN THE TWO CAMPAIGNS DOES NOT REFUSE.** It is
+   reported. The argument: every comparison metric is reporting-only, so nothing
+   automated acts on it, and refusing would remove the one comparison an
+   operator most wants after a configuration change. A reader who can see the
+   configuration differs decides. **Stated rather than glossed: this is the one
+   place the pass chose reporting over refusing.**
+4. **NO REGISTERED QUERY READS `drift_metrics` OR `drift_reference`.**
+   `queries.ADDITIVE_COLUMNS` declares the table so the FIRST query that does
+   cannot rediscover item 38's defect, and nothing consumes it yet -- the
+   dashboard reads both through `dashboard/data.py` loaders instead.
+5. **THE CAMPAIGN STITCH RULE NOW HAS THREE IMPLEMENTATIONS**
+   (`queries.campaign_summary`'s recursive CTE, `campaign_spend_before`'s
+   backward walk, `campaign_run_ids`' two-way walk). The third is PINNED against
+   the second in the new test; the first is pinned against the second by
+   `tests/test_spend_gate.py`. Three walkers of one rule is a consolidation
+   candidate and was not one this pass could take without touching the spend
+   gate.
+6. **THE REPORTING-ONLY STRATA ARE NOT RENDERED SEPARATELY ON THE TAB.** They
+   are in the table with their `stratum` column and in `drift_metrics`; no tile,
+   no chart, no per-stratum trend.
+7. **THE FULL TEN-TAB WALK IS THE NEXT ITEM**, per the brief. This pass rendered
+   the drift tab, and `tests/test_dashboard_app_integration.py` renders all ten
+   -- which is how the performance-tab breakage was caught -- but no other tab
+   was reviewed against the new shapes.
+8. **`load_drift_metrics_data` STILL CALLS `st.error` ON ANY EXCEPTION**, which
+   includes `no such table: drift_metrics` on a database written before that
+   table existed. A migration reported as a fault. PRE-EXISTING -- that loader
+   is untouched by this pass -- and named here because the new
+   `load_drift_reference_data` beside it deliberately does NOT, for exactly
+   that reason, so the two now disagree about how to report an absent table.
+9. **THE STATUS VOCABULARY HAS THIRTEEN MEMBERS AND THIS PASS EXERCISES
+   ELEVEN.** `unverified_inputs` and `reference_unresolvable` are driven;
+   `read_failure` is driven only through the ordering probe's planted raise and
+   the two corrupt-designation shapes, and no test drives a metric body raising
+   for a reason the code did not plant. A metric that raised in production would
+   take that branch, which is verified by construction (every body is wrapped)
+   and not by a drive.
+
+### Three repairs to the drift core (the drift repair pass)
+
+**THREE DEFECTS ON THE UNCOMMITTED DRIFT CORE, TWO OF THEM DEPARTURES FROM THE
+APPROVED DESIGN AND ONE A MANUFACTURED VERDICT.** No billed call, no AWS call,
+no commit: everything stays in the working tree. The production `inferences.db`
+(`ab1403e3…`, 90,185,728 bytes) and `ablation_results.db` (`f2bc23c6…`) are
+byte-unchanged, and `PROMPT_VERSION` 1.11.0, `FINGERPRINT_VERSION` 8 and
+`llm_classifier_renderer_digest` `5ea2c6cc…` are identical to HEAD -- all six
+hashed renderer modules byte-compared, so no model-visible classifier input
+moved.
+
+**1. `resolve_alert` MANUFACTURED VERDICTS AND THE RENDERER GUARD COULD NOT SEE
+IT.** It returned `int(bool(alert))`, so `None` became **0** -- which the tab
+draws as a green OK -- and `nan` became **1** -- which it draws as an ALERT.
+`display_state` already refuses to draw an OK for either spelling, and that
+guard is correct and is a LAST line of defence: by the time the renderer is
+asked, the value it receives is a well-formed verdict and there is nothing left
+to guard against. The conversion happened upstream of the database.
+
+`classify_alert` is the one place a raw value is now READ, answering a closed
+three-member `ALERT_OUTCOMES`; `resolve_alert` returns **`(value, outcome)`**
+rather than a bare value, which is the fix rather than a style choice -- a
+function that can fail to answer must make its caller handle the failure, and a
+two-member return is the smallest thing that does. MISSING stays missing end to
+end and is still `computed` (the metric ran and declined to assert); INVALID
+REJECTS the reading as `malformed_inputs`, with the caller's claimed status
+REPLACED, in `metric()` and again at the write gate -- so a result assembled by
+any other means still cannot store a verdict its axes do not support. **`bool`
+is tested FIRST**, because `isinstance(True, int)` is True; a float that round
+trips exactly is the same int, so a pandas float64 column holding a real verdict
+is not rejected for its dtype; and `pandas.NA` is caught by an `except` around
+the NaN comparison, because `NA != NA` is NA rather than a bool.
+
+**2. THE COMPARISON CAMPAIGN WAS `MAX(runs.id)`.** Which campaign a drift run
+measures was decided by insertion order -- the SAME defect the designation store
+replaced, surviving on the other side of the comparison. `comparison` is the
+FIRST parameter of `run_drift_detection` and of `main()`, REQUIRED, with no
+default; `COMPARISON_LATEST` is an explicit OPT-IN and `COMPARISON_SELECTIONS`
+records which of the two was used, **on every row including the
+baseline-independent one** -- unlike the reference, the comparison population is
+what every metric was computed over. `resolve_comparison_selection` RAISES on
+anything else including `None`, and **excludes `bool` explicitly**, because
+`comparison=True` would otherwise select run 1: a real campaign, silently, on a
+value that means nothing. `20- Drift Detection.py` requires `--comparison` and
+exits **2** without it, having opened nothing.
+
+**3. `pair_rows` VERIFIED PATIENT HASHES AND NOTHING ELSE.** So two campaigns
+judged by DIFFERENT MODELS over the same patients produced pairs it called
+verified, and a paired z-score over them measures the model change under the
+word "drift". `PAIR_EVIDENCE_INFERENCE` is the declared per-ROW half (seven
+members) and `PAIR_EVIDENCE_RUN` the per-RUN half -- `RUN_FINGERPRINT_COLUMNS`
+checked as ONE composite item, because that tuple is already this project's
+answer to "may these two populations be treated as one". Three outcomes, with
+INCOMPARABLE OUTRANKING UNVERIFIED on evidential grounds: an OBSERVED difference
+is stronger than an absence, so one unreadable column must not downgrade a real
+incompatibility into "we could not tell". `incomparable_on` / `unverified_on`
+name WHICH fact disagreed and which could not be read, and the comparison-level
+note renders them -- without which a refusal says "no verified pair survives"
+and an operator cannot tell a model change from a re-indexed corpus from a
+database that never recorded a hash.
+
+**REPORTING-ONLY DOES NOT WAIVE ANY OF IT.** The metrics do not alert, so no
+machine acts on the number -- and a human reading a paired statistic beside two
+campaigns judged by different models is being handed a measurement of the model
+change. The deferral is of the ALERT, not of the attribution.
+
+**TWO DEFECTS IN THE REPAIR'S OWN WORK, BOTH FOUND BY RE-READING IT AFTER IT WAS
+GREEN.** `drift_metrics.comparison_selection` is the THIRD closed vocabulary on
+that table and shipped without the guard the other two have -- an asymmetry with
+no argument behind it. `require_selection` closes it, and the trap it catches is
+real: the opt-in ARGUMENT is `"latest"` and the recorded SELECTION is
+`"latest_opt_in"`, so a caller handing the write gate the argument value stored a
+bucket no consumer groups on. It RAISES rather than downgrading (unlike the
+alert one line below): an unreadable alert is a defect in one metric's body and
+the run has twenty others worth keeping, while an unrecognised selection is a
+caller passing a value this module does not define and is the same for every row.
+And `_reference_caption`'s docstring promised "the reference AND comparison a
+reading was taken against" while naming only the reference -- **the column was
+written by every drift run and rendered by nothing**, which is the same shape as
+the availability tile this redesign had to add. `_selection_clause` is the fix;
+a run predating the column gains no clause rather than a false one, and a value
+the label map does not know is rendered VERBATIM rather than guessed at.
+
+**TWO STALE HAND-WRITTEN SCHEMA COPIES WENT RED, AND THE PIN THAT SHOULD CATCH
+THEM CANNOT.** `tests/test_monitoring_ecog_availability_drift.py` carries a
+literal `CREATE TABLE drift_metrics` standing in for the production shape, kept
+hand-written on the argument that deriving it from the writer's own dict would
+make its round trip agree with itself -- which is right, and whose cost is that
+the fifth era-16 column made `log_drift_metrics` raise `no such column` in a file
+whose subject is ECOG availability. `tests/test_storage_schema_guards.py` cannot
+see it: that file compares the writer's constants against a database the WRITER
+built, so a second hand-written copy of the shape is outside its reach by
+construction. The literal is updated and the cost is now written down beside it.
+The drift-redesign test's own no-identity fixture was rebuilt from
+`initialize_database` and narrowed by hand to the ONE thing that scenario is
+about, so it cannot go stale the same way again.
+
+**AND ONE SIGNATURE PIN WAS NARROWED RATHER THAN RELAXED.**
+`tests/test_monitoring_ecog_availability_drift.py` pinned
+`select_comparison_population`'s arguments at exactly `["db_path"]` under the
+label "takes no reference either". The property it holds -- this selector
+consults no reference -- is unchanged; what moved it is a LEGITIMATE argument,
+and the list stays EXACT (a substring test for "reference" would pass over an
+argument named `baseline`, and a not-in-the-list test would pass over a third
+argument added silently) with `comparison` added and its requiredness asserted
+beside it.
+
+**FIVE TARGETED FAILURE CONTROLS, FIVE CAUGHT, EACH WITH A CLEAN CONTROL READ
+FIRST.** C7 the conversion restored with the GATE LEFT INTACT -- which isolates
+it from C4, so a copy that passed C4 could still be converting -- and a MISSING
+verdict becomes 0 while an INVALID one becomes 1; C8 a default reinstated on
+`comparison`, so a call naming no campaign RUNS; C9 the hash-only pair rule
+restored, and five pairs judged by different models come back VERIFIED naming
+nothing; C10 the selection guard removed in-process, and the opt-in argument
+lands in the column; C11 the caption clause removed, and the page names no
+comparison while the row underneath it still records one. C10 and C11 are
+in-process attribute rebinds with the restore asserted BY IDENTITY, which is the
+natural control for a module-global lookup; C7-C9 are `copytree` copies with a
+`sitecustomize` stripping the editable install's MetaPathFinder and a realpath
+preflight inside the child.
+
+**VERIFIED BY RUNNING.** `tests/test_monitoring_drift_redesign.py` **325**
+(was 230); `tests/test_monitoring_ecog_availability_drift.py` **134**;
+CI bucket A **113 ran, 0 failed**; **CI bucket B 5/5 in 399.0 s** -- the bucket
+this item had never exercised -- with `oncotriage/config.py` and
+`oncotriage/registries/cancer_code_registry.py` sha256-confirmed restored;
+`tests/test_package_invariants.py` **261/0/0**;
+`tests/test_dashboard_app_integration.py` **110**;
+`tests/test_storage_schema_guards.py` **135**;
+`.github/scripts/ci_test_buckets.py --check` consistent at 132 test files;
+`static_checks.py` compiles 296.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **`log_drift_metrics` WRITES COLUMNS IT DOES NOT ENSURE EXIST.** It relies on
+   `initialize_database` having run; a hand-built or pre-era table gets
+   `Database error: table drift_metrics has no column named …`. LOUD rather than
+   silent, and it is what both stale fixtures above reported -- but the writer's
+   contract is "the caller migrated" and nothing states it at the call sites.
+2. **`--show-reference` AGAINST A MISSING DATABASE EXITS 0**, printing
+   `reference: read_failure`. Defensible for a reporting command and invisible
+   to a script reading the exit code.
+3. **NOTHING PINS THE PROSE.** Both defects in this pass's own work were stale
+   CLAIMS -- a docstring promising a comparison it did not name, a guard
+   asymmetry with no argument -- and no check reads either. They were found by
+   re-reading, which is not a mechanism.
+4. **THE SELECTION IS NOT GATED BY THE RESUME FINGERPRINT** and should not be:
+   it is a property of one drift run rather than of the campaign. Stated so the
+   absence is a decision.
+
+
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is
 argued in place: FALLBACK_MAIN_PATH in oncotriage/settings.py.

@@ -100,20 +100,36 @@ except ImportError:
 
 from oncotriage import config as _config
 from oncotriage.config import (
-    BASELINE_WINDOW_DAYS,
-    COMPARISON_WINDOW_DAYS,
     ECOG_UNAVAILABLE_RATE_THRESHOLD,
     MIN_SAMPLES_COMPARISON,
 )
 from oncotriage.monitoring import drift as _drift_pkg
 from oncotriage.monitoring.drift import (
+    CATEGORY_AVAILABILITY,
     SCIPY_AVAILABLE,
-    detect_data_availability,
     ecog_unavailable_rate,
     log_drift_metrics,
     resolve_drift_db_path,
     z_score_drift,
 )
+from oncotriage.monitoring.drift_states import (
+    POLICY_BASELINE_INDEPENDENT,
+    STATUS_COMPUTED,
+    STATUS_INSUFFICIENT_DATA,
+    STATUS_NO_DATA,
+    STATUS_REFUSED_COLUMN_ABSENT,
+)
+
+# THE TWO WINDOW CONSTANTS ARE GONE (the drift redesign) and this file used to
+# import them. `BASELINE_WINDOW_DAYS` and `COMPARISON_WINDOW_DAYS` were how a
+# baseline was SELECTED -- the earliest rows in the table against the latest --
+# and the redesign replaced that with an explicit operator designation, so
+# there is no window left for them to size. They were deleted from
+# `oncotriage/config.py` rather than left as documented knobs that move
+# nothing, on `BATCH_SIZE`'s precedent, and `log_drift_metrics` no longer takes
+# them: `drift_metrics.baseline_window_days` is written NULL from schema era 16
+# on, which is also what separates a row written by the window selector from
+# one written by the designation selector.
 
 # The repository root, derived from the package's own location rather than from
 # this file's. `oncotriage/__init__.py` -> `oncotriage/` -> the code directory.
@@ -182,7 +198,29 @@ UNDATED_AMB  = ("undated_ambiguous", None, _N)
 NO_OBS       = ("none_recorded", None, _N)
 PRE_MIGRATION = (None, None, _N)
 
-REQUIRED_KEYS = {"metric_value", "threshold", "alert", "notes"}
+REQUIRED_KEYS = {"metric_value", "threshold", "alert", "notes",
+                 "status", "policy"}
+"""The keys every metric result carries, INCLUDING THE TWO STATE AXES.
+
+THE LAST TWO ARE THE DRIFT REDESIGN'S. Before them, `alert` was the whole
+answer -- and every early return of every metric wrote `alert = 0`, the same
+byte a healthy reading writes, so "measured and fine" and "never measured" were
+one value. `status` says what the computation did and `policy` says whether an
+alert is a possible outcome at all; `alert` is NULL unless both say it means
+something.
+"""
+
+
+def alert_of(result):
+    '''The stored alert, resolved through the SHARED owner rather than read.
+
+    A HELPER RATHER THAN `result["alert"]` AT EVERY CALL SITE, because what this
+    file asserts about alerts is now a statement about two axes: a metric whose
+    status is not `computed` has `alert is None`, whatever it measured. Reading
+    the key directly would let a check written against the old two-state world
+    pass by comparing None with 0.
+    '''
+    return result["alert"]
 
 
 print("\n" + "=" * 70)
@@ -201,8 +239,13 @@ print("=" * 70)
 _all_after = ecog_unavailable_rate(rows(ALL_AFTER))
 check("rate is exactly 1.0", _all_after["metric_value"], 1.0)
 check("it alerts", _all_after["alert"], 1)
-check("numerator is every row", _all_after["numerator"], _N)
-check("denominator is every row", _all_after["denominator"], _N)
+check("status is computed", _all_after["status"], STATUS_COMPUTED)
+check("policy is baseline_independent -- it consults no reference, which is "
+      "what lets it answer when the designated reference has failed",
+      _all_after["policy"], POLICY_BASELINE_INDEPENDENT)
+check("the denominator is every row", _all_after["sample_size"], _N)
+check("notes carry the counts", f"{_N}/{_N}" in (_all_after["notes"] or ""),
+      True)
 check("threshold comes from the config module",
       _all_after["threshold"], ECOG_UNAVAILABLE_RATE_THRESHOLD)
 
@@ -216,7 +259,14 @@ check("and alerts", _undated["alert"], 1)
 _healthy = ecog_unavailable_rate(rows(SCORED))
 check("a fully scored corpus rates 0.0", _healthy["metric_value"], 0.0)
 check("and does not alert", _healthy["alert"], 0)
-check("and carries no notes", _healthy["notes"], None)
+# A CLEAN RESULT CARRIES ITS COUNTS AND NOT THE DIAGNOSIS, which is a change:
+# it used to carry `notes = None`. The counts are what a reporting reader wants
+# ("0/10" is more useful than a blank cell); the DIAGNOSIS is a remedy for a
+# problem that did not occur, and printing it under a clean reading is how an
+# operator learns to ignore it.
+check("carries its counts", "0/" + str(_N) in (_healthy["notes"] or ""), True)
+check("and NOT the reference-date diagnosis",
+      "DATA_SNAPSHOT_DATE" in (_healthy["notes"] or ""), False)
 
 # Mixed, on both sides of the threshold.
 _half = ecog_unavailable_rate(rows(("all_after_reference_date", None, 5),
@@ -243,13 +293,13 @@ print("=" * 70)
 _diluted = ecog_unavailable_rate(rows(ALL_AFTER, (None, None, 990)))
 check("rate is computed on reporting rows only", _diluted["metric_value"], 1.0)
 check("so the alert still fires", _diluted["alert"], 1)
-check("denominator counts only reporting rows", _diluted["denominator"], _N)
+check("denominator counts only reporting rows", _diluted["sample_size"], _N)
 check("excluded rows are reported, not dropped silently",
-      _diluted["rows_pre_migration"], 990)
+      _diluted["excluded"].get("no_selection_path_recorded"), 990)
 
 _mixed_eras = ecog_unavailable_rate(rows(ALL_AFTER, SCORED, PRE_MIGRATION))
 check("mixed eras: denominator is the reporting rows",
-      _mixed_eras["denominator"], 2 * _N)
+      _mixed_eras["sample_size"], 2 * _N)
 check("mixed eras: rate is 0.5", _mixed_eras["metric_value"], 0.5)
 
 
@@ -265,14 +315,15 @@ _no_obs = ecog_unavailable_rate(rows(NO_OBS))
 check("a corpus where nobody has an ECOG rates 0.0",
       _no_obs["metric_value"], 0.0)
 check("and does not alert", _no_obs["alert"], 0)
-check("but those rows DO count in the denominator", _no_obs["denominator"], _N)
-check("and are reported separately", _no_obs["rows_no_observation"], _N)
+check("but those rows DO count in the denominator", _no_obs["sample_size"], _N)
+check("and are reported separately",
+      _no_obs["excluded"].get("no_observation_on_file"), _N)
 
 # The distinction that matters: same number of NULL ecog_value in both frames,
 # opposite verdicts.
 _unusable_only = ecog_unavailable_rate(rows(ALL_AFTER))
 check("none_recorded and all_after_reference_date both have NULL ecog_value",
-      (_no_obs["denominator"], _unusable_only["denominator"]), (_N, _N))
+      (_no_obs["sample_size"], _unusable_only["sample_size"]), (_N, _N))
 check("but only one of them alerts",
       (_no_obs["alert"], _unusable_only["alert"]), (0, 1))
 
@@ -292,7 +343,10 @@ print("=" * 70)
 _zeros = ecog_unavailable_rate(rows(SCORED_ZERO))
 check("a cohort scored entirely 0 rates 0.0", _zeros["metric_value"], 0.0)
 check("and does not alert", _zeros["alert"], 0)
-check("numerator is empty", _zeros["numerator"], 0)
+check("numerator is empty -- ECOG 0 is a SCORE, and it is falsy, so an "
+      "implementation testing truthiness would report a fully-active cohort "
+      "as unavailable",
+      f"0/{_N}" in (_zeros["notes"] or ""), True)
 
 _zeros_and_unusable = ecog_unavailable_rate(rows(SCORED_ZERO, ALL_AFTER))
 check("ECOG 0 rows are not counted as unavailable",
@@ -310,22 +364,36 @@ print("=" * 70)
 # The state every row in inferences is in today.
 _all_pre = ecog_unavailable_rate(rows(PRE_MIGRATION))
 check("metric_value is None, not 0.0", _all_pre["metric_value"], None)
-check("it does not alert", _all_pre["alert"], 0)
-check("denominator is 0", _all_pre["denominator"], 0)
+# THE ALERT IS `None` AND NOT `0`, AND THAT IS THE REDESIGN'S WHOLE POINT HERE.
+# `0` is a VERDICT -- "this was measured and it is fine" -- and this reading
+# measured nothing. The shipped code wrote `0` from this branch and the
+# dashboard rendered it as a green tick.
+check("it does not alert, and the absence is NULL rather than a verdict",
+      alert_of(_all_pre), None)
+check("...and the status says which kind of nothing it was",
+      _all_pre["status"], STATUS_NO_DATA)
+check("the denominator is a MEASURED zero rather than an absence: no row "
+      "reported a selection path, which is a different finding from a column "
+      "that is not there", _all_pre["sample_size"], 0)
 check("notes explain why", "predate the ecog_* columns" in (_all_pre["notes"] or ""), True)
 check("insufficient data is distinguishable from a clean 0.0 rate",
       _all_pre["metric_value"] == _healthy["metric_value"], False)
 
 _empty = ecog_unavailable_rate(rows())
 check("an empty frame is also insufficient", _empty["metric_value"], None)
-check("and does not alert", _empty["alert"], 0)
+check("and does not alert", alert_of(_empty), None)
+check("...as no_data rather than as a rate of zero",
+      _empty["status"], STATUS_NO_DATA)
 
 # A denominator of 1 that happens to be unusable is a rate of 1.0 on one
 # patient: noise wearing the costume of the alarm.
 _one_row = ecog_unavailable_rate(rows(("all_after_reference_date", None, 1)))
 check("a single reporting row is below the sample floor",
       _one_row["metric_value"], None)
-check("and does not alert on n=1", _one_row["alert"], 0)
+check("and does not alert on n=1", alert_of(_one_row), None)
+check("...and says it was a FLOOR rather than an absence of data, which are "
+      "two different things to tell an operator",
+      _one_row["status"], STATUS_INSUFFICIENT_DATA)
 check("the floor is the file's existing comparison minimum",
       f">= {MIN_SAMPLES_COMPARISON}" in (_one_row["notes"] or ""), True)
 
@@ -333,7 +401,13 @@ check("the floor is the file's existing comparison minimum",
 _no_columns = ecog_unavailable_rate(pd.DataFrame({"patient_id": ["a", "b"]}))
 check("missing columns return insufficient data rather than raising",
       _no_columns["metric_value"], None)
-check("and do not alert", _no_columns["alert"], 0)
+check("and do not alert", alert_of(_no_columns), None)
+# AN ABSENT COLUMN AND AN EMPTY ONE HAVE DIFFERENT REMEDIES -- migrate the
+# database, versus run the pipeline -- and the shipped code gave both the same
+# answer. THREE statuses now cover what used to be one "insufficient".
+check("...and it is refused_column_absent, not no_data: the remedy is a "
+      "migration, not another campaign",
+      _no_columns["status"], STATUS_REFUSED_COLUMN_ABSENT)
 check("and say which columns were absent",
       "ecog_selection" in (_no_columns["notes"] or ""), True)
 
@@ -356,22 +430,30 @@ for _label, _res in (("alerting", _all_after), ("clean", _healthy),
 check("the shared keys are the ones z_score_drift also returns",
       sorted(_shared - set(_reference)), [])
 
-check("alert is an int, as log_drift_metrics expects",
-      all(isinstance(r["alert"], int) for r in (_all_after, _healthy, _all_pre)), True)
+check("alert is an int when the two axes say it means something",
+      all(isinstance(r["alert"], int) for r in (_all_after, _healthy)), True)
+# ...AND `None` WHEN THEY DO NOT, which is the half `isinstance(int)` above
+# cannot state: `isinstance(None, int)` is False, so a version that stored 0
+# here would pass the line above and fail this one.
+check("...and None when they do not, so a not-computed reading stores no "
+      "verdict at all", alert_of(_all_pre), None)
 check("metric_value is a float when present",
       isinstance(_all_after["metric_value"], float), True)
 
-# No baseline keys: log_drift_metrics copies metric_value into the z_score
-# column only when baseline_mean AND baseline_std are both present. A threshold
-# alert must not be recorded as a z-score.
-check("no baseline_mean", "baseline_mean" in _all_after, False)
-check("no baseline_std", "baseline_std" in _all_after, False)
-check("no p_value", "p_value" in _all_after, False)
+# THE SHAPE IS TOTAL NOW, AND THAT IS A CHANGE. It used to vary by branch --
+# a threshold alert carried no `baseline_mean`, `baseline_std` or `p_value`, so
+# a consumer had to know which branch produced a dict to know its keys. Every
+# result comes from `drift.metric()` and carries every key in `METRIC_KEYS`;
+# what distinguishes a threshold alert from a z-score is that those three are
+# None, which is a VALUE a consumer can test rather than an absence it has to
+# guess at.
+for _absent in ("baseline_mean", "baseline_std", "p_value"):
+    check(f"{_absent} is present as a key and None in value, so the writer "
+          f"records no z-score for a threshold alert",
+          (_absent in _all_after, _all_after[_absent]), (True, None))
 
-_bundle = detect_data_availability(rows(ALL_AFTER))
-check("detect_data_availability returns the metric under its name",
-      list(_bundle), ["ecog_unavailable_rate"])
-check("and it alerts", _bundle["ecog_unavailable_rate"]["alert"], 1)
+check("every key in METRIC_KEYS is on every result, whatever the branch",
+      sorted(set(_drift_pkg.METRIC_KEYS) - set(_all_pre)), [])
 
 
 # ===========================================================================
@@ -389,7 +471,9 @@ check("notes say the corpus and the snapshot disagree",
 check("notes name the resulting selection path",
       "all_after_reference_date" in _notes, True)
 check("notes carry the counts", f"{_N}/{_N}" in _notes, True)
-check("a clean result carries no diagnosis", _healthy["notes"], None)
+check("a clean result carries its counts and NOT the diagnosis",
+      ("0/" + str(_N) in (_healthy["notes"] or "")
+       and "DATA_SNAPSHOT_DATE" not in (_healthy["notes"] or "")), True)
 
 # Round-trip through log_drift_metrics into a throwaway database.
 #
@@ -424,9 +508,25 @@ _DRIFT_SCHEMA = '''
         metric_name TEXT NOT NULL, metric_value REAL, baseline_mean REAL,
         baseline_std REAL, p_value REAL, z_score REAL, threshold REAL,
         alert INTEGER, baseline_window_days INTEGER,
-        comparison_window_days INTEGER, notes TEXT
+        comparison_window_days INTEGER, notes TEXT,
+        status TEXT, alert_policy TEXT, reference_id INTEGER, stratum TEXT,
+        comparison_selection TEXT
     )
 '''
+# THE FIVE TRAILING COLUMNS ARE SCHEMA ERA 16's, and they are written out here
+# rather than derived from DRIFT_METRIC_COLUMN_ADDITIONS on purpose: this
+# fixture's job is to stand in for the PRODUCTION shape, and deriving it from
+# the same dict the writer reads would make the round trip below agree with
+# itself. `tests/test_storage_schema_guards.py` is what pins the two together.
+#
+# THE COST OF THAT DECISION IS PAID HERE AND IS WORTH KNOWING: a column added
+# to the era and not to this literal makes `log_drift_metrics` raise
+# `no such column`, in a file whose subject is ECOG availability and not the
+# schema. It is a LOUD failure rather than a silent one, and the schema-guards
+# pin cannot see it -- that file compares the writer's constants against a
+# database the WRITER built, so a second hand-written copy of the shape is
+# outside its reach by construction. `comparison_selection` is the fifth, and
+# it went stale exactly this way.
 
 for _db in (_SCRATCH_DB, _DECOY_DB):
     _conn = sqlite3.connect(_db)
@@ -466,10 +566,11 @@ def _production_drift_rows():
 
 _PRODUCTION_ROWS_BEFORE = _production_drift_rows()
 
-_written = log_drift_metrics(
-    {"data_availability": detect_data_availability(rows(ALL_AFTER))},
-    BASELINE_WINDOW_DAYS, COMPARISON_WINDOW_DAYS,
-    db_path=_SCRATCH_DB)
+_AVAILABILITY_BUNDLE = {
+    CATEGORY_AVAILABILITY: {
+        "ecog_unavailable_rate": ecog_unavailable_rate(rows(ALL_AFTER))}}
+
+_written = log_drift_metrics(_AVAILABILITY_BUNDLE, db_path=_SCRATCH_DB)
 
 check("log_drift_metrics reports the database it actually wrote to",
       _written, _SCRATCH_DB)
@@ -479,10 +580,7 @@ check("log_drift_metrics reports the database it actually wrote to",
 # production") is exactly the thing this check exists to prevent, so it is
 # aimed at a SECOND throwaway database instead. The assertion above must be
 # capable of coming out False, or it is not an assertion.
-_written_decoy = log_drift_metrics(
-    {"data_availability": detect_data_availability(rows(ALL_AFTER))},
-    BASELINE_WINDOW_DAYS, COMPARISON_WINDOW_DAYS,
-    db_path=_DECOY_DB)
+_written_decoy = log_drift_metrics(_AVAILABILITY_BUNDLE, db_path=_DECOY_DB)
 check("the same assertion FAILS when the write goes elsewhere (negative control)",
       _written_decoy == _SCRATCH_DB, False)
 check("...and the decoy write landed in the decoy, so the control is not "
@@ -503,6 +601,19 @@ if _row is not None:
     check("stored metric_value", _row["metric_value"], 1.0)
     check("stored threshold", _row["threshold"], ECOG_UNAVAILABLE_RATE_THRESHOLD)
     check("stored alert", _row["alert"], 1)
+    check("stored status", _row["status"], STATUS_COMPUTED)
+    check("stored alert policy -- the axis that says an alert is possible at "
+          "all for this metric", _row["alert_policy"],
+          POLICY_BASELINE_INDEPENDENT)
+    check("stored NO reference id: a baseline-independent metric consults "
+          "none, and NULL here is that fact rather than a failure to resolve "
+          "one", _row["reference_id"], None)
+    check("stored no stratum -- this reading is over the whole population",
+          _row["stratum"], None)
+    check("the two window columns are NULL: selection is no longer by window, "
+          "and a number there would describe a mechanism that did not run",
+          (_row["baseline_window_days"], _row["comparison_window_days"]),
+          (None, None))
     check("the diagnosis is stored, not just printed",
           "DATA_SNAPSHOT_DATE" in (_row["notes"] or ""), True)
     check("it is NOT recorded as a z-score", _row["z_score"], None)
@@ -615,21 +726,47 @@ check("the module parsed to a non-empty set of top-level functions",
       len(_sig_defs) >= 10, True)
 
 _fn = next(n for n in _sig_defs if n.name == "ecog_unavailable_rate")
-check("takes exactly one argument", [a.arg for a in _fn.args.args], ["df"])
+check("takes a frame and an optional stratum, and NO baseline -- so there is "
+      "no reference to compare against even by accident",
+      [a.arg for a in _fn.args.args], ["df", "stratum"])
 
 _avail = next(n for n in _sig_defs if n.name == "detect_data_availability")
-check("detect_data_availability takes only the current window",
-      [a.arg for a in _avail.args.args], ["current_df"])
+check("detect_data_availability takes the comparison population and NO "
+      "reference argument, which is what makes 'availability consults no "
+      "reference' a property of the call graph rather than a promise",
+      [a.arg for a in _avail.args.args], ["conn", "comparison"])
+
+# ...AND NEITHER DOES THE SELECTOR THAT FEEDS IT. `select_comparison_population`
+# used to take the resolved reference, which made resolving the reference a
+# PREREQUISITE of selecting the comparison and therefore upstream of this
+# metric. Splitting the two is the ordering PART 4 of the redesign asks for.
+_select = next(n for n in _sig_defs if n.name == "select_comparison_population")
+check("select_comparison_population takes no reference either",
+      [a.arg for a in _select.args.args], ["db_path", "comparison"])
+# THE PIN IS AN EXACT LIST AND THAT IS DELIBERATE -- a substring test for
+# "reference" would pass over an argument named `baseline`, and a
+# not-in-the-list test would pass over a third argument added silently. What it
+# costs is that a LEGITIMATE argument moves it, which is what `comparison` did:
+# which campaign a drift run measures is now a required decision rather than
+# MAX(runs.id), and the pin is updated rather than relaxed because the property
+# it holds -- this selector consults no reference -- is unchanged.
+check("...and `comparison` is REQUIRED, so the selector cannot fall back to a "
+      "campaign nobody chose, which is what it did before",
+      (len(_select.args.args), len(_select.args.defaults)), (2, 0))
+
+check("get_baseline_and_current_data is GONE -- the time-window selector is "
+      "what the designation store replaced",
+      any(n.name == "get_baseline_and_current_data" for n in _sig_defs), False)
 
 # PASS 20c-3b: every database entry point takes db_path. Asserted structurally
 # as well as exercised above, because the exercise proves that ONE call honours
 # it and this proves there is no second door.
-for _name, _expected_tail in (("log_drift_metrics", "db_path"),
-                              ("get_baseline_and_current_data", "db_path"),
-                              ("run_drift_detection", "db_path")):
+for _name in ("log_drift_metrics", "run_drift_detection",
+              "designate_reference", "show_reference", "clear_reference"):
     _node = next(n for n in _sig_defs if n.name == _name)
-    _args = [a.arg for a in _node.args.args]
-    check(f"{_name} takes db_path", _args[-1], _expected_tail)
+    _args = [a.arg for a in _node.args.args] + [
+        a.arg for a in _node.args.kwonlyargs]
+    check(f"{_name} takes db_path", "db_path" in _args, True)
 
 # ...and no function in the module reaches a bare `inferences_path` any more.
 # That name is what File 41 used to rebind; a survivor would be a write this
@@ -690,11 +827,44 @@ check("...at the value the source text declares, so the grep above and this "
 _runner = _function_body(_DRIFT_MODULE, "run_drift_detection")
 check("the runner body is non-empty", len(_runner) > 200, True)
 check("run_drift_detection computes it", "detect_data_availability" in _runner, True)
-check("and counts its alerts into the total", "availability_alerts" in _runner, True)
+
+# THE ORDERING, BY AST. Availability must be computed AND LOGGED before the
+# reference is resolved -- not because the metric consults one, but because a
+# reference failure (a refusal, a mutation, a raise out of the resolver, a
+# hang) must not be able to reach the only alerting metric in the project.
+# Asserted on the ORDER of the two calls in the source, because a behavioural
+# check can only show that the two are independent on the inputs it happened to
+# use, and this is the property the brief asks for.
+_runner_node = next(n for n in _sig_defs if n.name == "run_drift_detection")
+# SORTED BY LINE NUMBER, NOT `ast.walk` ORDER. `ast.walk` is BREADTH-FIRST, so
+# its sequence is a statement about nesting depth rather than about which call
+# runs first -- and the first version of this check read it as source order and
+# reported a correctly-ordered function as wrong. Measured, not reasoned about:
+# the wrong reading put `resolve_reference` ahead of `detect_data_availability`
+# because the two sit at different depths.
+_runner_calls = [ast.unparse(c.func)
+                 for c in sorted((n for n in ast.walk(_runner_node)
+                                  if isinstance(n, ast.Call)),
+                                 key=lambda n: (n.lineno, n.col_offset))]
+check("the runner calls detect_data_availability and resolve_reference",
+      ("detect_data_availability" in _runner_calls
+       and "_reference.resolve_reference" in _runner_calls), True)
+check("...and availability comes FIRST",
+      _runner_calls.index("detect_data_availability")
+      < _runner_calls.index("_reference.resolve_reference"), True)
+check("...and it is LOGGED before that too, in its own transaction, so a "
+      "crash in the reference machinery costs the comparison metrics and not "
+      "the alerting one",
+      _runner_calls.index("log_drift_metrics")
+      < _runner_calls.index("_reference.resolve_reference"), True)
+
 _printer = _function_body(_DRIFT_MODULE, "print_drift_details")
 check("the printer body is non-empty", len(_printer) > 200, True)
-check("print_drift_details renders the category",
-      '"data_availability"' in _printer, True)
+check("print_drift_details renders every category, from the closed "
+      "vocabulary rather than a list of its own",
+      "METRIC_CATEGORIES" in _printer, True)
+check("...and the vocabulary has the availability category in it",
+      CATEGORY_AVAILABILITY in _drift_pkg.METRIC_CATEGORIES, True)
 
 
 # ===========================================================================
@@ -796,11 +966,21 @@ if _guards:
         and (_s.module or "").startswith("oncotriage")
         for _a in _s.names
     )
-    check("...and the guard imports main from oncotriage.monitoring.drift",
-          "main" in _guard_imports, True)
+    # THE GUARD IMPORTS THE MODULE NOW, NOT THE ONE FUNCTION. It grew three
+    # subcommands -- --designate-reference, --show-reference,
+    # --clear-reference -- so importing `main` alone would leave three of the
+    # four entry points unreachable. What has NOT changed is that the import is
+    # INSIDE the guard: a module-scope import here would be a name nothing but
+    # the call reads, which is the one thing a thin entry point may not have.
+    check("...and the guard imports the drift module from the package",
+          "drift" in _guard_imports, True)
     _calls = [ast.unparse(_s.func) for _s in ast.walk(_guards[0])
               if isinstance(_s, ast.Call)]
-    check("...and calls it", "main" in _calls, True)
+    check("...and calls main on it", "_drift.main" in _calls, True)
+    # ...AND THE THREE REFERENCE SUBCOMMANDS ARE REACHABLE, or a designation
+    # store with no way to write to it is a table nobody can fill.
+    for _sub in ("designate_reference", "show_reference", "clear_reference"):
+        check(f"...and reaches {_sub}", f"_drift.{_sub}" in _calls, True)
 else:
     fail("File 20's __main__ guard", "no guard found, so the three checks "
                                      "below could not run")
@@ -816,6 +996,10 @@ check("oncotriage.monitoring.drift actually exports main",
 # The nine names have not stopped mattering; what changed is WHERE a caller
 # gets them. Asserted against the package module, which is where this file and
 # every other caller imports them from.
+# `get_baseline_and_current_data` WAS A TENTH AND IT IS DELETED, which is why
+# this list is nine rather than ten: the time-window selector is the thing the
+# designation store replaced, and a check requiring it to still be reachable
+# would be requiring the defect to still be there.
 _FORMER_SHIM_EXPORTS = ("ecog_unavailable_rate", "detect_data_availability",
                         "log_drift_metrics", "print_drift_details",
                         "run_drift_detection", "z_score_drift", "ks_test_drift",

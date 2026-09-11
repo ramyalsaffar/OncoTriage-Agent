@@ -864,9 +864,22 @@ check("4b-2 ...and the three access paths `inferences` is actually read by",
 # commit, beside the measurement that justifies it. What has NOT changed is the
 # nct_id ruling -- there is still no index on it, and the exactness of this list
 # is what says so.
+#
+# `idx_drift_reference_active` JOINED IT AT SCHEMA ERA 16 and this exact pin is
+# what made that a declaration rather than an arrival. It is NOT measured the
+# way the five above are, and that is stated rather than implied: the table
+# holds one row per designation -- single digits for the life of a database --
+# so the index buys nothing at this scale. It exists because `is_active = 1` is
+# the ONLY access path the table has and because a designation store with a
+# thousand retired rows is a shape this schema should not have to re-open;
+# neither is a measurement, and if that table ever grows it is the number to
+# take. NO UNIQUE CONSTRAINT ON IT, deliberately: the first UNIQUE in this
+# schema would make IntegrityError reachable on a write path `_is_retryable`
+# classes TERMINAL, which is the argument `run_metrics` already makes.
 check("4c ...and NO index on nct_id, which is a measured ruling and not an "
       "oversight (32% slower; see the comment at the CREATE INDEX)",
-      _FRESH_INDEXES, ["idx_inferences_patient_id", "idx_inferences_run_id",
+      _FRESH_INDEXES, ["idx_drift_reference_active",
+                       "idx_inferences_patient_id", "idx_inferences_run_id",
                        "idx_inferences_timestamp", "idx_run_metrics_run_id",
                        "idx_trial_matches_inference_id"])
 # Re-open the SAME database through the real initialize_database. Written as

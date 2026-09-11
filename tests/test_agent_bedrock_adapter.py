@@ -1343,8 +1343,15 @@ check("matching_provider is TEXT in the real schema",
 # would look like, and only naming the members separates the two.
 check("...and no lookup table was introduced for it",
       sorted(_tables),
-      ["drift_metrics", "inferences", "run_environment", "run_metrics", "runs",
-       "trial_matches"])
+      ["drift_metrics", "drift_reference", "inferences", "run_environment",
+       "run_metrics", "runs", "trial_matches"])
+# `drift_reference` JOINED THE SET AT SCHEMA ERA 16 AND IT IS NOT A LOOKUP
+# TABLE FOR THIS COLUMN, which is what this assertion is about. It is the drift
+# redesign's designation store -- one row per reference an operator chose, with
+# the campaign, the row ids and a content digest -- and it names no provider,
+# no model and no `inferences` column at all. Declared here rather than
+# loosened to a subset test, because only naming the members separates "a
+# table was added" from "a lookup table was introduced for matching_provider".
 check("...beside matching_model, which is TEXT for the same reason",
       at(_decl, "matching_model"), "TEXT")
 

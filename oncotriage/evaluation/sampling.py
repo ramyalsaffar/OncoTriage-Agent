@@ -219,8 +219,18 @@ SAMPLE_DB_FILENAME = sample_db_filename()
 # readable "this extract carries no campaign aggregates" rather than a wrong
 # number. The campaign's real health record stays queryable where it is honest
 # -- in the source database, joined to the whole run.
+#
+# `drift_reference` JOINS THEM AT ERA 16, SCHEMA ONLY, AND FOR A THIRD REASON
+# THAT IS NEITHER OF THE TWO ABOVE. A designation row names row ids and run ids
+# OF THE SOURCE DATABASE; copied into an extract that holds thirty of those rows
+# it would designate a reference most of whose members are not there, and the
+# very next resolution would report it MUTATED -- a true statement about a
+# false premise. The schema travels for `drift_metrics`' stated reason (a tool
+# built against the production schema must open the extract) and the rows do
+# not, so an extract reports "no reference designated", which is exactly what is
+# true of it.
 COPIED_TABLES = ("inferences", "trial_matches", "drift_metrics", "runs",
-                 "run_metrics")
+                 "run_metrics", "drift_reference")
 
 
 #------------------------------------------------------------------------------

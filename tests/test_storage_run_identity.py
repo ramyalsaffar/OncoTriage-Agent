@@ -765,10 +765,16 @@ silence(_dl.initialize_database, _FRESH)
 # the reason the bedrock adapter's copy of this assertion states: exact is what
 # makes it fail when a table is introduced under any name, which is how this
 # line came to be edited.
-check("a fresh database carries all six tables",
+check("a fresh database carries all seven tables",
       tables_of(_FRESH),
-      ["drift_metrics", "inferences", "run_environment", "run_metrics", "runs",
-       "trial_matches"])
+      ["drift_metrics", "drift_reference", "inferences", "run_environment",
+       "run_metrics", "runs", "trial_matches"])
+# `drift_reference` JOINED THEM AT SCHEMA ERA 16 and the exact pin is what
+# caught it -- which is the pin working. It is the drift redesign's designation
+# store: one active row naming the campaign, the run ids, the row ids and a
+# content digest that a comparison is measured against, replacing a baseline
+# selected by time window. It has no `run_id` and is not part of run identity;
+# it is here because this assertion is about what a FRESH DATABASE IS.
 
 check("...and `runs` carries exactly RUN_COLUMNS plus its id",
       sorted(columns_of(_FRESH, "runs")),

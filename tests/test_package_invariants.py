@@ -4354,6 +4354,12 @@ _DECORATOR_INVENTORY = {
         ["st.cache_data(ttl=60)"],
     "oncotriage/dashboard/data.py::load_run_attribution_data":
         ["st.cache_data(ttl=60)"],
+    # The designation reader (the drift redesign). Same TTL as the other
+    # eight, and declared here rather than exempted for the reason this dict
+    # is EXACT: a loader added WITHOUT the decorator reads the database on
+    # every widget interaction and nothing else in the project would notice.
+    "oncotriage/dashboard/data.py::load_drift_reference_data":
+        ["st.cache_data(ttl=60)"],
     # The four that pass 20c-3c-1 dropped and its equivalence proof recovered.
     "oncotriage/dashboard/tabs/drift.py::render_drift_detection_tab":
         ["st.fragment"],
@@ -4474,6 +4480,22 @@ _DECORATOR_INVENTORY = {
     "oncotriage/spend.py::Stage5CallCounter.issued": ["property"],
     "oncotriage/spend.py::Stage5CallCounter.refusals": ["property"],
     "oncotriage/storage/database_logger.py::CampaignSpend.runs": ["property"],
+    # ---- The drift redesign ------------------------------------------------
+    # Seven read-only properties over three NamedTuples and two small classes.
+    # Every one is a DERIVED reading of fields already on the object -- a
+    # count, a mean, a boolean -- and none has a setter, which is what makes
+    # them properties rather than methods: a caller reading `.patients` is
+    # asking a question about the object, not asking it to do something.
+    "oncotriage/storage/database_logger.py::CampaignMembership.runs":
+        ["property"],
+    "oncotriage/monitoring/drift.py::FractionOverRows.n": ["property"],
+    "oncotriage/monitoring/drift.py::FractionOverRows.mean": ["property"],
+    "oncotriage/monitoring/drift.py::Population.patients": ["property"],
+    "oncotriage/monitoring/drift_reference.py::ReferenceResolution.ok":
+        ["property"],
+    "oncotriage/monitoring/drift_reference.py::CampaignRows.patients":
+        ["property"],
+    "oncotriage/monitoring/drift_reference.py::PairResult.counts": ["property"],
     # The structured-logging pass. `_Console` is a namespace of @staticmethods
     # rather than a module of bare functions so that `console.out` reads at
     # 1,100 call sites the way `print` did; `progress` stacks
@@ -5971,6 +5993,12 @@ check("every loader in data.py carries @st.cache_data(ttl=60), and the two "
        "load_trial_matches_data": ["st.cache_data(ttl=60)"],
        "load_drift_metrics_data": ["st.cache_data(ttl=60)"],
        "_readonly_connection": [],
+       # The drift redesign's designation reader. It is sited AFTER
+       # `_readonly_connection` because it calls it -- the three loaders above
+       # it use a plain `sqlite3.connect`, which CREATES the file, and a reader
+       # asking "does this database have a designation" must not answer by
+       # making a database that has nothing at all.
+       "load_drift_reference_data": ["st.cache_data(ttl=60)"],
        "load_run_tracking_availability": ["st.cache_data(ttl=60)"],
        "_load_run_query": [],
        "load_run_summary_data": ["st.cache_data(ttl=60)"],

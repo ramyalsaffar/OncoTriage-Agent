@@ -1739,6 +1739,36 @@ BUCKETS = {
     "test_indexer_admission_filters.py": (
         _E, "mesh_non_oncology_lookup.json (UMLS-derived, deliberately not vendored)",
         "KeyError: 'diabetes mellitus' -- the non-oncology lookup is absent"),
+    "test_monitoring_drift_redesign.py": (
+        _A, None,
+        # MEASURED against ONLY the directory skeleton, not against the
+        # developer tree: 219 passed, 0 failed, exit 0. Nothing in it reads a
+        # production artifact -- `paths._RESOLVED` is seeded with a temp path
+        # at import and restored at the end, and the one place a default could
+        # reach the real database (`resolve_drift_db_path(None)`) is RESOLVED
+        # and never connected to, which that function's own contract allows
+        # and which the file asserts.
+        "ran green against ONLY the directory skeleton, 219 checks: the drift "
+        "redesign -- the designation store, the layered row membership, the "
+        "two state axes, and the twelve-section end-to-end drive. No network, "
+        "no keys, no spend, no live Qdrant, no model load, no corpus, no git "
+        "history, no live server. Every database is built by the project's own "
+        "initialize_database() inside a tempfile.mkdtemp it removes and then "
+        "asserts gone, and paths._RESOLVED is seeded so nothing can resolve to "
+        "the production tree. It EXECS NOTHING and loads no module by "
+        "location: section 12's six failure controls are copytree COPIES of "
+        "the package with PYTHONPATH pointed at them, a sitecustomize that "
+        "strips the editable install's MetaPathFinder, and a realpath "
+        "preflight inside the child asserting the copy is what imported -- so "
+        "it needs no _EXEC_ALLOWLIST entry. It DOES render the real dashboard "
+        "tab through streamlit's AppTest, which is why it is slower than a "
+        "pure-unit file; streamlit is imported inside section 11 so a machine "
+        "without it records a SKIP rather than failing at the first import. "
+        "NOT in the collision matrix: it writes only inside its own temp "
+        "directory, and the five package files it reads are written by "
+        "neither of the suite's two writers and are sha256-compared at the "
+        "end.",
+    ),
     "test_monitoring_ecog_availability_drift.py": (
         _E, "the production inferences.db",
         "'the production table was readable, so the count is a real number' failed"),

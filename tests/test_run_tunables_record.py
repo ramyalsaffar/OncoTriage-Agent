@@ -679,10 +679,68 @@ def _column_subscripts(name):
     return sorted(found)
 
 
-check("6f  the column is reached in exactly ONE place in the package, and it "
-      "is a WRITE in the run-row writer -- no reader loads it to branch on",
+# THE COLUMN GAINED ITS FIRST READER AT THE DRIFT REDESIGN, AND THE CHECK IS
+# NARROWED TO THE PROPERTY IT ACTUALLY PROTECTS RATHER THAN RELAXED.
+#
+# The claim was "one place, and it is a WRITE -- no reader loads it to branch
+# on". Two things were folded into that: (a) nothing GATES on the column, which
+# is the property `runs.tunables`' own declaration makes ("nothing gates,
+# branches or refuses on it"), and (b) nothing reads it at all, which was true
+# only because nothing had needed it yet.
+#
+# `oncotriage/monitoring/drift_reference.py:_run_tunables` reads it to resolve
+# a DENOMINATOR -- the RRF_POOL_SIZE and TOP_K_CANDIDATES the reporting-only
+# underfill metrics divide by. That is the column's declared purpose: a
+# campaign run six months ago at RRF_POOL_SIZE = 50 must be read against 50,
+# and reading it against today's 100 would report a pool half empty that was in
+# fact full. It DECIDES NOTHING: a run whose tunables cannot be read reports
+# `unverified_inputs` and the metric declines to divide, which is a REFUSAL BY
+# THE METRIC rather than a gate on the run.
+#
+# THE SET STAYS EXACT so a third reader has to be declared here, in the same
+# commit, beside the argument for it -- which is the whole value of an exact
+# pin. What replaces the "no reader" half is 6f-ii below, which is the property
+# that must stay true.
+check("6f  the column is reached in exactly TWO places in the package: the "
+      "run-row WRITE, and the drift denominator READ",
       _column_subscripts("tunables"),
-      [("database_logger.py", "values['tunables']", "Store")])
+      [("database_logger.py", "values['tunables']", "Store"),
+       ("drift_reference.py", "row['tunables']", "Load")])
+# ...AND NOTHING GATES ON IT, which is what `runs.tunables`' declaration
+# promises and what 6d has already measured from the other side: two stamps
+# taken under different tunables compare as a MATCH. Asserted here as a
+# structural fact about the one reader -- it is in `monitoring`, which no
+# resume gate imports, and `run_fingerprint` does not import it.
+check("6f-ii ...and the reader is in `monitoring`, which no resume gate "
+      "imports -- so reading the column cannot become gating on it",
+      sorted({_f for _f, _e, c in _column_subscripts("tunables")
+              if c == "Load"}), ["drift_reference.py"])
+# BY AST, NOT BY TEXT, AND THE FIRST VERSION OF THIS CHECK WAS THE TEXT ONE --
+# which is the trap this very file records having hit at check 6f above, met
+# again forty lines later. `oncotriage/run_fingerprint.py` names "tunables"
+# FOUR times in prose: its own docstring argues at length that the tunables are
+# deliberately OUT of the stamp, and the comment beside the gated-field list
+# says so again. A grep reports the argument as a use of the thing it argues
+# about. SIXTH time in this project; the instrument is an ast walk.
+_FP_SRC = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(
+    _dl.__file__))), "run_fingerprint.py"), encoding="utf-8").read()
+_FP_TREE = ast.parse(_FP_SRC)
+check("6f-iii ...and run_fingerprint, which owns every gate, subscripts no "
+      "'tunables' key",
+      [ast.unparse(n) for n in ast.walk(_FP_TREE)
+       if isinstance(n, ast.Subscript) and isinstance(n.slice, ast.Constant)
+       and n.slice.value == "tunables"], [])
+check("6f-iv  ...and imports the reader's module nowhere, so it cannot come "
+      "to gate on it through one",
+      sorted({(n.module or "") for n in ast.walk(_FP_TREE)
+              if isinstance(n, ast.ImportFrom)
+              and "monitoring" in (n.module or "")}), [])
+check("6f-v   ...non-degeneracy: the same walk DOES find the subscripts "
+      "run_fingerprint really makes, so an empty result is a finding rather "
+      "than a broken walk",
+      len([n for n in ast.walk(_FP_TREE)
+           if isinstance(n, ast.Subscript)
+           and isinstance(n.slice, ast.Constant)]) > 5, True)
 check("6f  ...non-degeneracy: the same census over a column that IS read "
       "elsewhere finds Load contexts, so an empty reader set is a finding",
       sorted({c for _f, _e, c in _column_subscripts("note")}),

@@ -269,6 +269,49 @@ def _readonly_connection():
 
 
 @st.cache_data(ttl=60)
+def load_drift_reference_data():
+    """The drift REFERENCE designations. Cached for 60 seconds.
+
+    An empty frame WITH THE COLUMNS the tab reads whenever the table is absent
+    or unreadable, so a caller can index a column without testing first -- the
+    shape the loaders above already use, and what lets the drift tab render a
+    caption for a database that predates the designation store.
+
+    IT OPENS READ-ONLY, unlike the three loaders above. Those were left on a
+    plain ``sqlite3.connect`` because changing them is a behaviour change to
+    eight tabs; this one is new, and a plain connect CREATES the file, so a
+    reader asking "does this database have a designation" would answer by
+    making a database that has nothing at all.
+
+    THE SUPERSEDED ROWS COME TOO. ``is_active`` is projected rather than
+    filtered on, because a drift row names the designation it was taken against
+    in ``reference_id`` and that designation may since have been retired -- a
+    caption that could only resolve the ACTIVE one would print "unknown
+    reference" over every historical run.
+    """
+    columns = ["id", "designated_at", "designated_by", "label", "note",
+               "is_active", "anchor_run_id", "campaign_head_run_id",
+               "campaign_run_ids", "row_count", "patient_count",
+               "digest_algorithm", "content_digest"]
+    conn = None
+    try:
+        conn = _readonly_connection()
+        if conn is None:
+            return pd.DataFrame(columns=columns)
+        return pd.read_sql_query(
+            f"SELECT {', '.join(columns)} FROM drift_reference "
+            f"ORDER BY id DESC", conn)
+    except Exception:                                  # noqa: BLE001
+        # NOT `st.error`. An absent `drift_reference` is the ordinary state of
+        # a database written before schema era 16, and the drift tab says so in
+        # its own words; a red banner would report a migration as a fault.
+        return pd.DataFrame(columns=columns)
+    finally:
+        if conn:
+            conn.close()
+
+
+@st.cache_data(ttl=60)
 def load_run_tracking_availability():
     """What this database can answer about runs. Cached for 60 seconds.
 

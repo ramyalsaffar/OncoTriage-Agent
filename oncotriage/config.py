@@ -5456,16 +5456,45 @@ del _rater_model, _rater_row
 # Drift Detection CONFIGURATION
 # ===========================================================================
 
-# Baseline and comparison windows
-BASELINE_WINDOW_DAYS = 30       # First 30 days as baseline
-COMPARISON_WINDOW_DAYS = 7      # Compare last 7 days to baseline
-MIN_SAMPLES_BASELINE = 20       # Minimum inferences for valid baseline
-MIN_SAMPLES_COMPARISON = 5      # Minimum inferences for valid comparison
+# THE TWO WINDOW CONSTANTS ARE DELETED, AND THE DELETION IS THE POINT RATHER
+# THAN A TIDY-UP. `BASELINE_WINDOW_DAYS = 30` and `COMPARISON_WINDOW_DAYS = 7`
+# were how a drift baseline was SELECTED: the earliest rows in `inferences` were
+# the baseline and the latest were the comparison. So which rows the pipeline
+# was measured against was decided by insertion order, nobody chose it, nothing
+# recorded it, and a baseline captured after something went wrong read as no
+# drift at all. Selection is now an explicit operator designation --
+# `oncotriage/monitoring/drift_reference.py` -- and there is no window left for
+# these to size. They go rather than lingering as documented knobs that move
+# nothing, on `BATCH_SIZE`'s and `EXPANSION_TEMPERATURE`'s precedent, because
+# this file's standing promise is that an operator who sets a value here gets an
+# effect.
+#
+# `drift_metrics.baseline_window_days` and `.comparison_window_days` SURVIVE AS
+# COLUMNS and are NULL from schema era 16 onward. The schema is additive-only,
+# so they cannot be dropped; NULL is the honest value, and it is also what
+# separates a row written by the window selector from a row written by the
+# designation selector without anybody having to read a timestamp.
 
-# Alert thresholds
+# Population floors. NOT window sizes -- they are the minimum number of rows a
+# reference or a comparison population must contribute before a metric is
+# computed over it at all. A rate over three patients is noise wearing the
+# costume of a measurement.
+MIN_SAMPLES_BASELINE = 20       # Minimum reference rows for a comparison
+MIN_SAMPLES_COMPARISON = 5      # Minimum comparison rows for any metric
+
+# Thresholds. EVERY ONE OF THESE IS REPORTING-ONLY AS OF THE DRIFT REDESIGN and
+# none of them raises an alert: they are industry defaults, calibrated against
+# nothing in this pipeline, and an uncalibrated threshold produces alerts an
+# operator learns to ignore. They are still STORED beside every reading, in
+# `drift_metrics.threshold`, because a reader comparing a value against a
+# published convention is exactly what a reporting-only metric is for.
+# `oncotriage/monitoring/drift_states.py` owns the policy that makes them inert;
+# `ECOG_UNAVAILABLE_RATE_THRESHOLD` below is the one threshold that does alert,
+# and it alerts because it is baseline-independent rather than because it is
+# calibrated.
 KS_TEST_THRESHOLD = 0.05        # p-value < 0.05 = significant drift
 PSI_THRESHOLD = 0.2             # PSI > 0.2 = moderate drift (industry standard)
-Z_SCORE_THRESHOLD = 2.0         # |z| > 2.0 = alert (2 standard deviations)
+Z_SCORE_THRESHOLD = 2.0         # |z| > 2.0 = two standard deviations
 
 # PSI bins for continuous variables
 PSI_BINS = 10

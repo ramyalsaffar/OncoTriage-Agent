@@ -234,6 +234,37 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 16: the `drift_reference` TABLE, and five additive `drift_metrics`
+#        columns -- `status`, `alert_policy`, `reference_id`, `stratum` and
+#        `comparison_selection` -- added with DRIFT_METRIC_COLUMN_ADDITIONS and
+#        its migration loop.
+#        THE TABLE IS A DESIGNATION STORE and it is what replaces selecting a
+#        drift baseline by TIME WINDOW. The shipped selector took the earliest
+#        rows in the table as the baseline and the latest as the comparison, so
+#        which rows a campaign was measured against was decided by whichever
+#        happened to be first -- and a baseline captured AFTER the thing went
+#        wrong reads as no drift at all. A designated reference is an explicit
+#        operator act that records WHICH campaign, WHICH run ids, WHICH row
+#        ids and a CONTENT DIGEST over the columns the metrics read, so a
+#        reference whose rows were edited in place is detectable rather than
+#        silently compared against.
+#        THE FOUR COLUMNS ARE THE TWO STATE AXES PLUS THEIR PROVENANCE.
+#        `alert` alone could not say whether a metric was computed, and every
+#        early return in every metric wrote `alert = 0` -- the same byte a
+#        healthy reading writes. `status` says what the computation did,
+#        `alert_policy` says whether an alert is a possible outcome at all,
+#        `reference_id` names the designation the reading was taken against
+#        (NULL for a baseline-independent metric, which consults none),
+#        `stratum` carries the cancer group for the stratified reporting-only
+#        metrics -- one row per stratum rather than a JSON blob, on this
+#        schema's standing preference for plain-SQL queryability -- and
+#        `comparison_selection` records whether an operator CHOSE the campaign
+#        this reading was computed over or opted in to "whatever ran last",
+#        which are two different readings of the same number.
+#        ALL FOUR ARE ADDITIVE AND NULL ON EVERY EXISTING ROW. Nothing is
+#        backfilled: a row written before this era was produced by a writer
+#        that had no state axes, and inventing one for it would be asserting
+#        which of the four readings it was.
 # ERA 15: `runs.tunables`, added with RUN_COLUMN_ADDITIONS and its migration
 #        loop. It records the EFFECTIVE value of every constant in
 #        `config.TUNABLE_NAMES` at the moment the row was opened, as JSON with
@@ -406,7 +437,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 15
+SCHEMA_USER_VERSION = 16
 
 
 #------------------------------------------------------------------------------
@@ -2434,6 +2465,119 @@ TRIAL_MATCH_COLUMN_ADDITIONS = {
 
 
 # ===========================================================================
+# DRIFT METRIC STATE (the drift redesign)
+# ===========================================================================
+#
+# WHAT WAS MISSING, AND IT IS THE SAME SHAPE AS EVERY OTHER GAP THIS SCHEMA HAS
+# HAD TO CLOSE: one column carried two facts and a reader could not tell them
+# apart. `drift_metrics.alert` was written `0` by a metric that measured and was
+# fine, AND by a metric that could not run at all -- a PSI over a column of
+# NaNs, a KS test with one sample a side, a z-score whose baseline had no
+# variance, a metric whose column the database does not have. Every early return
+# of every metric in `oncotriage/monitoring/drift.py` wrote that byte, and the
+# dashboard rendered all of them as a green tick. So the one thing the drift
+# table exists to say -- whether the pipeline has moved -- was reported
+# identically by code that had checked and by code that had not.
+#
+# THE TWO AXES ARE STORED SEPARATELY BECAUSE THEY ARE INDEPENDENT FACTS.
+# `oncotriage/monitoring/drift_states.py` owns both vocabularies and the one
+# sentence that relates them ("alert is meaningful only when policy is alerting
+# AND status is computed"); this dict is only what makes the columns exist.
+#
+# THEY ARE TEXT AND NOT AN INTEGER ENUM. Every closed vocabulary in this schema
+# is stored as its own words -- `runs.status`, `inferences.ecog_selection`,
+# `trial_matches.verdict_source`, `not_evaluable_reason` -- for the reason that
+# decided those: a plain `SELECT status, COUNT(*) ... GROUP BY status` answers
+# for a reader who has never seen this module, and an integer code answers only
+# for one who has the mapping.
+DRIFT_METRIC_COLUMN_ADDITIONS = {
+    # WHAT THE COMPUTATION DID. A member of
+    # `drift_states.METRIC_STATUSES`, validated at the writer by
+    # `drift_states.require_status` -- so a typo raises rather than reaching a
+    # dashboard that renders it under an `else`.
+    #
+    # NULL MEANS THE ROW PREDATES THIS ERA and nothing is backfilled. A row
+    # written by the pre-redesign writer carries `alert = 0` whether or not it
+    # measured anything, and there is no evidence in the row from which to
+    # recover which; asserting one would be inventing the fact this column
+    # exists to record.
+    "status":       "TEXT",
+    # WHETHER AN ALERT IS A POSSIBLE OUTCOME AT ALL. A member of
+    # `drift_states.ALERT_POLICIES`.
+    #
+    # IT IS A PROPERTY OF THE METRIC AND IT IS STORED PER ROW ANYWAY, because a
+    # policy is a RULING and rulings change: every comparison metric ships
+    # `reporting_only` today because none of their thresholds has been
+    # calibrated against this pipeline's data, and the day one is calibrated its
+    # rows become `alerting` while the rows already stored must go on saying
+    # what they were taken under. A policy read from today's code would rewrite
+    # history every time the ruling moved.
+    "alert_policy": "TEXT",
+    # WHICH DESIGNATED REFERENCE THIS READING WAS TAKEN AGAINST -- a
+    # `drift_reference.id`, or NULL.
+    #
+    # NULL IS A VALUE HERE AND NOT AN ABSENCE, and it is the same shape
+    # `inferences.run_id`'s NULL has: a baseline-independent metric consults no
+    # reference by design, so NULL on such a row means "none was needed", and
+    # NULL on a comparison row means the reading is one of the `reference_*`
+    # refusals. `status` is what separates the two, which is why they are two
+    # columns.
+    #
+    # DECLARED AND UNENFORCED, for the four reasons written out at `runs`. The
+    # third applies with particular force: an IntegrityError on this write is
+    # classed TERMINAL by `_is_retryable`, so a constraint would turn a
+    # bookkeeping mismatch into a lost drift row.
+    "reference_id": "INTEGER",
+    # WHICH SLICE OF THE POPULATION THIS READING IS OVER -- a member of
+    # `registries.primary_cancer.CANCER_GROUPS`, or NULL for a metric computed
+    # over the whole population.
+    #
+    # ONE ROW PER STRATUM RATHER THAN A JSON BLOB, on this schema's standing
+    # preference: `SELECT stratum, metric_value ... WHERE metric_name = ?` is a
+    # question a reader can ask, and `json_extract` over a blob is a question
+    # only a reader who knows the blob's shape can ask. It is the same argument
+    # RUN_FINGERPRINT_COLUMNS makes about the stamp.
+    "stratum":      "TEXT",
+    # HOW THE COMPARISON CAMPAIGN WAS CHOSEN -- a member of
+    # `oncotriage/monitoring/drift.py:COMPARISON_SELECTIONS`, or NULL.
+    #
+    # "SOMEBODY CHOSE THIS CAMPAIGN" AND "THE TOOL PICKED WHATEVER RAN LAST"
+    # ARE TWO DIFFERENT READINGS OF THE SAME NUMBER, and without this column
+    # they are the same row. The drift engine used to resolve `MAX(runs.id)`
+    # itself with no argument at all, which is the same insertion-order
+    # selection the reference designation replaced on the other side of the
+    # comparison; the argument is required now, and this is where the answer
+    # lands so a reader can ask it in plain SQL rather than from a log line
+    # that has scrolled away.
+    #
+    # IT IS ON EVERY ROW, INCLUDING THE BASELINE-INDEPENDENT ONE, and that is
+    # the asymmetry with `reference_id` above rather than an oversight: the
+    # reference is consulted by SOME metrics, so NULL there is a fact about
+    # the metric; the comparison population is what EVERY metric was computed
+    # over, so how it was chosen is a fact about all of them.
+    "comparison_selection": "TEXT",
+}
+"""Columns added to `drift_metrics` after its CREATE TABLE (era 16).
+
+THE DICT AND THE LOOP EXIST NOW, on the instruction the `runs` migration
+records: "a column added to this table later gets the dict and the loop, copied
+from the two below, in the same commit that adds the column -- at which point
+the loop has something to do." These four are those columns and this is that
+commit.
+
+IT IS IN `queries.ADDITIVE_COLUMNS`, so a registered query that ever names one
+of these declares it in `requires_columns` and is SKIPPED on a database that
+predates them rather than taking `report()` down at that query -- which is item
+38's defect, and the reason that mapping is derived-checked rather than trusted.
+No registered query names `drift_metrics` today; the entry is what stops the
+next one that does from having to discover this.
+"""
+
+
+#------------------------------------------------------------------------------
+
+
+# ===========================================================================
 # RUN IDENTITY (the run-identity pass)
 # ===========================================================================
 #
@@ -4092,6 +4236,87 @@ CREATE TABLE IF NOT EXISTS drift_metrics (
 ''')
 
 
+    # THE DICT AND THE LOOP, era 16. `drift_metrics` had no migration path at
+    # all until this commit -- the CREATE above was the whole of it -- so the
+    # four state columns are the first this table has ever gained and this is
+    # the shape every other migration here already uses.
+    _existing_drift_columns = {
+        row[1] for row in cursor.execute("PRAGMA table_info(drift_metrics)")
+    }
+    for _column, _sql_type in DRIFT_METRIC_COLUMN_ADDITIONS.items():
+        if _column not in _existing_drift_columns:
+            cursor.execute(
+                f"ALTER TABLE drift_metrics ADD COLUMN {_column} {_sql_type}")
+            console.out(f"Schema migration: added drift_metrics.{_column}")
+
+
+    # Drift reference designations (era 16)
+    #
+    # WHAT THIS REPLACES. `get_baseline_and_current_data` selected a drift
+    # baseline BY TIME WINDOW: the earliest rows in the table were the baseline
+    # and the latest were the comparison. Which rows a campaign was measured
+    # against was therefore decided by whichever rows happened to be written
+    # first -- and the failure mode is the one that matters, because a baseline
+    # captured AFTER something went wrong reads as no drift at all. That is the
+    # same argument `ecog_unavailable_rate` already makes for being a threshold
+    # rather than a comparison, generalised: a comparison is only worth
+    # anything if a person chose what it compares against.
+    #
+    # ONE ACTIVE DESIGNATION, AND `is_active` IS HOW. Not a UNIQUE partial index
+    # -- this schema has no UNIQUE constraint anywhere, deliberately, because
+    # the first one makes IntegrityError reachable on a write path that classes
+    # it TERMINAL (see `run_metrics`). The designation writer clears the
+    # previous active row and inserts the new one in ONE transaction, which is
+    # what makes "one active" true; `active_reference` additionally reads
+    # `ORDER BY id DESC LIMIT 1`, so a file somebody edited by hand yields the
+    # newest rather than an arbitrary one.
+    #
+    # SUPERSEDED ROWS ARE KEPT. A designation is a record of what a campaign was
+    # measured against, and the drift rows that name it in `reference_id` are
+    # still in the table; deleting it would leave those rows pointing at
+    # nothing. `is_active = 0` is the retirement.
+    #
+    # WHY THE ROW IDS ARE STORED AND NOT RE-DERIVED. A campaign's membership is
+    # re-derivable from `runs` -- but only until somebody deletes a row, and the
+    # whole point of a reference is that it is the SAME population every time it
+    # is resolved. The stored list is what makes "these rows, not whichever rows
+    # that query returns today" checkable. `row_count` beside it is redundant by
+    # construction and is stored anyway, because a JSON blob that fails to parse
+    # then still yields the number a refusal can quote.
+    #
+    # WHY THE DIGEST. Ids and counts cannot see an UPDATE. A reference whose
+    # `age` column was edited in place has the same ids, the same count and a
+    # different meaning, and without a content digest it would go on being
+    # compared against as though it were the thing that was designated.
+    # `digest_columns` records WHICH columns the digest covered and
+    # `digest_algorithm` records HOW, so a change to either is visible in the
+    # row rather than silently altering what "mutated" means.
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS drift_reference (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    designated_at TEXT NOT NULL,
+    designated_by TEXT,
+    label TEXT,
+    note TEXT,
+    is_active INTEGER NOT NULL,
+    anchor_run_id INTEGER REFERENCES runs(id),
+    campaign_head_run_id INTEGER,
+    campaign_run_ids TEXT NOT NULL,
+    row_ids TEXT NOT NULL,
+    row_count INTEGER NOT NULL,
+    patient_count INTEGER NOT NULL,
+    fingerprint TEXT NOT NULL,
+    tunables TEXT,
+    digest_algorithm TEXT NOT NULL,
+    digest_columns TEXT NOT NULL,
+    content_digest TEXT NOT NULL
+)
+''')
+
+    _ensure_index(cursor, "idx_drift_reference_active", "drift_reference",
+                  ("is_active",))
+
+
     # Run metrics table (the health-persistence pass)
     #
     # CREATED LAST AND THAT IS DELIBERATE, on the same rule the `runs` comment
@@ -5016,6 +5241,189 @@ def campaign_spend_before(run_id, db_path=None) -> CampaignSpend:
                   inference_run_id=run_id,
                   error_type=type(exc).__name__, error_message=str(exc))
         return CampaignSpend()
+
+
+
+
+class CampaignMembership(NamedTuple):
+    """WHICH run rows constitute one campaign. See ``campaign_run_ids``."""
+
+    run_ids: tuple = ()
+    head_id: int = None
+    resolved: bool = False
+    reason: str = None
+
+    @property
+    def runs(self) -> int:
+        return len(self.run_ids)
+
+
+CAMPAIGN_MEMBERSHIP_UNRESOLVED = "run_row_not_found"
+CAMPAIGN_MEMBERSHIP_NO_STAMP = "no_fingerprint_stamp"
+CAMPAIGN_MEMBERSHIP_READ_FAILURE = "read_failure"
+CAMPAIGN_MEMBERSHIP_REASONS = (CAMPAIGN_MEMBERSHIP_UNRESOLVED,
+                               CAMPAIGN_MEMBERSHIP_NO_STAMP,
+                               CAMPAIGN_MEMBERSHIP_READ_FAILURE)
+"""Why a campaign could not be enumerated. CLOSED, and ``None`` when it was.
+
+THREE MEMBERS AND NOT ONE, because the remedies differ: a run id that names no
+row is a caller mistake, a run with no stamp is a database written before
+fingerprinting (or by a caller that stamped nothing) and can never be stitched,
+and a read failure is about the file rather than about the campaign.
+"""
+
+
+def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
+    """Every run row that belongs to ``run_id``'s campaign. NEVER RAISES.
+
+    THE STITCH RULE, WALKED IN BOTH DIRECTIONS. ``campaign_spend_before``
+    walks it BACKWARD only and that is right for its caller: it is asked at the
+    top of ``main()`` by a run that has just been created, so there is nothing
+    ahead of it to find. A caller that wants to name a campaign as a THING --
+    to designate it, to select rows from it, to say which run_ids constitute it
+    -- is usually holding a run in the middle of a finished chain, and the runs
+    that resumed it are as much a part of the campaign as the ones it resumed.
+
+    THE RULE IS NOT RE-DECIDED HERE. A run with ``resumed = 1`` continues the
+    campaign of the nearest PRECEDING run whose status is in
+    ``CAMPAIGN_RESUMABLE_STATUSES`` and whose ``RUN_FINGERPRINT_COLUMNS`` are
+    all identical; chains stitch transitively; both sides must carry a
+    ``fingerprint_version``, because SQLite's ``IS`` is null-safe equality and
+    two runs with NO stamp would otherwise compare equal on every column and
+    make every unstamped run in the table one campaign. That is
+    ``queries.campaign_summary``'s rule and ``campaign_spend_before``'s, and
+    all three are pinned against each other by a test rather than promised --
+    a restated rule is a rule that can drift.
+
+    THE FORWARD STEP IS THE MIRROR OF THE BACKWARD ONE AND IT IS NOT SYMMETRIC
+    BY ACCIDENT. Backward asks "which earlier resumable run does this resume";
+    forward asks "which later run resumed THIS one", which requires the
+    successor to carry ``resumed = 1``, requires THIS row's status to be
+    resumable, and takes the NEAREST such successor -- because "nearest
+    preceding" read forward means no other qualifying run may sit between them,
+    or the two would be different links.
+
+    A RUN THAT IS ITS OWN CAMPAIGN RESOLVES TO A ONE-MEMBER TUPLE. That is the
+    ordinary case for a campaign that never crashed, and it is a resolution
+    rather than a failure.
+
+    Args:
+        run_id: any member of the campaign. ``None`` returns an unresolved
+            membership rather than raising -- a caller with no run row has no
+            campaign, which is the same contract ``campaign_spend_before``
+            keeps for the same argument.
+        db_path: the database the run row is in.
+
+    Returns:
+        ``CampaignMembership``. ``run_ids`` is ASCENDING, so ``run_ids[0]`` is
+        the campaign's first run and equals ``head_id``. ``resolved`` is False
+        on every failure and ``reason`` names which, from
+        ``CAMPAIGN_MEMBERSHIP_REASONS``.
+
+    IT NEVER RAISES, on ``campaign_spend_before``'s precedent, and the
+    direction is the opposite of that one's: an empty membership here does not
+    let anything spend more, it makes a designation refuse. The failure is
+    COUNTED into ``RUN_RECORD_FAILURES`` under ``campaign_membership:`` so it is
+    never silent.
+    """
+    if run_id is None:
+        return CampaignMembership(reason=CAMPAIGN_MEMBERSHIP_UNRESOLVED)
+
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        conn = _open_connection(db_path)
+        try:
+            cursor = conn.cursor()
+            _fp = ", ".join(RUN_FINGERPRINT_COLUMNS)
+            cursor.execute(
+                f"SELECT id, resumed, status, {_fp} FROM runs WHERE id = ?",
+                (run_id,))
+            row = cursor.fetchone()
+            if row is None:
+                RUN_RECORD_FAILURES["campaign_membership:row_not_found"] += 1
+                return CampaignMembership(
+                    reason=CAMPAIGN_MEMBERSHIP_UNRESOLVED)
+
+            _stamp = list(row[3:])
+            if _stamp[0] is None:
+                # NO STAMP, NO CHAIN -- and, unlike `campaign_spend_before`,
+                # not "no campaign" either. The run is its own campaign of one,
+                # which is the honest reading: it exists, it produced rows, and
+                # nothing can be stitched to it. Resolved, with the reason
+                # recorded so a caller that needs a stamped campaign can refuse.
+                return CampaignMembership(run_ids=(row[0],), head_id=row[0],
+                                          resolved=True,
+                                          reason=CAMPAIGN_MEMBERSHIP_NO_STAMP)
+
+            _match = " AND ".join(f"{c} IS ?" for c in RUN_FINGERPRINT_COLUMNS)
+            _statuses = ", ".join("?" for _ in CAMPAIGN_RESUMABLE_STATUSES)
+
+            # ---- backward: to the head -----------------------------------
+            #
+            # BOUNDED BY `id <` AND CANNOT LOOP: each step selects a strictly
+            # smaller id, so the sequence decreases in a finite set. Identical
+            # to `campaign_spend_before`'s walk, which is the point.
+            before = []
+            cur_id, cur_resumed = row[0], row[1]
+            while cur_resumed == 1:
+                cursor.execute(
+                    f"SELECT id, resumed FROM runs "
+                    f"WHERE id < ? AND status IN ({_statuses}) "
+                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
+                    f"ORDER BY id DESC LIMIT 1",
+                    (cur_id, *CAMPAIGN_RESUMABLE_STATUSES, *_stamp))
+                prev = cursor.fetchone()
+                if prev is None:
+                    break
+                before.append(prev[0])
+                cur_id, cur_resumed = prev[0], prev[1]
+
+            # ---- forward: to the tail ------------------------------------
+            #
+            # BOUNDED BY `id >` for the mirror reason. The successor must be
+            # the NEAREST run that resumed a qualifying predecessor, and this
+            # row must itself be resumable for anything to have resumed it.
+            after = []
+            cur_id, cur_status = row[0], row[2]
+            while cur_status in CAMPAIGN_RESUMABLE_STATUSES:
+                cursor.execute(
+                    f"SELECT id, status FROM runs "
+                    f"WHERE id > ? AND resumed = 1 "
+                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
+                    f"ORDER BY id ASC LIMIT 1",
+                    (cur_id, *_stamp))
+                nxt = cursor.fetchone()
+                if nxt is None:
+                    break
+                # THE LINK IS ONLY REAL IF NOTHING QUALIFYING SITS BETWEEN
+                # THEM. `nxt` resumes the nearest PRECEDING resumable run with
+                # this stamp; if that is not `cur_id`, `nxt` belongs to a
+                # different link and this chain ends here. Asking the backward
+                # step is what checks it, rather than a second copy of the rule.
+                cursor.execute(
+                    f"SELECT id FROM runs "
+                    f"WHERE id < ? AND status IN ({_statuses}) "
+                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
+                    f"ORDER BY id DESC LIMIT 1",
+                    (nxt[0], *CAMPAIGN_RESUMABLE_STATUSES, *_stamp))
+                back = cursor.fetchone()
+                if back is None or back[0] != cur_id:
+                    break
+                after.append(nxt[0])
+                cur_id, cur_status = nxt[0], nxt[1]
+        finally:
+            conn.close()
+
+        ids = tuple(sorted(set(before) | {row[0]} | set(after)))
+        return CampaignMembership(run_ids=ids, head_id=ids[0], resolved=True)
+
+    except Exception as exc:                                   # noqa: BLE001
+        RUN_RECORD_FAILURES[f"campaign_membership:{type(exc).__name__}"] += 1
+        log.error("a campaign's run membership could not be read",
+                  event="campaign_membership_unreadable",
+                  inference_run_id=run_id,
+                  error_type=type(exc).__name__, error_message=str(exc))
+        return CampaignMembership(reason=CAMPAIGN_MEMBERSHIP_READ_FAILURE)
 
 
 
