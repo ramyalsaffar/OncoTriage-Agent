@@ -336,36 +336,70 @@ def render_drift_detection_tab(df):
             latest_run['metric_category'] == category_map[category_filter]
         ].copy()
 
-    display_df["Status"] = display_df.apply(
-        lambda row: f"{DISPLAY_MARKERS[row['display_state']]} "
-                    f"{row['display_state']}", axis=1)
-    display_df["Computation"] = display_df.apply(
-        lambda row: "(pre-era-16 row: no state recorded)" if row["is_legacy"]
-        else as_text(row.get("status")), axis=1)
-    display_df["Alert policy"] = display_df.apply(
-        lambda row: "(pre-era-16 row)" if row["is_legacy"]
-        else as_text(row.get("alert_policy")), axis=1)
+    # AN EMPTY SELECTION IS A TRUTHFUL STATE, NOT A CRASH (the dashboard-fixes
+    # pass), AND IT IS REACHABLE ON AN ORDINARY RUN.
+    #
+    # `DataFrame.apply(..., axis=1)` over a frame with NO ROWS returns an empty
+    # DATAFRAME carrying the source's columns rather than a Series, so the three
+    # assignments below become `df["Status"] = <a frame of 20 columns>` and
+    # pandas raises
+    #
+    #     ValueError: Cannot set a DataFrame with multiple columns to the
+    #                 single column Status
+    #
+    # -- measured, by selecting "Data Drift" on a run holding only
+    # `data_availability` rows, which is exactly what a run produces when the
+    # designated reference is absent, unresolvable or mutated: the availability
+    # family answers with no reference and every comparison family refuses. An
+    # operator diagnosing a refused reference is therefore the reader most
+    # likely to reach for this filter, and the page went down under them.
+    #
+    # IT IS NOT `return`. The Historical Trends section below is about
+    # `drift_df` -- every run, every category -- and has nothing to do with the
+    # category selected here, so returning would hide a working panel because a
+    # different one is empty.
+    if display_df.empty:
+        st.info(
+            f"**No {category_filter} reading in the latest drift run.** "
+            f"The run at {latest_timestamp.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"recorded {len(latest_run)} reading(s), none of them in this "
+            f"category. That is a statement about THIS run and not about the "
+            f"metric family: a run whose designated reference could not be "
+            f"resolved records the baseline-independent family and refuses "
+            f"every comparison family, so the refused families contribute no "
+            f"row at all. Select **All** to see what the run did record."
+        )
+    else:
+        display_df["Status"] = display_df.apply(
+            lambda row: f"{DISPLAY_MARKERS[row['display_state']]} "
+                        f"{row['display_state']}", axis=1)
+        display_df["Computation"] = display_df.apply(
+            lambda row: "(pre-era-16 row: no state recorded)" if row["is_legacy"]
+            else as_text(row.get("status")), axis=1)
+        display_df["Alert policy"] = display_df.apply(
+            lambda row: "(pre-era-16 row)" if row["is_legacy"]
+            else as_text(row.get("alert_policy")), axis=1)
 
-    available_cols = ['Status', 'Computation', 'Alert policy', 'metric_name',
-                      'stratum', 'metric_value', 'threshold', 'p_value',
-                      'z_score', 'baseline_mean', 'notes']
-    display_cols = [col for col in available_cols if col in display_df.columns]
+        available_cols = ['Status', 'Computation', 'Alert policy', 'metric_name',
+                          'stratum', 'metric_value', 'threshold', 'p_value',
+                          'z_score', 'baseline_mean', 'notes']
+        display_cols = [col for col in available_cols if col in display_df.columns]
 
-    st.dataframe(
-        display_df[display_cols],
-        use_container_width=True,
-        hide_index=True
-    )
+        st.dataframe(
+            display_df[display_cols],
+            use_container_width=True,
+            hide_index=True
+        )
 
-    st.caption(
-        "Each row is one monitored metric from the latest drift detection run. "
-        "**Status** is the rendered state, **Computation** is what the metric "
-        "actually did, and **Alert policy** is whether an alert is a possible "
-        "outcome at all. A reporting-only row shows a VALUE and never an OK: "
-        "its threshold is reported for comparison and is not applied. "
-        "`stratum` is the cancer group a reading is over; blank means the "
-        "whole population."
-    )
+        st.caption(
+            "Each row is one monitored metric from the latest drift detection "
+            "run. **Status** is the rendered state, **Computation** is what the "
+            "metric actually did, and **Alert policy** is whether an alert is a "
+            "possible outcome at all. A reporting-only row shows a VALUE and "
+            "never an OK: its threshold is reported for comparison and is not "
+            "applied. `stratum` is the cancer group a reading is over; blank "
+            "means the whole population."
+        )
 
     st.markdown("---")
 

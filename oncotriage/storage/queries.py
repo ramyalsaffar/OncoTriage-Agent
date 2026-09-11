@@ -174,7 +174,11 @@ from oncotriage.storage.database_logger import (
     RUN_RECORD_TERMINAL_STATUSES,
     TRIAL_MATCH_COLUMN_ADDITIONS,
 )
-from oncotriage.utils import get_model_cost
+from oncotriage.monitoring.drift_states import (
+    ALERTING_POLICIES,
+    STATUSES_WITH_VALUE,
+)
+from oncotriage.utils import UnknownModelPricingError, get_model_cost
 
 
 #------------------------------------------------------------------------------
@@ -292,6 +296,191 @@ class Query:
         return f"<Query {self.key!r} render={self.render!r}>"
 
 
+
+#------------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# THE DRIFT QUERIES ARE STATE-AWARE, AND ONE CASE SAYS WHAT A ROW IS
+# ---------------------------------------------------------------------------
+#
+# WHAT WAS WRONG, AND IT IS AN ARITHMETIC DEFECT RATHER THAN A PRESENTATION
+# ONE. Five registered queries computed alert rates as ``SUM(alert)`` over
+# ``COUNT(*)``. Since the drift redesign, ``drift_metrics.alert`` is NULL for
+# every reading that is not a verdict -- a reporting-only value (which is EVERY
+# comparison metric this project ships, by ruling), a metric that could not
+# compute, and every row written before schema era 16. ``SUM`` skips those
+# NULLs and ``COUNT(*)`` counts them, so:
+#
+#     the NUMERATOR counts verdicts and the DENOMINATOR counts rows.
+#
+# A run recording one alerting reading that alerted and nineteen reporting-only
+# values reported an alert rate of 5%. The true rate over the readings that can
+# alert is 100%. The error is unbounded, it is always in the reassuring
+# direction, and it gets worse as more reporting-only metrics are added --
+# which is the direction this project is deliberately moving in.
+#
+# ONE CASE, FIVE CONSUMERS. ``_DRIFT_ROW_CLASS_SQL`` is interpolated into every
+# rebuilt query below, on ``_CONSISTENCY_CASE_SQL``'s precedent, so there is no
+# second copy to forget. Its vocabulary and its two membership tests come from
+# ``oncotriage.monitoring.drift_states`` -- ``STATUSES_WITH_VALUE`` and
+# ``ALERTING_POLICIES``, the owners ``alert_is_meaningful`` itself consults --
+# rather than from literals here, so a fourth policy that does not alert cannot
+# start alerting in SQL while the Python says otherwise.
+#
+# THE MODULE IS SAFE TO IMPORT FROM HERE. ``drift_states`` imports nothing at
+# all -- not the drift engine, not scipy, not numpy -- which is the same reason
+# ``oncotriage/dashboard/tabs/drift.py`` reaches it rather than
+# ``oncotriage/monitoring/drift.py``.
+
+DRIFT_CLASS_ALERTABLE = "alertable"
+"""The reading CAN alert and carries a verdict. The ONLY class in a denominator."""
+
+DRIFT_CLASS_VERDICT_MISSING = "verdict_missing"
+"""It can alert, it computed, and ``alert`` is NULL.
+
+EXCLUDED FROM THE DENOMINATOR AND GIVEN ITS OWN COLUMN. Counting it as a clean
+reading is the exact defect ``drift_states.classify_alert`` exists to remove one
+layer up, where ``int(bool(None))`` turned a missing verdict into a 0 that
+renders as a green tick. Dividing by it here would do the same thing to a rate."""
+
+DRIFT_CLASS_VERDICT_INVALID = "verdict_invalid"
+"""It can alert and ``alert`` is a value that is not a verdict -- a 2, a -1.
+
+A DEFECT IN WHATEVER WROTE THE ROW, and its own class rather than a shade of
+missing: absence is the ordinary state of a reading with no verdict, and a third
+value is a writer that has misunderstood a two-valued column."""
+
+DRIFT_CLASS_NOT_COMPUTED = "not_computed"
+"""It could have alerted and the metric did not produce a reading.
+
+Its own column because a category whose alert count is zero BECAUSE NOTHING RAN
+is not a healthy category, and a rate alone cannot say which it was."""
+
+DRIFT_CLASS_REPORTING_ONLY = "reporting_only"
+"""The policy is not an alerting one, so no alert was ever a possible outcome.
+
+Not a failure of any kind, and still not a denominator: a reporting-only zero is
+a VALUE and never an OK, and averaging it into an alert rate asserts the
+judgement this project has explicitly deferred."""
+
+DRIFT_CLASS_PRE_ERA_16 = "pre_era_16"
+"""The row predates the two state axes, so it carries ``alert`` and no evidence
+about what that byte meant. Never guessed at -- the dashboard's
+``_row_display_state`` makes the same ruling for the same reason."""
+
+DRIFT_ROW_CLASSES = (DRIFT_CLASS_ALERTABLE, DRIFT_CLASS_VERDICT_MISSING,
+                     DRIFT_CLASS_VERDICT_INVALID, DRIFT_CLASS_NOT_COMPUTED,
+                     DRIFT_CLASS_REPORTING_ONLY, DRIFT_CLASS_PRE_ERA_16)
+"""Every class a ``drift_metrics`` row can fall into. CLOSED and TOTAL: the CASE
+below has no ``ELSE`` that is not one of these, so every row is counted exactly
+once and the per-class columns of a rebuilt query sum to its row count."""
+
+_DRIFT_ALERTING_POLICIES_SQL = ", ".join(
+    "'{0}'".format(p) for p in sorted(ALERTING_POLICIES))
+_DRIFT_STATUSES_WITH_VALUE_SQL = ", ".join(
+    "'{0}'".format(s) for s in sorted(STATUSES_WITH_VALUE))
+
+_DRIFT_ROW_CLASS_SQL = """CASE
+            WHEN status IS NULL OR alert_policy IS NULL THEN '{pre_era}'
+            WHEN alert_policy NOT IN ({alerting}) THEN '{reporting}'
+            WHEN status NOT IN ({with_value}) THEN '{not_computed}'
+            WHEN alert IS NULL THEN '{missing}'
+            WHEN alert NOT IN (0, 1) THEN '{invalid}'
+            ELSE '{alertable}'
+        END""".format(
+    pre_era=DRIFT_CLASS_PRE_ERA_16,
+    alerting=_DRIFT_ALERTING_POLICIES_SQL,
+    reporting=DRIFT_CLASS_REPORTING_ONLY,
+    with_value=_DRIFT_STATUSES_WITH_VALUE_SQL,
+    not_computed=DRIFT_CLASS_NOT_COMPUTED,
+    missing=DRIFT_CLASS_VERDICT_MISSING,
+    invalid=DRIFT_CLASS_VERDICT_INVALID,
+    alertable=DRIFT_CLASS_ALERTABLE,
+)
+"""The one classification. ORDER MATTERS and each arm is argued at its constant.
+
+``pre_era_16`` IS TESTED FIRST because a row with no axes has no policy to
+compare and no status to test, and SQL's three-valued logic would send it to the
+``ELSE`` -- the reassuring branch -- rather than to a NULL-aware one.
+
+``reporting_only`` IS TESTED BEFORE ``not_computed`` because a reporting-only
+reading that also failed to compute is, for the purpose of an ALERT RATE,
+reporting-only: it was never going to contribute a verdict, so reporting it as a
+computation failure would put it in a column an operator reads as "something
+that should have alerted did not run"."""
+
+
+DRIFT_SCOPE_OVERALL = "overall"
+DRIFT_SCOPE_STRATUM = "per_stratum"
+
+DRIFT_SCOPES = (DRIFT_SCOPE_OVERALL, DRIFT_SCOPE_STRATUM)
+"""How a drift reading is scoped, so an aggregate cannot double-count.
+
+THE WRITER EMITS BOTH. Every reading is written once per cancer-group stratum
+AND once over the whole population with ``stratum`` NULL, so an aggregate that
+groups by category alone counts each measurement twice -- once in the overall
+row and once in each stratum row -- and reports a "rate" over a denominator that
+is neither population. Every rebuilt query below carries this in its GROUP BY,
+so the two never mix and a reader summing within one scope is summing a real
+population."""
+
+_DRIFT_SCOPE_SQL = ("CASE WHEN stratum IS NULL THEN '{0}' ELSE '{1}' END"
+                    .format(DRIFT_SCOPE_OVERALL, DRIFT_SCOPE_STRATUM))
+
+
+def _drift_class_count(class_name, alias):
+    """``SUM(CASE WHEN <class> THEN 1 ELSE 0 END) as <alias>`` for one class."""
+    return ("SUM(CASE WHEN {0} = '{1}' THEN 1 ELSE 0 END) as {2}"
+            .format(_DRIFT_ROW_CLASS_SQL, class_name, alias))
+
+
+_DRIFT_ALERT_COUNT_SQL = (
+    "SUM(CASE WHEN {0} = '{1}' AND alert = 1 THEN 1 ELSE 0 END)"
+    .format(_DRIFT_ROW_CLASS_SQL, DRIFT_CLASS_ALERTABLE))
+
+_DRIFT_ALERTABLE_COUNT_SQL = (
+    "SUM(CASE WHEN {0} = '{1}' THEN 1 ELSE 0 END)"
+    .format(_DRIFT_ROW_CLASS_SQL, DRIFT_CLASS_ALERTABLE))
+
+_DRIFT_CLASS_COLUMNS = (",\n           ").join([
+    _DRIFT_ALERTABLE_COUNT_SQL + " as alertable",
+    _DRIFT_ALERT_COUNT_SQL + " as alerts",
+    _drift_class_count(DRIFT_CLASS_VERDICT_MISSING, "verdict_missing"),
+    _drift_class_count(DRIFT_CLASS_VERDICT_INVALID, "verdict_invalid"),
+    _drift_class_count(DRIFT_CLASS_NOT_COMPUTED, "not_computed"),
+    _drift_class_count(DRIFT_CLASS_REPORTING_ONLY, "reporting_only"),
+    _drift_class_count(DRIFT_CLASS_PRE_ERA_16, "pre_era_16"),
+])
+
+# THE RATE IS OVER `alertable` AND NOTHING ELSE, and NULLIF is what keeps it
+# honest: a group in which nothing could alert has NO rate, and NULL is how
+# that is said. A `0.0` there would be a measurement -- "nothing alerted" --
+# about a population in which nothing could.
+_DRIFT_ALERT_RATE_SQL = (
+    "ROUND(100.0 * {0} / NULLIF({1}, 0), 1) as alert_rate_pct_of_alertable"
+    .format(_DRIFT_ALERT_COUNT_SQL, _DRIFT_ALERTABLE_COUNT_SQL))
+
+# Every rebuilt drift query names these additive columns, so all five declare
+# the same requirement and skip together on a pre-era-16 database. DERIVED FROM
+# THE CASE rather than typed beside it: the CASE and the scope expression are
+# the only things that name them, so a column they stop naming stops being
+# declared.
+DRIFT_STATE_REQUIREMENTS = tuple(
+    ("drift_metrics", column) for column in
+    sorted(c for c in DRIFT_METRIC_COLUMN_ADDITIONS
+           if re.search(r"\b" + re.escape(c) + r"\b",
+                        _DRIFT_ROW_CLASS_SQL + " " + _DRIFT_SCOPE_SQL)))
+"""``requires_columns`` for the five rebuilt drift queries.
+
+WITHOUT IT ``report()`` DIES AND EVERY QUERY AFTER IT NEVER RUNS -- item 38's
+defect, exactly, reinstated by a state-aware query on the production database,
+whose ``drift_metrics`` is era 0 and has none of these columns."""
+
+
+#------------------------------------------------------------------------------
+
+
 # The message File 16 printed when the consistency query came back empty. A
 # named constant because ``report()`` and any future caller of
 # ``run(conn, 'pipeline_consistency')`` must agree on what "no rows" means, and
@@ -305,6 +494,45 @@ CONSISTENCY_CLEAN_MESSAGE = "No issues found - pipeline is consistent"
 # asserts a NULL-model group is reported rather than dropped. A literal in three
 # files is the shape that goes out of sync.
 NO_MODEL_LABEL = "(none)"
+
+BLANK_MODEL_LABEL = "(blank)"
+"""The label a group whose ``matching_model`` is the EMPTY STRING carries.
+
+ITS OWN LABEL AND NOT ``NO_MODEL_LABEL`` (the dashboard-fixes pass). A blank is
+not a NULL: the column was written and what was written was nothing, which is a
+different logging defect from no write at all. Sharing a label would also put
+two rows in the priced frame under one name whenever a table holds both, and
+``matching_model`` is what a reader of that frame indexes by.
+
+RENDERED RATHER THAN LEFT EMPTY, because ``""`` in a table cell is
+indistinguishable from a NULL cell -- which is the very distinction this
+constant exists to keep."""
+
+COST_UNPRICED_RAISE = "raise"
+COST_UNPRICED_DEGRADE = "degrade"
+
+COST_UNPRICED_POLICIES = (COST_UNPRICED_RAISE, COST_UNPRICED_DEGRADE)
+"""What ``price_model_groups`` does when ``PRICING_CONFIG`` has no rate for a
+model. CLOSED; anything else raises rather than silently selecting one.
+
+``raise`` IS THE DEFAULT AND STAYS THE DEFAULT. "Cost accounting fails loudly"
+is a project rule and it is a rule about WRITERS: ``log_inference`` and
+``log_ablation_result`` price BEFORE their ``try`` so an unpriced model reaches
+the operator instead of being stored as a zero. Nothing here weakens that --
+``get_model_cost`` is untouched and still raises, and File 16's Query 10 still
+takes the default.
+
+``degrade`` EXISTS FOR A READER THAT MUST NOT LOSE ITS WHOLE PANEL TO ONE ROW.
+The cost tab caught ``UnknownModelPricingError`` around this call and
+``return``ed, so ONE row carrying a model absent from the price table -- a
+judge whose pricing edit is outstanding, an archived row from a retired model,
+a hand-inserted row -- blanked the entire Cost & Tokens tab for every model
+beside it. That is a strictly worse failure than the one the rule protects
+against, and the protection is already present in a form a reader can act on:
+an unpriced group prices at $0.00, carries ``model_priced = False``, names
+itself in ``note``, and sets ``cost_complete = False``, which every consumer of
+this frame ALREADY reads and renders as "a FLOOR, not a total". The zero is not
+silent, which is the whole of what the rule requires."""
 
 
 # Queries whose output is not a rendering of their own frame. report() dispatches
@@ -1882,106 +2110,189 @@ QUERIES = (
     ORDER BY timestamp DESC
 """,
     ),
-    # File 16 line 713, `df_drift_zscore`
+    # File 16 line 713, `df_drift_zscore` -- REBUILT, state-aware.
     Query(
         key='drift_worst_zscores',
         heading='=== TOP 10 WORST Z-SCORES ===',
         render='to_string',
         blank_after=True,
+        requires_columns=DRIFT_STATE_REQUIREMENTS,
+        notes=("A z-score is only a reading of anything on a row that COMPUTED, "
+               "so `computation` and `alert_state` travel with it. `alert` is "
+               "projected only where `alert_state` says it is a verdict; "
+               "elsewhere the column is NULL and means 'no verdict', never "
+               "'no alert'.",),
         sql="""
     SELECT metric_category, metric_name,
+           {scope}                  as scope,
+           stratum,
+           status                   as computation,
+           alert_policy,
+           {row_class}              as alert_state,
+           CASE WHEN {row_class} = '{alertable}' THEN alert END as alert,
            ROUND(metric_value, 4)   as metric_value,
            ROUND(baseline_mean, 4)  as baseline_mean,
            ROUND(baseline_std, 4)   as baseline_std,
            ROUND(z_score, 2)        as z_score,
-           ROUND(p_value, 4)        as p_value,
-           alert
+           ROUND(p_value, 4)        as p_value
     FROM drift_metrics
+    WHERE z_score IS NOT NULL
     ORDER BY ABS(z_score) DESC
     LIMIT 10
-""",
+""".format(scope=_DRIFT_SCOPE_SQL, row_class=_DRIFT_ROW_CLASS_SQL,
+           alertable=DRIFT_CLASS_ALERTABLE),
     ),
-    # File 16 line 731, `df_alert_rate`
+    # File 16 line 731, `df_alert_rate` -- REBUILT, state-aware.
     Query(
         key='drift_alert_rate_by_category',
         heading='=== ALERT RATE BY CATEGORY ===',
         render='to_string',
         blank_after=True,
+        requires_columns=DRIFT_STATE_REQUIREMENTS,
+        notes=("`alert_rate_pct_of_alertable` divides by `alertable` ONLY -- "
+               "readings whose policy permits an alert, whose status is "
+               "computed, and which carry a real verdict. Every other class "
+               "has its own column and NONE of them is in a denominator. NULL "
+               "means the group had nothing that could alert, which is not a "
+               "rate of zero.",
+               "`scope` separates the whole-population rows from the "
+               "per-stratum ones. The writer emits both, so a total across "
+               "scopes counts every measurement twice.",),
         sql="""
     SELECT metric_category,
-           COUNT(*)        as total_checks,
-           SUM(alert)      as total_alerts,
-           ROUND(100.0 * SUM(alert) / COUNT(*), 1) as alert_rate_pct
+           {scope}     as scope,
+           COUNT(*)    as rows_total,
+           {classes},
+           {rate}
     FROM drift_metrics
-    GROUP BY metric_category
-    ORDER BY alert_rate_pct DESC
-""",
+    GROUP BY metric_category, scope
+    ORDER BY alert_rate_pct_of_alertable DESC, metric_category, scope
+""".format(scope=_DRIFT_SCOPE_SQL, classes=_DRIFT_CLASS_COLUMNS,
+           rate=_DRIFT_ALERT_RATE_SQL),
     ),
-    # File 16 line 746, `df_drift_summary`
+    # File 16 line 746, `df_drift_summary` -- REBUILT, state-aware.
     Query(
         key='drift_summary_per_metric',
         heading='=== DRIFT SUMMARY PER METRIC ===',
         render='to_string',
         blank_after=True,
+        requires_columns=DRIFT_STATE_REQUIREMENTS,
+        notes=("`run_count` is every row for this metric at this scope; "
+               "`alertable` is how many of them could carry a verdict AND did. "
+               "`total_alerts` is over `alertable` alone, so a metric that has "
+               "never computed reports 0 alerts beside a 0 `alertable` and is "
+               "distinguishable from one that computed and never alerted.",
+               "The averages are over whatever rows recorded a value, which is "
+               "not the same population as `alertable`: a reporting-only "
+               "metric records values and no verdicts.",),
         sql="""
     SELECT metric_category, metric_name,
+           {scope}                       as scope,
            COUNT(*)                      as run_count,
+           {classes},
+           {rate},
+           SUM(CASE WHEN metric_value IS NOT NULL THEN 1 ELSE 0 END)
+                                         as values_recorded,
            ROUND(AVG(metric_value), 4)   as avg_value,
            ROUND(AVG(baseline_mean), 4)  as avg_baseline,
            ROUND(AVG(z_score), 2)        as avg_z_score,
-           ROUND(MAX(ABS(z_score)), 2)   as max_abs_z_score,
-           SUM(alert)                    as total_alerts
+           ROUND(MAX(ABS(z_score)), 2)   as max_abs_z_score
     FROM drift_metrics
-    GROUP BY metric_category, metric_name
-    ORDER BY total_alerts DESC, max_abs_z_score DESC
-""",
+    GROUP BY metric_category, metric_name, scope
+    ORDER BY alerts DESC, max_abs_z_score DESC, metric_name, scope
+""".format(scope=_DRIFT_SCOPE_SQL, classes=_DRIFT_CLASS_COLUMNS,
+           rate=_DRIFT_ALERT_RATE_SQL),
     ),
-    # File 16 line 764, `df_latest_drift`
+    # File 16 line 764, `df_latest_drift` -- REBUILT, state-aware.
     Query(
         key='drift_latest_run',
         heading='=== LATEST DRIFT RUN ===',
         render='to_string',
         blank_after=True,
+        requires_columns=DRIFT_STATE_REQUIREMENTS,
+        notes=("One row per reading in the most recent run. `alert_state` is "
+               "what the row IS; `alert` is projected only where that says it "
+               "is a verdict. A blank `stratum` is the whole population -- see "
+               "`scope`.",),
         sql="""
     SELECT metric_category, metric_name,
-           metric_value, baseline_mean, z_score, alert, notes
+           {scope}        as scope,
+           stratum,
+           status         as computation,
+           alert_policy,
+           {row_class}    as alert_state,
+           CASE WHEN {row_class} = '{alertable}' THEN alert END as alert,
+           metric_value, baseline_mean, z_score, notes
     FROM drift_metrics
     WHERE timestamp = (SELECT MAX(timestamp) FROM drift_metrics)
-    ORDER BY ABS(z_score) DESC
-""",
+    ORDER BY scope, metric_category, metric_name, stratum
+""".format(scope=_DRIFT_SCOPE_SQL, row_class=_DRIFT_ROW_CLASS_SQL,
+           alertable=DRIFT_CLASS_ALERTABLE),
     ),
-    # File 16 line 777, `df_drift_trend`
+    # File 16 line 777, `df_drift_trend` -- REBUILT, state-aware.
     Query(
         key='drift_trend_over_time',
         heading='=== DRIFT TREND OVER TIME ===',
         render='to_string',
         blank_after=True,
+        requires_columns=DRIFT_STATE_REQUIREMENTS,
+        notes=("A gap in `metric_value` down this column is a run in which the "
+               "metric did not compute, and `alert_state` says which. Reading "
+               "the value column alone as a series would join two readings "
+               "across a run that produced neither.",),
         sql="""
     SELECT timestamp, metric_category, metric_name,
-           ROUND(metric_value, 4) as metric_value,
+           {scope}                 as scope,
+           stratum,
+           status                  as computation,
+           alert_policy,
+           {row_class}             as alert_state,
+           CASE WHEN {row_class} = '{alertable}' THEN alert END as alert,
+           ROUND(metric_value, 4)  as metric_value,
            ROUND(baseline_mean, 4) as baseline_mean,
-           ROUND(z_score, 2) as z_score,
-           alert
+           ROUND(z_score, 2)       as z_score
     FROM drift_metrics
-    ORDER BY metric_name, timestamp ASC
-""",
+    ORDER BY metric_name, scope, stratum, timestamp ASC
+""".format(scope=_DRIFT_SCOPE_SQL, row_class=_DRIFT_ROW_CLASS_SQL,
+           alertable=DRIFT_CLASS_ALERTABLE),
     ),
-    # File 16 line 792, `df_windows`
-    Query(
-        key='drift_window_configurations',
-        heading='=== WINDOW CONFIGURATIONS ===',
-        render='to_string',
-        blank_after=True,
-        sql="""
-    SELECT baseline_window_days, comparison_window_days,
-           COUNT(*)           as checks,
-           SUM(alert)         as alerts,
-           ROUND(AVG(ABS(z_score)), 2) as avg_abs_z_score
-    FROM drift_metrics
-    GROUP BY baseline_window_days, comparison_window_days
-    ORDER BY baseline_window_days
-""",
-    ),
+    # ---------------------------------------------------------------------
+    # `drift_window_configurations` (File 16 line 792, `df_windows`)
+    # WAS HERE AND IS RETIRED. DO NOT RE-ADD IT.
+    # ---------------------------------------------------------------------
+    #
+    # It read:
+    #
+    #     SELECT baseline_window_days, comparison_window_days,
+    #            COUNT(*) as checks, SUM(alert) as alerts, ...
+    #     FROM drift_metrics GROUP BY baseline_window_days, comparison_window_days
+    #
+    # BOTH GROUPING COLUMNS ARE NULL FROM SCHEMA ERA 16 ON, and that is not an
+    # accident of one release: the drift redesign DELETED the two config
+    # constants those columns recorded -- `BASELINE_WINDOW_DAYS` and
+    # `COMPARISON_WINDOW_DAYS` -- because it replaced time-window baseline
+    # selection with an explicitly DESIGNATED reference campaign. There is no
+    # window any more, so there is no configuration of one to group by.
+    #
+    # WHAT IT DEGRADES TO IS WORSE THAN AN ERROR. The columns still exist, so
+    # the query still runs: it returns ONE row, `(NULL, NULL)`, aggregating
+    # every reading this database has ever recorded under a heading that
+    # promises a per-configuration breakdown -- and its `SUM(alert)` carries
+    # the same denominator defect as the five queries above. A reader gets a
+    # number that looks like a comparison of two configurations and is a total
+    # over one population that no longer has the property being compared.
+    #
+    # THE FIX IS RETIREMENT, NOT REPAIR, and the reason is about the redesign
+    # rather than about SQL. The question "which window configuration produced
+    # these readings" has no answer to migrate to: what a reading was measured
+    # against is now a DESIGNATION, identified by `drift_metrics.reference_id`
+    # and recorded in the `drift_reference` table with the campaign's run ids,
+    # its row count and a content digest. That is a richer fact than a pair of
+    # day-counts, it is already stored, and a query over it belongs to whoever
+    # needs one -- under a name that does not promise windows.
+    #
+    # `expansion_token_efficiency`'s retirement above is the precedent, and the
+    # shape is the same: a query whose subject the pipeline no longer has.
     # File 16 line 820, `df_retrieval_degraded`
     Query(
         key='retrieval_degradation',
@@ -4221,22 +4532,42 @@ Named so the two producers -- the ``cost_by_model`` SQL and
 same contract, and so a producer that quietly stops emitting one column fails
 with the column named instead of raising AttributeError somewhere in the loop."""
 
-PRICED_COST_COLUMNS = ("matching_model", "model_recorded", "rows",
-                       "input_tokens", "output_tokens", "reasoning_tokens",
-                       "input_cost", "output_cost", "recomputed_cost",
-                       "cost_complete", "stored_cost", "note")
+PRICED_COST_COLUMNS = ("matching_model", "model_recorded", "model_priced",
+                       "rows", "input_tokens", "output_tokens",
+                       "reasoning_tokens", "input_cost", "output_cost",
+                       "recomputed_cost", "cost_complete", "stored_cost",
+                       "note")
 """What ``price_model_groups`` returns, in order. Pinned because the dashboard
 renders it and "tests/test_storage_query_layer.py" asserts on it.
 
 ``cost_complete`` sits immediately after ``recomputed_cost`` because it is that
-column's qualifier and nothing else's -- see ``price_model_groups``."""
+column's qualifier and nothing else's -- see ``price_model_groups``.
 
+``model_priced`` sits beside ``model_recorded`` for the same reason: the two are
+the two halves of "is there a rate to apply to this group", and they come apart
+in both directions. A NULL model is recorded-False and priced-False; a model
+named in the column and absent from ``PRICING_CONFIG`` is recorded-TRUE and
+priced-FALSE, which is the case that used to raise. ``cost_complete`` cannot
+answer it: that flag is also False for a group whose TOKEN counts are missing,
+so a consumer asking "which models could not be priced" would name groups whose
+model was priced perfectly well."""
+
+
+COST_UNPRICED_NOTE_PREFIX = "NO PRICE IN PRICING_CONFIG"
+"""How an unpriced group names itself in ``note``.
+
+A PREFIX rather than the whole sentence, because the sentence carries the model
+name and the rate table's ``last_updated`` -- the two things an operator needs
+and neither of which can be a constant. ``COST_INCOMPLETE_NOTES`` holds the
+prefix so a consumer can still test membership by ``startswith``."""
 
 COST_INCOMPLETE_NOTES = (
     "no token counts recorded (SUM was NULL, not 0)",
     "input token count not recorded (SUM was NULL, not 0)",
     "output token count not recorded (SUM was NULL, not 0)",
     "NO MODEL RECORDED BUT TOKENS PRESENT — logging defect",
+    COST_UNPRICED_NOTE_PREFIX,
+    "matching_model is BLANK on these rows — logging defect",
 )
 """The note fragments that accompany ``cost_complete = False``.
 
@@ -4272,13 +4603,20 @@ def _nullable_int(value):
     return None if pd.isna(value) else int(value)
 
 
-def price_model_groups(df_groups) -> pd.DataFrame:
+def price_model_groups(df_groups, on_unpriced=COST_UNPRICED_RAISE) -> pd.DataFrame:
     """Price one aggregate row per ``matching_model``. THE ONLY COPY.
 
     Args:
         df_groups: a frame carrying ``COST_GROUP_COLUMNS``. Two producers exist
             and they differ in where their nulls come from -- see the module
             docstring -- which is why every null test in here is ``pd.isna``.
+        on_unpriced: a member of ``COST_UNPRICED_POLICIES``. ``raise`` -- the
+            default, and what every caller written before the dashboard-fixes
+            pass gets -- lets ``UnknownModelPricingError`` out. ``degrade``
+            prices that one group at $0.00 with ``model_priced = False``,
+            ``cost_complete = False`` and the reason in ``note``, and prices
+            every other group normally. It is argued at
+            ``COST_UNPRICED_POLICIES``.
 
     Returns:
         A frame of ``PRICED_COST_COLUMNS``, one row per model, sorted by row
@@ -4296,11 +4634,16 @@ def price_model_groups(df_groups) -> pd.DataFrame:
     priced by the model that actually produced its tokens.
 
     Rates come from get_model_cost() / PRICING_CONFIG, never from a literal here,
-    so there is exactly one pricing table in the project and this raises
-    UnknownModelPricingError rather than quietly under-reporting when a model is
-    missing from it. It is called even for a group whose token sums are NULL or
-    zero, deliberately: an unpriced model must surface on the run that used it,
-    not on the first run that happened to spend tokens on it.
+    so there is exactly one pricing table in the project. An unpriced model is
+    NEVER quietly under-reported: under the default ``on_unpriced="raise"`` it
+    reaches the caller as ``UnknownModelPricingError``, and under ``"degrade"``
+    it becomes a row carrying ``model_priced = False``, ``cost_complete =
+    False`` and the reason in ``note`` -- which every consumer of this frame
+    already reads and renders as "a FLOOR, not a total". Which of the two a
+    caller wants is argued at ``COST_UNPRICED_POLICIES``. It is called even for
+    a group whose token sums are NULL or zero, deliberately: an unpriced model
+    must surface on the run that used it, not on the first run that happened to
+    spend tokens on it.
 
     A NULL token sum is carried through as ``<NA>`` in a nullable Int64 column
     and priced as zero spend, with the reason in ``note``. Those are different
@@ -4321,10 +4664,21 @@ def price_model_groups(df_groups) -> pd.DataFrame:
     recomputed_cost is not an accounting of its spend":
 
         the token SUMs are NULL     -- nothing is known about what was consumed;
-        the model is NULL AND the group carries tokens -- consumption is known
-                                       and there is no rate to price it at.
+        the group carries tokens and could not be PRICED -- consumption is
+                                       known and there is no rate to price it
+                                       at. Three shapes reach this, and the
+                                       frame keeps them apart in
+                                       ``model_recorded`` / ``model_priced`` /
+                                       ``note``: a NULL model, a BLANK one, and
+                                       a model PRICING_CONFIG has no rate for.
 
-    It is TRUE for a NULL-model group carrying zero tokens, which is the
+    THE SECOND CLAUSE USED TO READ "the model is NULL", and it was narrower than
+    the flag it describes. An unknown model could not reach this function at all
+    -- it raised -- so the two were the same set; once ``on_unpriced="degrade"``
+    made it reachable, a False that meant "no rate" would have been reported
+    under a sentence that said "no model".
+
+    It is TRUE for an unpriceable group carrying zero tokens, which is the
     ordinary no-candidates run: nothing was spent and $0.00 is the whole truth.
 
     IT DELIBERATELY SAYS NOTHING ABOUT ``stored_cost``. That column carries its
@@ -4338,6 +4692,16 @@ def price_model_groups(df_groups) -> pd.DataFrame:
     and make a partially-observable table produce no number at all, which is a
     different and worse failure than a number that says it is partial.
     """
+    if on_unpriced not in COST_UNPRICED_POLICIES:
+        # A RAISE AND NOT A FALLBACK TO THE DEFAULT. A typo here decides
+        # whether an unpriced model stops the caller or is absorbed, and
+        # silently picking one of the two is the choice this vocabulary is
+        # closed to prevent.
+        raise ValueError(
+            f"price_model_groups: on_unpriced={on_unpriced!r} is not one of "
+            f"{list(COST_UNPRICED_POLICIES)}."
+        )
+
     _missing = [c for c in COST_GROUP_COLUMNS if c not in df_groups.columns]
     if _missing:
         raise ValueError(
@@ -4356,6 +4720,14 @@ def price_model_groups(df_groups) -> pd.DataFrame:
         # rejects -- taking the whole cost panel down with an
         # UnknownModelPricingError naming 'nan'.
         _model_recorded = not pd.isna(_model)
+        # A BLANK NAME IS A RECORDED VALUE THAT CANNOT BE PRICED (the
+        # dashboard-fixes pass). `pd.isna("")` is False, so a blank sailed past
+        # the NULL branch straight into `get_model_cost("")`, which raises --
+        # the identical whole-panel failure an unknown model caused, reached by
+        # a row whose defect is emptier still. It is not folded into
+        # `model_recorded`: the column WAS written, and what it says about that
+        # write is a different fact from what it says about a row nothing wrote.
+        _model_blank = _model_recorded and not str(_model).strip()
 
         _in = _nullable_int(_row.input_tokens)
         _out = _nullable_int(_row.output_tokens)
@@ -4368,11 +4740,33 @@ def price_model_groups(df_groups) -> pd.DataFrame:
         _out_priced = 0 if _out is None else _out
 
         _notes = []
-        if _model_recorded:
+        _model_priced = False
+        if _model_blank:
+            _in_cost = _out_cost = 0.0
+            _notes.append("matching_model is BLANK on these rows — logging "
+                          "defect")
+        elif _model_recorded:
             # Split into two calls purely to get the input and output halves
             # separately; get_model_cost returns their sum.
-            _in_cost = get_model_cost(_model, _in_priced, 0)
-            _out_cost = get_model_cost(_model, 0, _out_priced)
+            #
+            # THE TRY IS ROUND THE LOOKUP AND NOTHING ELSE, and it exists only
+            # under `degrade`. `get_model_cost` is untouched and still raises;
+            # what changes is that ONE caller -- a reader, never a writer -- can
+            # ask for the failure per group instead of per call. See
+            # COST_UNPRICED_POLICIES.
+            try:
+                _in_cost = get_model_cost(_model, _in_priced, 0)
+                _out_cost = get_model_cost(_model, 0, _out_priced)
+                _model_priced = True
+            except UnknownModelPricingError:
+                if on_unpriced == COST_UNPRICED_RAISE:
+                    raise
+                _in_cost = _out_cost = 0.0
+                _notes.append(
+                    f"{COST_UNPRICED_NOTE_PREFIX} for {_model!r} "
+                    f"(last_updated {PRICING_CONFIG.get('last_updated')}) — "
+                    f"this group contributes $0.00 and its real spend is "
+                    f"unknown")
         else:
             # matching_model IS NULL means no Stage 5 response was obtained for
             # those rows (node_no_candidates, or a failure before the first call
@@ -4406,16 +4800,29 @@ def price_model_groups(df_groups) -> pd.DataFrame:
         #
         # `_stored is None` is deliberately NOT a term: this flag qualifies
         # recomputed_cost. See the docstring.
+        # `_model_priced` REPLACES `_model_recorded` IN THIS CONJUNCTION, and
+        # the widening is what makes the flag true to its own docstring: it is
+        # False when "there is no rate to price this group's consumption at",
+        # and an unknown or blank model is exactly that. Leaving
+        # `_model_recorded` here would report an unpriced group's $0.00 as a
+        # complete accounting of its spend -- the one error a reader cannot
+        # detect from the number.
         _cost_complete = ((_in is not None and _out is not None)
-                          and (_model_recorded
+                          and (_model_priced
                                or (_in_priced == 0 and _out_priced == 0)))
 
         _cost_rows.append({
-            "matching_model": _model if _model_recorded else NO_MODEL_LABEL,
+            "matching_model": (BLANK_MODEL_LABEL if _model_blank
+                               else _model if _model_recorded
+                               else NO_MODEL_LABEL),
             # Carried explicitly rather than inferred from the label, so a model
             # genuinely named "(none)" could never be mistaken for the NULL
             # group by a consumer.
             "model_recorded": _model_recorded,
+            # Whether a RATE was found and applied. See PRICED_COST_COLUMNS for
+            # why this is not derivable from `model_recorded` or from
+            # `cost_complete`.
+            "model_priced": _model_priced,
             "rows": int(_row.rows_n),
             "input_tokens": _in,
             "output_tokens": _out,

@@ -8,18 +8,40 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-from oncotriage.dashboard.tiers import PATIENT_OUTCOME_FULL
+from oncotriage.dashboard.tiers import (ANY_MATCH_COLUMN,
+                                        PATIENT_OUTCOME_FULL,
+                                        any_match_rate,
+                                        any_match_series)
 
 
 def render_patient_demographics_tab(df):
     """Render Patient Demographics tab with equity analysis."""
     
     st.header("👥 Patient Demographics & Equity Analysis")
-    
+
+    # EVERY "MATCH RATE" ON THIS TAB COMES FROM ONE PREDICATE (the
+    # dashboard-fixes pass), and materialising it as a column is what makes
+    # that possible rather than tidy: `DataFrame.agg` on a single column cannot
+    # see a second one, so the SIX per-group aggregations below could not ask
+    # `match_tier` without it and went on reading `eligible_matches` instead.
+    #
+    # THE HALF-FIX WOULD HAVE BEEN WORSE THAN NO FIX. The average line drawn
+    # across those bars (the two `add_vline` calls) is `overall_match_rate`;
+    # moving only the line and the tile to the tier definition would have drawn
+    # a line measured one way across bars measured another, so on any frame
+    # where the two disagree the line would cross bars it is not a mean of.
+    #
+    # `.copy()` BECAUSE THE FRAME IS `main()`'s AND NINE OTHER TABS SEE IT.
+    # Streamlit calls the ten renderers with one object; assigning a column in
+    # place would leak this tab's derived column into every tab that runs after
+    # it and into the sidebar's CSV export.
+    df = df.copy()
+    df[ANY_MATCH_COLUMN] = any_match_series(df)
+
     # --- Summary Metrics ---
     col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
 
-    overall_match_rate = (df['eligible_matches'] > 0).mean() * 100
+    overall_match_rate = any_match_rate(df)
     full_match_rate_demo = (df['match_tier'] == 'Full Match').mean() * 100
     partial_match_rate_demo = (df['match_tier'] == 'Partial Match').mean() * 100
     unconfirmed_match_rate_demo = (df['match_tier'] == 'Unconfirmed Match').mean() * 100
@@ -45,8 +67,10 @@ def render_patient_demographics_tab(df):
                        "found, but no criterion confirmed either")
     with col7:
         st.metric("Any Match", f"{overall_match_rate:.1f}%",
-                  help="Patients with at least 1 eligible trial (full, partial, or "
-                       "unconfirmed). Used as baseline in charts below")
+                  help="Patients with at least 1 eligible trial (full, partial or "
+                       "unconfirmed), derived from match_tier like every tile "
+                       "beside it. Used as the baseline line in the charts "
+                       "below, which measure their bars the same way.")
     
     st.markdown("---")
     
@@ -83,7 +107,7 @@ def render_patient_demographics_tab(df):
         age_stats = df_age.groupby('age_label').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100)
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
         ).reset_index().sort_values('age_label')
         
         fig_age = go.Figure()
@@ -106,7 +130,7 @@ def render_patient_demographics_tab(df):
         sex_stats = df.groupby('sex').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100)
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
         ).reset_index()
         
         fig_sex = go.Figure()
@@ -138,7 +162,7 @@ def render_patient_demographics_tab(df):
         race_stats = df.groupby('race').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100)
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
         ).reset_index().sort_values('patient_count', ascending=False)
         
         # Only show groups with enough patients
@@ -167,7 +191,7 @@ def render_patient_demographics_tab(df):
         eth_stats = df.groupby('ethnicity').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100)
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
         ).reset_index().sort_values('patient_count', ascending=False)
         
         eth_stats = eth_stats[eth_stats['patient_count'] >= 1]
@@ -230,7 +254,7 @@ def render_patient_demographics_tab(df):
         condition_stats = df.groupby('primary_condition').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100)
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
         ).reset_index().sort_values('patient_count', ascending=False)
         
         # Top 15 conditions
@@ -314,7 +338,7 @@ def render_patient_demographics_tab(df):
         )
         burden_stats = df_burden.groupby('condition_bucket', observed=True).agg(
             patient_count=('patient_id', 'count'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100),
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100),
             avg_matches=('eligible_matches', 'mean')
         ).reset_index()
         
@@ -345,7 +369,7 @@ def render_patient_demographics_tab(df):
         )
         med_stats = df_meds.groupby('med_bucket', observed=True).agg(
             patient_count=('patient_id', 'count'),
-            match_rate=('eligible_matches', lambda x: (x > 0).mean() * 100),
+            match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100),
             avg_matches=('eligible_matches', 'mean')
         ).reset_index()
         

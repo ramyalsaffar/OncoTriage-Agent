@@ -1,8 +1,11 @@
 """
-Dashboard data loaders.
+Dashboard data loaders, and the schema preflight that runs before them.
 
-The three ``@st.cache_data(ttl=60)`` readers of ``inferences.db``, moved
-verbatim out of "21- Streamlit Dashboard.py" in pass 20c-3c-1.
+The three ``@st.cache_data(ttl=60)`` readers of ``inferences.db`` at the top of
+this module were moved verbatim out of "21- Streamlit Dashboard.py" in pass
+20c-3c-1. Seven more have joined them since -- the four run-table readers, the
+drift designation reader and ``dashboard_schema_readiness`` -- and each is
+argued where it sits.
 
 THE DATABASE PATH IS READ THROUGH ``paths``, NOT IMPORTED BY NAME. Writing
 ``from oncotriage.paths import inferences_path`` at module scope would be an
@@ -39,14 +42,20 @@ change to eight tabs in a pass that owes one, and because ``main()`` has already
 returned before they could matter.
 """
 
+import ast
 import os
+import re
 import sqlite3
+import threading
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 
 from oncotriage import paths
+from oncotriage.storage import database_logger as _database_logger
 from oncotriage.storage import queries
+from oncotriage.storage.database_logger import SCHEMA_USER_VERSION
 
 
 @st.cache_data(ttl=60)
@@ -250,6 +259,470 @@ del _unknown_run_keys
 
 
 
+# ===========================================================================
+# THE SCHEMA PREFLIGHT (the dashboard-fixes pass)
+# ===========================================================================
+#
+# WHAT IT IS FOR, MEASURED RATHER THAN ARGUED. The production ``inferences.db``
+# on this machine is SCHEMA ERA 0 -- ``PRAGMA user_version`` 0,
+# ``application_id`` 0, 66 columns on ``inferences``, and the pre-naming-pass
+# ``gpt4o_*`` spellings where the current schema has ``llm_classifier_*``.
+# Driven through ``main()`` against a synthetic database of exactly that shape,
+# the dashboard raised
+#
+#     KeyError: 'llm_classifier_evaluation_time'
+#
+# at ``tabs/overview.py``'s stage-timing chart, INSIDE ``main()``, which has no
+# handler -- so the whole page, all ten tabs, rendered one traceback and no
+# diagnosis. A reader is told a column name and nothing about what to do.
+#
+# WHY A PREFLIGHT AND NOT A try/except ROUND EACH TAB. A caught KeyError names
+# whichever column the first tab happened to reach; it says nothing about the
+# other twenty a database of that era is also missing, and the next release
+# moves which one is first. The question a reader needs answered is "is this
+# database one this dashboard was written against", which is answerable ONCE,
+# before anything renders, and which names EVERY missing thing at the same time.
+#
+# THE VERSION STAMP IS REPORTED AND NEVER THE GATE, AND THAT IS THE HALF THAT
+# IS EASY TO GET WRONG. ``PRAGMA user_version`` is written by
+# ``initialize_database``; a database carrying the current number and missing a
+# column -- a hand-built one, a partially-restored one, one whose migration was
+# interrupted between the ALTER and the stamp -- would PASS a version-only gate
+# and then raise the identical KeyError one tab later. So the columns are
+# checked independently of the stamp, and the stamp is carried into the
+# diagnosis as evidence rather than consulted as a verdict.
+#
+# THE REQUIREMENT IS DERIVED, NOT DECLARED. A hand-written column list here
+# would be a second statement of what the dashboard reads, and it would rot in
+# the one direction that matters: a tab that starts reading a new column
+# silently stops being covered. So the requirement is the INTERSECTION of two
+# things neither of which this module writes down --
+#
+#     what the dashboard NAMES  : every string constant in oncotriage/dashboard,
+#                                 docstrings excluded, collected by AST;
+#     what the schema HAS       : the column set ``initialize_database`` itself
+#                                 creates, read off a throwaway database the
+#                                 schema owner builds.
+#
+# -- so neither side can drift from its own source. The intersection
+# over-approximates on the naming side (a string constant that happens to spell
+# a column the code does not index is required anyway) and that is the SAFE
+# direction: it can only widen a diagnosis about a database that is already
+# behind, and it can never let a column a tab really reads go unchecked.
+
+
+SCHEMA_NO_DATABASE = "no_database"
+"""No file at the configured path. Not a schema finding at all."""
+
+SCHEMA_UNREADABLE = "unreadable"
+"""The file is there and could not be interrogated -- not a database, locked,
+or a permission fault. REPORTED, never folded into ``no_database``: "there is
+nothing here" and "there is something here I cannot read" send an operator to
+different places."""
+
+SCHEMA_TABLES_MISSING = "tables_missing"
+"""A table the dashboard loads unconditionally is absent."""
+
+SCHEMA_COLUMNS_MISSING = "columns_missing"
+"""Every required table is there and at least one required column is not.
+
+This is the ERA GAP, and it is the state the production database is in. It is
+its own member rather than a shade of ``tables_missing`` because the remedy
+differs: a missing table can be created by the next writer to open the file,
+and a column the schema RENAMED cannot -- ``gpt4o_evaluation_time`` does not
+become ``llm_classifier_evaluation_time`` by running the pipeline again."""
+
+SCHEMA_READY = "ready"
+"""Every required table and column is present. SAYS NOTHING ABOUT ROWS -- an
+empty, freshly-initialized, current-era database is READY, and ``main()``'s own
+"no data available" message is what covers it. Collapsing the two would make a
+database that has simply not been run yet indistinguishable from one the
+dashboard cannot read."""
+
+SCHEMA_STATES = (SCHEMA_NO_DATABASE, SCHEMA_UNREADABLE, SCHEMA_TABLES_MISSING,
+                 SCHEMA_COLUMNS_MISSING, SCHEMA_READY)
+"""Every value ``state`` can take. CLOSED, on ``RUN_TRACKING_STATES``' footing:
+``main()`` branches on it and an unlisted value would fall through every branch
+and render nothing -- which is the silent-blank-page shape this preflight
+exists to remove."""
+
+DASHBOARD_TABLES = ("inferences", "trial_matches")
+"""The tables ``main()`` loads before any tab renders, so their absence is fatal
+to the page rather than to one panel.
+
+``drift_metrics`` IS DELIBERATELY NOT HERE. The drift tab already answers for
+its own absence in its own words -- ``load_drift_metrics_data`` returns an
+empty frame and the tab renders a "how to enable drift detection" panel -- and
+promoting it here would refuse the whole dashboard over a table whose absence
+one tab handles correctly. ``runs`` and ``run_metrics`` likewise: that is what
+``load_run_tracking_availability`` above is for."""
+
+
+_SCHEMA_CACHE = {}
+_SCHEMA_CACHE_LOCK = threading.RLock()
+
+
+# The column-list line shapes `initialize_database`'s CREATE TABLE statements
+# use, so a constraint clause is not mistaken for a column. Not a complete SQL
+# grammar and does not need to be: what this must never do is INVENT a column
+# name, and every rejection here can only narrow the parse -- which
+# `_reference_schema` reports rather than absorbs.
+_NOT_A_COLUMN = frozenset({
+    "primary", "foreign", "unique", "check", "constraint", "key",
+})
+
+_CREATE_TABLE_RE = re.compile(
+    r"CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?"
+    r"([A-Za-z_][A-Za-z0-9_]*)\s*\((.*)\)\s*$",
+    re.IGNORECASE | re.DOTALL)
+
+
+def _columns_of_create_table(statement):
+    """``(table, [columns])`` for one ``CREATE TABLE`` statement, or ``None``.
+
+    The column name is the first token of each top-level comma-separated item,
+    with table-level constraint clauses rejected by keyword.
+    """
+    match = _CREATE_TABLE_RE.search(statement.strip())
+    if not match:
+        return None
+    table, body = match.group(1), match.group(2)
+    columns, depth, item = [], 0, []
+    for char in body:
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+        if char == "," and depth == 0:
+            columns.append("".join(item))
+            item = []
+        else:
+            item.append(char)
+    columns.append("".join(item))
+    names = []
+    for column in columns:
+        tokens = column.strip().split()
+        if not tokens:
+            continue
+        first = tokens[0].strip('"`[]')
+        if first.lower() in _NOT_A_COLUMN:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", first):
+            names.append(first)
+    return table, names
+
+
+def _reference_schema():
+    """``{table: frozenset(columns)}`` for the schema THIS BUILD creates.
+
+    DERIVED FROM ``oncotriage/storage/database_logger.py``'S OWN SOURCE and
+    NOT by building a database, which is what the first version did. That
+    version was correct and it broke an isolation guarantee one layer up:
+    ``tests/test_dashboard_app_integration.py`` records every ``sqlite3.connect``
+    a render makes and requires every one of them to be the scratch database
+    under test, and a preflight that builds a throwaway reference database
+    opens a second one. The check was right -- a page render should open the
+    database it was pointed at and nothing else -- so the derivation moved
+    rather than the check.
+
+    TWO SOURCES, BOTH THE OWNER'S. The ``CREATE TABLE`` statements inside
+    ``initialize_database`` (string constants, read by AST) and the
+    ``*_COLUMN_ADDITIONS`` dicts beside them, which is every column a migration
+    can add. Neither is a second declaration: they are the two halves of what
+    that function creates.
+
+    A PARSE THAT FINDS NOTHING IS REPORTED, NEVER TREATED AS AN EMPTY SCHEMA.
+    A requirement set that silently shrank would report FEWER missing columns,
+    which reads exactly like a healthier database -- the dangerous direction.
+    ``_SCHEMA_CACHE["schema_parse_error"]`` carries it out to
+    ``dashboard_schema_readiness``, which refuses to say READY on the strength
+    of a derivation that produced nothing.
+
+    CACHED FOR THE LIFE OF THE PROCESS, not for 60 seconds: it is a pure
+    function of the code, so nothing a Streamlit rerun does can change it. The
+    lock is ``agent/deps.py``'s shape and is here for its reason -- the read and
+    the build are two operations and a Streamlit server runs several script
+    threads.
+    """
+    with _SCHEMA_CACHE_LOCK:
+        if "tables" in _SCHEMA_CACHE:
+            return _SCHEMA_CACHE["tables"]
+        tables = {}
+        try:
+            source = Path(os.path.abspath(_database_logger.__file__)).read_text(
+                encoding="utf-8")
+            for node in ast.walk(ast.parse(source)):
+                if not (isinstance(node, ast.Constant)
+                        and isinstance(node.value, str)
+                        and "CREATE TABLE" in node.value.upper()):
+                    continue
+                parsed = _columns_of_create_table(node.value)
+                if parsed is None:
+                    continue
+                table, names = parsed
+                tables.setdefault(table, set()).update(names)
+        except (OSError, SyntaxError) as exc:
+            _SCHEMA_CACHE["schema_parse_error"] = f"{type(exc).__name__}: {exc}"
+
+        # EVERY ADDITIVE COLUMN TOO. A CREATE TABLE describes the shape a FRESH
+        # database is born with; a migrated one additionally carries whatever
+        # the addition dicts declare, and the dashboard reads several of those
+        # (`llm_classifier_call_details`, `matching_call_mode`, ...).
+        for table, additions in (
+                ("inferences", _database_logger.INFERENCE_COLUMN_ADDITIONS),
+                ("trial_matches",
+                 _database_logger.TRIAL_MATCH_COLUMN_ADDITIONS),
+                ("drift_metrics",
+                 _database_logger.DRIFT_METRIC_COLUMN_ADDITIONS),
+                ("runs", _database_logger.RUN_COLUMN_ADDITIONS)):
+            tables.setdefault(table, set()).update(additions)
+
+        _SCHEMA_CACHE["tables"] = {t: frozenset(c) for t, c in tables.items()}
+        return _SCHEMA_CACHE["tables"]
+
+
+def _names_the_dashboard_uses():
+    """Every string constant in ``oncotriage/dashboard``, docstrings excluded.
+
+    Collected by AST rather than by a regex, so a column name inside a comment
+    is invisible and one inside an f-string's literal half is not missed.
+
+    DOCSTRINGS ARE STRIPPED, and it is the same rule
+    ``oncotriage/run_fingerprint.py`` applies to the renderer digest: this
+    module's own prose names a dozen columns while arguing about them, and a
+    scan that counted prose would report the argument as the thing it argues
+    about -- a shape this project has now met six times.
+
+    Cached for the life of the process beside ``_reference_schema``: both are
+    pure functions of the source on disk.
+    """
+    with _SCHEMA_CACHE_LOCK:
+        if "names" in _SCHEMA_CACHE:
+            return _SCHEMA_CACHE["names"]
+        root = os.path.dirname(os.path.abspath(__file__))
+        found = set()
+        for directory, _sub, files in os.walk(root):
+            if os.path.basename(directory) == "__pycache__":
+                continue
+            for filename in sorted(files):
+                if not filename.endswith(".py"):
+                    continue
+                try:
+                    tree = ast.parse(
+                        Path(os.path.join(directory, filename))
+                        .read_text(encoding="utf-8"))
+                except (OSError, SyntaxError):        # noqa: PERF203 -- reported
+                    # A module that cannot be parsed contributes no names. It
+                    # cannot be a silent pass either: a requirement set that
+                    # shrank would report FEWER missing columns, which reads
+                    # exactly like a healthier database. `_parse_failures`
+                    # carries it out to the caller.
+                    _SCHEMA_CACHE.setdefault("parse_failures", []).append(
+                        os.path.join(directory, filename))
+                    continue
+                for node in ast.walk(tree):
+                    if isinstance(node, (ast.Module, ast.ClassDef,
+                                         ast.FunctionDef, ast.AsyncFunctionDef)):
+                        body = getattr(node, "body", [])
+                        if (body and isinstance(body[0], ast.Expr)
+                                and isinstance(body[0].value, ast.Constant)
+                                and isinstance(body[0].value.value, str)):
+                            body[0].value.value = ""
+                for node in ast.walk(tree):
+                    if (isinstance(node, ast.Constant)
+                            and isinstance(node.value, str)):
+                        found.add(node.value)
+        _SCHEMA_CACHE["names"] = frozenset(found)
+        return _SCHEMA_CACHE["names"]
+
+
+def dashboard_column_requirements():
+    """``{table: sorted(columns)}`` the dashboard needs on a current database.
+
+    The intersection argued at the top of this section, MINUS the columns a
+    writer will supply on its own. Returns only the tables in
+    ``DASHBOARD_TABLES``, because those are the two whose absence is fatal to
+    the page.
+    """
+    schema = _reference_schema()
+    named = _names_the_dashboard_uses()
+    tolerated = _tolerated_columns()
+    return {table: sorted((schema.get(table, frozenset()) & named)
+                          - tolerated.get(table, frozenset()))
+            for table in DASHBOARD_TABLES}
+
+
+def _tolerated_columns():
+    """``{table: frozenset}`` -- named by the dashboard, and NOT worth refusing.
+
+    THE DISTINCTION IS THE PROJECT'S OWN AND IT IS ALREADY WRITTEN DOWN, in
+    ``oncotriage/storage/queries.py``'s skip banner: a column a migration ADDS
+    is the ordinary state of a database written before it, and the next writer
+    to open the file supplies it -- while a column the naming pass RENAMED is
+    one no writer will ever repair, because the migration loop can only ADD.
+
+    SO THE TWO GET DIFFERENT ANSWERS. A renamed column missing is a REFUSAL:
+    that database cannot be rendered and no command short of an archive will
+    change it. An additive column missing is a WARNING: the page renders, and
+    the tabs that read one already guard it, which is checkable rather than
+    hoped for -- ``tabs/run_health.py`` returns early on
+    ``"run_id" not in df.columns`` and says so on screen, and
+    ``dashboard/call_mode.py`` answers a not-recorded bucket.
+
+    WITHOUT THIS SPLIT THE PREFLIGHT REGRESSES A WORKING PATH, and it did:
+    ``run_id`` is additive, the Run Health tab handles its absence correctly
+    and reports "partial", and the first version of this requirement named it
+    -- which would have refused the WHOLE dashboard for a database whose only
+    fault is that it predates one column. Measured in this pass, not reasoned
+    about.
+
+    THE RESIDUAL IS STATED RATHER THAN HIDDEN. An additive column read by a tab
+    that does NOT guard it still raises, exactly as it did before this preflight
+    existed: the preflight narrows the failure, it does not claim to remove it.
+    ``dashboard_schema_readiness`` reports every tolerated column the database
+    lacks in ``tolerated_missing``, and the page prints them, so an operator
+    meeting such a traceback has already been told which columns are absent.
+    """
+    return {
+        "inferences": (frozenset(_database_logger.INFERENCE_COLUMN_ADDITIONS)
+                       - frozenset(_database_logger.RENAMED_INFERENCE_COLUMNS)),
+        "trial_matches": frozenset(
+            _database_logger.TRIAL_MATCH_COLUMN_ADDITIONS),
+    }
+
+
+@st.cache_data(ttl=60)
+def dashboard_schema_readiness():
+    """Whether this database is one the dashboard can render. Cached 60s.
+
+    Returns a dict with:
+        state             one of ``SCHEMA_STATES``
+        db_path           the resolved path, always, so a diagnosis can name it
+        recorded_version  ``PRAGMA user_version``, or None when unread
+        required_version  ``database_logger.SCHEMA_USER_VERSION``
+        version_note      how the two compare, in words, or ``""``
+        missing_tables    sorted, of ``DASHBOARD_TABLES``
+        missing_columns   sorted ``"table.column"``, empty when a table is gone
+        tolerated_missing sorted ``"table.column"`` a writer WILL supply --
+                          reported, never a refusal; see ``_tolerated_columns``
+        checked_columns   how many were checked -- a non-degeneracy figure, so a
+                          derivation that silently produced nothing cannot read
+                          as a clean database
+        parse_failures    dashboard modules the name scan could not parse
+        error             the exception text, or None
+
+    IT NEVER RAISES. It is the thing that runs before the page has anything to
+    render an error INTO, so an exception here would be the blank page it exists
+    to prevent. Every failure becomes a state.
+
+    MISSING COLUMNS ARE NOT REPORTED FOR AN ABSENT TABLE. Naming both tells an
+    operator to add a column to a table that is not there -- the rule
+    ``queries.missing_requirements`` already applies one layer down, adopted
+    rather than re-argued.
+    """
+    db_path = paths.inferences_path
+    blank = {"state": SCHEMA_READY, "db_path": db_path,
+             "recorded_version": None, "required_version": SCHEMA_USER_VERSION,
+             "version_note": "", "missing_tables": [], "missing_columns": [],
+             "tolerated_missing": [], "checked_columns": 0,
+             "parse_failures": [], "error": None}
+
+    if not os.path.isfile(db_path):
+        return dict(blank, state=SCHEMA_NO_DATABASE)
+
+    conn = None
+    try:
+        conn = _readonly_connection()
+        if conn is None:                                # raced with a deletion
+            return dict(blank, state=SCHEMA_NO_DATABASE)
+
+        recorded = conn.execute("PRAGMA user_version").fetchone()[0]
+        present = queries.available_tables(conn)
+        requirements = dashboard_column_requirements()
+        parse_failures = list(_SCHEMA_CACHE.get("parse_failures", []))
+        schema_error = _SCHEMA_CACHE.get("schema_parse_error")
+
+        # A DERIVATION THAT PRODUCED NOTHING IS NOT A CLEAN DATABASE. Reporting
+        # READY on the strength of an empty requirement set is the failure this
+        # whole section is built to avoid, arriving through the derivation
+        # rather than through the database.
+        if schema_error or not all(requirements.get(t)
+                                   for t in DASHBOARD_TABLES):
+            return dict(
+                blank, state=SCHEMA_UNREADABLE, recorded_version=recorded,
+                error=("the dashboard's column requirement could not be "
+                       "derived from oncotriage/storage/database_logger.py"
+                       + (f": {schema_error}" if schema_error else
+                          " -- the parse produced no columns for "
+                          + ", ".join(t for t in DASHBOARD_TABLES
+                                      if not requirements.get(t)))))
+
+        missing_tables = sorted(t for t in DASHBOARD_TABLES if t not in present)
+        missing_columns = []
+        tolerated_missing = []
+        tolerated = _tolerated_columns()
+        named = _names_the_dashboard_uses()
+        checked = 0
+        for table, columns in requirements.items():
+            if table in missing_tables:
+                continue
+            have = queries.table_columns(conn, table)
+            checked += len(columns)
+            missing_columns.extend(f"{table}.{c}" for c in columns
+                                   if c not in have)
+            # REPORTED AND NOT REFUSED. The page renders without these and the
+            # tabs that read them guard them; naming them is what stops an
+            # operator meeting an unguarded one as a bare traceback.
+            tolerated_missing.extend(
+                f"{table}.{c}"
+                for c in sorted(tolerated.get(table, frozenset()) & named)
+                if c not in have)
+        missing_columns.sort()
+        tolerated_missing.sort()
+
+        if recorded > SCHEMA_USER_VERSION:
+            note = (f"the database records schema era {recorded} and this "
+                    f"build knows era {SCHEMA_USER_VERSION}: THIS CODE IS "
+                    f"BEHIND THE DATABASE, not the other way round. Do not "
+                    f"archive it.")
+        elif recorded < SCHEMA_USER_VERSION:
+            note = (f"the database records schema era {recorded} and this "
+                    f"build creates era {SCHEMA_USER_VERSION}.")
+        else:
+            note = (f"the database records the current schema era "
+                    f"{recorded}, so the stamp and the columns DISAGREE -- "
+                    f"which is itself a finding: this file was not built by "
+                    f"initialize_database, or a migration stopped between the "
+                    f"ALTER and the stamp."
+                    if missing_columns or missing_tables else "")
+
+        if missing_tables:
+            state = SCHEMA_TABLES_MISSING
+        elif missing_columns:
+            state = SCHEMA_COLUMNS_MISSING
+        else:
+            state = SCHEMA_READY
+
+        return {"state": state, "db_path": db_path,
+                "recorded_version": recorded,
+                "required_version": SCHEMA_USER_VERSION,
+                "version_note": note, "missing_tables": missing_tables,
+                "missing_columns": missing_columns,
+                "tolerated_missing": tolerated_missing,
+                "checked_columns": checked,
+                "parse_failures": parse_failures, "error": None}
+
+    except Exception as exc:                       # noqa: BLE001 -- reported
+        return dict(blank, state=SCHEMA_UNREADABLE,
+                    error=f"{type(exc).__name__}: {exc}")
+    finally:
+        if conn:
+            conn.close()
+
+
+#------------------------------------------------------------------------------
+
+
 def _readonly_connection():
     """A read-only connection to the configured database, or ``None``.
 
@@ -277,7 +750,7 @@ def load_drift_reference_data():
     shape the loaders above already use, and what lets the drift tab render a
     caption for a database that predates the designation store.
 
-    IT OPENS READ-ONLY, unlike the three loaders above. Those were left on a
+    IT OPENS READ-ONLY, unlike the three ORIGINAL loaders at the top of this module. Those were left on a
     plain ``sqlite3.connect`` because changing them is a behaviour change to
     eight tabs; this one is new, and a plain connect CREATES the file, so a
     reader asking "does this database have a designation" would answer by
@@ -392,7 +865,7 @@ def _load_run_query(key):
     """Run one registered query read-only and return its frame.
 
     An empty frame WITH THE QUERY'S COLUMNS on any failure, so a caller can index
-    a column without testing first -- the shape the three loaders above already
+    a column without testing first -- the shape the three ORIGINAL loaders at the top of this module already
     use. The availability loader is what distinguishes "failed" from "no rows";
     a caller that has not asked it has not earned an answer.
     """

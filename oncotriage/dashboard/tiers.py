@@ -23,7 +23,16 @@ starts mutating them fails rather than corrupting every later rerun.
 # Match tier vocabulary. Ordered best -> worst; every tier_order / tier_colors
 # list in this file is built from these two so a tier can never be defined in
 # one chart and dropped from another.
-MATCH_TIERS = ['Full Match', 'Partial Match', 'Unconfirmed Match', 'No Match']
+MATCH_TIER_NO_MATCH = 'No Match'
+"""The worst tier, named once.
+
+IT WAS A LITERAL IN THREE PLACES -- ``MATCH_TIERS``, ``ANY_MATCH_TIERS``'s
+derivation and ``assign_tier``'s fallback -- and the repair pass added a
+fourth reader in the sidebar. A string typed out in four files is the shape
+pass 20f-3 had to come back and fix for '✅ Full Match'."""
+
+MATCH_TIERS = ['Full Match', 'Partial Match', 'Unconfirmed Match',
+               MATCH_TIER_NO_MATCH]
 
 MATCH_TIER_COLORS = {
     'Full Match':        '#2ca02c',
@@ -120,6 +129,181 @@ if len(PATIENT_OUTCOME_LABELS) != len(MATCH_TIERS):
     )
 
 
+# ===========================================================================
+# "ANY MATCH": ONE MEANING, ONE DERIVATION, ONE OWNER (the dashboard-fixes pass)
+# ===========================================================================
+#
+# THE MEANING, SETTLED BEFORE THE OWNER. "Any Match" is a PER-PATIENT outcome
+# and it is the complement of the worst tier: a patient is an Any Match exactly
+# when `enrich_match_tiers` put them in Full, Partial or Unconfirmed. It is
+# DERIVED from MATCH_TIERS rather than written out, so a fifth tier joins it by
+# being added once.
+#
+# TWO SURFACES HAD TWO DERIVATIONS AND NEITHER NAMED THE OTHER:
+#
+#   tabs/overview.py     full_rate + partial_rate + unconfirmed_rate
+#                        -- three percentages summed, tier-based;
+#   tabs/demographics.py (df['eligible_matches'] > 0).mean() * 100
+#                        -- the stored COLUMN, which is a count Stage 6 wrote.
+#
+# ON THE PRODUCTION TABLE THEY AGREE TO FOUR DECIMAL PLACES (97.1971% both,
+# 1,106 rows, zero disagreeing rows -- measured, not assumed), which is exactly
+# why this went unnoticed. They are not the same question and they come apart
+# on shapes the pipeline really produces:
+#
+#   * `trial_matches` empty or not yet written, with `eligible_matches > 0` on
+#     the inference rows. `enrich_match_tiers` assigns every patient
+#     'No Match'; the column says they matched. 0% against N%.
+#   * an eligible trial row whose `match_score` is NULL. Every tier bucket
+#     compares against the score and NaN fails all three, so the patient is
+#     'No Match' with `eligible_matches` counting the trial.
+#   * `eligible_matches` NULL -- a row written before the column, or by a
+#     failure return. `NaN > 0` is False, so the column says no match while the
+#     tiers may say otherwise.
+#
+# WHY THE TIER SIDE IS THE MEANING AND NOT THE COLUMN. Every other tile in both
+# panels -- Full, Partial, Unconfirmed, No Match -- is `match_tier`-based, so
+# "Any Match" derived from a different source is a total that does not have to
+# equal its own parts. It did not: the overview tile summed three
+# tier-percentages while the demographics tile beside FOUR tier-percentages
+# read the column. A total and its parts computed from two sources is the
+# defect, whichever source is "righter".
+
+ANY_MATCH_TIERS = tuple(t for t in MATCH_TIERS if t != MATCH_TIER_NO_MATCH)
+"""The tiers that count as a match. DERIVED, so a new tier is included by
+default and EXCLUDED only by a deliberate edit -- the safe direction for a
+figure that is a complement."""
+
+ANY_MATCH_COLUMN = "any_match"
+"""The boolean column ``any_match_series`` produces.
+
+NAMED because ``tabs/demographics.py`` has to aggregate it -- ``DataFrame.agg``
+on a single column cannot see a second one, so the per-group match rates need
+the predicate materialised rather than recomputed inside six lambdas."""
+
+
+def any_match_series(df):
+    """A boolean Series: is each row a patient with at least one eligible trial.
+
+    THE ONE DERIVATION. Every "Any Match" figure in the dashboard is this
+    Series counted, averaged or grouped.
+
+    RAISES when ``match_tier`` is absent, and does NOT fall back to
+    ``eligible_matches``. A fallback would be the second derivation this
+    function exists to remove, reachable exactly when a caller forgot
+    ``enrich_match_tiers`` -- and it would then disagree with every tier tile
+    beside it while looking like it had worked.
+    """
+    if 'match_tier' not in df.columns:
+        raise KeyError(
+            "any_match_series: the frame has no 'match_tier' column. Every "
+            "dashboard frame is enriched by enrich_match_tiers() in "
+            "oncotriage/dashboard/app.py:main() before any tab sees it; a "
+            "frame without it has not been through that call."
+        )
+    return df['match_tier'].isin(ANY_MATCH_TIERS)
+
+
+def any_match_count(df) -> int:
+    """How many patients in ``df`` have at least one eligible trial."""
+    return int(any_match_series(df).sum())
+
+
+def any_match_rate(df) -> float:
+    """The Any Match percentage of ``df``, or ``float('nan')`` when empty.
+
+    NaN AND NOT 0.0 FOR AN EMPTY FRAME. ``Series.mean()`` over no rows is
+    already NaN and it is kept: 0.0% asserts that none of the patients matched,
+    which is a measurement, and there are no patients to have measured. Every
+    caller formats with an f-string, where NaN renders "nan%" -- visibly not a
+    number rather than a plausible wrong one.
+    """
+    return float(any_match_series(df).mean() * 100)
+
+
+TRIAL_MISSING_TITLE_LABEL = "(no title recorded)"
+"""How a trial with no recorded title is NAMED on a panel that lists trials.
+
+A LABEL AND NOT A DROP, AND THE DROP IS WHAT USED TO HAPPEN. A panel that
+grouped by ``['nct_id', 'trial_title']`` lost rows silently, because
+``DataFrame.groupby`` discards NaN group keys by default:
+
+    a trial whose every row had a NULL title VANISHED from the panel entirely
+        -- no entry, no error, and every patient evaluated against it
+        unreachable from it;
+
+    a trial with a MIXED title -- some rows recorded, some NULL -- appeared
+        ONCE carrying only its titled rows, so its count was silently short by
+        the untitled ones. Measured on a two-patient fixture: 1 shown, 2 real.
+
+Both are reproduced in ``tests/test_dashboard_repair_pass.py``. Neither
+raised, which is why neither had been noticed.
+
+AN EARLIER REPORT BLAMED ``r['trial_title'][:55]`` FOR RAISING ON A NULL, and
+that was wrong: nothing with a NULL title ever reached that slice, because the
+groupby had already dropped it. The slice is safe for a different reason --
+the title it slices is THIS LABEL when nothing was recorded.
+
+IT LIVES HERE RATHER THAN IN THE TAB THAT FIRST NEEDED IT, because a SECOND
+panel needs it. The Trial Explorer's selector and Match Quality's "Top Matched
+Trials" both name a trial, and a user-visible label typed out in two files is
+the shape ``PATIENT_OUTCOME_FULL`` above was introduced to remove -- there the
+two copies had already drifted into two vocabularies that happened to share a
+string."""
+
+
+def display_trial_title(titles) -> str:
+    """The title to SHOW for one trial, given that trial's own recorded titles.
+
+    THE FIRST RECORDED ONE AMONG THEM, so a trial with a mixed title is named
+    by the title it HAS rather than by the absence of one, and a trial with
+    none at all is named by ``TRIAL_MISSING_TITLE_LABEL`` rather than dropped.
+    Either way it is ONE entry, which is what makes the trial ID alone a usable
+    group key.
+
+    A RECORDED TITLE IS A NON-BLANK STRING, and that definition is the whole
+    of the second defect this function had to be widened for. The first
+    version asked ``first_valid_index()``, which answers "not NaN" -- and
+    ``storage/database_logger.py`` writes ``match.get("title", "")``, so the
+    value THIS PIPELINE produces for a trial with no title is the EMPTY
+    STRING and never NaN. Measured consequences of the narrower reading:
+
+        ``groupby`` does NOT discard an empty-string key, it is a perfectly
+            good one -- so on the pair the empty-title rows were never
+            DROPPED, they were SPLIT off into a second entry. Rows preserved,
+            identity halved, which is the quieter half of the same defect and
+            the ONLY half reachable from this project's own writer;
+
+        ``first_valid_index()`` calls ``""`` valid, so a trial carrying a
+            recorded title on one row and the writer's default on another was
+            named by whichever came first -- a BLANK cell beside a title the
+            database holds.
+
+    Whitespace-only is blank too: ``"   "`` is not a title, and a panel that
+    printed it would show an entry a reader cannot name.
+
+    THE SURVIVING VALUE IS RETURNED VERBATIM, never stripped: this renders
+    RECORDED data, and ``.strip()`` is used to decide emptiness rather than to
+    edit what the database holds.
+
+    A NON-STRING IS NOT A TITLE EITHER, which is a deliberate narrowing of the
+    old ``str(...)`` coercion: NaN, None and ``pandas.NA`` are all skipped by
+    the same test, with no import and no equality comparison -- ``value !=
+    value`` catches NaN and RAISES on ``pandas.NA``, whose truthiness is
+    undefined.
+
+    A group with no recorded title anywhere -- including an EMPTY group, which
+    ``dropna().iloc[0]`` would raise IndexError on -- answers the label.
+
+    IT TAKES THE SERIES ``groupby(...).agg`` HANDS AN AGGREGATOR and only
+    iterates it, so this module still imports nothing at all.
+    """
+    for value in titles:
+        if isinstance(value, str) and value.strip():
+            return value
+    return TRIAL_MISSING_TITLE_LABEL
+
+
 def classify_trial_score(match_score) -> str:
     """
     Bucket one ELIGIBLE trial's match_score into its tier.
@@ -158,7 +342,7 @@ def enrich_match_tiers(df, trial_matches):
         df['full_match_count'] = 0
         df['partial_match_count'] = 0
         df['unconfirmed_match_count'] = 0
-        df['match_tier'] = 'No Match'
+        df['match_tier'] = MATCH_TIER_NO_MATCH
         return df
 
     eligible = trial_matches[trial_matches['eligible'] == 'eligible'].copy()
@@ -185,7 +369,7 @@ def enrich_match_tiers(df, trial_matches):
             return 'Partial Match'
         elif row['unconfirmed_match_count'] > 0:
             return 'Unconfirmed Match'
-        return 'No Match'
+        return MATCH_TIER_NO_MATCH
 
     df['match_tier'] = df.apply(assign_tier, axis=1)
 

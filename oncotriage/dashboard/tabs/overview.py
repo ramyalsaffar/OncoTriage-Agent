@@ -9,7 +9,66 @@ import streamlit as st
 
 from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.tiers import MATCH_TIER_COLORS, PATIENT_OUTCOME_FULL
+from oncotriage.dashboard.tiers import (MATCH_TIER_COLORS,
+                                        PATIENT_OUTCOME_FULL,
+                                        any_match_count,
+                                        any_match_rate)
+
+
+
+# ===========================================================================
+# STAGE RETENTION: ONE DERIVATION, AND A ZERO THAT IS NEVER INVENTED
+# ===========================================================================
+
+RETENTION_UNAVAILABLE = "—"
+"""What a retention tile shows when it has no honest percentage to show.
+
+AN EM DASH AND NOT "0.0%". The three tiles all read ``... if total > 0 else 0``,
+which renders 0.0% for a selection that recorded no counts at all -- and 0.0%
+is a MEASUREMENT: it says every candidate was dropped at that stage. A reader
+cannot tell that from "nothing was recorded", and only one of the two is a
+reason to go and look at the pipeline."""
+
+
+def _retention(df, numerator_column, denominator_column):
+    """``(display, note)`` for one retention tile. THE ONE DERIVATION.
+
+    ``note`` is the sentence appended to the tile's help text, and it is empty
+    exactly when the display is a real percentage.
+
+    ``min_count=1`` IS THE LOAD-BEARING ARGUMENT. ``Series.sum()`` over a column
+    that is NULL on every row returns ``0.0``, not NA -- so without it a
+    selection that recorded nothing produces a denominator of 0, takes the
+    ``else`` branch, and prints a percentage-shaped nothing. It is the same
+    argument ``queries.model_groups_from_frame`` already makes for the cost
+    sums, adopted rather than re-derived: "no count was ever recorded" and
+    "these rows counted zero" are different facts and pandas collapses them by
+    default.
+
+    ALL THREE TILES SHARE IT. Only the middle one was named as defective, and
+    the other two carry the identical ``else 0``; giving the three one owner is
+    what stops the next edit repairing one and leaving two, which is how this
+    one came to be alone.
+    """
+    numerator = df[numerator_column].sum(min_count=1)
+    denominator = df[denominator_column].sum(min_count=1)
+
+    if pd.isna(numerator) or pd.isna(denominator):
+        absent = [c for c, v in ((denominator_column, denominator),
+                                 (numerator_column, numerator))
+                  if pd.isna(v)]
+        return RETENTION_UNAVAILABLE, (
+            f" NOT AVAILABLE: no row in this selection recorded "
+            f"{' or '.join(absent)}, so there is no measurement to divide. "
+            f"This is not a retention of zero.")
+
+    if denominator <= 0:
+        return RETENTION_UNAVAILABLE, (
+            f" NOT AVAILABLE: this selection's total {denominator_column} is "
+            f"{int(denominator)}, so the stage had nothing to retain. A "
+            f"percentage of nothing is not zero percent.")
+
+    return f"{numerator / denominator * 100:.1f}%", ""
 
 
 def render_overview_tab(df):
@@ -110,17 +169,20 @@ def render_overview_tab(df):
         # "Any Match" counts every eligible trial including the unconfirmable
         # ones, so it is deliberately shown next to the tier split rather than
         # in place of it.
-        any_match_rate = full_rate + partial_rate + unconfirmed_rate
-        any_match_count = (
-            (df['match_tier'] == 'Full Match').sum()
-            + (df['match_tier'] == 'Partial Match').sum()
-            + (df['match_tier'] == 'Unconfirmed Match').sum()
-        )
+        #
+        # THROUGH THE ONE OWNER (the dashboard-fixes pass). This summed the
+        # three tier percentages -- correct arithmetic over the right source,
+        # and a SECOND derivation of a figure the Demographics tab computed a
+        # third way, from `eligible_matches`. See ANY_MATCH_TIERS in
+        # oncotriage/dashboard/tiers.py for the two shapes on which the two
+        # answers came apart.
         st.metric(
             "Any Match",
-            f"{any_match_rate:.1f}%",
-            delta=f"{any_match_count} patients",
-            help="Patients with at least 1 eligible trial (full, partial, or unconfirmed)"
+            f"{any_match_rate(df):.1f}%",
+            delta=f"{any_match_count(df)} patients",
+            help="Patients with at least 1 eligible trial (full, partial, or "
+                 "unconfirmed). Derived from match_tier, like every tile "
+                 "beside it, so the total and its parts share one source."
         )
 
     st.markdown("---")
@@ -162,7 +224,17 @@ def render_overview_tab(df):
             'Hybrid Retrieval': df['hybrid_retrieval_time'].mean(),
             'Cross-Encoder': df['cross_encoder_time'].mean(),
             'Rule Filter': df['rule_filter_time'].mean(),
-            'GPT-4o Eval': df['llm_classifier_evaluation_time'].mean()
+            # THE SERIES NAME IS THE STAGE, NOT A MODEL (the dashboard-fixes
+            # pass). It read 'GPT-4o Eval' -- a label the naming pass left
+            # behind when it renamed the column underneath it, so this chart
+            # named a model that has not served Stage 5 since 2026-08-04 while
+            # reading `llm_classifier_evaluation_time`. Its three siblings
+            # above are all STAGE names; a model name here is the odd one out
+            # AND the one that goes stale. Interpolating `MATCHING_MODEL` was the other
+            # option and is wrong for a HISTORICAL chart: the mean is over rows
+            # that may have been judged by several models, so naming today's
+            # would be a claim about rows it did not produce.
+            'LLM Classifier': df['llm_classifier_evaluation_time'].mean()
         }
         
         fig_stages = go.Figure(data=[
@@ -544,32 +616,49 @@ def render_overview_tab(df):
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        retrieved_total = df['candidates_retrieved'].sum()
-        reranked_total = df['candidates_reranked'].sum()
-        rerank_retention = (reranked_total / retrieved_total * 100) if retrieved_total > 0 else 0
+        _value, _note = _retention(df, 'candidates_reranked',
+                                   'candidates_retrieved')
         st.metric(
             "Retrieved → Reranked",
-            f"{rerank_retention:.1f}%",
-            help="Percentage of retrieved candidates that survive cross-encoder reranking"
+            _value,
+            help="Percentage of retrieved candidates that survive cross-encoder "
+                 "reranking." + _note
         )
     
     with col2:
-        filtered_total = df['candidates_filtered'].sum()
-        filter_retention = (filtered_total / reranked_total * 100) if reranked_total > 0 else 0
+        # THE COLUMN WAS WRONG AND THE LABEL WAS RIGHT (the dashboard-fixes
+        # pass). This tile is headed "Reranked → Rule Filter" and divided by
+        # `candidates_filtered`, which is `len(filtered_trials)` --
+        # Stage 4's output AFTER the quality gate AND after the
+        # MAX_TRIALS_FOR_EVALUATION cost cap, two stages further down the
+        # funnel than the heading claims. `candidates_after_rule_filter` is the
+        # rule filter's own survivor count, which is what the heading names.
+        #
+        # MEASURED ON THE PRODUCTION TABLE, 1,106 rows: the pre-fix figure is
+        # 12,951 / 44,240 = 29.3% and the true one is 26,436 / 44,240 = 59.8%.
+        # So the tile understated the rule filter's retention by half, and it
+        # did it by silently reporting the cost cap's effect as the rule
+        # filter's -- a number that moves when MAX_TRIALS_FOR_EVALUATION moves,
+        # under a heading about a stage that cap has nothing to do with.
+        _value, _note = _retention(df, 'candidates_after_rule_filter',
+                                   'candidates_reranked')
         st.metric(
             "Reranked → Rule Filter",
-            f"{filter_retention:.1f}%",
-            help="Percentage of reranked candidates that pass quality + rule filters"
+            _value,
+            help="Percentage of reranked candidates that survive the Stage 4 "
+                 "RULE filter (MeSH site relevance, stage, histology, age, "
+                 "sex). The quality gate and the cost cap are further down and "
+                 "are not counted here." + _note
         )
     
     with col3:
-        evaluated_total = df['candidates_evaluated'].sum()
-        eligible_total = df['eligible_matches'].sum()
-        eligibility_rate = (eligible_total / evaluated_total * 100) if evaluated_total > 0 else 0
+        _value, _note = _retention(df, 'eligible_matches',
+                                   'candidates_evaluated')
         st.metric(
             "Evaluated → Eligible",
-            f"{eligibility_rate:.1f}%",
-            help="Percentage of GPT-4o evaluated trials that are eligible (full + partial matches)"
+            _value,
+            help="Percentage of Stage 5 evaluated trials that are eligible "
+                 "(full + partial + unconfirmed)." + _note
         )
 
 

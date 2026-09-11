@@ -624,30 +624,78 @@ def render_performance_tab(df):
                    'Trials Evaluated', 'Total Time (s)', f'{_judge} Time (s)',
                    'Output Tokens']
 
-    slowest = df.nlargest(10, 'total_time').copy()
-    # ANNOTATE BEFORE SLICING, and from a COPY: `annotate` derives the display
-    # bucket through the same mapping every other panel groups by, including
-    # the column-absent case, so a database predating era 3 renders the
-    # not-recorded bucket here rather than raising a KeyError.
-    slowest = call_mode.annotate(slowest)[_slow_cols + ['call_mode_label']]
-    slowest.insert(0, 'Rank', range(1, len(slowest) + 1))
+    # ONLY MEASURED ROWS ARE RANKED, AND A RANKING WITH NOTHING TO RANK SAYS SO
+    # (the repair pass). This was `df.nlargest(10, 'total_time')`, which is
+    # wrong in TWO ways that a dtype tells apart and a reader cannot:
+    #
+    #   ALL ROWS UNMEASURED, object dtype -- what `pd.read_sql_query` returns
+    #     for a REAL column that is NULL on every row -- RAISES
+    #     "Column 'total_time' has dtype object, cannot use method 'nlargest'".
+    #     Inside a tab, with no handler between here and main(), so one such
+    #     selection took all ten tabs down. Reproduced.
+    #
+    #   ALL ROWS UNMEASURED, float64 -- the same selection reached through a
+    #     frame pandas has already typed -- does NOT raise. It returns rows
+    #     whose time cells are blank, ranked 1..n, under a heading that says
+    #     "Top 10 patients by total end-to-end pipeline latency". A silent
+    #     wrong answer, which is the worse of the two.
+    #
+    # AND A PARTLY-MEASURED FRAME WAS WRONG TOO, quietly. `nlargest` does NOT
+    # drop NaN rows: measured on pandas 2.2.3, a 12-row frame with 5 NaN
+    # returns 10 rows of which 3 are NaN -- it pads the requested n with
+    # unmeasured rows. So a cohort with fewer than ten timings put patients
+    # nobody timed into a latency ranking, below the ones it did.
+    #
+    # THE GUARD IS ON THE VALUES AND NOT ON THE DTYPE, which is the same ruling
+    # `oncotriage/dashboard/tabs/overview.py:_retention` makes for a zero
+    # denominator: "are there usable measurements" is the question, and a
+    # predicate written against a dtype answers it for one of the two shapes.
+    _timings = pd.to_numeric(df['total_time'], errors='coerce')
+    _measured_mask = _timings.notna()
+    _measured = int(_measured_mask.sum())
+    _unmeasured = int(len(df) - _measured)
 
-    slowest.columns = ['Rank'] + _slow_names + ['Call Mode']
-    
-    slowest['Total Time (s)'] = slowest['Total Time (s)'].round(1)
-    slowest[f'{_judge} Time (s)'] = slowest[f'{_judge} Time (s)'].round(1)
-    
-    st.dataframe(
-        slowest,
-        use_container_width=True,
-        hide_index=True
-    )
-    
-    st.caption(
-        "Top 10 patients by total end-to-end pipeline latency. "
-        f"Rank 1 = slowest. High latency typically correlates with more trials "
-        f"evaluated or larger {_judge} output."
-    )
+    if _measured == 0:
+        st.info(
+            f"**Timing unavailable.** No patient in this selection recorded a "
+            f"`total_time`, so there is no latency to rank -- all "
+            f"{len(df):,} row(s) are unmeasured. That is not a ranking of "
+            f"zero: a row with no timing is one nothing was measured for, and "
+            f"showing it at rank 1 would assert a measurement that was never "
+            f"taken."
+        )
+    else:
+        slowest = df[_measured_mask].nlargest(10, 'total_time').copy()
+        # ANNOTATE BEFORE SLICING, and from a COPY: `annotate` derives the display
+        # bucket through the same mapping every other panel groups by, including
+        # the column-absent case, so a database predating era 3 renders the
+        # not-recorded bucket here rather than raising a KeyError.
+        slowest = call_mode.annotate(slowest)[_slow_cols + ['call_mode_label']]
+        slowest.insert(0, 'Rank', range(1, len(slowest) + 1))
+
+        slowest.columns = ['Rank'] + _slow_names + ['Call Mode']
+
+        slowest['Total Time (s)'] = slowest['Total Time (s)'].round(1)
+        slowest[f'{_judge} Time (s)'] = slowest[f'{_judge} Time (s)'].round(1)
+
+        st.dataframe(
+            slowest,
+            use_container_width=True,
+            hide_index=True
+        )
+
+        # THE UNMEASURED COUNT IS STATED, NEVER LEFT TO BE INFERRED FROM A SHORT
+        # TABLE. A ranking over 7 of 12 patients and a ranking over 7 of 7 look
+        # identical on screen, and only one of them is a ranking of the cohort.
+        st.caption(
+            f"Top {min(10, _measured)} patients by total end-to-end pipeline "
+            f"latency, ranked over the {_measured:,} of {len(df):,} row(s) that "
+            f"recorded a `total_time`. Rank 1 = slowest. High latency typically "
+            f"correlates with more trials evaluated or larger {_judge} output."
+            + (f" **{_unmeasured:,} row(s) recorded no timing and are not "
+               f"ranked** -- they are excluded, not placed last."
+               if _unmeasured else "")
+        )
 
     st.markdown("---")
 

@@ -13,6 +13,7 @@ from oncotriage.dashboard.tiers import (
     MATCH_TIER_COLORS,
     PATIENT_OUTCOME_FULL,
     PATIENT_OUTCOME_LABELS,
+    display_trial_title,
 )
 
 
@@ -373,7 +374,33 @@ def render_match_quality_tab(df):
                 # same score as one confirmed on every criterion. The count of
                 # zero-score inferences is reported beside it instead.
                 elig = elig.copy()
-                top = elig.groupby(['nct_id', 'trial_title']).agg(
+                # GROUPED BY TRIAL ID ALONE, the pattern the Trial Explorer's
+                # selector was repaired to in the same item. The title is a
+                # DISPLAY attribute of a trial and not part of its identity;
+                # grouping on the pair made a recorded title and a missing one
+                # two different trials, of which `DataFrame.groupby` then kept
+                # one and DROPPED the other, because it discards NaN group keys
+                # by default. Here that cost:
+                #
+                #     a trial whose every eligible row had a NULL title was
+                #         ABSENT from this ranking -- not ranked low, absent --
+                #         so the panel that answers "which trials matched the
+                #         most patients" could not see it at all;
+                #
+                #     a trial with a MIXED title was ranked on its TITLED rows
+                #         only, so its Match Count was short by the untitled
+                #         ones and its Avg Score was a mean over a subset.
+                #
+                # Both are silent: nothing raises, and a shorter table is
+                # indistinguishable from a corpus holding fewer trials.
+                #
+                # THE TITLE AGGREGATION COMES FIRST so the POSITIONAL rename
+                # below still names the right five columns, and the title it
+                # picks is the FIRST RECORDED one among that trial's own rows --
+                # see tiers.display_trial_title, the one owner of that rule and
+                # of the label an untitled trial is named by.
+                top = elig.groupby('nct_id').agg(
+                    trial_title=('trial_title', display_trial_title),
                     match_count=('inference_id', 'count'),
                     avg_score=('match_score', 'mean'),
                     unconfirmed=('match_score', lambda s: int((s <= 0).sum())),

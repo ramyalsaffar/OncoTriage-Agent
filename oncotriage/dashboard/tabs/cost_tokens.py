@@ -160,7 +160,12 @@ def render_cost_tokens_tab(df):
                      hide_index=True)
     
     st.markdown("---")
-    st.subheader("Cost Breakdown by Model")
+    # THE "Cost Breakdown by Model" HEADING USED TO BE HERE AND IS NOW RENDERED
+    # BELOW, after the pricing (the dashboard-fixes pass). It carries the
+    # PARTIAL label and the excluded-row count, which cannot be known until the
+    # groups have been priced. A heading is read by everybody and a banner
+    # further down is read by whoever scrolls; the figure a partial breakdown
+    # most needs qualified is the one people quote out of the heading.
     
     # This recomputes cost from raw tokens rather than reading
     # estimated_cost_usd, so it needs the same pricing table the writer used.
@@ -194,18 +199,38 @@ def render_cost_tokens_tab(df):
     # (node_no_candidates, or a pre-response failure); they carry no Stage 5
     # tokens and so contribute no cost, but dropping them silently would hide a
     # logging defect if they ever did.
+    # PER GROUP, NOT PER PANEL (the dashboard-fixes pass). This read
+    #
+    #     except UnknownModelPricingError: st.error(...); return
+    #
+    # so ONE group whose model is absent from PRICING_CONFIG blanked the WHOLE
+    # tab -- every priced model beside it, the token panels, the projections,
+    # the per-mode breakdown. The states that reach it are ordinary: a judge
+    # whose pricing edit is outstanding, an archived row from a retired model,
+    # a hand-inserted row, a blank `matching_model`. `on_unpriced="degrade"`
+    # prices that group at $0.00 with `model_priced = False` and the reason in
+    # `note`, and prices every other group normally; the loop below names and
+    # counts them, and the PARTIAL banner qualifies every figure built on the
+    # remainder. See queries.COST_UNPRICED_POLICIES for why this is not a
+    # weakening of "cost accounting fails loudly" -- File 16's Query 10 takes
+    # the raising default, and `get_model_cost` is untouched.
     try:
-        _priced = queries.price_model_groups(queries.model_groups_from_frame(df))
-    except UnknownModelPricingError as e:
-        st.error(
-            f"Cost breakdown unavailable: {e}"
-        )
+        _priced = queries.price_model_groups(
+            queries.model_groups_from_frame(df),
+            on_unpriced=queries.COST_UNPRICED_DEGRADE)
+    except UnknownModelPricingError as e:                # pragma: no cover
+        # UNREACHABLE UNDER `degrade` AND KEPT ANYWAY. The handler is what
+        # stands between a future edit that changes the policy back and a
+        # traceback rendered where a dashboard should be; deleting it would
+        # make that edit silent.
+        st.error(f"Cost breakdown unavailable: {e}")
         return
 
     cost_components = []      # one row per (model, input|output)
     llm_classifier_input_cost = 0.0
     llm_classifier_output_cost = 0.0
     unpriceable_tokens = 0
+    unpriced_groups = []      # (label, rows, tokens, note) -- named AND counted
     unrecorded_token_models = []
 
     for _row in _priced.itertuples(index=False):
@@ -219,10 +244,16 @@ def render_cost_tokens_tab(df):
         if pd.isna(_row.input_tokens) and pd.isna(_row.output_tokens):
             unrecorded_token_models.append(_row.matching_model)
 
-        if not _row.model_recorded:
-            # Nothing to price against. Surfaced only if it carries
-            # tokens, because a no-candidates run legitimately has none.
+        if not _row.model_priced:
+            # NOTHING TO PRICE THIS GROUP'S CONSUMPTION AT, for any of three
+            # reasons the frame keeps apart: `matching_model` is NULL, it is
+            # blank, or it names a model PRICING_CONFIG has no rate for. The
+            # first is the ordinary no-candidates run and the other two are
+            # findings; all three contribute $0.00 and none of them may be
+            # folded into the priced total.
             unpriceable_tokens += _in + _out
+            unpriced_groups.append((_row.matching_model, int(_row.rows),
+                                    _in + _out, _row.note))
             continue
 
         llm_classifier_input_cost += _row.input_cost
@@ -230,12 +261,24 @@ def render_cost_tokens_tab(df):
         cost_components.append((f"{_row.matching_model} Output", _row.output_cost))
         cost_components.append((f"{_row.matching_model} Input", _row.input_cost))
 
-    if unpriceable_tokens:
+    # EVERY EXCLUDED GROUP IS NAMED AND COUNTED, one line each, and the count
+    # of EXCLUDED ROWS is stated -- which is what makes the PARTIAL label below
+    # a measurement rather than a caveat. A single aggregate warning would say
+    # how many tokens were dropped and not which models dropped them, and the
+    # model name is the whole of the remedy for the unpriced case (add its rate
+    # to PRICING_CONFIG).
+    _excluded_rows = sum(rows for _l, rows, _t, _n in unpriced_groups)
+    if unpriced_groups:
+        _lines = "\n".join(
+            f"- **{label}** — {rows:,} row(s), {tokens:,} Stage 5 token(s) "
+            f"excluded. {note}"
+            for label, rows, tokens, note in unpriced_groups)
         st.warning(
-            f"{unpriceable_tokens:,} Stage 5 tokens are on rows with no "
-            f"matching_model recorded and are excluded from this breakdown. "
-            f"A row with tokens but no model is a logging defect — the model "
-            f"that produced them was not carried out of Stage 5."
+            f"**{len(unpriced_groups)} model group(s) could not be priced** "
+            f"({_excluded_rows:,} of {int(_priced['rows'].sum()):,} rows, "
+            f"{unpriceable_tokens:,} Stage 5 tokens). They contribute $0.00 "
+            f"below, which is not a statement that they cost nothing.\n\n"
+            f"{_lines}"
         )
 
     if unrecorded_token_models:
@@ -246,6 +289,26 @@ def render_cost_tokens_tab(df):
             f"the same as their having spent nothing."
         )
 
+    # THE HEADING, WITH THE PARTIAL LABEL ON IT WHEN IT IS PARTIAL.
+    # `cost_complete` is the field the query layer exposes for "is this group's
+    # recomputed cost an accounting of its spend", and it is False for BOTH
+    # causes a partial breakdown can have -- a group with no rate, and a group
+    # whose token counts were never recorded. Labelling from it rather than
+    # from `model_priced` alone is what stops the heading claiming a full
+    # accounting over groups that were priced correctly at rates applied to
+    # counts nobody recorded.
+    _incomplete_groups = _priced[~_priced["cost_complete"]]
+    _partial_rows = (int(_incomplete_groups["rows"].sum())
+                     if len(_incomplete_groups) else 0)
+    _total_rows = int(_priced["rows"].sum()) if len(_priced) else 0
+    if len(_incomplete_groups):
+        st.subheader(
+            f"Cost Breakdown by Model — PARTIAL "
+            f"({len(_incomplete_groups)} of {len(_priced)} model groups, "
+            f"{_partial_rows:,} of {_total_rows:,} rows excluded)")
+    else:
+        st.subheader("Cost Breakdown by Model")
+
     # THE TWO WARNINGS ABOVE NAME THE CAUSES; THIS ONE QUALIFIES THE NUMBERS.
     # Both of them describe groups whose recomputed cost is $0.00 for want of
     # information rather than for want of spend, and every figure below —
@@ -255,29 +318,35 @@ def render_cost_tokens_tab(df):
     # layer exposes for exactly this question, and asking it here is what keeps
     # this tab and File 16's Query 10 saying the same thing about the same
     # database.
-    _incomplete = _priced[~_priced["cost_complete"]]
-    _incomplete_rows = int(_incomplete["rows"].sum()) if len(_incomplete) else 0
-    if len(_incomplete):
+    if len(_incomplete_groups):
         st.warning(
             f"**The cost figures below are a FLOOR, not a total.** "
-            f"{len(_incomplete)} of {len(_priced)} model groups "
-            f"({_incomplete_rows:,} of {int(_priced['rows'].sum()):,} rows) "
+            f"{len(_incomplete_groups)} of {len(_priced)} model groups "
+            f"({_partial_rows:,} of {_total_rows:,} rows) "
             f"could not be priced from what was recorded — "
-            f"{', '.join(_incomplete['matching_model'].tolist())} — and "
+            f"{', '.join(_incomplete_groups['matching_model'].tolist())} — and "
             f"contribute $0.00 instead of their real spend. Every percentage "
             f"and projection on this tab is computed over the priced remainder."
         )
 
     if not cost_components:
-        # Every row has a NULL matching_model, so there is nothing to price
-        # and nothing to name. Said out loud rather than drawn as an empty
-        # pie chart, which is the failure mode this whole block was rewritten
-        # to remove.
+        # NOT ONE GROUP COULD BE PRICED. Said out loud rather than drawn as an
+        # empty pie chart, which is the failure mode this whole block was
+        # rewritten to remove.
+        #
+        # THE MESSAGE NAMES THE CAUSE RATHER THAN ASSERTING ONE. It used to say
+        # flatly that `matching_model` is NULL on every row -- true when the
+        # only way to reach here was a NULL model, and FALSE the moment an
+        # unpriced or blank model could arrive here too. A reader sent to look
+        # for NULLs in a table whose models are all populated and simply absent
+        # from PRICING_CONFIG is being sent to the wrong place.
         st.info(
-            "No row in this selection records which model produced it "
-            "(matching_model is NULL on all of them), so no cost breakdown "
-            "can be computed. Rows written by a pipeline terminal node always "
-            "carry the model that answered."
+            "**No cost breakdown can be computed for this selection.** Not one "
+            "of its "
+            f"{len(_priced)} model group(s) has both a model and a rate to "
+            "price it at:\n\n"
+            + "\n".join(f"- **{label}** — {rows:,} row(s). {note}"
+                         for label, rows, _tokens, note in unpriced_groups)
         )
         return
 

@@ -15,9 +15,84 @@ from datetime import datetime
 
 import streamlit as st
 
+from oncotriage.dashboard.tiers import (ANY_MATCH_TIERS, MATCH_TIER_NO_MATCH,
+                                        any_match_series)
+
+
+MATCH_FILTER_ALL = "All"
+
+
+def _tier_phrase(tiers):
+    """``('a', 'b', 'c')`` -> ``"a, b or c"``; total over any non-empty tuple.
+
+    Written as a function rather than a one-line join so the two- and
+    one-member cases are not a ``[:-1]``/``[-1]`` slice quietly producing
+    ", or x" -- ``MATCH_TIERS`` is a list somebody can edit, and a label that
+    renders as punctuation is a label nobody can read.
+    """
+    words = [t.replace(" Match", "") for t in tiers]
+    if len(words) == 1:
+        return words[0]
+    return ", ".join(words[:-1]) + " or " + words[-1]
+
+
+MATCH_FILTER_ANY = f"Any Match ({_tier_phrase(ANY_MATCH_TIERS)})"
+"""The label states the DEFINITION, and it is DERIVED FROM IT rather than typed.
+
+IT USED TO READ "Any Match (Full + Partial)" AND THE PARENTHESIS WAS FALSE IN
+BOTH DIRECTIONS. The filter beneath it was ``eligible_matches > 0``, which
+counts an Unconfirmed patient -- so the label excluded a group the filter
+included -- and the charts every tab draws beside it count Unconfirmed too,
+through ``tiers.any_match_series``. A reader narrowing to "Full + Partial" got
+a selection containing neither definition's population.
+
+A HAND-WRITTEN LABEL IS HOW THAT HAPPENED, AND REPLACING ONE CORRECT LITERAL
+WITH ANOTHER WOULD LEAVE THE MECHANISM IN PLACE. The text comes out of
+``ANY_MATCH_TIERS`` -- the same tuple ``any_match_series`` selects on -- so a
+fifth tier, or a tier moved out of the Any Match set, rewrites this label
+rather than leaving it describing the previous definition."""
+
+MATCH_FILTER_NONE = f"{MATCH_TIER_NO_MATCH} Only"
+"""The complement of the above under the SAME owner, which is what makes the
+two a partition, and named from the same constant for the same reason.
+
+``eligible_matches == 0`` was NOT a complement: a row whose
+``eligible_matches`` is NULL satisfies neither ``> 0`` nor ``== 0`` -- NaN
+compares False to both -- so such a patient vanished from the page under EITHER
+selection, and appeared under "All". ``match_tier`` has no such third state:
+``enrich_match_tiers`` assigns one of four values to every row."""
+
+MATCH_FILTER_OPTIONS = (MATCH_FILTER_ALL, MATCH_FILTER_ANY, MATCH_FILTER_NONE)
+"""Every option the match-status filter offers. CLOSED: the branch below is
+exhaustive over it, and an unlisted value would fall through and filter
+nothing while the widget said it had."""
+
+MATCH_FILTER_UNAVAILABLE = (
+    "Match status filter unavailable: this frame has no `match_tier` column, "
+    "so there is nothing to filter on. `oncotriage/dashboard/app.py:main()` "
+    "enriches before it calls this function; a caller that does not has not "
+    "been through `enrich_match_tiers`."
+)
+"""What the sidebar says instead of offering a filter it cannot apply.
+
+NOT A FALLBACK TO ``eligible_matches``. That column is the THIRD definition
+this repair removes, and reaching for it here -- in the one place that decides
+what every tab sees -- would put it back exactly where it does the most damage.
+NOT A RAISE EITHER: this function is reached before any tab renders, so a raise
+here is a blank page for a caller-ordering mistake. The filter is simply not
+offered, and the reason is on screen."""
+
 
 def render_sidebar(df):
-    """Render sidebar with filters and data refresh controls."""
+    """Render sidebar with filters and data refresh controls.
+
+    THE MATCH-STATUS FILTER READS ``match_tier``, SO ``df`` MUST ALREADY BE
+    ENRICHED. ``main()`` calls ``enrich_match_tiers`` above this call for that
+    reason; the ordering is a correctness property rather than a convenience,
+    and moving it is what let this filter stop being a third definition of
+    "Any Match". A frame without the column still renders every other filter --
+    see ``MATCH_FILTER_UNAVAILABLE``.
+    """
     
     st.sidebar.header("⚙️ Filters")
     
@@ -103,11 +178,20 @@ def render_sidebar(df):
     
     # Match Status filter
     st.sidebar.subheader("Match Status")
-    match_status_option = st.sidebar.selectbox(
-        "Select match status",
-        options=['All', 'Any Match (Full + Partial)', 'No Match Only'],
-        index=0
-    )
+    match_tier_available = 'match_tier' in df.columns
+    if match_tier_available:
+        match_status_option = st.sidebar.selectbox(
+            "Select match status",
+            options=list(MATCH_FILTER_OPTIONS),
+            index=0,
+            help="Derived from match_tier -- the SAME owner the Overview and "
+                 "Demographics tiles and the demographics charts use, so a "
+                 "selection here and the figures it produces are the same "
+                 "question asked once."
+        )
+    else:
+        match_status_option = MATCH_FILTER_ALL
+        st.sidebar.caption(MATCH_FILTER_UNAVAILABLE)
     
     # Apply filters
     filtered_df = df.copy()
@@ -137,10 +221,25 @@ def render_sidebar(df):
         (filtered_df['medication_count'] <= medication_range[1])
     ]
     
-    if match_status_option == 'Any Match (Full + Partial)':
-        filtered_df = filtered_df[filtered_df['eligible_matches'] > 0]
-    elif match_status_option == 'No Match Only':
-        filtered_df = filtered_df[filtered_df['eligible_matches'] == 0]
+    # ONE OWNER, BOTH SELECTIONS (the repair pass). This read
+    #
+    #     filtered_df['eligible_matches'] > 0        and        == 0
+    #
+    # which is a THIRD definition of "Any Match" -- beside the Overview tile's
+    # and the Demographics tab's, both of which the Part 4 pass had already
+    # made one -- and it is the one that decides what EVERY tab sees. A reader
+    # narrowing to "Any Match" and then reading an Any Match percentage was
+    # reading a figure computed over a population selected by a different rule.
+    #
+    # THE COMPLEMENT IS TAKEN FROM THE SAME MASK RATHER THAN WRITTEN OUT, so
+    # the two selections partition by construction. Writing the second as its
+    # own predicate is how the pair came to have a hole: NaN is neither `> 0`
+    # nor `== 0`.
+    if match_tier_available and match_status_option != MATCH_FILTER_ALL:
+        _any_match = any_match_series(filtered_df)
+        filtered_df = filtered_df[
+            _any_match if match_status_option == MATCH_FILTER_ANY
+            else ~_any_match]
     
     # Show filter stats
     st.sidebar.markdown("---")

@@ -4340,6 +4340,15 @@ _DECORATOR_INVENTORY = {
     # than exempted from it: this inventory is EXACT on purpose, so a new
     # decorated definition has to be declared here, which is the moment
     # somebody reads what decorator it carries and what TTL it names.
+    # The SCHEMA PREFLIGHT (the dashboard-fixes pass). Same TTL as the other
+    # nine, and declared here rather than exempted for the reason this dict is
+    # EXACT. It is the only one of the ten whose answer is about the DATABASE'S
+    # SHAPE rather than its contents, and it is cached for the same 60 seconds
+    # anyway: the shape can change under a running dashboard -- the next writer
+    # to open the file migrates it -- so a preflight cached for the life of the
+    # process would go on refusing a database that had since been repaired.
+    "oncotriage/dashboard/data.py::dashboard_schema_readiness":
+        ["st.cache_data(ttl=60)"],
     "oncotriage/dashboard/data.py::load_run_tracking_availability":
         ["st.cache_data(ttl=60)"],
     "oncotriage/dashboard/data.py::load_run_summary_data":
@@ -5986,12 +5995,35 @@ _decorated = {
 # NOT be cached. `_readonly_connection` returns a live sqlite3.Connection, and a
 # cached one would be handed to a later rerun after the first caller closed it;
 # `_load_run_query` is the uncached body the four cached loaders wrap.
-check("every loader in data.py carries @st.cache_data(ttl=60), and the two "
-      "private helpers deliberately carry nothing",
+check("every loader in data.py carries @st.cache_data(ttl=60), and the five "
+      "private/derivation helpers deliberately carry nothing",
       _decorated,
       {"load_inferences_data": ["st.cache_data(ttl=60)"],
        "load_trial_matches_data": ["st.cache_data(ttl=60)"],
        "load_drift_metrics_data": ["st.cache_data(ttl=60)"],
+       # THE SCHEMA PREFLIGHT AND ITS THREE DERIVATION HELPERS (the
+       # dashboard-fixes pass). The preflight is cached like every other
+       # loader -- it opens the database, and it must re-ask, because the next
+       # writer to open that file migrates it and a preflight cached for the
+       # life of the process would go on refusing a database since repaired.
+       #
+       # THE THREE HELPERS ARE UNCACHED ON PURPOSE AND ARE DECLARED RATHER THAN
+       # FILTERED OUT. `_reference_schema` and `_names_the_dashboard_uses`
+       # memoise into a module-level dict behind a lock, for the LIFE OF THE
+       # PROCESS rather than for 60 seconds: both are pure functions of the
+       # source on disk, so nothing a rerun does can change them, and an
+       # @st.cache_data on either would rebuild a throwaway database and
+       # re-parse fifteen modules every minute for an answer that cannot move.
+       # `dashboard_column_requirements` is their pure composition.
+       "_columns_of_create_table": [],
+       "_reference_schema": [],
+       "_names_the_dashboard_uses": [],
+       "dashboard_column_requirements": [],
+       # WHICH ABSENT COLUMNS ARE A REFUSAL AND WHICH ARE A WARNING. Uncached
+       # for the two helpers' reason: it is a pure function of two constants
+       # in `database_logger`, so nothing a rerun does can change it.
+       "_tolerated_columns": [],
+       "dashboard_schema_readiness": ["st.cache_data(ttl=60)"],
        "_readonly_connection": [],
        # The drift redesign's designation reader. It is sited AFTER
        # `_readonly_connection` because it calls it -- the three loaders above

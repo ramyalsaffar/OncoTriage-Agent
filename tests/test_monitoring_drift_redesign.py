@@ -2653,12 +2653,19 @@ if _HAVE_STREAMLIT:
         shutil.rmtree(_plant_root)
     os.makedirs(_plant_root)
     _plant_mod = os.path.join(_plant_root, "planted_drift_tab.py")
+    # THE ANCHOR MOVED WHEN THE EMPTY-CATEGORY GUARD WAS ADDED (the
+    # dashboard-fixes pass): the three Status/Computation/Alert-policy
+    # assignments are now inside an `else:` and carry four more spaces of
+    # indentation. The plant is re-anchored rather than loosened -- the
+    # expression it replaces is the same one, one indentation level in -- and
+    # the "the plant matched" check below is what reported the move, which is
+    # that check working.
     _planted = _tab_src.replace(
-        """    display_df["Status"] = display_df.apply(
-        lambda row: f"{DISPLAY_MARKERS[row['display_state']]} "
-                    f"{row['display_state']}", axis=1)""",
-        """    display_df["Status"] = display_df["alert"].apply(
-        lambda x: '\\U0001F6A8 ALERT' if x == 1 else '\\u2705 OK')""")
+        """        display_df["Status"] = display_df.apply(
+            lambda row: f"{DISPLAY_MARKERS[row['display_state']]} "
+                        f"{row['display_state']}", axis=1)""",
+        """        display_df["Status"] = display_df["alert"].apply(
+            lambda x: '\\U0001F6A8 ALERT' if x == 1 else '\\u2705 OK')""")
     check("C6 the plant matched the shipped Status expression",
           _planted != _tab_src, True)
     try:

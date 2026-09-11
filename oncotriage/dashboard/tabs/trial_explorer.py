@@ -12,7 +12,7 @@ from oncotriage.dashboard.data import load_trial_matches_data
 from oncotriage.dashboard.nullsafe import is_absent
 from oncotriage.dashboard.tiers import (TRIAL_STATUS_NO_SCORE, TRIAL_STATUS_PARTIAL,
                                         TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED,
-                                        classify_trial_score)
+                                        classify_trial_score, display_trial_title)
 
 
 @st.fragment
@@ -45,7 +45,14 @@ def render_trial_explorer_tab(df):
         suffixes=('', '_inf')
     ).drop(columns='id_inf', errors='ignore')
     
-    trial_summary = filtered_matches.groupby(['nct_id', 'trial_title']).agg(
+    # GROUPED BY TRIAL ID ALONE (the repair pass). The title is a DISPLAY
+    # attribute of a trial, not part of its identity: an NCT id is the
+    # identity, and grouping on the pair made a recorded title and a missing
+    # one two different trials -- of which pandas then kept one and dropped the
+    # other. See tiers.TRIAL_MISSING_TITLE_LABEL for what that cost, and
+    # tiers.display_trial_title for how the surviving entry is named.
+    trial_summary = filtered_matches.groupby('nct_id').agg(
+        trial_title=('trial_title', display_trial_title),
         total_patients=('patient_id', 'nunique'),
         eligible_count=('eligible', lambda x: (x == 'eligible').sum()),
         avg_score=('match_score', 'mean')
@@ -95,6 +102,8 @@ def render_trial_explorer_tab(df):
     not_eligible_patients = (trial_dedup['eligible'] == 'not_eligible').sum()
     total_patients = eligible_patients + not_eligible_patients
 
+    # `selected_trial['trial_title']` is the aggregated DISPLAY title, so it is
+    # MISSING_TITLE_LABEL rather than a NaN for a trial that recorded none.
     st.subheader(f"{selected_trial['trial_title']}")
     st.caption(f"NCT ID: {selected_nct}  |  Phase: {trial_data['trial_phase'].iloc[0]}")
 
