@@ -140,6 +140,31 @@ _SHA_ENTRY_BEFORE = hashlib.sha256(_ENTRY_SRC.encode("utf-8")).hexdigest()
 
 _TMP = tempfile.mkdtemp(prefix="ablationctl_")
 
+# INSIDE _TMP so the existing cleanup removes it, and NOT created here:
+# `control.ensure_lock_directory` creates it 0700 and verifies it.
+_LOCK_DIR = os.path.join(_TMP, "locks")
+_LOCK_NOTE = _harness.lock_isolation_note(dict(os.environ),
+                                          "test_ablation_stop_and_lock.py")
+if _LOCK_NOTE:
+    print(_LOCK_NOTE)
+
+# AND IN THIS PROCESS TOO. This file PLANTS a symlink at the study lock path it
+# derives in-process (6G), so a parent on the default directory would plant it
+# where the child never looks: measured, the study RAN and the three checks
+# that say an unopenable lock is refused reported a run that started four
+# pairs. Restored at the end: `pytest tests/` shares one process.
+_LOCK_DIR_SAVED = os.environ.get(_harness.LOCK_DIR_ENV)
+os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR
+# CREATED HERE BECAUSE THIS FILE ACQUIRES LOCKS IN ITS OWN PROCESS: a parent
+# acquisition at an explicit path does not ensure the directory (the study
+# passes `ensure_directory=path is None`), so a fresh isolated directory would
+# meet ENOENT rather than a lock. 0700 under a mkdtemp that is already 0700.
+os.makedirs(_LOCK_DIR, mode=0o700, exist_ok=True)
+# THE DEFAULT DERIVATION, CAPTURED ONCE WITH THE ISOLATION LIFTED. Read by the
+# two section-3 checks whose subject is the security property of the default
+# per-user directory rather than of whatever this file points its children at.
+_DEFAULT_LOCK_DIR = _harness.without_lock_isolation(_control.lock_directory)
+
 
 # ===========================================================================
 # HARNESS
@@ -540,7 +565,13 @@ check("3a  the lock file lives OUTSIDE the state directory -- whose other "
       "of a guessable path, so another user could pre-create it as a symlink "
       "to something this user can write and the first study to start would "
       "O_CREAT through it and ftruncate the target to zero",
-      (os.path.dirname(_path_a), _control.lock_directory()),
+      # TWO FACTS, AND THE SECOND IS MEASURED WITH THIS FILE'S OWN ISOLATION
+      # LIFTED. The first says the lock lives in whatever directory is in
+      # force; the second is the SECURITY property of the DEFAULT derivation,
+      # which has to be asked with the variable unset or it compares this
+      # file's temp directory with itself and passes for the wrong reason.
+      # MEASURED: it did, and FAILED, when this file first set the override.
+      (os.path.dirname(_path_a), _DEFAULT_LOCK_DIR),
       (_control.lock_directory(),
        os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")))
 check("3a-b ...and the directory is named by the UID rather than by the login "
@@ -550,7 +581,8 @@ check("3a-b ...and the directory is named by the UID rather than by the login "
       "whenever those differed between invocations (a cron entry beside an "
       "interactive shell), and two namespaces for one checkpoint is the double "
       "bill this lock exists to prevent",
-      os.path.basename(_control.lock_directory()),
+      # THE DEFAULT DERIVATION, with this file's isolation lifted -- see 3a.
+      os.path.basename(_DEFAULT_LOCK_DIR),
       f"oncotriage-{os.getuid()}")
 check("3a-c ...and lock_directory() is PURE while ensure_lock_directory() is "
       "the one that creates, on the output_dir()/ensure_output_dir() split "
@@ -1485,6 +1517,12 @@ def drive_entry(name, *, park=False, action=None, args=(), patients=6,
     env.update(_harness.park_env(
         _harness.PARK_ALL if park else _harness.PARK_NONE,
         ready, release, cap=90))
+    # THE PROVIDER-ALLOWANCE LOCK'S DIRECTORY, PRIVATE TO THIS FILE. The entry
+    # point now takes a lock keyed on the provider ALLOWANCE -- the SAME one a
+    # batch run takes, since a study dispatches the same judge -- so without
+    # this, this file's children and the three runner harnesses' children would
+    # all guard one lock in bucket A. See _control_harness.LOCK_DIR_ENV.
+    _harness.isolate_locks(env, _LOCK_DIR)
 
     def _log_text():
         try:
@@ -2055,6 +2093,16 @@ check("8c  ...and the two hashes are of DIFFERENT files (non-degeneracy: the "
       "twice in one expression and was a tautology)",
       _SHA_STUDY_BEFORE == _SHA_ENTRY_BEFORE, False)
 
+# RESTORED BEFORE THE TREE GOES: `pytest tests/` imports every module into one
+# process, so a leaked value would point a later file's locks into a directory
+# this one has just removed.
+if _LOCK_DIR_SAVED is None:
+    os.environ.pop(_harness.LOCK_DIR_ENV, None)
+else:
+    os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR_SAVED
+check("8e  the lock-directory isolation is restored to exactly what it was "
+      "found at, so this file leaves no state in the process",
+      os.environ.get(_harness.LOCK_DIR_ENV), _LOCK_DIR_SAVED)
 shutil.rmtree(_TMP, ignore_errors=True)
 check("8d  the temp tree is gone", os.path.exists(_TMP), False)
 

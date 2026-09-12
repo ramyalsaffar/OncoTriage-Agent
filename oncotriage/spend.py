@@ -1340,7 +1340,11 @@ BILLED_SITE_DISPOSITIONS = (DISPOSITION_GATED_HERE, DISPOSITION_GATED_UPSTREAM,
 
 BILLED_SITES = {
     # ── STAGE 5 ───────────────────────────────────────────────────────────
-    "oncotriage/agent/evaluation.py::call_matching_model": (
+    # THE SINGLE-ATTEMPT SENDERS, SINCE THE PROVIDER-RESILIENCE PASS. The
+    # billed attribute access moved one frame down: `call_matching_model` and
+    # its warmup now wrap these in the one retry policy, and the node's three
+    # call sites -- which the gate brackets -- still call the wrappers.
+    "oncotriage/agent/evaluation.py::_send_matching_call": (
         DISPOSITION_GATED_UPSTREAM,
         "oncotriage/agent/evaluation.py::_spend_gate",
         "The Stage 5 node brackets all three of its billed call sites -- the "
@@ -1350,7 +1354,7 @@ BILLED_SITES = {
         "function as well would decline the same request twice and would "
         "break the counter's phase keys, which name WHICH of the three sites "
         "declined."),
-    "oncotriage/agent/evaluation.py::call_matching_model_warmup": (
+    "oncotriage/agent/evaluation.py::_send_matching_warmup_call": (
         DISPOSITION_GATED_UPSTREAM,
         "oncotriage/agent/evaluation.py::_spend_gate",
         "The per-trial cache writer, gated at the `warmup:` phase. See the "

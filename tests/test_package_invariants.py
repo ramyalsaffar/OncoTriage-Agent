@@ -4434,6 +4434,13 @@ _DECORATOR_INVENTORY = {
     # tests/test_mcp_server_stdio_contract.py section 2 asserts the parameter
     # NAMES, and this entry is what makes the decorator's loss visible here too.
     "oncotriage/mcp/server.py::_stdout_to_stderr": ["contextlib.contextmanager"],
+    # THE PER-SCOPE PROVIDER LOCK. A generator without the decorator raises
+    # AttributeError on `with exclusive_scope_lock(...)`, which is exactly the
+    # loss this inventory exists to make visible in a bucket run rather than
+    # when somebody starts a campaign -- the same argument the batch runner's
+    # and the study's `exclusive_run_lock` entries carry.
+    "oncotriage/provider_resilience.py::exclusive_scope_lock":
+        ["contextlib.contextmanager"],
     "oncotriage/mcp/server.py::_counted.decorate.wrapper": ["functools.wraps(fn)"],
     "oncotriage/mcp/server.py::parse_fhir_bundle_tool":
         ["_counted('parse_fhir_bundle')"],
@@ -5434,6 +5441,14 @@ def make_factory(key):
 
 ACCESSORS = {
     deps.OPENAI_CLIENT:    ("get_openai_client", "_OPENAI"),
+    # THE SECOND OPENAI SEAM. Stage 5's client is its own key with its own
+    # factory (SDK retries 0), so it needs its own row here or the build-once
+    # guarantee is unchecked for exactly the accessor that Stage 5 resolves on
+    # every patient of every run. THIS TABLE IS HAND-LISTED RATHER THAN DERIVED
+    # FROM deps.OVERRIDE_KEYS, which is why adding the key elsewhere did not
+    # add it here and this file still reported green -- a silent under-count
+    # rather than a failure.
+    deps.OPENAI_INFERENCE_CLIENT: ("get_openai_inference_client", "_OPENAI_INF"),
     deps.BEDROCK_CLIENT:   ("get_bedrock_client", "_BEDROCK"),
     deps.QDRANT_CLIENT:    ("get_qdrant_client", "_QDRANT"),
     deps.BM25_QUERY_MODEL: ("get_bm25_query_model", "_BM25"),
@@ -5495,23 +5510,31 @@ else:
     # with zero keys, or if every worker silently died.
     check("it ran with MAX_WORKERS threads, and MAX_WORKERS is more than one",
           (_payload.get("workers") or 0) > 1, True)
-    # NINE SINCE deps.BEDROCK_CLIENT JOINED THE SEAM. Written as a literal
-    # rather than as len(ACCESSORS), because ACCESSORS lives in the SUBPROCESS
-    # source below: deriving the expectation from the thing under test is how a
-    # table that quietly stopped covering a key passes anyway.
-    check("every accessor key was exercised", len(_keys), 9)
+    # TEN SINCE deps.OPENAI_INFERENCE_CLIENT JOINED THE SEAM (was nine at
+    # deps.BEDROCK_CLIENT). Written as a literal rather than as len(ACCESSORS),
+    # because ACCESSORS lives in the SUBPROCESS source below: deriving the
+    # expectation from the thing under test is how a table that quietly stopped
+    # covering a key passes anyway. THIS LITERAL FIRING IS THE MECHANISM
+    # WORKING -- the split added a key in deps and this number is what refused
+    # to let the concurrency table silently cover one fewer accessor than the
+    # seam has.
+    check("every accessor key was exercised", len(_keys), 10)
     check("every key was observed by every worker (no worker died silently)",
           _payload.get("observations_per_key"), [_payload.get("workers")])
 
     check("every key handed the same object to all MAX_WORKERS threads",
           _payload.get("keys_with_more_than_one_object"), [])
-    check("...for every one of the nine keys, not just the ones that happened "
+    check("...for every one of the ten keys, not just the ones that happened "
           "to be fast", sorted(_payload.get("keys_with_one_object") or []),
           sorted(_keys))
     check("each factory ran EXACTLY ONCE, so 'same object' is not twelve builds "
           "with eleven thrown away",
           sorted(set((_payload.get("builds") or {}).values())), [1])
-    check("...and deps reports exactly those eight keys as cached, through the "
+    # "EIGHT" WAS ALREADY WRONG BEFORE THE SPLIT -- it compares against _keys,
+    # which was nine at the time this line said eight, so the prose and the
+    # assertion disagreed and only the assertion was load-bearing. Corrected to
+    # ten with the rest rather than left as a second wrong number.
+    check("...and deps reports exactly those ten keys as cached, through the "
           "non-building query added in pass 20c-3b",
           sorted(_payload.get("cached_keys") or []), sorted(_keys))
 

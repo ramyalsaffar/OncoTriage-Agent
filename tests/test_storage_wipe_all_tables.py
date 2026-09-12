@@ -86,6 +86,11 @@ import tempfile
 
 from oncotriage import paths as _paths
 from oncotriage.storage.maintenance import empty_database
+# HOISTED FROM SECTION 7. Section 6 builds the production PARITY database with
+# it now -- the schema comes from the project's own writer rather than from a
+# read of the production file -- so the import has to precede that section
+# rather than sitting beside its original single use further down.
+from oncotriage.storage.database_logger import initialize_database
 
 
 #------------------------------------------------------------------------------
@@ -122,6 +127,25 @@ def raises(fn):
 
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage-wipe-")
+
+# THE SIDECAR STATE BEFORE THIS FILE RUNS, CAPTURED AT MODULE SCOPE.
+#
+# The isolation PROOF is that this file opens no production database at all;
+# this capture is what lets section 6 SHOW it rather than assert it. Compared
+# against the same two paths at the end, it fails if this file creates a `-wal`
+# or a `-shm` beside the production database -- which is what a `mode=ro`
+# connection to a WAL database does, and what this file used to do.
+#
+# IT RECORDS THE STATE RATHER THAN DEMANDING ABSENCE. Those sidecars may be
+# present for reasons that have nothing to do with this file -- any campaign,
+# any reader, any other process -- so "they are not there" is not a statement
+# about this file's behaviour, while "they are exactly as I found them" is.
+# `tests/test_storage_packing_and_cache_columns.py` asserts their ABSENCE and
+# fails on sidecars it did not create; that is its own repair, not this one's.
+_PROD_SIDECARS_BEFORE = {
+    suffix: os.path.exists(_paths.inferences_path + suffix)
+    for suffix in ("-wal", "-shm")
+}
 
 
 def _db(name, *statements):
@@ -318,21 +342,52 @@ print("=" * 70)
 # or one that created a table under another name, fails it -- but it is no
 # longer a statement about WHICH tables production has, and the non-degeneracy
 # line above is what keeps it from passing over an empty read.
-_production = _paths.inferences_path
+# THE SHAPE COMES FROM THE PROJECT'S OWN WRITER, ON A SCRATCH DATABASE. THE
+# PRODUCTION FILE IS NEVER OPENED.
+#
+# WHY THIS MOVED. It used to read `sqlite_master` out of the production
+# database over a `mode=ro` URI. Read-only is not side-effect-free on a WAL
+# database: SQLite creates the `-wal` and `-shm` sidecars for ANY connection,
+# including a reader, because a WAL reader needs the shared-memory index. So
+# this file -- whose own section 5 promises it touched nothing -- was creating
+# two files beside the production database on every run, and
+# `tests/test_storage_packing_and_cache_columns.py` is what detected them,
+# failing on `os.path.exists(_PROD_DB + "-wal")` for sidecars IT did not make.
+# MEASURED: production `inferences.db` carries WAL header bytes (2, 2), and the
+# sidecars' mtimes advanced on runs of this file and never on runs of that one.
+#
+# `immutable=1` WOULD SUPPRESS THE SIDECARS AND IS NOT USED, DELIBERATELY.
+# SQLite's own documentation is explicit that it is for media that CANNOT
+# change, and tells the caller that using it on a database another process may
+# write yields undefined behaviour and can return incorrect results. The
+# production database is written by every campaign. A flag that makes this test
+# quiet by telling SQLite a false thing about a live file is not an isolation
+# fix; not opening the file is.
+#
+# WHAT IS LOST AND WHAT IS KEPT. The clone is no longer derived from what the
+# production file HAPPENS to hold -- which was already narrowed to "every
+# CREATE executed and produced a table under the name it names" -- and is now
+# derived from `initialize_database`, the function that PUTS that shape there.
+# That is the parity rule: the scratch database carries the schema the writer
+# creates, so a statement that fails or creates a table under another name
+# still fails this, and the comparison no longer depends on whether a campaign
+# has ever run on this machine.
+_parity = os.path.join(_TMP, "production_parity.db")
+initialize_database(_parity)
 _schema = []
 _production_tables = []
-if os.path.exists(_production):
-    _conn = sqlite3.connect(f"file:{_production}?mode=ro", uri=True)
-    try:
-        for _name, _sql in _conn.execute(
-                "SELECT name, sql FROM sqlite_master WHERE type='table' "
-                "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"):
-            _production_tables.append(_name)
-            _schema.append(_sql)
-    finally:
-        _conn.close()
+_conn = sqlite3.connect(_parity)
+try:
+    for _name, _sql in _conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE type='table' "
+            "AND name NOT LIKE 'sqlite_%' AND sql IS NOT NULL"):
+        _production_tables.append(_name)
+        _schema.append(_sql)
+finally:
+    _conn.close()
 
-check("the production schema was read and is non-degenerate",
+check("the production SHAPE was built by initialize_database and is "
+      "non-degenerate (no production file was opened)",
       len(_schema) >= 3, True)
 check("...and every statement read came with the name it creates",
       len(_production_tables), len(_schema))
@@ -350,10 +405,17 @@ if _schema:
           sorted((t, _count(_clone, t)) for t in _clone_tables),
           sorted((t, 0) for t in _clone_tables))
 
-# The production database itself must be exactly as it was: this file opened it
-# read-only and never handed it to empty_database.
-check("the production database still exists and was never wiped by this file",
-      os.path.exists(_production), True)
+# THE PRODUCTION DATABASE IS NEVER OPENED BY THIS FILE AT ALL, which is a
+# stronger claim than the one that stood here ("opened read-only and never
+# handed to empty_database") and is why the two sidecar checks below can be an
+# isolation PROOF rather than a hope: a file that opens nothing cannot create a
+# `-wal` or a `-shm`, whatever journal mode the database is in.
+check("this file resolved no production path and opened no production "
+      "database", "_production" in dir(), False)
+for _suffix in ("-wal", "-shm"):
+    check(f"...and created no {_suffix} sidecar beside it",
+          os.path.exists(_paths.inferences_path + _suffix),
+          _PROD_SIDECARS_BEFORE[_suffix])
 
 
 # ===========================================================================

@@ -1836,8 +1836,8 @@ def _probe_throttle_ceiling(args, config, adapter):
           f"was measured at {args.max_rpm:.0f} in the AWS console "
           f"(2026-08-30). Everything above this section held itself under it; "
           f"this section does not.")
-    print(f"  Retries are OFF for this phase only (max_attempts=1), so every "
-          f"429 surfaces instead of being absorbed.")
+    print(f"  Retries are OFF for this phase only (total_max_attempts=1), so "
+          f"every 429 surfaces instead of being absorbed.")
 
     throttle_client = boto3.client(
         "bedrock-runtime",
@@ -1845,7 +1845,13 @@ def _probe_throttle_ceiling(args, config, adapter):
         config=_BotoConfig(
             connect_timeout=config.BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS,
             read_timeout=config.MATCHING_REQUEST_TIMEOUT_SECONDS,
-            retries={"max_attempts": 1, "mode": "standard"}),
+            # `total_max_attempts`, NOT `max_attempts` (the provider-resilience
+            # pass). In a botocore Config the latter counts RETRIES: measured
+            # offline against botocore 1.42.42, {"max_attempts": 1} makes TWO
+            # wire attempts, so this phase used to absorb one 429 per call
+            # while printing that retries were off. {"total_max_attempts": 1}
+            # makes exactly one.
+            retries={"total_max_attempts": 1, "mode": "standard"}),
     )
     kw = adapter.build_converse_request(
         PROBE_SYSTEM, config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE,
@@ -1930,14 +1936,16 @@ def _probe_throttle_ceiling(args, config, adapter):
 
     if w1["thr"] and not w2["thr"]:
         verdict = ("BURSTY — wave 1 throttled and wave 2, after a recovery "
-                   "pause, did not. The limit refills. Raising "
-                   "BEDROCK_ANTHROPIC_MAX_ATTEMPTS lets a campaign ride these "
-                   "out.")
+                   "pause, did not. The limit refills. This burst bypassed the "
+                   "pipeline's pacer on purpose; a campaign paces every wire "
+                   "attempt to config.PROVIDER_REQUESTS_PER_MINUTE, so set "
+                   "that figure to the burst size that did NOT throttle.")
     elif w1["thr"] and w2["thr"]:
-        verdict = ("SUSTAINED — both waves throttled. botocore's retry quota "
-                   "drains under sustained throttling and stops retrying, so a "
-                   "bigger BEDROCK_ANTHROPIC_MAX_ATTEMPTS does nothing: the "
-                   "remedy is a smaller BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS.")
+        verdict = ("SUSTAINED — both waves throttled. The limit is not "
+                   "refilling at this rate, so a larger "
+                   "config.MATCHING_CALL_MAX_ATTEMPTS only waits longer: lower "
+                   "config.PROVIDER_REQUESTS_PER_MINUTE (or "
+                   "BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS).")
     elif not w1["thr"]:
         verdict = ("NOT REACHED — no 429 at this burst size. Either the "
                    "applied quota is higher than the console reported, or the "

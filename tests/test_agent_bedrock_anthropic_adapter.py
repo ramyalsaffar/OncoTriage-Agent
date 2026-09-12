@@ -276,6 +276,13 @@ _KNOB_NAMES = tuple(sorted(
 _SHIPPED_AT_IMPORT = {n: getattr(config, n)
                       for n in ("MATCHING_PROVIDER",) + _KNOB_NAMES}
 
+# EXPLICIT TEST LIMITS -- see tests/_provider_pin.py. Sections here drive the
+# real dispatch, which reserves before sending; the shipped scopes are UNKNOWN
+# and refuse. Stating the limit is the harness's job, not the pacer's.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _provider_pin import install_test_quotas, restore_test_quotas  # noqa: E402
+install_test_quotas(os.path.basename(__file__))
+
 
 # ===========================================================================
 # STAND-INS
@@ -435,10 +442,13 @@ check("...and the OpenAI provider is still a member of the vocabulary, so the "
 # unconditional OpenAI return, and the OpenAI return must be last.
 _EVAL_SRC = open(_EVALUATION_PATH, encoding="utf-8").read()
 _EVAL_TREE = ast.parse(_EVAL_SRC)
+# `_send_matching_call` since the provider-resilience pass: the dispatch body
+# these pins are about moved one frame below the retry-policy wrapper.
 _call_fn = next((n for n in ast.walk(_EVAL_TREE)
                  if isinstance(n, ast.FunctionDef)
-                 and n.name == "call_matching_model"), None)
-check_true("call_matching_model is present in evaluation.py", _call_fn is not None)
+                 and n.name == "_send_matching_call"), None)
+check_true("the single-attempt dispatcher (_send_matching_call) is present in "
+           "evaluation.py", _call_fn is not None)
 
 if _call_fn is not None:
     _body_src = ast.unparse(_call_fn)
@@ -450,8 +460,20 @@ if _call_fn is not None:
     _last = _call_fn.body[-1]
     check("the final statement is still the unconditional OpenAI return",
           isinstance(_last, ast.Return), True)
-    check_true("...and it names the OpenAI client, unguarded",
-               "get_openai_client" in ast.unparse(_last))
+    # THE INFERENCE CLIENT, NOT THE EMBEDDING ONE, AND THAT DISTINCTION IS THE
+    # POINT RATHER THAN A RENAME. Stage 5 is covered by the retry policy, so it
+    # reads `deps.get_openai_inference_client()` (SDK retries 0, or the policy's
+    # attempt budget is true of the policy and false of the wire). Stage 2's
+    # embedding and the index build stay on `deps.get_openai_client()`, whose
+    # SDK retry is their ONLY resilience. Pinning the bare word "OpenAI client"
+    # would be satisfied by either, which is exactly the confusion that made
+    # this line stale when the split landed.
+    _last_src = ast.unparse(_last)
+    check_true("...and it names the INFERENCE client, unguarded",
+               "get_openai_inference_client" in _last_src)
+    check_true("...and NOT the embedding client, so the split is pinned rather "
+               "than merely 'some OpenAI client'",
+               "deps.get_openai_client()" not in _last_src)
     # Every provider dispatch is an `if` ABOVE it.
     _dispatch_ifs = [n for n in _call_fn.body
                      if isinstance(n, ast.If)
@@ -2659,6 +2681,27 @@ for _path, _sha in sorted(_SHA_BEFORE.items()):
 
 check("boto3 was never imported by anything this file did",
       "boto3" in sys.modules, False)
+
+
+# ── THE TEST QUOTA LIMITS ARE RELEASED, AND THE RELEASE IS MEASURED ─────────
+#
+# ABOVE THE SUMMARY, NEVER BELOW IT, on `release_openai_arm`'s own argument: a
+# release below the results line still decides the exit code while being
+# absent from the number the summary printed -- a run reporting "0 failed" and
+# exiting non-zero, a defect this project has shipped three times.
+#
+# WITHOUT THIS THE TABLES STAY MUTATED FOR THE LIFE OF THE PROCESS. All four
+# files that call `install_test_quotas` imported `restore_test_quotas` and none
+# of them called it. One-file-per-process in bucket A that is invisible; under
+# `pytest tests/`, which imports every one of them into ONE interpreter, the
+# SECOND install raises ProviderPinError and aborts collection. The collision
+# and its removal are driven in tests/test_provider_quotas_lookup.py section 6.
+_QUOTA_OWNER, _QUOTA_RESTORED = restore_test_quotas()
+check("the test quota limits this file installed are RELEASED, and both tables "
+      "are back to what _provider_pin read at its OWN import -- compared "
+      "against that independent reading rather than against the value the "
+      "restore just assigned",
+      (_QUOTA_OWNER, _QUOTA_RESTORED), (os.path.basename(__file__), True))
 
 
 # ===========================================================================

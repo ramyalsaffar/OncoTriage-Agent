@@ -401,7 +401,18 @@ def lock_directory() -> str:
     `oncotriage-batch-run-` and `oncotriage-ablation-run-`. A serial run and a
     batch run must not refuse each other -- they guard different things -- so
     the prefixes are load-bearing and must stay distinct.
+
+    `ONCOTRIAGE_LOCK_DIR` MOVES IT. See `oncotriage/control.py`'s copy for the
+    argument -- bucket A's concurrency, not an operator knob -- and note that
+    this file's whole reason for keeping its own copy is that it imports
+    nothing from the project, so the variable's name is a literal here too.
+    `tests/test_serial_runner_lock.py` section 9a requires this body to be
+    IDENTICAL to control's after `ast.unparse`, docstring aside, so the two
+    cannot drift.
     """
+    override = os.environ.get("ONCOTRIAGE_LOCK_DIR")
+    if override and override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
     return os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")
 
 

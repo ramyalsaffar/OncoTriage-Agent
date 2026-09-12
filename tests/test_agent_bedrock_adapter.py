@@ -271,6 +271,16 @@ _SHIPPED_AT_IMPORT = {
                  "BEDROCK_SEND_SEED_IN_EXTRA_BODY")
 }
 
+# EXPLICIT TEST LIMITS -- see tests/_provider_pin.py for the argument. Section 1
+# drives the OpenAI arm's real dispatch, which RESERVES before it sends, and
+# `config` ships UNKNOWN for that scope: unknown REFUSES rather than running
+# unpaced. MEASURED before this line existed: `QuotaUnknown: scope 'openai'`,
+# and the recorder saw zero calls. The pacer has no stub-detection bypass and
+# must not grow one, so the harness states the limit it drives under.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _provider_pin import install_test_quotas, restore_test_quotas  # noqa: E402
+install_test_quotas(os.path.basename(__file__))
+
 
 # ===========================================================================
 # STAND-INS
@@ -410,10 +420,16 @@ check("...spelt exactly: the shipped default is the Converse branch",
 # is built from are pinned to text.
 
 _EVAL_TREE = ast.parse(open(_EVALUATION_PATH, encoding="utf-8").read())
+# `_send_matching_call` SINCE THE PROVIDER-RESILIENCE PASS. The single-attempt
+# dispatcher -- the body every pin below is about -- moved one frame down, and
+# `call_matching_model` now wraps it in the one retry policy. Every property
+# pinned here is a property of the body, which did not change; retargeting the
+# lookup is what keeps the pins about that body rather than about the wrapper.
 _call_fn = next((n for n in ast.walk(_EVAL_TREE)
                  if isinstance(n, ast.FunctionDef)
-                 and n.name == "call_matching_model"), None)
-check_true("call_matching_model is present in evaluation.py", _call_fn is not None)
+                 and n.name == "_send_matching_call"), None)
+check_true("the single-attempt dispatcher (_send_matching_call) is present in "
+           "evaluation.py", _call_fn is not None)
 
 _chat_calls = [n for n in ast.walk(_call_fn or ast.Module(body=[], type_ignores=[]))
                if isinstance(n, ast.Call)
@@ -465,8 +481,19 @@ check("...which is populated by exactly one guarded assignment, so it is "
       ["_extra_kwargs = {}", "_extra_kwargs['prompt_cache_key'] = "
        "prompt_cache_key"])
 
-check("the OpenAI call still reads its client from deps.get_openai_client()",
-      "deps.get_openai_client()" in ast.unparse(_chat_calls[0].func)
+# THE INFERENCE CLIENT SINCE THE SPLIT, AND THE DISTINCTION IS LOAD-BEARING.
+# Stage 5 is covered by the retry policy, so it reads
+# `deps.get_openai_inference_client()` (SDK retries 0, or the policy's attempt
+# budget is true of the policy and false of the wire). Stage 2's embedding and
+# the index build stay on `deps.get_openai_client()`, whose SDK retry is their
+# only resilience. This line used to name the bare accessor and went stale the
+# moment the split landed -- which is the pin working, not a nuisance.
+check("the OpenAI call reads its client from deps.get_openai_inference_client()",
+      "deps.get_openai_inference_client()" in ast.unparse(_chat_calls[0].func)
+      if _chat_calls else False, True)
+check("...and NOT from the embedding client, so the split is pinned rather "
+      "than merely 'some OpenAI client'",
+      "deps.get_openai_client()" not in ast.unparse(_chat_calls[0].func)
       if _chat_calls else False, True)
 
 # The dispatch is ABOVE the return, so the return is reached unchanged.
@@ -483,8 +510,12 @@ check("call_matching_model has exactly three returns: the two Bedrock "
 check("...and the LAST statement of the function is still the unconditional "
       "OpenAI return, which is what 'the default path is unchanged' means",
       isinstance(_call_fn.body[-1], ast.Return) if _call_fn else False, True)
-check("...naming the OpenAI client, with no provider guard around it",
-      "deps.get_openai_client()" in ast.unparse(_call_fn.body[-1])
+check("...naming the OpenAI INFERENCE client, with no provider guard around it",
+      "deps.get_openai_inference_client()" in ast.unparse(_call_fn.body[-1])
+      if _call_fn else False, True)
+check("...and not the embedding client, which is a different seam with a "
+      "different retry posture",
+      "deps.get_openai_client()" not in ast.unparse(_call_fn.body[-1])
       if _call_fn else False, True)
 
 # --- 1c. Behavioural: drive the real function ------------------------------
@@ -1786,6 +1817,27 @@ check("...and the two hashes are NOT the same value, so the comparison above "
 
 shutil.rmtree(_TMP, ignore_errors=True)
 check("the scratch directory is gone", os.path.exists(_TMP), False)
+
+
+# ── THE TEST QUOTA LIMITS ARE RELEASED, AND THE RELEASE IS MEASURED ─────────
+#
+# ABOVE THE SUMMARY, NEVER BELOW IT, on `release_openai_arm`'s own argument: a
+# release below the results line still decides the exit code while being
+# absent from the number the summary printed -- a run reporting "0 failed" and
+# exiting non-zero, a defect this project has shipped three times.
+#
+# WITHOUT THIS THE TABLES STAY MUTATED FOR THE LIFE OF THE PROCESS. All four
+# files that call `install_test_quotas` imported `restore_test_quotas` and none
+# of them called it. One-file-per-process in bucket A that is invisible; under
+# `pytest tests/`, which imports every one of them into ONE interpreter, the
+# SECOND install raises ProviderPinError and aborts collection. The collision
+# and its removal are driven in tests/test_provider_quotas_lookup.py section 6.
+_QUOTA_OWNER, _QUOTA_RESTORED = restore_test_quotas()
+check("the test quota limits this file installed are RELEASED, and both tables "
+      "are back to what _provider_pin read at its OWN import -- compared "
+      "against that independent reading rather than against the value the "
+      "restore just assigned",
+      (_QUOTA_OWNER, _QUOTA_RESTORED), (os.path.basename(__file__), True))
 
 
 # ===========================================================================

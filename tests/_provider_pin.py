@@ -106,6 +106,141 @@ class ProviderPinError(RuntimeError):
     """The pin could not be established, or was released without being set."""
 
 
+TEST_REQUESTS_PER_MINUTE = 1_000_000
+TEST_TOKENS_PER_MINUTE = 1_000_000_000
+"""EXPLICIT test limits. Not defaults, not "unlimited", and never shipped.
+
+WHY A TEST FILE HAS TO CONFIGURE A QUOTA AT ALL. ``config`` ships ``None`` --
+UNKNOWN -- for every scope but one, and ``provider_resilience.reserve`` refuses
+before the send rather than dispatching under a limit nobody measured. That
+refusal is correct for production and it fires in an offline test too, because
+the pacer cannot tell a stand-in from a provider and MUST NOT TRY: a
+stub-detection bypass in production code would be a hole in exactly the guard
+this exists to be. So a file that drives Stage 5 says what limit it is driving
+under, in its own harness, on purpose.
+
+WHY THESE NUMBERS. Large enough that the spacing they imply (60s / 900,000
+starts) is far below the resolution of anything these files measure, so pacing
+never changes a test's timing or its outcome -- these files' subject is the
+request shape, not the rate. A file whose subject IS the rate sets its own
+limits (``tests/test_provider_resilience.py``'s ``quotas()``), and a file
+proving the REFUSAL fires must not install these at all.
+
+A ROW ARGUED ``QUOTA_NOT_APPLICABLE`` IS LEFT ALONE. Overwriting it with a
+number would be this harness asserting that a family governs a scope when the
+config's own row argues, from the API's semantics, that it does not."""
+
+_QUOTA_STATE = {"saved": None}
+
+_IMPORT_QUOTAS = (dict(config.PROVIDER_REQUESTS_PER_MINUTE),
+                  dict(config.PROVIDER_TOKENS_PER_MINUTE))
+"""Both quota tables as this module FIRST saw them, for `restore_test_quotas`.
+
+AN INDEPENDENT READING, WHICH IS THE ONLY KIND A RESTORE CHECK MAY USE. It is
+captured at import -- before any file has installed anything -- so comparing
+the tables against it after a restore is a statement about the tables rather
+than about the variable the restore just assigned. See the comment in
+`restore_test_quotas` for the tautology that stood there."""
+
+
+def install_test_quotas(who):
+    """Configure explicit test limits for every scope. Returns the previous pair.
+
+    Raises ``ProviderPinError`` if limits are already installed: two installs
+    in one process means one of them restores to the other's value, which is
+    the nesting defect ``pin_openai_arm`` refuses for the same reason.
+    """
+    if _QUOTA_STATE["saved"] is not None:
+        raise ProviderPinError(
+            f"{who}: test quota limits installed by "
+            f"{_QUOTA_STATE['saved'][0]!r} are already in force.")
+    previous = (who,
+                dict(config.PROVIDER_REQUESTS_PER_MINUTE),
+                dict(config.PROVIDER_TOKENS_PER_MINUTE))
+    _QUOTA_STATE["saved"] = previous
+
+    def _explicit(table):
+        return {scope: (value if value == config.QUOTA_NOT_APPLICABLE
+                        else limit)
+                for scope, value, limit in
+                ((s, table[s], limit) for s, limit in
+                 ((s, TEST_REQUESTS_PER_MINUTE
+                   if table is config.PROVIDER_REQUESTS_PER_MINUTE
+                   else TEST_TOKENS_PER_MINUTE)
+                  for s in table))}
+
+    config.PROVIDER_REQUESTS_PER_MINUTE = _explicit(
+        config.PROVIDER_REQUESTS_PER_MINUTE)
+    config.PROVIDER_TOKENS_PER_MINUTE = _explicit(
+        config.PROVIDER_TOKENS_PER_MINUTE)
+    return previous[1], previous[2]
+
+
+def restore_test_quotas():
+    """Put both quota tables back. Returns ``(who, restored_ok)``."""
+    if _QUOTA_STATE["saved"] is None:
+        raise ProviderPinError(
+            "restore_test_quotas() was called with no test limits installed.")
+    who, rpm, tpm = _QUOTA_STATE["saved"]
+    config.PROVIDER_REQUESTS_PER_MINUTE = rpm
+    config.PROVIDER_TOKENS_PER_MINUTE = tpm
+    _QUOTA_STATE["saved"] = None
+    # COMPARED AGAINST WHAT THIS MODULE SAW AT IMPORT, NEVER AGAINST THE VALUE
+    # JUST ASSIGNED. `config.PROVIDER_REQUESTS_PER_MINUTE = rpm` followed by
+    # `config.PROVIDER_REQUESTS_PER_MINUTE == rpm` compares an object with
+    # itself: True however broken the restore is, which is a check that CANNOT
+    # FAIL, and it is what stood here while twenty-four files asserted on its
+    # result. The import-time snapshot is an independent reading, so it also
+    # catches a file that mutated a row in place and a nested installer that
+    # restored to the wrong generation.
+    restored = (config.PROVIDER_REQUESTS_PER_MINUTE == _IMPORT_QUOTAS[0]
+                and config.PROVIDER_TOKENS_PER_MINUTE == _IMPORT_QUOTAS[1])
+    return (who, restored)
+
+
+def test_quotas_only(who, out=print):
+    """Install EXPLICIT test quota limits WITHOUT pinning any Stage 5 arm.
+
+    **WHY THE TWO ARE SEPARABLE, AND WHY THIS ONE HAS TO EXIST.** Every file
+    that pins the OpenAI arm also needs test limits, so `pin_openai_arm`
+    installs them -- but the converse is false, and measured: the two files that
+    drive the rater's batch path (`tests/test_evaluation_rater.py`, 8 drives of
+    `submit_batches` and 10 of `collect_results`, and
+    `tests/test_spend_coverage.py`, 5 drives) install NO provider pin and MUST
+    NOT. Their subject is the batch harness under the SHIPPED provider; pinning
+    Stage 5 to OpenAI would change what they measure to make an unrelated quota
+    refusal go away, which is a harness configuring its way around the code
+    rather than testing it.
+
+    So the limits are reachable on their own. What is NOT offered is a way to
+    pin an arm without limits: every pinned file drives Stage 5, and Stage 5
+    reserves before it sends.
+
+    Returns the previous pair, exactly as `install_test_quotas` does. Release
+    with `release_test_quotas`.
+    """
+    previous = install_test_quotas(who)
+    out(f"[provider pin] {who}: EXPLICIT test quota limits installed for every "
+        f"scope ({TEST_REQUESTS_PER_MINUTE:,} requests/min, "
+        f"{TEST_TOKENS_PER_MINUTE:,} tokens/min); no Stage 5 arm was pinned. "
+        f"The shipped config leaves these scopes UNKNOWN, which REFUSES before "
+        f"dispatch -- see config.PROVIDER_REQUESTS_PER_MINUTE.")
+    return previous
+
+
+def release_test_quotas(out=print):
+    """Restore both quota tables. Returns ``(who, restored_ok)``.
+
+    The counterpart of `test_quotas_only`, kept separate from
+    `release_openai_arm` for that function's own reason: a file that installed
+    no pin must not have to release one.
+    """
+    who, restored = restore_test_quotas()
+    out(f"[provider pin] {who}: test quota limits released; both quota tables "
+        f"are back to the shipped values.")
+    return (who, restored)
+
+
 def pin_openai_arm(who, out=print):
     """Pin Stage 5 to the OpenAI provider for this process.
 
@@ -142,6 +277,14 @@ def pin_openai_arm(who, out=print):
 
     _STATE["who"] = who
     _STATE["previous"] = previous
+
+    # EXPLICIT TEST LIMITS, INSTALLED WITH THE PIN. Every file that installs
+    # this pin drives Stage 5, and Stage 5 reserves before it sends; at the
+    # shipped config that reservation REFUSES, because the scopes are UNKNOWN.
+    # Installing the limits here rather than in each file is the same argument
+    # the pin itself rests on -- one implementation, one release, one place to
+    # get the ordering right -- and it is why sixteen files needed no edit.
+    install_test_quotas(who)
 
     # LOUD EVEN WHEN IT OVERRODE NOTHING, on `pin_call_mode_for_fixture_process`
     # 's argument: a notice that appears only when the pin changed something is
@@ -181,7 +324,8 @@ def release_openai_arm(out=print):
     config.MATCHING_PROVIDER = previous
     _STATE["who"] = None
     _STATE["previous"] = None
-    restored = config.MATCHING_PROVIDER == previous
+    _, quotas_restored = restore_test_quotas()
+    restored = config.MATCHING_PROVIDER == previous and quotas_restored
     out(f"[provider pin] {who}: released; config.MATCHING_PROVIDER is back to "
         f"{previous!r}.")
     return (who, previous, restored)

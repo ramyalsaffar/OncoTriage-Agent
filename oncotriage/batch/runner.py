@@ -163,6 +163,7 @@ from oncotriage.config import (
 from oncotriage.agent.evaluation import (
     MatchingModelMismatchError,
     clear_stage5_shutdown,
+    request_stage5_drain,
     request_stage5_shutdown,
 )
 from oncotriage.evaluation import cohort as campaign_cohort
@@ -204,6 +205,7 @@ from oncotriage import run_fingerprint
 from oncotriage.observability import console, get_logger
 from oncotriage import degradation
 from oncotriage import spend
+from oncotriage import provider_resilience
 from oncotriage import tracking
 
 
@@ -769,6 +771,70 @@ def clear_all() -> None:
     console.out("[State] All batch runner state cleared. Ready for fresh run.")
 
 
+def retire_superseded_results(completed_ids) -> "str | None":
+    """Move an earlier campaign's results file aside when nothing is resumed.
+
+    Returns the retired file's path, or None when nothing was retired.
+
+    THE DEFECT, MEASURED ON A REAL RUN. The operator's 2026-09-11 five-patient
+    smoke run printed a batch summary over 1,110 entries: its own 10 plus 1,100
+    left in ``batch_runner_results.json`` by an August campaign. The checkpoint
+    and the results file are the two halves of ONE resume state -- ``clear_all``
+    exists for exactly that pair -- but two paths clear only the first half:
+    ``--fresh`` calls ``clear_checkpoint()`` alone, and a run that completes
+    with no errors clears its checkpoint "for next fresh run" and keeps its
+    results. Either way the NEXT run starts with no checkpoint and
+    ``load_results()`` hands it the earlier campaign's entries, which
+    ``print_summary`` then counts as this run's patients.
+
+    WHY THIS SHAPE AND NOT "SUMMARISE THIS SESSION ONLY". A RESUMED run's
+    summary is deliberately campaign-wide -- ``print_summary``'s own caveat
+    treats "this session's patients only" as the DEGRADED case, printed when
+    prior results could not be loaded -- so narrowing every summary would break
+    resume semantics to fix a fresh-run defect. The fix is at the one place the
+    two halves diverge: a run that resumes nothing has no business loading a
+    results file, because no entry in it can belong to this run.
+
+    RETIRED, NOT DELETED. The file is renamed beside itself with a UTC stamp,
+    so the earlier campaign's report survives; the database holds every row
+    either way. A rename that fails is COUNTED and announced, and the run then
+    loads the file as it always did -- a report defect must not stop a paid
+    campaign -- with the summary's merge stated rather than silent.
+    """
+    if completed_ids:
+        return None
+    rp = _results_path()
+    if not rp.exists():
+        return None
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    target = rp.with_name(f"{rp.stem}.retired-{stamp}{rp.suffix}")
+    n = 1
+    while target.exists():
+        n += 1
+        target = rp.with_name(f"{rp.stem}.retired-{stamp}-{n}{rp.suffix}")
+    try:
+        os.rename(rp, target)
+    except OSError as exc:
+        RESULTS_FILE_FAILURES[f"retire:{type(exc).__name__}"] += 1
+        console.out(f"[Results] WARNING: no checkpoint is being resumed, so "
+                    f"{rp.name} belongs to an EARLIER campaign, and it could "
+                    f"not be moved aside ({exc}). THIS RUN'S SUMMARY WILL "
+                    f"INCLUDE THAT CAMPAIGN'S ENTRIES. Move it yourself before "
+                    f"the next run.")
+        log.warning("results file from an earlier campaign could not be "
+                    "retired", event="results_retire_failed",
+                    status="degraded", error_type=type(exc).__name__,
+                    error_message=str(exc))
+        return None
+    console.out(f"[Results] No checkpoint is being resumed, so {rp.name} "
+                f"belonged to an earlier campaign; retired it to "
+                f"{target.name}. This run's summary covers this run's patients "
+                f"only.")
+    log.info("results file from an earlier campaign retired",
+             event="results_retired", status="ok")
+    return str(target)
+
+
 # ===========================================================================
 # THE RUN LOCK  (the pre-migration pass)
 # ===========================================================================
@@ -1259,6 +1325,25 @@ class _StopSwitch(control.StopSwitch):
 
     def _warn(self, message, **fields):
         log.warning(message, **fields)
+
+    def poll(self, where=None) -> bool:
+        """``control.StopSwitch.poll``, plus the Stage 5 DRAIN on the first trip.
+
+        THE SECOND THING DECIDED HERE, AND IT IS THIS PROGRAM'S RATHER THAN
+        THE BASE CLASS's (the provider-resilience pass). Under client-side
+        pacing an in-flight patient can wait a long time in the pacer before
+        its warmup is sent. Such a patient has paid for nothing in its current
+        attempt, so STOP's promise -- patients already in flight complete --
+        does not need it to complete, and making it wait out the pacer only
+        holds the stop. ``request_stage5_drain`` makes Stage 5 decline exactly
+        that work and nothing else: a patient whose warmup was answered still
+        completes. It is idempotent, so calling it on every poll after the
+        trip is harmless; the base class's latch keeps the disk read to once.
+        """
+        tripped = super().poll(where)
+        if tripped:
+            request_stage5_drain("the operator's STOP sentinel")
+        return tripped
 
 
 def _read_stop_message(path) -> str:
@@ -3494,6 +3579,12 @@ def print_summary(results_list: list, total_wall_time: float, db_path=None,
     # silence here would be indistinguishable from a ledger that was never wired
     # up -- and this is the number the whole gate exists to make true.
     spend.print_report()
+    # BESIDE THE SPEND BLOCK AND ALWAYS PRINTED, for its reason: silence would
+    # be indistinguishable from a pacer that was never consulted. It carries
+    # what the counters cannot -- waiting SECONDS and the unconfirmed-billing
+    # DOLLARS -- while the per-outcome counts also reach the degradation block
+    # and run_metrics through the registry.
+    provider_resilience.print_report()
 
     if census_snapshot is not None:
         degradation.print_census_report(census_snapshot)
@@ -3573,7 +3664,13 @@ def main():
     # three above it are. A shutdown asked of an EARLIER main() in this process
     # would make every patient of this one fail with no request sent -- the
     # loudest possible version of "state that describes the wrong run".
+    # (It forgets the operator-STOP drain with it; see request_stage5_drain.)
     clear_stage5_shutdown()
+    # THE PACER'S SCHEDULE AND PER-CALL STATISTICS, for the same reason: an
+    # earlier run's scheduled starts would space this run's first requests
+    # behind requests that were never sent, and its statistics would be
+    # reported as this run's. Its counters are cleared with the registry's.
+    provider_resilience.reset()
     # THE FIFTH AND SIXTH PIECES OF PER-RUN MODULE STATE, cleared for the reason
     # the four above them are, and with a sharper consequence than any of them:
     # a ledger that survived into the next run would make that run inherit this
@@ -3622,6 +3719,14 @@ def main():
         # one. It is here beside the stop sentinel's line because the two are
         # the same fact for an operator -- what will stop this run, and how.
         console.out(spend.describe_cap())
+        # THE PACING AND THE RETRY POLICY ARE ANNOUNCED BESIDE THE CAP, for the
+        # cap's reason: they are what decides how fast this run may spend and
+        # how it behaves when the provider pushes back, an UNPACED scope must
+        # say so rather than be the quiet state, and the PROCESS-LOCAL rule --
+        # two processes against one account each pace to the whole quota -- is
+        # something an operator needs before a second run is started, not after.
+        console.out(provider_resilience.describe_pacing(
+            concurrency=provider_resilience.stage5_concurrency(MAX_WORKERS)))
         console.out()
 
         # ------------------------------------------------------------------
@@ -3790,6 +3895,10 @@ def main():
             console.out()
             console.out(str(exc))
             raise SystemExit(1)
+        # A RUN THAT RESUMES NOTHING LOADS NO EARLIER RESULTS. Above
+        # load_results() and below load_checkpoint(), because the checkpoint is
+        # what says whether this is a resume. See retire_superseded_results.
+        retire_superseded_results(completed_ids)
         results_list = load_results()
 
         # WAS THIS A RESUME. ONE BOOLEAN, TAKEN ONCE, HANDED TO BOTH RECORDS.

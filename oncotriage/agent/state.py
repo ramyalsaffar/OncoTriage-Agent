@@ -441,6 +441,22 @@ class TrialMatchState(TypedDict):
     # field by field.
     llm_classifier_refusal: Optional[str]
 
+    # Set by Stage 5 when a failure was a TRANSPORT failure the one retry policy
+    # in oncotriage/provider_resilience.py already spent its TOTAL budget on
+    # (the provider-resilience pass): a short note naming the category, the
+    # exception type and the attempt count; absent or None on every other path.
+    #
+    # A TERMINAL SIGNAL FOR THE REASON `llm_classifier_refusal` IS ONE. The
+    # budget spans the SDK's retries, the policy's and the patient-level path's,
+    # so route_after_llm_classifier sends this to the error handler instead of
+    # re-entering Stage 5 for a second full budget -- which is what "one budget"
+    # means. A response that ARRIVED and would not parse never sets it and keeps
+    # MAX_LLM_CLASSIFIER_RETRIES exactly as before.
+    #
+    # NOT in the result dict and therefore not a column: the note is already in
+    # `error`, and this is a routing fact.
+    llm_classifier_transport_exhausted: Optional[str]
+
     # Truncation control (Stage 5). A SEPARATE budget from llm_classifier_retries: that
     # one counts whole-node retries for a malformed or failed response, this
     # counts levels of halving spent because a response was cut off at

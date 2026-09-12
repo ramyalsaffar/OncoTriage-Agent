@@ -93,6 +93,20 @@ from oncotriage.agent import evaluation as _evaluation          # noqa: E402
 from oncotriage.storage import database_logger as _dl           # noqa: E402
 from oncotriage.storage import queries as _queries              # noqa: E402
 from oncotriage.utils import get_model_cost                     # noqa: E402
+# READ BY SECTION 9's BYPASS CONTROLS, AND THE REASON IS A MEASUREMENT.
+# `oncotriage/provider_resilience.py` gives Stage 5 a pacer whose waits consult
+# a cancellation predicate, and `evaluation._stage5_cancellation` returns a
+# Stage5SpendStopped the moment the cap is crossed -- so the pacer is a SECOND,
+# independent brake on spend. That makes "how many requests went out" unable to
+# see the wave gate's removal: with the gate planted away the pacer cancels the
+# queued calls instead, and how many it cancels depends on whether a stub reply
+# takes more or less than one paced interval. MEASURED: the same plant sends 4
+# requests alone and 3 inside this file, and c32 in
+# tests/test_agent_stage5_per_trial_calls.py sends 6 under CI's loaded runner
+# and 5 on an idle machine. The RESERVATION count is the observable that cannot
+# move: `reserve` increments it before any wait, so it counts every attempt
+# that reached the wire path whatever the pacer then did with it.
+from oncotriage import provider_resilience as _pr               # noqa: E402
 
 # ===========================================================================
 # THIS FILE'S SUBJECT IS THE DORMANT OpenAI STAGE 5 REQUEST -- SO IT PINS IT
@@ -1636,23 +1650,67 @@ plant("9d  CLEAN CONTROL: the UNPLANTED module sends nothing when the budget "
 # one -- the plant would be masked by the gate one site over and reported as
 # caught while measuring nothing. The first version of this control did exactly
 # that.
-def _requests_crossing_mid_wave_pre(module):
-    return len(run_node(_SIX, cap=3 * CALL_COST, parallel=1,
-                        node=module.node_llm_classifier_evaluation)[1].requests)
+# THE OBSERVABLE IS THE RESERVATION COUNT, NOT THE REQUEST COUNT, AND THAT IS A
+# MEASURED CORRECTION RATHER THAN A WEAKENING. This control used to count
+# `stub.requests` and expect 7. It got 3 -- the same number the CLEAN module
+# sends -- so the plant was reported as uncaught while the safeguard's removal
+# was in fact perfectly visible. The cause is the pacer, not the gate: see the
+# `_pr` import above. `reserve` counts an attempt BEFORE it waits, so every
+# queued call that reached the wire path is counted whether the pacer then
+# cancelled it or the provider answered it -- which is exactly "the queued trial
+# calls go out after the budget has been crossed", and it is invariant to how
+# fast this machine happens to be. The WAVE-PHASE DECLINE COUNT is asserted
+# beside it, because that is the accounting the removed lines own: a gate that
+# is gone declines nothing and records nothing, and 9f/9g would still pass on a
+# module whose wave phase had silently stopped being counted.
+#
+# DRIVEN ON A BUDGET THAT CROSSES **MID-WAVE**, NOT ONE ALREADY SPENT, AND THAT
+# IS THE MEASUREMENT RATHER THAN A CONVENIENCE: with the budget spent before
+# the patient starts, the WARMUP gate declines first and clears the queue, so a
+# probe run there reports 0 requests for the planted module AND for the shipped
+# one -- the plant would be masked by the gate one site over and reported as
+# caught while measuring nothing. The first version of this control did exactly
+# that.
+_MID_WAVE_ALLOWED = 3
+"""The mid-wave budget, in whole calls: `cap=_MID_WAVE_ALLOWED * CALL_COST`.
+
+Named so the two expectations below are DERIVED from the cap rather than
+retyped beside it. One warmup plus `_MID_WAVE_ALLOWED - 1` trial calls cross
+it, so the clean module reserves exactly `_MID_WAVE_ALLOWED` attempts and
+declines the remaining trials at the `wave:` phase."""
+
+
+def _mid_wave_reach(module):
+    """``(wire attempts RESERVED, wave-phase declines)`` under a mid-wave cap.
+
+    The reservation count is read as a DELTA around the drive: the pacer's
+    counters are process-global and this file drives the node dozens of times,
+    so an absolute reading would be every earlier scenario's total as well.
+    """
+    _scope = config.matching_quota_scope()
+    _before = _pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"]
+    run_node(_SIX, cap=_MID_WAVE_ALLOWED * CALL_COST, parallel=1,
+             node=module.node_llm_classifier_evaluation)
+    return (_pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"] - _before,
+            sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
+                if k.startswith(spend.SPEND_SKIP_WAVE_KEY_PREFIX)))
 
 
 plant("9e  *** a BYPASS at the wave's call site is CAUGHT [9b/4c]: the queued "
-      "trial calls go out after the budget has been crossed ***",
+      "trial calls reach the wire after the budget has been crossed, and the "
+      "wave phase stops counting the declines it no longer makes ***",
       [("            _refusal = _spend_gate(spend.SPEND_SKIP_WAVE_KEY_PREFIX,\n"
         "                                   _call_counter, where=\"a Stage 5 wave\",\n"
         "                                   count=len(chunk_))\n"
         "            if _refusal is not None:\n"
         "                return (\"error\", _refusal)\n",
         "")],
-      _requests_crossing_mid_wave_pre, 7)
-check("9e-i CLEAN CONTROL for 9e: the unplanted module stops at three, so the "
-      "plant is measured against a probe that can tell the difference",
-      _requests_crossing_mid_wave_pre(_evaluation), 3)
+      _mid_wave_reach, (1 + len(_SIX), 0))
+check("9e-i CLEAN CONTROL for 9e: the unplanted module reserves only what the "
+      "budget allows and declines the rest at the wave phase, so the plant is "
+      "measured against a probe that can tell the difference",
+      _mid_wave_reach(_evaluation),
+      (_MID_WAVE_ALLOWED, len(_SIX) - (_MID_WAVE_ALLOWED - 1)))
 
 # --- 9f: the warmup's gate is removed --------------------------------------
 plant("9f  *** a BYPASS at the WARMUP is CAUGHT: the patient sends the one "

@@ -169,6 +169,23 @@ except ImportError:
 from oncotriage import config
 from oncotriage.evaluation import rater as R
 
+import _provider_pin                                             # noqa: E402
+
+# EXPLICIT TEST QUOTA LIMITS, AND NO PROVIDER PIN -- see
+# `tests/_provider_pin.test_quotas_only` for why the two are separable and why
+# this file must NOT pin an arm. It drives the real `collect_results` and
+# `submit_batches`, whose management calls are paced under
+# `config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH`; the shipped config leaves that
+# scope's requests/minute UNKNOWN, which REFUSES before the send.
+# THE NAME IS A LITERAL, NOT `os.path.basename(__file__)`, AND THAT IS THIS
+# FILE'S OWN CONVENTION RATHER THAN A SHORTCUT. Unlike its siblings this module
+# binds NO module-scope `os` -- the bootstrap imports it as `_os` and each later
+# section takes its own alias (`_osmod`, `_os9`, `_os9k`) -- so the usual
+# expression raises `NameError` here and aborts the file before its first
+# check. MEASURED: it did, at this line, and the run reported no summary at all.
+_PIN_WHO = "test_evaluation_rater.py"
+_provider_pin.test_quotas_only(_PIN_WHO)
+
 
 _RESULTS = {"passed": 0, "failed": 0}
 _FAILURES = []
@@ -4568,6 +4585,13 @@ check("9s  non-degeneracy: the refusal really was produced (an empty message "
 
 
 print()
+# RELEASED ABOVE THE SUMMARY, NEVER BELOW IT: a release below the results line
+# still decides the exit code while being absent from the number printed.
+_QUOTA_WHO, _QUOTA_RESTORED = _provider_pin.release_test_quotas()
+check("[provider pin] the test quota limits this file installed were released, "
+      "and both tables are back to the shipped values",
+      (_QUOTA_WHO, _QUOTA_RESTORED), (_PIN_WHO, True))
+
 print("=" * 70)
 print("SUMMARY")
 print("=" * 70)

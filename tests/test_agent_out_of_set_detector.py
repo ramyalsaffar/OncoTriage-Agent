@@ -1510,8 +1510,8 @@ _control(
 _control(
     "7j. a count on Stage 5's parse-error return is CAUGHT",
     _EVAL_SRC,
-    [('            error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"',
-      '            error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"\n'
+    [('            error_msg = f"LLM classifier JSON parse error (attempt {retry_count + 1}): {str(e)}"',
+      '            error_msg = f"LLM classifier JSON parse error (attempt {retry_count + 1}): {str(e)}"\n'
       '            _partial_count = len(hallucinated_ids)'),
      ('                "llm_classifier_raw_response": chunk_text,',
       '                "llm_classifier_raw_response": chunk_text,\n'

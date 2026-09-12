@@ -80,9 +80,9 @@ from oncotriage.config import (
     MATCHING_SEED,
     MAX_LLM_CLASSIFIER_RETRIES,
     MAX_TRUNCATION_SPLITS,
-    RETRY_BASE_DELAY,
 )
 from oncotriage.observability import console, get_logger
+from oncotriage import provider_resilience
 from oncotriage import spend
 
 
@@ -492,7 +492,46 @@ def _warn_temperature_once() -> None:
 
 def call_matching_model(system_prompt: str, user_prompt: str, *,
                         prompt_cache_key: Optional[str] = None):
+    """Issue ONE logical Stage 5 request under the pacer and the one retry policy.
+
+    THE DISPATCH SEAM, AND THE PLACE PROVIDER RESILIENCE LIVES (the
+    provider-resilience pass). ``_send_matching_call`` below is the
+    single-attempt dispatcher -- the request each arm sends, unchanged byte for
+    byte -- and this wraps it in ``provider_resilience.execute``: every wire
+    attempt is paced against ``config.PROVIDER_REQUESTS_PER_MINUTE`` for the
+    configured provider, a TRANSIENT failure is retried with full-jitter backoff
+    up to ``config.MATCHING_CALL_MAX_ATTEMPTS`` wire attempts in TOTAL, anything
+    else raises at once, and a pacing or backoff wait is abandoned the moment a
+    shutdown or a spend stop is requested. It is here rather than inside an
+    adapter so a new provider brings a classifier and keeps the mechanism.
+
+    THE THREE CALL SITES IN THE NODE ARE UNCHANGED, and the spend gate still
+    runs ONCE per logical call at each of them: the call ceiling bounds logical
+    calls, this bounds the wire attempts each may make, and the product is the
+    most one invocation can send.
+
+    THE PROVIDER'S CONFIGURATION IS VALIDATED HERE, ABOVE THE POLICY, so a
+    configuration refusal raises before the first attempt instead of being
+    classified as a provider failure -- an unclassified failure is charged an
+    upper bound to the spend ledger as possibly billed, and a typo in a config
+    constant is not money.
+    """
+    if config.MATCHING_PROVIDER != config.MATCHING_PROVIDER_OPENAI:
+        config.validate_matching_provider_config()
+    return _execute_matching_call(
+        lambda: _send_matching_call(system_prompt, user_prompt,
+                                    prompt_cache_key=prompt_cache_key),
+        system_prompt, user_prompt, max_output=config.MATCHING_MAX_TOKENS,
+        drain_applies=False)
+
+
+def _send_matching_call(system_prompt: str, user_prompt: str, *,
+                        prompt_cache_key: Optional[str] = None):
     """Issue the Stage 5 evaluation request and return the raw API response.
+
+    ONE ATTEMPT. Since the provider-resilience pass this is what
+    ``call_matching_model`` hands ``provider_resilience.execute``; nothing below
+    changed, and the OpenAI request it sends is still the byte-identical one.
 
     Lifted out of node_llm_classifier_evaluation unchanged. It is the single point where
     the pipeline talks to the matching model, which is what lets a recording
@@ -677,7 +716,7 @@ def call_matching_model(system_prompt: str, user_prompt: str, *,
     # request dict had to stay byte-identical.
     _warn_temperature_once()
 
-    return deps.get_openai_client().chat.completions.create(
+    return deps.get_openai_inference_client().chat.completions.create(
         model=MATCHING_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -873,25 +912,23 @@ def _http_status_of(exc: BaseException) -> Optional[int]:
     object. Neither is asserted to exist: this runs on a failure path and must
     not raise a second, unrelated exception while classifying the first.
     """
-    _response = getattr(exc, "response", None)
     # THE THIRD PLACE IS BOTOCORE'S AND IT WAS MISSING, which made this
     # function return None for EVERY error the Converse branch can raise. A
     # botocore ``ClientError`` carries a plain dict at ``.response``, so
-    # ``getattr(dict, "status_code")`` is None and the second candidate above
+    # ``getattr(dict, "status_code")`` is None and the second candidate there
     # never fires -- and with the status unread, ``classify_warmup_rejection``
     # answered "not a shape refusal" for every 400 on that branch. A provider
     # refusing the warmup's ``maxTokens`` would have been read as a transport
     # failure and FAILED THE PATIENT instead of degrading to the one-then-rest
     # schedule, once per patient, for the whole campaign.
-    _metadata = (_response.get("ResponseMetadata")
-                 if isinstance(_response, dict) else None)
-    for _candidate in (getattr(exc, "status_code", None),
-                       getattr(_response, "status_code", None),
-                       (_metadata.get("HTTPStatusCode")
-                        if isinstance(_metadata, dict) else None)):
-        if isinstance(_candidate, int) and not isinstance(_candidate, bool):
-            return _candidate
-    return None
+    #
+    # A ONE-LINE DELEGATE SINCE THE ONE-CLASSIFIER PASS. The body moved to
+    # ``provider_resilience.http_status_of`` UNCHANGED, because three other
+    # billed paths need the same reading and a second copy is how the botocore
+    # gap above got in. This name is KEPT rather than replaced at its call
+    # sites: ``classify_warmup_rejection`` is provider-specific and lives here,
+    # and the two existing test files that drive it name this function.
+    return provider_resilience.http_status_of(exc)
 
 
 def classify_warmup_rejection(exc: BaseException) -> Optional[str]:
@@ -937,7 +974,41 @@ def classify_warmup_rejection(exc: BaseException) -> Optional[str]:
 
 def call_matching_model_warmup(system_prompt: str, *,
                                prompt_cache_key: Optional[str] = None):
+    """The per-trial cache warmup, as ONE logical call under the one policy.
+
+    Paced and retried exactly as ``call_matching_model`` is, with one
+    difference: the operator's STOP sentinel (the DRAIN) cancels a wait here and
+    not on a trial call. A patient whose warmup has not yet been answered has
+    paid for nothing in this attempt, so abandoning it costs nothing and a
+    resume re-runs it; a patient whose warmup HAS been answered completes, which
+    is the STOP contract ``Stage5ShutdownRequested``'s block records.
+
+    THE LOCAL CHECKS RUN HERE, ABOVE THE POLICY, for ``call_matching_model``'s
+    reason: a refusal of the configuration must not be classified as a possibly
+    billed provider failure. ``_send_matching_warmup_call`` repeats them, which
+    costs two comparisons and keeps it correct when called on its own.
+    """
+    _user = config.MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE
+    if not _user:
+        raise _WarmupUserMessageError(
+            "MATCHING_PER_TRIAL_WARMUP_USER_MESSAGE must be a non-empty "
+            f"string; it is {_user!r}")
+    assert_per_trial_provider_supported()
+    if config.MATCHING_PROVIDER != config.MATCHING_PROVIDER_OPENAI:
+        config.validate_matching_provider_config()
+    return _execute_matching_call(
+        lambda: _send_matching_warmup_call(system_prompt,
+                                           prompt_cache_key=prompt_cache_key),
+        system_prompt, _user,
+        max_output=config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,
+        drain_applies=True)
+
+
+def _send_matching_warmup_call(system_prompt: str, *,
+                               prompt_cache_key: Optional[str] = None):
     """Write the shared prefix into the provider's cache. Evaluates nothing.
+
+    ONE ATTEMPT; ``call_matching_model_warmup`` owns pacing and retries.
 
     The response is NEVER PARSED. Two things are read off it and nothing else:
     the usage block, so the warmup's own tokens are billed honestly rather than
@@ -1032,7 +1103,7 @@ def call_matching_model_warmup(system_prompt: str, *,
     # process however they interleave.
     _warn_temperature_once()
 
-    return deps.get_openai_client().chat.completions.create(
+    return deps.get_openai_inference_client().chat.completions.create(
         model=MATCHING_MODEL,
         messages=[
             {"role": "system", "content": system_prompt},
@@ -1663,6 +1734,40 @@ def classify_cache_write(response) -> str:
 _SHUTDOWN_REQUESTED = False
 _SHUTDOWN_REASON = None
 
+# THE DRAIN: the operator's STOP sentinel, as far as Stage 5 can honour it
+# without breaking STOP's promise (the provider-resilience pass).
+#
+# WHAT IT DOES AND DOES NOT DO, AND WHY IT IS NOT THE FLAG ABOVE. The paragraph
+# above is right that STOP must not fail an in-flight patient that has already
+# PAID -- its round would be discarded and a resume would re-bill all of it. But
+# under client-side pacing a patient can sit in the pacer for a long time before
+# its warmup is sent, and a patient in the patient-level backoff has already
+# failed its attempt. Neither has paid for anything in its current attempt, so
+# abandoning either costs NOTHING and a resume re-runs it. This flag stops
+# exactly those: the warmup gate, the warmup's own pacing and backoff waits, and
+# the patient-level backoff. It never cancels a trial call's wait -- a patient
+# whose warmup was answered completes, which is the STOP contract unchanged.
+#
+# SET BY `oncotriage/batch/runner.py`'s stop switch the moment it trips; a plain
+# boolean for the flag above's signal-safety reason; cleared with it.
+_DRAIN_REQUESTED = False
+_DRAIN_REASON = None
+
+
+def request_stage5_drain(reason: str) -> None:
+    """Ask Stage 5 to start no new BILLED work for any patient. Idempotent.
+
+    The first reason wins, on ``request_stage5_shutdown``'s footing."""
+    global _DRAIN_REQUESTED, _DRAIN_REASON
+    if not _DRAIN_REQUESTED:
+        _DRAIN_REASON = reason
+    _DRAIN_REQUESTED = True
+
+
+def stage5_drain_requested() -> bool:
+    """Has the operator's STOP reached Stage 5? A plain read; never raises."""
+    return _DRAIN_REQUESTED
+
 
 def request_stage5_shutdown(reason: str) -> None:
     """Ask Stage 5 to stop issuing requests. Idempotent; safe in a handler.
@@ -1700,9 +1805,14 @@ def clear_stage5_shutdown() -> None:
     describes the wrong run, and here it would make every patient of that run
     fail without a request being sent.
     """
-    global _SHUTDOWN_REQUESTED, _SHUTDOWN_REASON
+    global _SHUTDOWN_REQUESTED, _SHUTDOWN_REASON, _DRAIN_REQUESTED, _DRAIN_REASON
     _SHUTDOWN_REQUESTED = False
     _SHUTDOWN_REASON = None
+    # THE DRAIN IS FORGOTTEN WITH IT, for this function's own reason: a STOP
+    # honoured by an earlier run in this process must not make every patient
+    # of the next run decline its warmup.
+    _DRAIN_REQUESTED = False
+    _DRAIN_REASON = None
 
 
 class Stage5ShutdownRequested(RuntimeError):
@@ -1723,6 +1833,18 @@ class Stage5ShutdownRequested(RuntimeError):
     ``_on_done`` checkpoints a success, so a resume would SKIP that patient
     forever. The whole cohort would then carry a silent hole shaped like
     whenever somebody pressed Ctrl-C.
+    """
+
+
+class Stage5DrainRequested(Stage5ShutdownRequested):
+    """A Stage 5 request was NOT issued because the operator's STOP was seen.
+
+    A SUBCLASS, for ``Stage5SpendStopped``'s reason: every place that must not
+    isolate a shutdown to its trial must not isolate this either. It is raised
+    only where nothing has been paid in the patient's current attempt -- the
+    warmup gate and the warmup's waits -- so the patient fails at no cost and a
+    resume re-runs it. The distinct class is what lets the stored row say
+    "abandoned at no cost" rather than "a shutdown was requested".
     """
 
 
@@ -1911,6 +2033,280 @@ def _charge_spend(response):
     spend.SPEND_LEDGER.charge(getattr(response, "model", None),
                               getattr(usage, "prompt_tokens", None),
                               getattr(usage, "completion_tokens", None))
+
+
+# ---------------------------------------------------------------------------
+# PROVIDER RESILIENCE AT THE DISPATCH SEAM (the provider-resilience pass)
+# ---------------------------------------------------------------------------
+#
+# The mechanism is oncotriage/provider_resilience.py and is provider-agnostic.
+# What is provider-SPECIFIC lives here, beside the dispatch it serves: how each
+# arm's exceptions map onto the mechanism's closed category vocabulary, and how
+# a request's token reservation is estimated.
+
+_CONVERSE_CATEGORY_TO_POLICY = {
+    bedrock_anthropic_adapter.ERROR_THROTTLED:
+        provider_resilience.CATEGORY_THROTTLED,
+    bedrock_anthropic_adapter.ERROR_NOT_READY:
+        provider_resilience.CATEGORY_MODEL_NOT_READY,
+    bedrock_anthropic_adapter.ERROR_FORBIDDEN:
+        provider_resilience.CATEGORY_CLIENT,
+    bedrock_anthropic_adapter.ERROR_NOT_FOUND:
+        provider_resilience.CATEGORY_CLIENT,
+    bedrock_anthropic_adapter.ERROR_VALIDATION:
+        provider_resilience.CATEGORY_CLIENT,
+    bedrock_anthropic_adapter.ERROR_MODEL_ERROR:
+        provider_resilience.CATEGORY_MODEL_ERROR,
+    bedrock_anthropic_adapter.ERROR_TIMEOUT:
+        provider_resilience.CATEGORY_TIMEOUT,
+    bedrock_anthropic_adapter.ERROR_CREDENTIALS:
+        provider_resilience.CATEGORY_LOCAL,
+    bedrock_anthropic_adapter.ERROR_LOCAL_PARAMS:
+        provider_resilience.CATEGORY_LOCAL,
+    bedrock_anthropic_adapter.ERROR_TRANSLATION:
+        provider_resilience.CATEGORY_TRANSLATION,
+    bedrock_anthropic_adapter.ERROR_UNCLASSIFIED:
+        provider_resilience.CATEGORY_UNCLASSIFIED,
+    # CONNECTION and SERVER are decided below by the exception's identity,
+    # because each covers one billed and one unbilled case.
+}
+"""The Converse taxonomy onto the policy's. TOTAL, guarded below: a Converse
+category without a row would be classified unclassified and charged."""
+
+# botocore names for a connection that never OPENED -- nothing was sent.
+_CONVERSE_CONNECT_PHASE = frozenset({"EndpointConnectionError",
+                                     "ConnectTimeoutError"})
+# httpx names, under an OpenAI SDK APIConnectionError, for the same phase.
+# `_OPENAI_CONNECT_PHASE` WAS HERE AND IS DELETED (the one-classifier pass). Its
+# two readers were the OpenAI-SDK branch of `_classify_matching_failure`, which
+# moved to `provider_resilience.classify_openai_failure` and took the constant
+# with it. `_CONVERSE_CONNECT_PHASE` above STAYS: the Converse branch is
+# provider-specific and is still classified here.
+#
+# IT WAS DEAD AND THE NEVER-READ SCAN COULD NOT SEE IT, which is worth recording
+# where it happened. `tests/test_package_invariants.py` check 2h reports a
+# module-level constant nothing reads -- and it matches by NAME across the whole
+# repository corpus, so the identically-named live constant now in
+# `provider_resilience.py` satisfied the scan for this dead one. 261/261 passed
+# with it standing. A same-named constant in a second module is a blind spot in
+# that check, not a property of this deletion.
+
+
+def _assert_converse_mapping_is_total() -> None:
+    _unmapped = [c for c in bedrock_anthropic_adapter.ERROR_CATEGORIES
+                 if c not in _CONVERSE_CATEGORY_TO_POLICY
+                 and c not in (bedrock_anthropic_adapter.ERROR_CONNECTION,
+                               bedrock_anthropic_adapter.ERROR_SERVER)]
+    if _unmapped:
+        raise RuntimeError(
+            f"Converse error categories {_unmapped} have no provider-resilience "
+            f"policy row in evaluation._CONVERSE_CATEGORY_TO_POLICY; they would "
+            f"be classified unclassified -- never retried, and charged as "
+            f"possibly billed")
+
+
+_assert_converse_mapping_is_total()
+
+
+def _retry_after_seconds(exc: BaseException) -> Optional[float]:
+    """A ``retry-after`` hint in SECONDS. A delegate since the one-classifier pass.
+
+    The body moved to ``provider_resilience.retry_after_seconds`` UNCHANGED, and
+    it took its counter with it: this version reached across into
+    ``provider_resilience.PROVIDER_RETRY_OUTCOMES`` to record an unreadable
+    header, so the reader lived here and the counter lived there. Three other
+    billed paths need the same reading, and a second copy of a header parser is
+    how the botocore gap in ``_http_status_of`` got in.
+
+    THE NAME IS KEPT because the Converse branch below still calls it, and
+    because it is the one place a reader looks for "how is a retry-after read".
+    """
+    return provider_resilience.retry_after_seconds(exc)
+
+
+def _classify_matching_failure(exc: BaseException):
+    """One failed Stage 5 attempt -> ``provider_resilience.AttemptVerdict``.
+
+    THE PROVIDER-SPECIFIC HALF OF THE RETRY POLICY. The Converse arm reads the
+    adapter's own taxonomy (``category_of``, the non-counting half of
+    ``classify_error``, so the unknown-error counter moves once per failure as
+    it always did). The two OpenAI-SDK arms read the SDK's exception classes by
+    NAME along the MRO -- no ``import openai`` needed here -- and the HTTP status
+    through ``_http_status_of``, which already reads all three places a status
+    can live.
+    """
+    _names = {cls.__name__ for cls in type(exc).__mro__}
+    if config.MATCHING_PROVIDER == config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        _cat = bedrock_anthropic_adapter.category_of(exc)
+        _name, _code = bedrock_anthropic_adapter.error_identity(exc)
+        if _cat == bedrock_anthropic_adapter.ERROR_CONNECTION:
+            _policy = (provider_resilience.CATEGORY_CONNECT
+                       if _name in _CONVERSE_CONNECT_PHASE
+                       else provider_resilience.CATEGORY_CONNECTION_LOST)
+        elif _cat == bedrock_anthropic_adapter.ERROR_SERVER:
+            _policy = (provider_resilience.CATEGORY_SERVICE_UNAVAILABLE
+                       if "ServiceUnavailableException" in (_name, _code)
+                       else provider_resilience.CATEGORY_SERVER)
+        else:
+            _policy = _CONVERSE_CATEGORY_TO_POLICY.get(
+                _cat, provider_resilience.CATEGORY_UNCLASSIFIED)
+        return provider_resilience.verdict_for(_policy,
+                                               _retry_after_seconds(exc))
+    # THE TWO OPENAI-SDK ARMS GO THROUGH THE ONE OWNER (the one-classifier
+    # pass). This branch WAS the project's only OpenAI-SDK classifier, and three
+    # other billed paths -- the ragas judge, the ragas embedder and the rater's
+    # four batch calls -- had none at all, so every failure of theirs reached
+    # `verdict_for` as `unclassified`: never retried, a 429 included, and
+    # charged as possibly billed. It moved to
+    # `provider_resilience.classify_openai_failure` verbatim so all four share
+    # one rule.
+    #
+    # THE TRANSLATION CLASS IS PASSED IN RATHER THAN IMPORTED THERE. It is this
+    # arm's adapter's, and `provider_resilience` is provider-agnostic by
+    # construction -- importing an adapter into it would be the edge the module
+    # docstring rules out. Every other caller passes none, because no other
+    # caller has such a class.
+    return provider_resilience.classify_openai_failure(
+        exc, translation_types=(bedrock_adapter.BedrockResponseTranslationError,))
+
+
+def _reservation_input_tokens(system_prompt: str, user_prompt: str) -> int:
+    """A deliberately HIGH estimate of one attempt's input tokens.
+
+    The system and user text plus the structured-output schema every trial
+    call carries, over ``config.PROVIDER_RESERVATION_CHARS_PER_TOKEN`` -- which
+    is set below either measured tokenizer's ratio precisely so this over-
+    reserves. Rounded UP by one token. Only a configured token quota reads it.
+    """
+    _chars = (len(system_prompt or "") + len(user_prompt or "")
+              + len(str(build_response_format())))
+    return int(_chars / float(config.PROVIDER_RESERVATION_CHARS_PER_TOKEN)) + 1
+
+
+def _usage_token_total(response) -> Optional[int]:
+    """A success's actual tokens (prompt + completion), or None when unreported.
+
+    Converse's ``prompt_tokens`` has already had the disjoint cache counts
+    summed back by the adapter, so this counts cached input too -- the
+    conservative reading of a token quota whose treatment of cache reads this
+    project has not verified."""
+    _usage = getattr(response, "usage", None)
+    _p = getattr(_usage, "prompt_tokens", None)
+    _c = getattr(_usage, "completion_tokens", None)
+    if (isinstance(_p, int) and isinstance(_c, int)
+            and not isinstance(_p, bool) and not isinstance(_c, bool)):
+        return _p + _c
+    return None
+
+
+def _stage5_cancellation(*, drain_applies: bool):
+    """A ``cancelled`` callable for the policy: an exception to raise, or None.
+
+    ASKED BEFORE EVERY ATTEMPT AND THROUGHOUT EVERY WAIT, so a sleeping retry
+    never holds a run that has been told to stop. In order: a shutdown
+    (SIGTERM, Ctrl-C) cancels every wait; the operator's STOP cancels only a
+    wait where nothing in the patient's current attempt has been paid
+    (``drain_applies``); and a spend stop cancels every wait, because the next
+    gate would decline the request anyway and waiting for that answer only
+    delays the run's end. Each returns the exception class the send loop already
+    refuses to isolate, so a cancelled trial fails its patient rather than
+    completing it with a hole -- the c33 lesson, unchanged.
+    """
+    def _cancelled():
+        if _SHUTDOWN_REQUESTED:
+            return Stage5ShutdownRequested(
+                f"the request was not issued: {_SHUTDOWN_REASON}")
+        if drain_applies and _DRAIN_REQUESTED:
+            return Stage5DrainRequested(
+                f"the request was not issued: {_DRAIN_REASON}")
+        if spend.SPEND_STOP.requested:
+            return Stage5SpendStopped(
+                "the request was not issued: a spend limit stopped the run",
+                limit=getattr(spend.SPEND_STOP, "limit", None))
+        if spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5):
+            return Stage5SpendStopped(
+                f"the request was not issued: the campaign has spent "
+                f"${spend.active_spend(spend.SPEND_SOURCE_STAGE5):.2f} and "
+                f"config.SPEND_CAP_USD is the limit",
+                limit=spend.SPEND_LIMIT_CAP)
+        return None
+    return _cancelled
+
+
+def _execute_matching_call(send, system_prompt: str, user_prompt: str, *,
+                           max_output: int, drain_applies: bool):
+    """Run one logical Stage 5 call through ``provider_resilience.execute``.
+
+    THE RESERVATION is the estimated input plus the request's own
+    ``max_output`` -- the value the adapter puts in the request, never a smaller
+    one: request identity is frozen and pacing does not get to change it.
+
+    A POSSIBLY-BILLED FAILURE IS CHARGED THAT SAME UPPER BOUND to the spend
+    ledger, priced at the wire model. The ledger used to be charged only when a
+    response arrived, which assumed a zero for a read timeout or a dropped
+    connection that the provider may well have billed.
+    """
+    _input = _reservation_input_tokens(system_prompt, user_prompt)
+    _max_output = int(max_output)
+
+    def _charge_upper_bound(_verdict) -> float:
+        return spend.SPEND_LEDGER.charge(config.matching_wire_model(),
+                                         _input, _max_output)
+
+    return provider_resilience.execute(
+        send,
+        scope=config.matching_quota_scope(),
+        reservation_tokens=_input + _max_output,
+        # DECLARED, NEVER INFERRED FROM THE NUMBER. Stage 5 generates tokens,
+        # so this is an inference reservation whatever the estimate happens to
+        # come back as -- and `provider_resilience.execute` refuses a
+        # non-positive one BY NAME rather than letting it past
+        # `require_known_quota`, which asks the number. Today the sum cannot be
+        # zero (`_reservation_input_tokens` rounds UP by a token and
+        # `_max_output` is the request's own ceiling); the declaration is what
+        # keeps the guarantee true of a renderer, a ceiling or an arithmetic
+        # change that does not exist yet.
+        reservation_kind=provider_resilience.RESERVATION_INFERENCE,
+        classify=_classify_matching_failure,
+        sdk_attempts=config.matching_sdk_attempts_per_call(),
+        cancelled=_stage5_cancellation(drain_applies=drain_applies),
+        on_possibly_billed=_charge_upper_bound,
+        usage_tokens_of=_usage_token_total,
+        label="stage5")
+
+
+def _transport_exhaustion_note(exc: Optional[BaseException]) -> Optional[str]:
+    """Why a failed Stage 5 attempt is TERMINAL for the patient, or None.
+
+    A failure the one retry policy has already handled -- it carries the
+    policy's attempt count -- is a TRANSPORT failure its TOTAL budget covered:
+    a transient error it retried to exhaustion, or a non-transient one it
+    refused to retry. The graph must not re-enter Stage 5 for another full
+    budget, so the node returns this in ``llm_classifier_transport_exhausted``
+    and ``graph.route_after_llm_classifier`` goes to the error handler.
+
+    None FOR EVERYTHING ELSE, and each exclusion is load-bearing: a shutdown or
+    spend stop keeps its existing "free passes" shape; an unconfirmed cache
+    write is a response that ARRIVED; and an exception with no attempt count
+    never went through the policy -- an ``IndexError`` on a malformed response,
+    say -- and keeps the patient-level retry it always had.
+    """
+    if exc is None or isinstance(exc, Stage5ShutdownRequested):
+        return None
+    if isinstance(exc, PerTrialCacheUnconfirmedError):
+        return None
+    _attempts = getattr(exc, provider_resilience.ATTEMPTS_ATTR, None)
+    if _attempts is None:
+        return None
+    _category = getattr(exc, provider_resilience.CATEGORY_ATTR, None)
+    return (f"{_category}: {type(exc).__name__} after {_attempts} provider "
+            f"attempt(s)")
+
+
+def _attempts_clause(exc: Optional[BaseException]) -> str:
+    """``" after N provider attempt(s)"`` for a stored error sentence, or ""."""
+    _attempts = getattr(exc, provider_resilience.ATTEMPTS_ATTR, None)
+    return "" if _attempts is None else f" after {_attempts} provider attempt(s)"
 
 
 
@@ -4692,13 +5088,25 @@ def node_llm_classifier_evaluation(state: TrialMatchState) -> dict:
     # Accumulate timing across retries (previous attempts' time is already in stage_timings)
     prior_llm_classifier_time = state.get("stage_timings", {}).get("llm_classifier_evaluation", 0.0)
 
-    # Exponential backoff on retries (skip delay on first attempt)
+    # THE PATIENT-LEVEL BACKOFF IS THE ONE POLICY'S SCHEDULE (the
+    # provider-resilience pass). It was `RETRY_BASE_DELAY * 2**(n-1)` -- 1 s, 2 s
+    # -- in an uninterruptible `time.sleep`, which in the smoke run put every
+    # re-entry inside the quota window that had just refused the warmup. It is
+    # full jitter capped at the window now, and CANCELLABLE: a shutdown, a spend
+    # stop or the operator's STOP ends it within PROVIDER_WAIT_POLL_SECONDS, and
+    # the gates below then decline the attempt. Nothing in this attempt has been
+    # paid yet, so the STOP drain applies. A TRANSPORT failure never reaches
+    # this line any more -- the policy's total budget covered it and the router
+    # sent it to the error handler -- so this is a response that arrived and
+    # would not parse, retried as before.
     if retry_count > 0:
-        delay = RETRY_BASE_DELAY * (2 ** (retry_count - 1))
+        delay = provider_resilience.full_jitter_delay(retry_count)
         log.info("backing off before a Stage 5 retry", stage=5,
                  retry=retry_count, max_retries=MAX_LLM_CLASSIFIER_RETRIES,
-                 delay_s=delay)
-        time.sleep(delay)
+                 delay_s=round(delay, 3))
+        _backoff_cancelled = _stage5_cancellation(drain_applies=True)
+        provider_resilience.cancellable_wait(
+            delay, lambda: _backoff_cancelled() is not None)
 
     # ── De-identify, render, and PROVE the render carries no identifier ───
     #
@@ -6057,13 +6465,20 @@ CLINICAL TRIALS:
             # `pending` IS CLEARED for the reason the transport-failure arm
             # clears it: `_obtain`'s live-call path is real, and a send loop
             # left with chunks would send every one of them uncached.
-            if _SHUTDOWN_REQUESTED:
+            # THE OPERATOR's STOP (THE DRAIN) IS DECLINED HERE TOO, and only at
+            # this gate and inside the warmup's own waits: nothing of this
+            # patient's attempt has been paid yet, so abandoning it costs
+            # nothing and the checkpoint resumes it. See `_DRAIN_REQUESTED`.
+            if _SHUTDOWN_REQUESTED or _DRAIN_REQUESTED:
+                _gate_reason = (_SHUTDOWN_REASON if _SHUTDOWN_REQUESTED
+                                else _DRAIN_REASON)
                 STAGE5_SHUTDOWN_SKIPS[
                     f"{SHUTDOWN_SKIP_WARMUP_KEY_PREFIX}"
-                    f"{_SHUTDOWN_REASON or 'unspecified'}"] += 1
-                _warmup_error = Stage5ShutdownRequested(
+                    f"{_gate_reason or 'unspecified'}"] += 1
+                _warmup_error = (Stage5ShutdownRequested if _SHUTDOWN_REQUESTED
+                                 else Stage5DrainRequested)(
                     f"no Stage 5 request was issued for this patient: "
-                    f"{_SHUTDOWN_REASON}")
+                    f"{_gate_reason}")
                 _warmup_error_source = WARMUP_SOURCE_SHUTDOWN
                 pending.clear()
                 log.warning(
@@ -6073,7 +6488,7 @@ CLINICAL TRIALS:
                     "does not record it as done", stage=5, status="error",
                     event="per_trial_shutdown_before_warmup",
                     retry=retry_count + 1, count=len(_dispatch_pairs),
-                    reason=_SHUTDOWN_REASON, degraded=True)
+                    reason=_gate_reason, degraded=True)
             elif _spend_gate(spend.SPEND_SKIP_WARMUP_KEY_PREFIX,
                              _call_counter,
                              where="a Stage 5 cache warmup") is not None:
@@ -6107,8 +6522,33 @@ CLINICAL TRIALS:
                     _warmup_response = call_matching_model_warmup(
                         system_prompt, prompt_cache_key=_cache_key)
                 except Exception as _wu_exc:          # noqa: BLE001 -- classified
-                    _rejection = classify_warmup_rejection(_wu_exc)
-                    if _rejection is None:
+                    _rejection = (None if isinstance(_wu_exc,
+                                                     Stage5ShutdownRequested)
+                                  else classify_warmup_rejection(_wu_exc))
+                    if isinstance(_wu_exc, Stage5ShutdownRequested):
+                        # A WAIT INSIDE THE ONE POLICY WAS CANCELLED -- a
+                        # shutdown, a spend stop or the operator's STOP arrived
+                        # while the warmup was paced or backing off. It is the
+                        # gate above reached a moment later, and gets the
+                        # gate's handling and sentence rather than "the shared
+                        # prefix could not be warmed", which would send an
+                        # operator looking for an endpoint fault.
+                        _warmup_error = _wu_exc
+                        _warmup_error_source = (
+                            WARMUP_SOURCE_SPEND_LIMIT
+                            if isinstance(_wu_exc, Stage5SpendStopped)
+                            else WARMUP_SOURCE_SHUTDOWN)
+                        pending.clear()
+                        log.warning(
+                            "the Stage 5 cache warmup's wait was cancelled; no "
+                            "trial call was issued and the patient is failed "
+                            "deliberately so the checkpoint does not record it "
+                            "as done", stage=5, status="stopped",
+                            event="per_trial_warmup_wait_cancelled",
+                            retry=retry_count + 1,
+                            error_type=type(_wu_exc).__name__,
+                            count=len(_dispatch_pairs), degraded=True)
+                    elif _rejection is None:
                         # A TRANSPORT FAILURE. `pending` is emptied so the send
                         # loop cannot issue a single trial call -- `_obtain`'s
                         # live-call path is a real path and would otherwise send
@@ -6925,11 +7365,20 @@ CLINICAL TRIALS:
             # It is a no-op in grouped mode, where `_prefetched` is None.
             _account_unconsumed()
             elapsed = time.time() - start
-            error_msg = f"GPT-4o API error (attempt {retry_count + 1}): {str(e)}"
+            # THE LABEL NAMES THE STAGE, NOT A MODEL. It said "GPT-4o API
+            # error" for two years after gpt-4o stopped being the judge, and
+            # the batch summary's error breakdown printed it verbatim.
+            error_msg = (f"LLM classifier API error (attempt {retry_count + 1})"
+                         f"{_attempts_clause(e)}: {str(e)}")
             log.error("Stage 5 API call failed", stage=5, status="error",
                       retry=retry_count + 1, error_type=type(e).__name__,
                       error_message=str(e))
             return {
+                # THE ROUTING FACT. Non-None -- the one policy already spent its
+                # budget on this call -- sends the patient to the error handler
+                # rather than re-entering Stage 5 for a second full budget.
+                "llm_classifier_transport_exhausted":
+                    _transport_exhaustion_note(e),
                 # Calls ISSUED before this return, never summed. A list is not a
                 # count, so a short one understates nothing; see the accumulator.
                 "llm_classifier_call_details": call_details,
@@ -7329,7 +7778,7 @@ CLINICAL TRIALS:
             # prefetched and the queue is genuinely unissued.
             _account_unconsumed()
             elapsed = time.time() - start
-            error_msg = f"GPT-4o JSON parse error (attempt {retry_count + 1}): {str(e)}"
+            error_msg = f"LLM classifier JSON parse error (attempt {retry_count + 1}): {str(e)}"
             log.error("Stage 5 response was not valid JSON", stage=5,
                       status="error", retry=retry_count + 1,
                       error_type=type(e).__name__, error_message=str(e),
@@ -7843,6 +8292,13 @@ CLINICAL TRIALS:
         # tokens and its ledger row would vanish, and the failed row would
         # report one fewer billed call than the provider charged for.
         _account_unconsumed()
+        # TERMINAL WHEN THE ONE POLICY ALREADY SPENT ITS BUDGET. See
+        # `_transport_exhaustion_note`: a warmup the policy gave up on, or a
+        # wave whose every call it gave up on, must not be re-entered for a
+        # second full budget.
+        _transport_exhausted = _transport_exhaustion_note(
+            _warmup_error if _warmup_error is not None
+            else per_trial_last_error)
         if _warmup_error is not None:
             # THE TWO WRITERS GET TWO SENTENCES AND ONE RETURN. What differs is
             # only how many requests reached the provider before the wave was
@@ -7863,8 +8319,16 @@ CLINICAL TRIALS:
                 # "the shared prefix could not be warmed" on a row an operator
                 # produced by pressing Ctrl-C sends them looking for an
                 # endpoint fault that never happened.
-                _what = ("a shutdown was requested before this patient's wave "
-                         "was dispatched, so no request was issued at all")
+                if isinstance(_warmup_error, Stage5DrainRequested):
+                    # THE OPERATOR's STOP, honoured at no cost: nothing of
+                    # this attempt was paid, and the checkpoint resumes it.
+                    _what = ("the operator's STOP was seen before this patient "
+                             "had a billed request answered, so it was "
+                             "abandoned at no cost and a resume re-runs it")
+                else:
+                    _what = ("a shutdown was requested before this patient's "
+                             "wave was dispatched, so no request was issued "
+                             "at all")
             elif _warmup_error_source == WARMUP_SOURCE_SPEND_LIMIT:
                 # NOT A FAILURE OF ANYTHING EITHER, and not a shutdown. The
                 # branch above would have told an operator that somebody
@@ -7875,10 +8339,11 @@ CLINICAL TRIALS:
             elif _warmup_error_source == WARMUP_SOURCE_FALLBACK_WRITER:
                 _what = ("the provider refused the dedicated warmup's shape "
                          "and the fallback's cache writer then failed, so the "
-                         "rest of the wave was not issued")
+                         "rest of the wave was not issued"
+                         + _attempts_clause(_warmup_error))
             else:
                 _what = ("the shared prefix could not be warmed, so no trial "
-                         "call was issued")
+                         "call was issued" + _attempts_clause(_warmup_error))
             error_msg = (f"Stage 5 per-trial cache warmup error (attempt "
                          f"{retry_count + 1}): {_what}; "
                          f"{type(_warmup_error).__name__}: {_warmup_error}")
@@ -7936,6 +8401,9 @@ CLINICAL TRIALS:
             "llm_classifier_prompt_version": PROMPT_VERSION,
             "llm_classifier_prompt_sha256": system_prompt_sha256,
             "llm_classifier_patient_record_tokens": patient_record_tokens,
+            # THE ROUTING FACT. Non-None sends the patient to the error handler
+            # instead of re-entering Stage 5 for a second full budget.
+            "llm_classifier_transport_exhausted": _transport_exhausted,
             "stage_timings": {**state.get("stage_timings", {}), "llm_classifier_evaluation": round(prior_llm_classifier_time + elapsed, 3)}
         }
 

@@ -199,6 +199,23 @@ _SHA_ENTRY_BEFORE = hashlib.sha256(_ENTRY_SRC.encode("utf-8")).hexdigest()
 
 _TMP = tempfile.mkdtemp(prefix="stopswitch_")
 
+# INSIDE _TMP so the existing cleanup removes it, and NOT created here:
+# `control.ensure_lock_directory` creates it 0700 and verifies it.
+_LOCK_DIR = os.path.join(_TMP, "locks")
+_LOCK_NOTE = _harness.lock_isolation_note(dict(os.environ),
+                                          "test_runner_stop_switch.py")
+if _LOCK_NOTE:
+    print(_LOCK_NOTE)
+
+# AND IN THIS PROCESS TOO. `control.lock_directory()` reads it on every call,
+# so a child in a private directory and a parent on the default one disagree
+# about where every lock file is -- and any in-process derivation of a lock
+# path then addresses a file no child ever touches. See the same block in
+# tests/test_runner_preflight_and_state_faults.py for the six checks that
+# measured. Restored at the end: `pytest tests/` shares one process.
+_LOCK_DIR_SAVED = os.environ.get(_harness.LOCK_DIR_ENV)
+os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR
+
 
 # ===========================================================================
 # HARNESS
@@ -1125,6 +1142,12 @@ def drive(root, *, park="none", action=None, args=(), repo=None, patients=40,
     })
     env.update(_harness.submit_env(submitted))
     env.update(_harness.park_env(park, ready, release, cap=150))
+    # THE PROVIDER-ALLOWANCE LOCK'S DIRECTORY, PRIVATE TO THIS FILE. The entry
+    # point now takes a lock keyed on the provider ALLOWANCE, which no
+    # checkpoint directory distinguishes -- so without this every child of
+    # every harness in bucket A would guard the same one. See
+    # _control_harness.LOCK_DIR_ENV.
+    _harness.isolate_locks(env, _LOCK_DIR)
     env.pop("PYTHONNOUSERSITE", None)
 
     def _count(phase):
@@ -2171,6 +2194,16 @@ check("10d the production inferences path was never resolved in this process, "
       "so no scenario could have written to it",
       "inferences_path" in _paths._RESOLVED, False)
 
+# RESTORED BEFORE THE TREE GOES: `pytest tests/` imports every module into one
+# process, so a leaked value would point a later file's locks into a directory
+# this one has just removed.
+if _LOCK_DIR_SAVED is None:
+    os.environ.pop(_harness.LOCK_DIR_ENV, None)
+else:
+    os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR_SAVED
+check("10h the lock-directory isolation is restored to exactly what it was "
+      "found at, so this file leaves no state in the process",
+      os.environ.get(_harness.LOCK_DIR_ENV), _LOCK_DIR_SAVED)
 shutil.rmtree(_TMP, ignore_errors=True)
 check("10e the scratch tree was removed", os.path.exists(_TMP), False)
 

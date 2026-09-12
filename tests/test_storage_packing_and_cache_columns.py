@@ -344,6 +344,28 @@ _EV_DIGEST_BEFORE = digest(_EV_PY)
 _PROD_DB = _paths.inferences_path
 _PROD_DIGEST_BEFORE = digest(_PROD_DB)
 
+# THE SIDECARS' STATE BEFORE THIS FILE RUNS, CAPTURED AT MODULE SCOPE.
+#
+# SECTION 5 USED TO DEMAND THEIR ABSENCE AND THAT WAS THE WRONG QUESTION.
+# `os.path.exists(_PROD_DB + "-wal")` is a statement about the whole machine,
+# not about this file: SQLite creates both sidecars for ANY connection to a WAL
+# database including a read-only one, so any campaign, any reader, any other
+# test that has ever opened the production database leaves them there -- and
+# they persist. MEASURED: both were present on this developer tree (a `-shm` of
+# 32,768 bytes and a zero-length `-wal`) and section 5 therefore FAILED twice
+# on files it did not create. `tests/test_storage_wipe_all_tables.py` was one
+# creator and has been repaired; the assertion is still wrong, because it would
+# fail again on the next reader and it never was about this file.
+#
+# WHAT IS ASSERTED INSTEAD IS THE PROPERTY THIS FILE CAN OWN: the sidecars are
+# EXACTLY AS THEY WERE FOUND. That fails if this file creates one, which is the
+# isolation defect worth catching, and it passes whether or not they existed
+# beforehand -- so the check no longer depends on whether a campaign has ever
+# run on this machine.
+_PROD_SIDECARS_BEFORE = {
+    suffix: os.path.exists(_PROD_DB + suffix) for suffix in ("-wal", "-shm")
+}
+
 # The four columns this file is about, with the SQL type each is declared as.
 NEW_COLUMNS = {
     "llm_classifier_cached_input_tokens": "INTEGER",
@@ -1037,9 +1059,12 @@ check("oncotriage/agent/evaluation.py is byte-identical",
       digest(_EV_PY), _EV_DIGEST_BEFORE)
 check("the production inference database is byte-identical",
       digest(_PROD_DB), _PROD_DIGEST_BEFORE)
-for _suffix in ("-wal", "-shm"):
-    check(f"no {_suffix} file was created beside the production database",
-          os.path.exists(_PROD_DB + _suffix), False)
+check("the production database's -wal and -shm sidecars are EXACTLY as this "
+      "file found them, so nothing here opened it (a read-only connection to a "
+      "WAL database creates both, which is why the question is 'unchanged' "
+      "rather than 'absent' -- see _PROD_SIDECARS_BEFORE)",
+      {suffix: os.path.exists(_PROD_DB + suffix)
+       for suffix in _PROD_SIDECARS_BEFORE}, _PROD_SIDECARS_BEFORE)
 check("every database this file wrote is inside the scratch directory",
       sorted({os.path.commonpath([os.path.abspath(p), _TMP])
               for p in (_DB, _LEGACY, _FAILDB)}), [_TMP])

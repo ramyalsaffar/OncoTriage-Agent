@@ -124,7 +124,7 @@ import re
 import time
 from collections import Counter, OrderedDict
 
-from oncotriage import config, paths, spend, spend_journal
+from oncotriage import config, paths, provider_resilience, spend, spend_journal
 from oncotriage.agent.prompts import PROMPT_VERSION, render_system_prompt
 from oncotriage.evaluation import judge_independence
 from oncotriage.observability import console, get_logger
@@ -3553,7 +3553,148 @@ def require_client():
             code="api_key_absent")
     log.info("rater.credentials_resolved", stage="credentials",
              reason=source)
-    return openai.OpenAI(), source
+    # ── `max_retries=0`: THE SDK MAY NOT RE-SEND A SUBMISSION ──────────────
+    #
+    # THE REASON IS `batches.create`, AND IT IS NOT THE USUAL ONE. Everywhere
+    # else in this project an SDK retry is turned off because a replacement
+    # policy covers the client's every consumer. Here the argument is sharper
+    # and stands on its own: `batches.create` is the ONE call in this project
+    # whose retry can COMMIT A WHOLE SECOND BATCH -- up to
+    # MAX_REQUESTS_PER_BATCH billed requests. An accepted request whose
+    # response is lost is indistinguishable, to the SDK, from one that never
+    # arrived, so its silent re-send is exactly the duplicate submission
+    # `reconcile_uncertain_submission` exists to make impossible. A retry layer
+    # that cannot be asked what it did must not sit underneath one that
+    # verifies before it re-attempts.
+    #
+    # THE REPLACEMENT IS NOW WIRED, AND THIS BLOCK SAID THE OPPOSITE FOR AS
+    # LONG AS IT WAS NOT. It read: the four retrieval calls "have NOT been
+    # given a replacement", and that putting them under the policy was "an
+    # OPERATOR DECISION RATHER THAN AN OMISSION" because pacing retrieval
+    # "would strand results ALREADY PAID FOR behind a missing integer, which
+    # is a different consequence and one nobody has ruled on".
+    #
+    # **THE OPERATOR HAS NOW RULED, AND THE RULING IS THAT ALL SIX CALLS ARE
+    # PACED.** `_paced_management` puts every one of them under
+    # `provider_resilience.execute` at
+    # `config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH`. The consequence the old text
+    # named is real and is accepted rather than denied: with that scope's
+    # requests/minute UNKNOWN the pacer refuses BEFORE the first attempt, so a
+    # retrieval of results already paid for refuses too. What makes that
+    # affordable is that the refusal is a CONFIGURATION refusal an operator
+    # clears with one integer -- the message names the constant, the scope and
+    # the family -- and nothing is lost while it stands: the batch and its
+    # output file stay in the account's storage and `--resume <id>` collects
+    # them the moment the number is set.
+    #
+    # `max_retries=0` IS UNCHANGED AND ITS ARGUMENT IS UNTOUCHED. The policy
+    # now supplies the retries the SDK is not allowed to make, which is what
+    # the paragraph above was waiting for; `sdk_attempts=1` at every call site
+    # is the statement that one `send()` makes exactly one wire attempt, so the
+    # policy's budget and the pacer's rate bound are both true of the wire.
+    #
+    # `models.retrieve` IS THE ONE CALL DELIBERATELY LEFT OUT, and it is named
+    # here so its absence is a decision rather than a gap somebody finds later.
+    # It is the free visibility check that runs BEFORE anything is uploaded,
+    # and pacing it would put a refusal in front of the diagnostic whose whole
+    # purpose is to refuse early and cheaply -- an operator whose quota is
+    # unset would be told about the quota instead of about the key, which is
+    # the misdiagnosis the check exists to prevent. It is one request per run.
+    return openai.OpenAI(max_retries=0), source
+
+
+def _paced_management(call, label, *, max_attempts):
+    """One OpenAI Batch-API MANAGEMENT call, under the pacer and the policy.
+
+    **`max_attempts` IS REQUIRED AND HAS NO DEFAULT, AND THAT IS A MONEY
+    ARGUMENT RATHER THAN A STYLE ONE.** `provider_resilience.execute` retries a
+    TRANSIENT failure -- a throttle, a 500, a timeout -- up to
+    `config.MATCHING_CALL_MAX_ATTEMPTS`, which is 6. For the four RETRIEVAL
+    calls that is exactly what is wanted: they are idempotent reads and a
+    transient blip on a poll should ride out rather than end the run. For the
+    two CREATE calls it is catastrophic, and this module already says so in as
+    many words at `require_client`: "`batches.create` is the ONE call in this
+    project whose retry can COMMIT A WHOLE SECOND BATCH -- up to
+    MAX_REQUESTS_PER_BATCH billed requests", and the duplicate is undetectable
+    afterwards because both batches return valid ratings for the same
+    custom_ids. That is the precise failure `reconcile_uncertain_submission`
+    exists to prevent, and a policy retry would reintroduce it UNDERNEATH the
+    mechanism built to stop it -- a retry layer that cannot be asked what it did
+    sitting below one that verifies before it re-attempts.
+
+    So neither value is safe to inherit and the caller states which it is, on
+    `provider_resilience.RESERVATION_KINDS`' own footing one module over. Pass
+    ``1`` for a call whose re-issue commits something, and ``None`` -- the
+    policy's own budget -- for an idempotent read.
+
+    THE UPLOAD TAKES ``1`` TOO, and it is the weaker of the two cases stated
+    rather than glossed: a retried `files.create` commits no batch and bills no
+    model, so its cost is an orphan file in the account's storage. It is held to
+    the same rule anyway, because the existing code treats the upload as "the
+    point of no return in practice" and puts the spend gate above it -- and
+    because a create that raised and may have been ACCEPTED is the exact input
+    `reconcile_uncertain_submission` is written to classify. Retrying it here
+    would answer that question before the mechanism could ask it.
+
+    **WHY THESE CALLS ARE `RESERVATION_MANAGEMENT` AND RESERVE ZERO TOKENS.**
+    `files.create`, `batches.create`, `batches.list`, `batches.retrieve` and
+    `files.content` upload a file, enqueue it, list, read a status and download
+    a result. None of them generates a model token, which is why this scope's
+    token row is `QUOTA_NOT_APPLICABLE` rather than `None` -- and why declaring
+    `RESERVATION_MANAGEMENT` here is a statement about the API rather than an
+    escape from the token guard. A caller that declared it for a generating
+    call would be asserting something false about the provider; see
+    `provider_resilience.RESERVATION_KINDS`.
+
+    **NO `on_possibly_billed` AND NO `usage_tokens_of`, AND BOTH OMISSIONS ARE
+    DELIBERATE.** Those two exist to charge an upper bound for a failed attempt
+    that may have been billed by the MODEL, and to settle a reservation against
+    a usage figure. A management call is not model-billed and reports no usage,
+    so passing either would put a fabricated number into the spend ledger and
+    into the token window. The batch's real cost is charged where it is
+    measured -- `charge_batch_to_ledger`, from the usage the results carry.
+
+    **`sdk_attempts=1` BECAUSE `require_client` BUILDS WITH `max_retries=0`.**
+    The two have to agree: the pacer reserves that many slots per policy
+    attempt, so declaring more than the SDK can make would under-use the rate
+    and declaring fewer would let the wire exceed it.
+
+    **A PRE-SEND REFUSAL BECOMES A `RaterRefusal`, WHICH IS WHAT MAKES THE EXIT
+    CODE RIGHT.** `provider_resilience` refuses an unknown quota with
+    `QuotaUnknown`, a `RuntimeError` that `main()` handles nowhere -- so
+    unconverted it would leave this program as an uncaught traceback: no
+    "REFUSED:" line, no named remedy, and an exit status that says nothing.
+    Converted here it reaches `main()`'s existing `except RaterRefusal` and
+    exits 1, the CONFIGURATION refusal code, beside `SpendLimitReached`'s 3.
+
+    **AND THE MARKER IS CARRIED ONTO THE REFUSAL RATHER THAN LOST IN THE
+    CONVERSION.** `submit_batches` asks `is_pre_send_refusal` to decide whether
+    an exception is an uncertain create; a conversion that dropped the marker
+    would make every quota refusal look like a lost response and send this
+    program to `reconcile_uncertain_submission` to ask the provider about a
+    request it never made.
+    """
+    try:
+        return provider_resilience.execute(
+            call,
+            scope=config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH,
+            reservation_tokens=0,
+            reservation_kind=provider_resilience.RESERVATION_MANAGEMENT,
+            classify=provider_resilience.classify_openai_failure,
+            sdk_attempts=1,
+            max_attempts=max_attempts,
+            label=label)
+    except BaseException as exc:
+        if not provider_resilience.is_pre_send_refusal(exc):
+            raise
+        refusal = RaterRefusal(
+            f"the pacer refused the {label} call before it was sent: {exc} "
+            f"NOTHING WAS SENT for this call and nothing has been billed by "
+            f"it. Anything already submitted in this session is unaffected and "
+            f"stays retrievable with --resume <id>.",
+            code="pacing_refused")
+        provider_resilience.mark_pre_send_refusal(refusal)
+        raise refusal from exc
 
 
 def model_is_visible(client, model):
@@ -4066,6 +4207,155 @@ def persist_raw_replies(out_dir, batch_id, text, kind="output"):
     return path, "written"
 
 
+RECONCILE_FOUND = "found"
+RECONCILE_ABSENT = "absent"
+RECONCILE_UNKNOWN = "unknown"
+RECONCILE_OUTCOMES = (RECONCILE_FOUND, RECONCILE_ABSENT, RECONCILE_UNKNOWN)
+"""What is known after asking the provider whether an uncertain submission
+landed. CLOSED, and each member names a DIFFERENT next action.
+
+  ``found``    the batch EXISTS and is this chunk's. ADOPT it; do not resubmit.
+  ``absent``   the provider has no such batch. Submitting once is SAFE.
+  ``unknown``  the question could not be answered. STOP, report, resubmit
+               NOTHING.
+
+THE THIRD MEMBER IS THE WHOLE POINT. Folding it into ``absent`` is the
+duplicate submission this reconciliation exists to prevent: "I could not tell"
+read as "it did not land" resubmits a batch that may already be running, and a
+batch is up to ``MAX_REQUESTS_PER_BATCH`` billed requests. Folding it into
+``found`` is the opposite loss -- a session that stops and reports a batch
+nobody created. Neither is recoverable by re-running, so the honest answer is
+its own outcome with its own remedy."""
+
+
+def _batch_identity(chunk, tag, index):
+    """The facts that make a provider-side batch THIS chunk's, as a dict.
+
+    **THE BYTES ARE THE IDENTITY AND EVERYTHING ELSE NARROWS.** The digest is
+    over exactly what ``submit_batches`` uploads -- ``batch_jsonl(chunk)`` --
+    so a batch whose input file hashes to this value carries THIS chunk's
+    requests, whatever it is called. The endpoint, the completion window and
+    the metadata are compared beside it because a file can be reused across
+    two batches submitted with different parameters, and such a batch is not
+    this submission even though its bytes match.
+
+    THE FILENAME AND THE METADATA ARE NARROWING CLUES AND NOT IDENTITY, which
+    is why they are recorded here but never sufficient on their own: an
+    operator may submit the same chunk twice deliberately, and two batches
+    would then carry the same name and the same metadata. Only the bytes plus
+    the parameters say "this is the submission I was about to make".
+    """
+    return {
+        "jsonl_sha256": _sha256(batch_jsonl(chunk)),
+        "endpoint": BATCH_ENDPOINT,
+        "completion_window": BATCH_COMPLETION_WINDOW,
+        "metadata": {"harness": "oncotriage-rater", "tag": tag,
+                     "chunk": str(index)},
+        "requests": len(chunk),
+    }
+
+
+def _batch_matches_identity(client, batch, identity):
+    """Is ``batch`` the submission ``identity`` describes? Raises on unknown.
+
+    RAISES ``RaterRefusal`` RATHER THAN ANSWERING False WHEN IT CANNOT TELL --
+    a download that fails, a batch with no input file, bytes that will not
+    decode. False here would mean "not this submission", which the caller acts
+    on by SUBMITTING AGAIN; "I could not read the evidence" must not be able to
+    produce that action.
+    """
+    if getattr(batch, "endpoint", None) != identity["endpoint"]:
+        return False
+    if getattr(batch, "completion_window", None) != identity[
+            "completion_window"]:
+        return False
+    meta = getattr(batch, "metadata", None) or {}
+    if {k: str(v) for k, v in dict(meta).items()} != identity["metadata"]:
+        return False
+    file_id = getattr(batch, "input_file_id", None)
+    if not file_id:
+        raise RaterRefusal(
+            f"batch {getattr(batch, 'id', '<unknown>')!r} matches this "
+            f"submission's parameters and carries no input_file_id, so its "
+            f"REQUESTS cannot be compared and it cannot be adopted or ruled "
+            f"out. NOTHING WAS RESUBMITTED.",
+            code="reconcile_no_input_file")
+    try:
+        body = _read_file_text(client, file_id)
+    except Exception as exc:                                    # noqa: BLE001
+        raise RaterRefusal(
+            f"could not download the input file {file_id!r} of candidate "
+            f"batch {getattr(batch, 'id', '<unknown>')!r} "
+            f"({type(exc).__name__}: {str(exc)[:200]}), so whether this "
+            f"submission already landed CANNOT BE ESTABLISHED. NOTHING WAS "
+            f"RESUBMITTED -- re-run once the account is reachable.",
+            code="reconcile_unreadable") from exc
+    if body is None:
+        raise RaterRefusal(
+            f"the input file {file_id!r} of candidate batch "
+            f"{getattr(batch, 'id', '<unknown>')!r} came back empty, so this "
+            f"submission's identity cannot be established. NOTHING WAS "
+            f"RESUBMITTED.",
+            code="reconcile_unreadable")
+    return _sha256(body) == identity["jsonl_sha256"]
+
+
+def reconcile_uncertain_submission(client, identity, *, limit=50):
+    """Did an uncertain ``files.create`` / ``batches.create`` already land?
+
+    **CALLED ONLY AFTER AN UNCERTAIN CREATE, NEVER ON THE HAPPY PATH.** A
+    successful ``batches.create`` returns the batch and there is nothing to
+    reconcile; this runs when the create RAISED, where the one thing that is
+    not known is whether the provider accepted it before the response was lost.
+    That is also why the happy path reaches neither ``batches.list`` nor
+    ``files.content``: a stand-in that answers only the two create endpoints
+    -- which is every stub in this suite -- is unaffected by this function
+    existing.
+
+    Returns a ``(outcome, batch)`` pair whose outcome is a
+    ``RECONCILE_OUTCOMES`` member. ``batch`` is the adopted batch for
+    ``found`` and None otherwise.
+
+    **IT NEVER RESUBMITS AND NEVER RAISES ON `unknown`.** The caller decides:
+    this function's contract is to ANSWER, and turning "I could not tell" into
+    an exception here would put the decision in the wrong place -- the caller
+    is the one that knows whether it is inside a loop with batches already
+    created and a state file to write.
+
+    ``limit`` BOUNDS THE LISTING. A newly created batch is the most recent, so
+    the first page is where it is; scanning an account's whole history would
+    make the recovery slower than the submission and would reach batches from
+    other sessions that are none of this one's business.
+    """
+    try:
+        # AN IDEMPOTENT READ, so the policy's own budget applies: listing twice
+        # costs a listing and commits nothing.
+        page = _paced_management(lambda: client.batches.list(limit=limit),
+                                 "batches.list", max_attempts=None)
+        candidates = list(getattr(page, "data", None) or [])
+    except Exception as exc:                                    # noqa: BLE001
+        # A PRE-SEND REFUSAL IS NOT "THE PROVIDER COULD NOT BE ASKED", AND
+        # FOLDING IT INTO `unknown` WOULD BE A FALSE STATEMENT ABOUT WHAT
+        # HAPPENED. `unknown` means the provider WAS asked and did not answer
+        # usefully -- it is the outcome that stops a resubmission because the
+        # question is genuinely open. A pacer refusal means the listing never
+        # left this process, so the question was never put; reporting it as
+        # `unknown` would tell the caller a round trip happened that did not,
+        # and would bury a configuration defect an operator fixes with one
+        # integer inside an outcome whose remedy is "wait and re-run".
+        if provider_resilience.is_pre_send_refusal(exc):
+            raise
+        # THE PROVIDER COULD NOT BE ASKED. This is exactly the state that must
+        # NOT read as "it did not land".
+        log.warning("rater.reconcile_unavailable", stage="submit",
+                    error_type=type(exc).__name__)
+        return RECONCILE_UNKNOWN, None
+    for batch in candidates:
+        if _batch_matches_identity(client, batch, identity):
+            return RECONCILE_FOUND, batch
+    return RECONCILE_ABSENT, None
+
+
 def submit_batches(client, chunks, state, state_path, tag, out_dir=None):
     """Upload one JSONL file per chunk, create one batch each, record the ids.
 
@@ -4105,24 +4395,150 @@ def submit_batches(client, chunks, state, state_path, tag, out_dir=None):
         spend.require_budget(spend.SPEND_SOURCE_RATER,
                              f"the rater's {tag} batch {i + 1}/{len(chunks)}")
         payload = batch_jsonl(chunk).encode("utf-8")
-        # A FILENAME THE PROVIDER ECHOES BACK, carrying the tag and the chunk
-        # index, so a stray file in the account's storage is attributable.
-        upload = client.files.create(
-            file=(f"oncotriage_rater_{tag}_{i + 1}.jsonl", payload),
-            purpose="batch")
-        batch = client.batches.create(
-            input_file_id=upload.id,
-            endpoint=BATCH_ENDPOINT,
-            completion_window=BATCH_COMPLETION_WINDOW,
-            metadata={"harness": "oncotriage-rater", "tag": tag,
-                      "chunk": str(i)})
+        # ── VERIFY BEFORE RE-ATTEMPT ───────────────────────────────────────
+        #
+        # **AN UNCERTAIN CREATE IS RECONCILED BEFORE ANYTHING IS SENT AGAIN.**
+        # `files.create` and `batches.create` are the two calls here that can
+        # be ACCEPTED and still raise -- a response lost after the provider
+        # committed it. The SDK's own retries are off for exactly this reason
+        # (see `require_client`), so nothing re-sends behind this code's back;
+        # what is left is this code's own decision, and "it raised, try again"
+        # is the wrong one. A second `batches.create` commits up to
+        # MAX_REQUESTS_PER_BATCH billed requests a second time, and the
+        # duplicate is not detectable afterwards: both batches return valid
+        # ratings for the same custom_ids.
+        #
+        # THE HAPPY PATH IS UNCHANGED AND REACHES NEITHER `batches.list` NOR
+        # `files.content`. That is load-bearing rather than incidental: every
+        # stand-in in this suite answers `files.create` and `batches.create`
+        # and nothing else, so a reconciliation on the ordinary path would
+        # break all three of them -- and, worse, would make a routine
+        # submission depend on two endpoints it has no reason to touch.
+        _identity = _batch_identity(chunk, tag, i)
+        try:
+            # A FILENAME THE PROVIDER ECHOES BACK, carrying the tag and the
+            # chunk index, so a stray file in the account's storage is
+            # attributable.
+            # `max_attempts=1`: THE POLICY MAY NOT RE-ISSUE A CREATE. See
+            # `_paced_management`. One attempt, and a failure goes to the
+            # verify-before-retry path below, which ASKS the provider what
+            # landed instead of guessing.
+            upload = _paced_management(
+                lambda: client.files.create(
+                    file=(f"oncotriage_rater_{tag}_{i + 1}.jsonl", payload),
+                    purpose="batch"),
+                "files.create", max_attempts=1)
+            batch = _paced_management(
+                lambda: client.batches.create(
+                    input_file_id=upload.id,
+                    endpoint=BATCH_ENDPOINT,
+                    completion_window=BATCH_COMPLETION_WINDOW,
+                    metadata={"harness": "oncotriage-rater", "tag": tag,
+                              "chunk": str(i)}),
+                "batches.create", max_attempts=1)
+        except Exception as exc:                                # noqa: BLE001
+            # A SPEND STOP IS NOT AN UNCERTAIN CREATE. It is raised by the gate
+            # ABOVE, never by the provider, so it must travel to main()'s own
+            # handler unchanged rather than being reconciled as a lost
+            # response.
+            if isinstance(exc, spend.SpendLimitReached):
+                raise
+            # NEITHER IS A PRE-SEND REFUSAL, AND THE REASON IS THE SAME SHAPE.
+            # `reconcile_uncertain_submission` exists for ONE state: the create
+            # was ISSUED and its response was lost, so whether the provider
+            # accepted it is genuinely unknown. A pacer refusal is the opposite
+            # -- `provider_resilience` refused ABOVE the send, so no request
+            # left this process and there is nothing to reconcile. Letting it
+            # fall through would spend a `batches.list` asking the provider
+            # about a submission that was never made, and would then report a
+            # configuration defect as `submission_uncertain`, whose remedy
+            # ("re-run once the account is reachable") is not the remedy.
+            #
+            # THE MARKER IS THE EVIDENCE, NOT THE TYPE. `_paced_management`
+            # converts a pre-send refusal to a `RaterRefusal` and carries the
+            # marker onto it, so this test recognises it without an
+            # `isinstance` list that a future raise site could silently join.
+            if provider_resilience.is_pre_send_refusal(exc):
+                raise
+            console.out("")
+            console.out(f"  [{tag}] batch {i + 1}/{len(chunks)} did not "
+                        f"complete ({type(exc).__name__}). It may have been "
+                        f"ACCEPTED before the response was lost -- asking the "
+                        f"provider before anything is sent again.")
+            outcome, found = reconcile_uncertain_submission(client, _identity)
+            if outcome == RECONCILE_UNKNOWN:
+                raise RaterRefusal(
+                    f"the {tag} submission's batch {i + 1}/{len(chunks)} "
+                    f"raised {type(exc).__name__}: {str(exc)[:200]} -- and "
+                    f"whether it was ACCEPTED could not be established, "
+                    f"because the provider could not be listed. NOTHING WAS "
+                    f"RESUBMITTED, deliberately: a second batches.create "
+                    f"commits up to {MAX_REQUESTS_PER_BATCH} billed requests "
+                    f"again and the duplicate is undetectable afterwards -- "
+                    f"both batches return valid ratings for the same "
+                    f"custom_ids. Batch ids created before this point are in "
+                    f"{state_path} and are resumable with --resume <id>. "
+                    f"Re-run once the account is reachable: this code will ask "
+                    f"again before it sends.",
+                    code="submission_uncertain") from exc
+            if outcome == RECONCILE_FOUND:
+                # ADOPTED, NOT RESUBMITTED. The provider has this chunk's
+                # requests, verified by the sha256 of the input file it holds
+                # against the bytes this iteration was about to upload.
+                # THE ID IS TAKEN DIRECTLY RATHER THAN WRAPPED IN A STAND-IN
+                # OBJECT. The first version built a `types.SimpleNamespace`
+                # here so the two paths could share `upload.id` below -- and
+                # `types` is not imported in this module, so the ONE path that
+                # matters most (a real uncertain create, adopted) would have
+                # raised NameError instead of recording the adoption. Both
+                # paths now carry the id itself, which needs no import and no
+                # object that exists only to be read once.
+                batch = found
+                _input_file_id = getattr(found, "input_file_id", None)
+                console.out(f"  [{tag}] ADOPTED already-accepted batch "
+                            f"{getattr(batch, 'id', '<unknown>')}: its input "
+                            f"file matches this chunk's bytes exactly. Nothing "
+                            f"was submitted twice.")
+                log.warning("rater.submission_adopted", stage=tag,
+                            reason="uncertain_create_reconciled")
+            else:
+                # ABSENT: the provider has no such batch, so submitting once is
+                # safe. Exactly once -- this is not a loop.
+                console.out(f"  [{tag}] the provider has no such batch; "
+                            f"submitting once.")
+                # `max_attempts=1` HERE TOO, and this is the site where it
+                # matters most: this is the ONE deliberate re-submission in the
+                # program, taken only after the provider has been asked and has
+                # answered ABSENT. A policy retry on top of it would turn
+                # "submit exactly once more" into "submit up to six times more".
+                upload = _paced_management(
+                    lambda: client.files.create(
+                        file=(f"oncotriage_rater_{tag}_{i + 1}.jsonl", payload),
+                        purpose="batch"),
+                    "files.create", max_attempts=1)
+                batch = _paced_management(
+                    lambda: client.batches.create(
+                        input_file_id=upload.id,
+                        endpoint=BATCH_ENDPOINT,
+                        completion_window=BATCH_COMPLETION_WINDOW,
+                        metadata={"harness": "oncotriage-rater", "tag": tag,
+                                  "chunk": str(i)}),
+                    "batches.create", max_attempts=1)
+                _input_file_id = upload.id
+        else:
+            # THE ORDINARY PATH, and the `else` is what keeps it ordinary: it
+            # runs only when the `try` raised nothing, so a submission that
+            # never failed does not touch the reconciliation's vocabulary at
+            # all.
+            _input_file_id = upload.id
         ids.append(batch.id)
         state.setdefault("batches", []).append(
             {"id": batch.id, "tag": tag, "chunk": i, "requests": len(chunk),
-             "input_file_id": upload.id})
+             "input_file_id": _input_file_id})
         write_state(state_path, state)
         console.out(f"  [{tag}] batch {i + 1}/{len(chunks)} created: "
-                    f"{batch.id}  ({len(chunk)} requests, file {upload.id})")
+                    f"{batch.id}  ({len(chunk)} requests, file "
+                    f"{_input_file_id})")
         console.out(f"           resume with: --resume {batch.id}")
         log.info("rater.batch_created", stage=tag, count=len(chunk))
     return ids
@@ -4138,7 +4554,13 @@ def poll_batch(client, batch_id, interval, timeout):
     started = time.time()
     last = None
     while True:
-        batch = client.batches.retrieve(batch_id)
+        # PACED PER POLL, NOT ONCE FOR THE LOOP. Every iteration is its own
+        # request against the account's batch-management allowance, and a poll
+        # loop is precisely the shape that turns one call into hundreds -- so
+        # pacing the loop body is the only placement that bounds the rate this
+        # function produces.
+        batch = _paced_management(lambda: client.batches.retrieve(batch_id),
+                                  "batches.retrieve", max_attempts=None)
         status = batch.status
         counts = getattr(batch, "request_counts", None)
         line = (f"    {batch_id}: {status} "
@@ -4173,7 +4595,8 @@ def _read_file_text(client, file_id):
     """One output file's whole body as text, or None when there is no file."""
     if not file_id:
         return None
-    content = client.files.content(file_id)
+    content = _paced_management(lambda: client.files.content(file_id),
+                                "files.content", max_attempts=None)
     # The SDK returns an HttpxBinaryResponseContent; `.text` decodes it. A
     # plain `str` is accepted so a stand-in can hand back the body directly.
     if isinstance(content, str):
@@ -4225,7 +4648,8 @@ def collect_results(client, batch_id, index, model, out_dir=None):
     stop_reasons = Counter()
     answering_models = Counter()
 
-    batch = client.batches.retrieve(batch_id)
+    batch = _paced_management(lambda: client.batches.retrieve(batch_id),
+                              "batches.retrieve", max_attempts=None)
     status = getattr(batch, "status", None)
     output_text = _read_file_text(client, getattr(batch, "output_file_id", None))
     error_text = _read_file_text(client, getattr(batch, "error_file_id", None))
@@ -7106,6 +7530,33 @@ def _report_plan(run, index, out_dir, args, calibration=None,
             "full_cache_usd": full_cache_cost, "calibration": calibration,
             "chunks": len(chunks), "reservation_usd": reserved,
             "reservation": reservation}
+
+
+def dispatches_billed_calls(argv=None):
+    """Can this invocation reach the provider? Read by ``rater_run.py``.
+
+    WHY THE ENTRY POINT ASKS AT ALL. It takes the OpenAI batch-management
+    allowance lock around ``main()``, and a lock held for the whole invocation
+    would refuse a ``--dry-run`` -- which costs nothing, issues no request and
+    is the one mode an operator runs WHILE a live session is going. Refusing a
+    free operation because a paid one holds an allowance it does not use is a
+    usability regression with no safety in it.
+
+    IT USES THIS MODULE'S OWN PARSER rather than testing ``sys.argv`` for a
+    string, and that is the whole reason it is a function here instead of two
+    lines in the guard: argparse accepts unambiguous ABBREVIATIONS (``--dry``),
+    so a substring test would hand the lock to a dry run and the refusal would
+    be about a flag nobody typed. Parsing twice is safe because argparse is a
+    pure function of argv with no side effect beyond ``--help`` and a usage
+    error, both of which exit -- the same argument ``26- Ablation Study.py``
+    already carries for its own double parse.
+
+    ``--dry-run``, ``--submit`` and ``--resume`` are one mutually exclusive
+    group, so this is simply "was a spending mode asked for".
+    """
+    args = _parse_args(argv)
+    return bool(getattr(args, "submit", False)
+                or getattr(args, "resume", None))
 
 
 def main(argv=None):

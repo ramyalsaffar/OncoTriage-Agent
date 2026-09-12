@@ -252,6 +252,21 @@ _SHA_ENTRY_BEFORE = hashlib.sha256(
     open(_ENTRY_PATH, "rb").read()).hexdigest()
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage-sigterm-")
+
+# INSIDE _TMP so the existing cleanup removes it, and NOT created here:
+# `control.ensure_lock_directory` creates it 0700 and verifies it.
+_LOCK_DIR = os.path.join(_TMP, "locks")
+_LOCK_NOTE = _harness.lock_isolation_note(dict(os.environ),
+                                          "test_runner_sigterm_shutdown.py")
+if _LOCK_NOTE:
+    print(_LOCK_NOTE)
+
+# AND IN THIS PROCESS TOO -- a child in a private lock directory and a parent
+# on the default one disagree about where every lock file is. See the same
+# block in tests/test_runner_preflight_and_state_faults.py for what that
+# measured. Restored at the end: `pytest tests/` shares one process.
+_LOCK_DIR_SAVED = os.environ.get(_harness.LOCK_DIR_ENV)
+os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR
 print(f"Scratch: {_TMP}")
 
 
@@ -779,6 +794,10 @@ def drive(name, *, sig, repo=None, patients=40, timeout=180, double=False):
     })
     env.update(_harness.submit_env(submitted))
     env.update(_harness.park_env(_harness.PARK_ALL, ready, release))
+    # THE PROVIDER-ALLOWANCE LOCK'S DIRECTORY, PRIVATE TO THIS FILE. The entry
+    # point now takes a lock keyed on the provider ALLOWANCE, which no
+    # checkpoint directory distinguishes. See _control_harness.LOCK_DIR_ENV.
+    _harness.isolate_locks(env, _LOCK_DIR)
     env.pop("PYTHONNOUSERSITE", None)
 
     def _count_started():
@@ -1621,6 +1640,16 @@ check("5c  ...and those comparisons are not tautologies: both files are "
       (len(_RUNNER_SRC) > 1000, len(_ENTRY_SRC) > 1000,
        _SHA_RUNNER_BEFORE != _SHA_ENTRY_BEFORE), (True, True, True))
 
+# RESTORED BEFORE THE TREE GOES: `pytest tests/` imports every module into one
+# process, so a leaked value would point a later file's locks into a directory
+# this one has just removed.
+if _LOCK_DIR_SAVED is None:
+    os.environ.pop(_harness.LOCK_DIR_ENV, None)
+else:
+    os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR_SAVED
+check("5f  the lock-directory isolation is restored to exactly what it was "
+      "found at, so this file leaves no state in the process",
+      os.environ.get(_harness.LOCK_DIR_ENV), _LOCK_DIR_SAVED)
 shutil.rmtree(_TMP, ignore_errors=True)
 check("5d  the scratch tree was removed", os.path.exists(_TMP), False)
 

@@ -116,8 +116,10 @@ import tempfile
 import time
 
 import oncotriage
+from oncotriage import config as _runner_config           # noqa: E402
 from oncotriage import control as _control               # noqa: E402
 from oncotriage import paths as _paths
+from oncotriage import provider_resilience as _pr        # noqa: E402
 from oncotriage.batch import runner as _runner
 
 # tests/ ON sys.path SO THE SHARED HARNESS IMPORTS. There is no __init__.py in
@@ -162,6 +164,50 @@ _SHA_RUNNER_BEFORE = hashlib.sha256(_RUNNER_SRC.encode("utf-8")).hexdigest()
 _SHA_ENTRY_BEFORE = hashlib.sha256(_ENTRY_SRC.encode("utf-8")).hexdigest()
 
 _TMP = tempfile.mkdtemp(prefix="runnerpreflight_")
+
+# INSIDE _TMP, SO THE EXISTING CLEANUP REMOVES IT, and NOT created here:
+# `control.ensure_lock_directory` creates it 0700 and verifies its ownership
+# and mode, and `control.lock_directory` is documented PURE precisely so
+# asking for a path does not bring a directory into existence.
+_LOCK_DIR = os.path.join(_TMP, "locks")
+_LOCK_NOTE = _harness.lock_isolation_note(
+    dict(os.environ), "test_runner_preflight_and_state_faults.py")
+if _LOCK_NOTE:
+    print(_LOCK_NOTE)
+
+# ── AND IN THIS PROCESS TOO, NOT ONLY IN THE CHILDREN ──────────────────────
+#
+# MEASURED, NOT ARGUED, AND IT WAS A REAL REGRESSION THE FIRST TIME THIS FILE
+# ISOLATED ONLY THE CHILDREN. `control.lock_directory()` reads this variable on
+# every call, so a child pointed at a private directory and a PARENT still on
+# the default one disagree about where every lock file is -- and this file
+# DERIVES lock paths in its own process for four different purposes: to assert
+# the file exists while a holder is live (4a, 4c), to read the refusal's own
+# `lock file:` line (3d), and to PLANT a symlink at the path the entry point
+# will open (8e, and the ablation file's 6ae). With the parent on the default
+# directory every one of those addressed a file the child never touched: 8e's
+# substitution was planted where nothing would open it, so the run PROCEEDED
+# and the check that says an unopenable lock is refused reported a run that
+# started four patients. Six checks failed and none of them was about the lock.
+#
+# RESTORED AT THE END OF THE FILE rather than left set: `pytest tests/` imports
+# every module in this directory into ONE process, so a leaked value would send
+# the next file's locks into a directory this one has already removed.
+_LOCK_DIR_SAVED = os.environ.get(_harness.LOCK_DIR_ENV)
+os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR
+# CREATED HERE BECAUSE THIS FILE ACQUIRES LOCKS IN ITS OWN PROCESS. A child
+# reaches `ensure_lock_directory`, which creates it 0700 and verifies it; a
+# PARENT acquisition at an explicit path does NOT (the runner passes
+# `ensure_directory=path is None`, so a caller who named the file owns its
+# directory). MEASURED: without this, section 1's first explicit-path
+# acquisition raised FileNotFoundError out of `hold_exclusive_lock` and the
+# whole file ABORTED, losing every check below it. 0700 under a mkdtemp that is
+# already 0700, so `ensure_lock_directory`'s ownership and mode checks pass.
+os.makedirs(_LOCK_DIR, mode=0o700, exist_ok=True)
+# THE DEFAULT DERIVATION, CAPTURED ONCE WITH THE ISOLATION LIFTED. Read by the
+# two checks in section 1 whose subject is the security property of the default
+# per-user directory rather than of whatever this file points its children at.
+_DEFAULT_LOCK_DIR = _harness.without_lock_isolation(_control.lock_directory)
 
 
 # ===========================================================================
@@ -265,7 +311,16 @@ check("1b-b ...specifically in a PER-USER subdirectory of the system temp "
       "start would O_CREAT through it and ftruncate the target to zero. The "
       "sticky bit does not help: it stops one user DELETING another's file, "
       "not creating one at an unclaimed name",
-      (os.path.dirname(os.path.abspath(_PATH_A)), _control.lock_directory()),
+      # TWO FACTS, AND THE SECOND IS MEASURED WITH THIS FILE'S OWN ISOLATION
+      # LIFTED. The first says the lock lives in whatever directory is in
+      # force -- true under the override this file sets for its children and
+      # true in production. The second is the SECURITY property and its
+      # subject is the DEFAULT derivation, so it has to be asked with the
+      # variable unset or it would compare this file's temp directory with
+      # itself and pass for the wrong reason. MEASURED: it did exactly that
+      # when this file first set the override process-wide, and FAILED, which
+      # is the good direction. See _control_harness.without_lock_isolation.
+      (os.path.dirname(os.path.abspath(_PATH_A)), _DEFAULT_LOCK_DIR),
       (_control.lock_directory(),
        os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")))
 def _creating_calls(module_src, function_name):
@@ -309,9 +364,10 @@ check("1b-d ...and the directory is named by the UID rather than by the login "
       "whenever those differed between invocations (a cron entry beside an "
       "interactive shell), and two namespaces for one checkpoint directory is "
       "the double bill this lock exists to prevent",
-      (os.path.basename(_control.lock_directory()),
-       os.environ.get("USER", "") in os.path.basename(
-           _control.lock_directory()) and bool(os.environ.get("USER"))),
+      # THE DEFAULT DERIVATION, with this file's isolation lifted -- see 1b-b.
+      (os.path.basename(_DEFAULT_LOCK_DIR),
+       os.environ.get("USER", "") in os.path.basename(_DEFAULT_LOCK_DIR)
+       and bool(os.environ.get("USER"))),
       (f"oncotriage-{os.getuid()}", False))
 check("1c  a trailing separator does not make a different lock -- "
       "paths.checkpoint_path resolves WITH one and a caller may pass either",
@@ -640,6 +696,16 @@ class Run:
         env.update(_harness.park_env(
             _harness.PARK_ALL if self.park else _harness.PARK_NONE,
             self.ready, self.release))
+        # THE PROVIDER-ALLOWANCE LOCK'S DIRECTORY, PRIVATE TO THIS FILE. The
+        # entry point now takes a lock keyed on the provider ALLOWANCE, which
+        # is a property of the account rather than of any directory -- so every
+        # child of every harness in bucket A would otherwise guard the same one
+        # and they would refuse each other for a reason that is the suite's
+        # parallelism rather than the code's behaviour. See
+        # _control_harness.LOCK_DIR_ENV. It is PER FILE and not per invocation
+        # on purpose: section 5 below needs two of this file's own children to
+        # collide on it.
+        _harness.isolate_locks(env, _LOCK_DIR)
         env.pop("PYTHONNOUSERSITE", None)
         return env
 
@@ -839,15 +905,34 @@ check("4c  the lock FILE is still there, which is what says 4b is about the "
 
 
 # ===========================================================================
-# 5. A SECOND CHECKPOINT DIRECTORY IS NOT BLOCKED
+# 5. A SECOND CHECKPOINT DIRECTORY IS A SECOND RUN LOCK AND ONE ALLOWANCE
 # ===========================================================================
 #
-# THE OTHER HALF OF THE KEY. Two deployments on one machine -- two containers,
-# two ONCOTRIAGE_MAIN_PATH values, a scratch run beside a production one -- are
-# independent runs against independent state and must not exclude each other.
-# Without this check the fix would be indistinguishable from a global mutex.
+# THIS SECTION USED TO ASSERT THE OPPOSITE OF WHAT IT ASSERTS NOW, AND THE
+# REVERSAL IS AN OPERATOR RULING RATHER THAN A REPAIR. It read: "Two
+# deployments on one machine -- two containers, two ONCOTRIAGE_MAIN_PATH
+# values, a scratch run beside a production one -- are independent runs against
+# independent state and must not exclude each other. Without this check the fix
+# would be indistinguishable from a global mutex."
+#
+# THAT PROPERTY AND ONE-PROCESS-PER-ALLOWANCE CANNOT BOTH HOLD, and the second
+# is what was ruled. Two checkpoint directories are two RUN-LOCK keys and ONE
+# PROVIDER ALLOWANCE: the pacer's state is each process's own memory, so both
+# runs would pace to the whole configured quota and together send twice it --
+# which is the burst `oncotriage/provider_resilience.py` was written after a
+# real throttling storm to prevent, and which no checkpoint directory can
+# distinguish. `25- Batch Runner.py` now takes the allowance lock nested inside
+# its run lock, so the second run is refused by name.
+#
+# WHAT IS NOT LOST, AND IT IS 5c. The two runs still take DIFFERENT RUN LOCKS.
+# That is what says the refusal comes from the ALLOWANCE rather than from a run
+# lock that has quietly become the global mutex the old comment warned about --
+# so 5c is kept unchanged and is now the discriminating check rather than an
+# afterthought to 5b. 5f, the symlinked path, is still refused by the RUN lock,
+# because the run lock is acquired first: two checks, two mechanisms, and the
+# console text below is what tells them apart.
 
-print("\n=== 5. a different checkpoint directory is independent ===")
+print("\n=== 5. one allowance across two checkpoint directories ===")
 
 _OTHER_ROOT = os.path.join(_TMP, "other")
 _HOLDER = Run(os.path.join(_TMP, "holderroot"), tag="holder", park=True,
@@ -877,11 +962,46 @@ _HOLDER.join()
 check("5a  the holder was live throughout (non-degeneracy: a holder that had "
       "already exited would make 5b true for the wrong reason)",
       _HOLDER_SATURATED, True)
-check("5b  a run against a DIFFERENT checkpoint directory is not refused",
-      (_ELSEWHERE.exit, len(_ELSEWHERE.started_patients)), (0, 4))
-check("5c  ...and the two locked different files",
+check("5b  *** A RUN AGAINST A DIFFERENT CHECKPOINT DIRECTORY IS REFUSED WITH "
+      "EXIT 3, HAVING STARTED NO PATIENT. *** Two run-lock keys and ONE "
+      "provider allowance: the pacer is process-local, so both would pace to "
+      "the whole configured quota and together send twice it. This check "
+      "asserted the opposite until the single-process-per-allowance ruling; "
+      "see the section header for what was traded away",
+      (_ELSEWHERE.exit, len(_ELSEWHERE.started_patients)),
+      (_control.EXIT_LOCKED, 0))
+check("5b-a ...and it is the ALLOWANCE that refused it, not the run lock -- "
+      "which is the difference between the shipped ruling and a global mutex. "
+      "The two refusals have different headers and only one of them can be in "
+      "this console",
+      ("REFUSING TO RUN: another process on this host is already pacing"
+       in _ELSEWHERE.out,
+       "REFUSING TO RUN: another batch run holds the lock" in _ELSEWHERE.out),
+      (True, False))
+check("5b-b ...and the refusal names the SCOPE, which the digest-named lock "
+      "file cannot be mapped back to, and the holder's pid so an operator can "
+      "act on it",
+      (_runner_config.matching_quota_scope() in _ELSEWHERE.out,
+       f"{_HOLDER.proc.pid}" in _ELSEWHERE.out), (True, True))
+check("5b-c ...and it says nothing was billed, which is the standing every "
+      "refusal in this entry point carries",
+      "NOTHING HAS BEEN SENT AND NOTHING HAS BEEN BILLED" in _ELSEWHERE.out,
+      True)
+check("5c  ...and the two locked different RUN-LOCK files. *** THIS IS THE "
+      "DISCRIMINATING CHECK NOW: *** it is what says 5b's refusal came from "
+      "the provider allowance and NOT from a run lock that had quietly become "
+      "a global mutex, which is the failure the retired 5b was written to "
+      "catch",
       _runner.run_lock_path(_HOLDER.cp) == _runner.run_lock_path(_ELSEWHERE.cp),
       False)
+check("5c-b ...while the lock file 5b's refusal NAMES is the one this process "
+      "derives for the Stage 5 allowance -- which is what ties the printed "
+      "refusal to the allowance rather than leaving it a message that merely "
+      "reads plausibly. The allowance path takes no checkpoint directory at "
+      "all, which is why it is one lock for both runs",
+      os.path.basename(
+          _pr.scope_lock_path(_runner_config.matching_quota_scope()))
+      in _ELSEWHERE.out, True)
 check("5e  the symlinked path resolves to the SAME lock file as the directory "
       "it points at, which is the whole of F1: `abspath` does not resolve "
       "symlinks, so one directory named two ways produced two locks",
@@ -1605,6 +1725,17 @@ check("9d  the production inferences path was never resolved in this process, "
       "so no scenario could have written to it",
       "inferences_path" in _paths._RESOLVED, False)
 
+# RESTORED BEFORE THE TREE GOES, so a later file in the same interpreter
+# (`pytest tests/` imports every module into one process) does not inherit a
+# pointer into a directory this one has just removed -- which would send its
+# locks somewhere that does not exist rather than to the shared default.
+if _LOCK_DIR_SAVED is None:
+    os.environ.pop(_harness.LOCK_DIR_ENV, None)
+else:
+    os.environ[_harness.LOCK_DIR_ENV] = _LOCK_DIR_SAVED
+check("9f  the lock-directory isolation is restored to exactly what it was "
+      "found at, so this file leaves no state in the process",
+      os.environ.get(_harness.LOCK_DIR_ENV), _LOCK_DIR_SAVED)
 shutil.rmtree(_TMP, ignore_errors=True)
 check("9e  the scratch tree was removed", os.path.exists(_TMP), False)
 

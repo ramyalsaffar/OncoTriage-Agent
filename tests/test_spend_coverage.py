@@ -83,6 +83,15 @@ from oncotriage.evaluation import rater as _rater               # noqa: E402
 from oncotriage.evaluation import ragas_harness as _ragas       # noqa: E402
 from oncotriage.utils import get_model_cost                     # noqa: E402
 
+import _provider_pin                                            # noqa: E402
+
+# EXPLICIT TEST QUOTA LIMITS, AND NO PROVIDER PIN -- `test_quotas_only`'s own
+# docstring names this file as one of the two that drive the rater's batch path
+# and MUST NOT pin an arm. Those calls are paced under
+# `config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH`, which the shipped config leaves
+# UNKNOWN, so the pacer refuses before the send.
+_provider_pin.test_quotas_only(os.path.basename(__file__))
+
 _READ_FILES = [os.path.abspath(m.__file__) for m in
                (spend, _study, _rater, _ragas, config)]
 _BASELINE_HASHES = {p: hashlib.sha256(open(p, "rb").read()).hexdigest()
@@ -1327,27 +1336,135 @@ def drive_ragas_seam(builder_name, over_budget):
 _RAGAS_SRC = open(os.path.abspath(_ragas.__file__), encoding="utf-8").read()
 
 
-def gate_is_above_the_await(builder):
-    tree = ast.parse(_RAGAS_SRC)
+def gate_is_above_the_await(builder, src=None):
+    """Is the gate above the real client call, in whatever frame issues it?
+
+    **THE INSTRUMENT CHANGED WHEN THE CALL MOVED INTO A `send` CLOSURE, AND THE
+    SUBJECT DID NOT.** This walked `recording_create`'s IMMEDIATE body for a
+    statement containing `require_budget` and one containing `real_create`, and
+    compared their positions. That was faithful while both were direct
+    statements of that function. The provider-resilience wiring put the real
+    call inside a nested `send` -- which `provider_resilience.execute_async`
+    RE-INVOKES ON EVERY POLICY ATTEMPT -- so `recording_create`'s immediate
+    body now holds a `def` that contains BOTH strings and an `await` that
+    contains NEITHER, and the old positional comparison answered False for a
+    wrapper that is strictly safer than the one it was written for.
+
+    **THE NESTING IS THE FIX, NOT A REGRESSION, AND THAT IS WHY THE CHECK MOVES
+    RATHER THAN THE CODE.** With the gate left in `recording_create`'s body it
+    would be asked ONCE per logical call and every RETRY would be ungated: a
+    run that crossed its cap while a throttled call was being retried would go
+    on spending on that call for the whole attempt budget. Inside `send`, every
+    WIRE attempt is gated.
+
+    SO THE QUESTION IS ASKED OF THE FRAME THAT ISSUES THE CALL: find the
+    innermost function that contains `real_create`, and require the gate to be
+    above it THERE. That is the same property, asked where it is now true, and
+    it still answers False for a wrapper whose gate really is below its call.
+    """
+    tree = ast.parse(src if src is not None else _RAGAS_SRC)
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == builder:
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.AsyncFunctionDef) \
-                        and inner.name == "recording_create":
-                    body = inner.body
-                    gate_at = [i for i, s in enumerate(body)
-                               if "require_budget" in ast.unparse(s)]
-                    await_at = [i for i, s in enumerate(body)
-                                if "real_create" in ast.unparse(s)]
-                    if not gate_at or not await_at:
-                        return None
-                    return max(gate_at) < min(await_at)
+        if not (isinstance(node, ast.FunctionDef) and node.name == builder):
+            continue
+        for inner in ast.walk(node):
+            if not isinstance(inner, (ast.AsyncFunctionDef, ast.FunctionDef)):
+                continue
+            body = inner.body
+            # THE FRAME THAT *ISSUES* THE CALL, AND "ISSUES" MEANS A CALL NODE
+            # RATHER THAN THE NAME APPEARING. The first version of this walk
+            # tested `"real_create" in ast.unparse(s)`, which is TRUE of
+            # `real_create = client.chat.completions.create` -- the capture in
+            # the BUILDER's own body, two frames up, where there is no gate --
+            # so it answered False for the builder before ever reaching the
+            # `send` that issues the call. MEASURED: it failed against the
+            # shipped source while both controls passed, and one of those
+            # controls was passing for that same wrong reason.
+            #
+            # A statement that CONTAINS a nested function is still excluded, so
+            # the `async def _send` wrapper is not mistaken for the issuer.
+            def _calls_real_create(stmt):
+                if any(isinstance(d, (ast.AsyncFunctionDef, ast.FunctionDef))
+                       for d in ast.walk(stmt)):
+                    return False
+                return any(isinstance(c, ast.Call)
+                           and ast.unparse(c.func) == "real_create"
+                           for c in ast.walk(stmt))
+
+            issues = [i for i, s in enumerate(body) if _calls_real_create(s)]
+            if not issues:
+                continue
+            gate_at = [i for i, s in enumerate(body)
+                       if "require_budget" in ast.unparse(s)]
+            if not gate_at:
+                return False
+            return max(gate_at) < min(issues)
     return None
 
 
 for _b in ("build_judge", "build_embeddings"):
-    check(f"7c  *** {_b}'s gate is ABOVE the await, so a raise means NO "
-          f"request was issued ***", gate_is_above_the_await(_b), True)
+    check(f"7c  *** {_b}'s gate is ABOVE the real call, IN THE FRAME THAT "
+          f"ISSUES IT -- so a raise means NO request was issued, and because "
+          f"that frame is the `send` execute_async re-invokes, EVERY WIRE "
+          f"ATTEMPT is gated rather than only the first ***",
+          gate_is_above_the_await(_b), True)
+
+# *** THE FIRING CONTROL. *** Without it the rewritten walk could return True
+# for a shape it never really inspected -- which is the failure mode a
+# structural check has when its instrument stops matching its subject, and is
+# exactly what the previous version of this check had just demonstrated.
+_GATE_BELOW_SRC = '''
+def build_judge(a):
+    real_create = client.chat.completions.create
+
+    async def recording_create(*a, **k):
+        async def _send():
+            response = await real_create(*a, **k)
+            spend.require_budget(source, "probe")
+            return response
+        return await _paced(_send)
+    return recording_create
+'''
+_GATE_MISSING_SRC = '''
+def build_judge(a):
+    real_create = client.chat.completions.create
+
+    async def recording_create(*a, **k):
+        async def _send():
+            return await real_create(*a, **k)
+        return await _paced(_send)
+    return recording_create
+'''
+check("7c-i CONTROL: a gate BELOW the real call inside the same `send` frame "
+      "is reported False -- so the walk is comparing positions rather than "
+      "merely finding two strings in one function",
+      gate_is_above_the_await("build_judge", src=_GATE_BELOW_SRC), False)
+# *** AND THE NON-DEGENERACY THAT CAUGHT THE FIRST VERSION OF THIS WALK. ***
+# Both control sources carry `real_create = client.chat.completions.create` in
+# the BUILDER's body, exactly as the shipped module does. A walk that treated
+# that ASSIGNMENT as the issuing call returned False for every source it was
+# ever handed -- so 7c-i and 7c-ii passed while measuring nothing, which is the
+# shape this project's own rules exist to catch. A source whose gate IS above
+# its call must answer True, or the two controls above prove nothing.
+_GATE_ABOVE_SRC = '''
+def build_judge(a):
+    real_create = client.chat.completions.create
+
+    async def recording_create(*a, **k):
+        async def _send():
+            spend.require_budget(source, "probe")
+            return await real_create(*a, **k)
+        return await _paced(_send)
+    return recording_create
+'''
+check("7c-iii NON-DEGENERACY: a source whose gate IS above its call answers "
+      "True, so the two controls above are discriminating rather than a walk "
+      "that answers False for everything -- which is what the first version "
+      "of this instrument did, while both controls 'passed'",
+      gate_is_above_the_await("build_judge", src=_GATE_ABOVE_SRC), True)
+check("7c-ii CONTROL: a `send` with NO gate at all is reported False rather "
+      "than None, so a wrapper that simply dropped the gate fails here "
+      "instead of being reported as unmeasurable",
+      gate_is_above_the_await("build_judge", src=_GATE_MISSING_SRC), False)
 
 check("7d  CLEAN CONTROL: with budget, the wrapper reaches the client",
       drive_ragas_seam("judge", over_budget=False), (None, 1))
@@ -1994,6 +2111,12 @@ _paths._RESOLVED.update(_SAVED_RESOLVED)
 shutil.rmtree(_TMP, ignore_errors=True)
 check("11g the temp tree is gone", os.path.exists(_TMP), False)
 
+
+# RELEASED ABOVE THE SUMMARY, NEVER BELOW IT.
+_QUOTA_WHO, _QUOTA_RESTORED = _provider_pin.release_test_quotas()
+check("11h [provider pin] the test quota limits this file installed were "
+      "released, and both tables are back to the shipped values",
+      (_QUOTA_WHO, _QUOTA_RESTORED), (os.path.basename(__file__), True))
 
 print("\n" + "=" * 78)
 print(f"RESULTS: {_RESULTS['passed']} passed, {_RESULTS['failed']} failed")

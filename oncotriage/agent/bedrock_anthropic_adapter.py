@@ -443,11 +443,14 @@ is driven in the standing test with fabricated exceptions rather than with a
 live failure. Never changes control flow: Stage 5 catches bare ``Exception``
 and takes the same return whatever this says.
 
-  ThrottlingException          429  throttling. Retried in-SDK by botocore's
-                                    standard retry mode.
-  ModelNotReadyException       429  also retried in-SDK (the API reference says
-                                    "The AWS SDK will automatically retry the
-                                    operation up to 5 times").
+  ThrottlingException          429  throttling. TRANSIENT, retried by the one
+                                    project policy (oncotriage/
+                                    provider_resilience.py), NOT in-SDK: the
+                                    client makes one SDK attempt.
+  ModelNotReadyException       429  also TRANSIENT and retried by that policy.
+                                    The API reference says "The AWS SDK will
+                                    automatically retry the operation up to 5
+                                    times"; this project turns that off.
   AccessDeniedException        403  the model is not enabled for the account,
                                     or the credential lacks
                                     ``bedrock:InvokeModel`` on this model /
@@ -574,17 +577,23 @@ the wave.
 Both constants argue their own case; the short version is that a bound derived
 from an OpenAI latency estimate is not a bound for an AWS account whose Amazon
 Bedrock requests-per-minute quota is applied below the default. WHEN THE LIMIT
-IS HIT: Converse answers ``ThrottlingException`` / HTTP 429, botocore's standard
-mode retries it with a 1,000 ms base delay, exponential backoff and full
-jitter, capped at 20 s and honouring ``x-amz-retry-after``, up to
-``config.bedrock_anthropic_max_attempts()`` TOTAL attempts. Past that the
-exception reaches the node: on a trial call the trial is
-``per_trial_call_failed`` and the patient completes without it; on the WARMUP
-the patient fails cleanly and resumes. And there is a second floor -- standard
-mode's retry QUOTA, a 500-token bucket charged 5 per throttling retry, which
-"when the available tokens are exhausted" stops retrying altogether. Sustained
-throttling drains it, and the remedy for that is a smaller bound rather than a
-bigger retry budget.
+IS HIT -- AND THIS PARAGRAPH CHANGED WITH THE PROVIDER-RESILIENCE PASS: the
+client-side pacer in ``oncotriage/provider_resilience.py`` exists so it is not
+hit at all, spacing every wire attempt to
+``config.PROVIDER_REQUESTS_PER_MINUTE`` x ``config.PROVIDER_PACING_HEADROOM``.
+If Converse still answers ``ThrottlingException`` / HTTP 429, botocore does
+NOT retry it -- the client is built with ``retries={"total_max_attempts": 1}``
+-- and the one project policy retries it with full-jitter backoff from
+``config.MATCHING_RETRY_BASE_SECONDS``, capped at the quota window and honouring
+``retry-after``, inside ``config.MATCHING_CALL_MAX_ATTEMPTS`` TOTAL wire
+attempts, each of them paced. Past that the exception reaches the node: on a
+trial call the trial is ``per_trial_call_failed`` and the patient completes
+without it; on the WARMUP the patient fails cleanly as TRANSPORT exhaustion,
+routed to the error handler rather than back into Stage 5, and resumes. The
+old second floor -- standard mode's retry QUOTA, a 500-token bucket charged 5
+per throttling retry -- no longer applies: with SDK retries off nothing draws
+on it. The remedy for SUSTAINED throttling is still a smaller quota figure or
+a smaller bound, never a bigger attempt budget.
 
 VERIFY-AT-GO-LIVE
 -----------------
@@ -720,16 +729,19 @@ did not run it.
 
 (A14) THE THROTTLING RESPONSE. Not a call this probe makes on purpose: it is
       what a real campaign meets when the account's requests-per-minute quota
-      binds. WHAT TO READ: whether the 429s are BURSTY (raise
-      BEDROCK_ANTHROPIC_MAX_ATTEMPTS and ride them out) or SUSTAINED (lower
-      BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS; botocore's retry quota drains under
-      sustained throttling and stops retrying altogether, so a bigger budget
-      does nothing). AWS's `feature-retry-behavior.html` also documents that
-      the behaviour it describes "requires opting in until it becomes the
-      default behavior. Set `AWS_NEW_RETRIES_2026=true` in your environment" --
-      this project does not set it, so the installed botocore may be using
-      pre-2026 backoff timing and quota costs. That is an environment decision
-      and is recorded rather than made here.
+      binds. WHAT TO READ: whether the 429s are BURSTY or SUSTAINED -- and
+      since the provider-resilience pass, neither is answered with
+      BEDROCK_ANTHROPIC_MAX_ATTEMPTS, which is the SDK's own attempt count and
+      ships 1. A 429 behind the pacer means
+      config.PROVIDER_REQUESTS_PER_MINUTE["bedrock_anthropic"] (or
+      PROVIDER_PACING_HEADROOM) states more than the account really has: lower
+      it. A larger config.MATCHING_CALL_MAX_ATTEMPTS only waits longer against
+      a limit that is not refilling. AWS's `feature-retry-behavior.html` also
+      documents that the behaviour it describes "requires opting in until it
+      becomes the default behavior. Set `AWS_NEW_RETRIES_2026=true` in your
+      environment" -- this project does not set it. With one SDK attempt on
+      the Stage 5 client it bears only on code that re-enables SDK retries.
+      That is an environment decision and is recorded rather than made here.
 
 NOTHING IN THIS MODULE RUNS AT IMPORT. No client, no credential, no socket, no
 file, and boto3 is imported inside the two functions that need it -- the same
@@ -1571,18 +1583,26 @@ def _error_code(exc: BaseException) -> Optional[str]:
     return code if isinstance(code, str) and code else None
 
 
-def classify_error(exc: BaseException) -> str:
-    """Name what went wrong. Never changes control flow.
+def error_identity(exc: BaseException) -> Tuple[str, Optional[str]]:
+    """``(class name, modeled error code or None)`` -- what a ClientError is.
 
-    NOTHING ABOUT STAGE 5's BEHAVIOUR DEPENDS ON THIS. Its except clause
-    catches bare ``Exception`` and takes the same return whatever this says, so
-    an error the taxonomy misreads costs a log field and nothing else. That is
-    deliberate: a classifier that gated recovery would be a second retry policy
-    disagreeing with botocore's.
+    Public so the dispatch seam can separate the two ``server`` cases
+    (ServiceUnavailable is refused before inference; InternalServer may not be)
+    without reaching for the private ``_error_code``."""
+    return type(exc).__name__, _error_code(exc)
+
+
+def category_of(exc: BaseException) -> str:
+    """The taxonomy category, with NO side effect. ``classify_error`` counts.
 
     Two lookups, in order: the exception's own class name, then -- for a
     ``ClientError``, which is one class covering every modeled service error --
     the error code inside it.
+
+    THE ONE RETRY POLICY DEPENDS ON THIS (the provider-resilience pass), which
+    is why it is separate from ``classify_error``: the policy asks once per
+    failed attempt and the failure log line asks too, and a counting classifier
+    asked twice would count an unknown error twice.
     """
     if isinstance(exc, BedrockConverseTranslationError):
         return ERROR_TRANSLATION
@@ -1597,8 +1617,24 @@ def classify_error(exc: BaseException) -> str:
         if by_code is not None:
             return by_code
 
-    BEDROCK_ANTHROPIC_DEGRADATIONS[DEGRADATION_UNKNOWN_ERROR] += 1
     return ERROR_UNCLASSIFIED
+
+
+def classify_error(exc: BaseException) -> str:
+    """Name what went wrong for the failure LOG LINE, counting an unknown one.
+
+    THIS FUNCTION STILL CHANGES NO CONTROL FLOW. What does, since the
+    provider-resilience pass, is ``category_of`` -- the same lookup without the
+    counter -- read by ``evaluation._classify_matching_failure`` to decide
+    whether a failed attempt is retried and whether it may have been billed.
+    botocore's own retries are disabled (``config.BEDROCK_ANTHROPIC_MAX_ATTEMPTS``
+    is 1), so there is exactly one retry policy and no second one to disagree
+    with it.
+    """
+    category = category_of(exc)
+    if category == ERROR_UNCLASSIFIED:
+        BEDROCK_ANTHROPIC_DEGRADATIONS[DEGRADATION_UNKNOWN_ERROR] += 1
+    return category
 
 
 # ---------------------------------------------------------------------------

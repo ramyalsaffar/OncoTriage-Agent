@@ -56,6 +56,14 @@ from oncotriage.evaluation import judge_independence as J        # noqa: E402
 from oncotriage.evaluation import rater as R                     # noqa: E402
 from oncotriage.evaluation import ragas_harness as G             # noqa: E402
 
+import _provider_pin                                             # noqa: E402
+
+# EXPLICIT TEST QUOTA LIMITS, AND NO PROVIDER PIN. This file drives the real
+# `R.submit_batches`, whose management calls are paced under
+# `config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH` -- UNKNOWN in the shipped config,
+# so the pacer refuses before the send. See `tests/_provider_pin.py`.
+_provider_pin.test_quotas_only(os.path.basename(__file__))
+
 
 _PASSED = []
 _FAILED = []
@@ -848,6 +856,12 @@ check("10c non-degeneracy: the three watched hashes differ, so 10c is not one "
 shutil.rmtree(_TMP, ignore_errors=True)
 check("10d the temp directory is gone", os.path.exists(_TMP), False)
 
+
+# RELEASED ABOVE THE SUMMARY, NEVER BELOW IT.
+_QUOTA_WHO, _QUOTA_RESTORED = _provider_pin.release_test_quotas()
+check("[provider pin] the test quota limits this file installed were released, "
+      "and both tables are back to the shipped values",
+      (_QUOTA_WHO, _QUOTA_RESTORED), (os.path.basename(__file__), True))
 
 print("\n" + "=" * 74)
 print(f"Passed: {len(_PASSED)}")

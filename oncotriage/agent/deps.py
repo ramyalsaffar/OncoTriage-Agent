@@ -210,6 +210,7 @@ log = get_logger(__name__)
 # rejects any key not in OVERRIDE_KEYS.
 
 OPENAI_CLIENT = "openai_client"
+OPENAI_INFERENCE_CLIENT = "openai_inference_client"
 BEDROCK_CLIENT = "bedrock_client"
 BEDROCK_ANTHROPIC_CLIENT = "bedrock_anthropic_client"
 QDRANT_CLIENT = "qdrant_client"
@@ -223,6 +224,7 @@ MESH_FILTER = "mesh_filter"
 
 OVERRIDE_KEYS = (
     OPENAI_CLIENT,
+    OPENAI_INFERENCE_CLIENT,
     BEDROCK_CLIENT,
     BEDROCK_ANTHROPIC_CLIENT,
     QDRANT_CLIENT,
@@ -1248,8 +1250,104 @@ def _build_bm25_query_model():
 # ---------------------------------------------------------------------------
 
 def get_openai_client():
-    """The OpenAI client Stage 2's embedding and Stage 5's chat call use."""
+    """The OpenAI client Stage 2's embedding and the index build use.
+
+    NO LONGER STAGE 5's. That call moved to `get_openai_inference_client()`
+    when the covered inference path took SDK retries to 0; this one keeps
+    `OPENAI_SDK_MAX_RETRIES`, because the embedding path is deliberately
+    outside the retry policy and the SDK's retry is its only resilience.
+    """
     return _resolve(OPENAI_CLIENT, config.get_openai_client)
+
+
+def get_openai_inference_client():
+    """The OpenAI client STAGE 5's chat completion uses. SDK retries OFF.
+
+    A SECOND KEY RATHER THAN A REDIRECT OF THE FIRST, on `BEDROCK_CLIENT`'s
+    precedent and for its reason: the two are reachable AT ONCE. Stage 2 still
+    embeds through `OPENAI_CLIENT` on every run whatever Stage 5 does, so
+    overloading one key would mean a harness that stubbed Stage 5's judge
+    silently stubbed Stage 2's embeddings too -- and the identity assertions
+    both fixture harnesses make would stop distinguishing them.
+
+    BOTH KEYS ARE HOOKED BY THE FIXTURE HARNESS. `capture._HOOK_KEYS` carries
+    this one beside `OPENAI_CLIENT`, so a capture wraps both clients and a
+    replay points both at the tripwire. Adding the key without adding the hook
+    would have been the exact regression the seam exists to prevent: Stage 5
+    reading a client no proxy wraps, issuing real billed calls, and the capture
+    reporting that it recorded them.
+    """
+    # OWN OVERRIDE, ELSE AN INSTALLED `OPENAI_CLIENT` OVERRIDE, ELSE BUILD.
+    #
+    # THE MIDDLE STEP IS NOT A CONVENIENCE. IT IS WHAT KEEPS THE SPLIT FROM
+    # SILENTLY UN-STUBBING STAGE 5, AND IT WAS ADDED AFTER THAT HAPPENED FOR
+    # REAL. The contract before the split was: override `OPENAI_CLIENT` and you
+    # have redirected every OpenAI call the agent makes. Thirty-five test files
+    # rely on exactly that and none of them knows this key exists. Resolving
+    # this key independently therefore made Stage 5 fall through to the real
+    # factory inside harnesses that believed they had stubbed it -- MEASURED,
+    # not predicted: two suites built a live client and a real
+    # `chat.completions.create` was billed while the recorder counted zero
+    # calls. That is precisely the pass-20c-2c regression this module exists to
+    # prevent, reached through a second CLIENT instead of a second PROVIDER.
+    #
+    # SO AN UNSTUBBED INFERENCE SEAM INHERITS THE STUB INSTALLED FOR THE OTHER
+    # ONE. A harness that wants them genuinely separate installs both keys
+    # explicitly -- which `fixtures/capture.py` does -- and step one wins. What
+    # cannot happen any more is the third state: a real client built while an
+    # override is installed for the same provider.
+    #
+    # BOTH READS ARE UNDER ONE LOCK ACQUISITION, for `_resolve`'s own reason.
+    # Reading this key, releasing, then reading the other is a check-then-act:
+    # a thread descheduled between them can miss an override installed in the
+    # gap and go on to build the real client -- the identical silent failure,
+    # reintroduced by the fix for it.
+    with _LOCK:
+        own = _OVERRIDES.get(OPENAI_INFERENCE_CLIENT, UNSET)
+        if not isinstance(own, _Unset):
+            return own
+        inherited = _OVERRIDES.get(OPENAI_CLIENT, UNSET)
+        if not isinstance(inherited, _Unset):
+            # DELIBERATELY NOT CACHED. An override is never cached, and caching
+            # an inherited one would pin Stage 5 to a stub after the harness
+            # that installed it had restored the seam.
+            return inherited
+    return _resolve(OPENAI_INFERENCE_CLIENT, config.get_openai_inference_client)
+
+
+SEAM_OWN_OVERRIDE = "own_override"
+SEAM_INHERITED_FROM_OPENAI_CLIENT = "inherited_from_openai_client"
+SEAM_DEFAULT = "default"
+
+OPENAI_INFERENCE_SEAM_STATES = (
+    SEAM_OWN_OVERRIDE,
+    SEAM_INHERITED_FROM_OPENAI_CLIENT,
+    SEAM_DEFAULT,
+)
+"""The three routes `get_openai_inference_client()` can take, as a closed set.
+
+A VOCABULARY RATHER THAN A BOOL, because the three have different meanings to a
+harness: its own stub is in force, it is borrowing the other seam's stub, or it
+would BUILD. Only the third can reach the network, and a test that means to
+assert "nothing here can call out" needs to name that one rather than infer it
+from an object's type."""
+
+
+def openai_inference_seam_state():
+    """Which route `get_openai_inference_client()` would take. NEVER builds.
+
+    `peek`'s contract, for a question `peek` cannot answer: peek reads ONE key,
+    and the whole point of this seam is that an unstubbed key defers to another
+    one. A harness asking "am I actually stubbed?" of this key alone would read
+    UNSET and conclude it was exposed, which is the opposite of the truth.
+    """
+    with _LOCK:
+        if not isinstance(_OVERRIDES.get(OPENAI_INFERENCE_CLIENT, UNSET),
+                          _Unset):
+            return SEAM_OWN_OVERRIDE
+        if not isinstance(_OVERRIDES.get(OPENAI_CLIENT, UNSET), _Unset):
+            return SEAM_INHERITED_FROM_OPENAI_CLIENT
+        return SEAM_DEFAULT
 
 
 def get_bedrock_client():

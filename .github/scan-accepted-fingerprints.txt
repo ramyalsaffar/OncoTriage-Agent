@@ -146,7 +146,21 @@ e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
 # with the insertion, which is why the locators differ. The fifth was added by
 # the provenance-truth pass, which edited that test to pin the EFFECTIVE
 # per-trial pacing bound in the index; the offset moved again for the same
-# reason.
+# reason. The sixth was added by the bounded-repair pass, which set MLflow's
+# documented telemetry opt-out above that file's bootstrap so it stops making
+# one outbound request on import; the sentinel's own statement was not touched
+# — `git diff` over that commit reports ZERO changed lines mentioning it — and
+# the offset moved from the fifth's to this one's purely because the insertion
+# sits above it.
+#
+# THE SIXTH IS ALSO THE FIRST ADDED WHILE ITS BLOB WAS STAGED RATHER THAN
+# COMMITTED, WHICH IS THE CASE BLOCK 5 WARNS ABOUT AND IS NOT THAT CASE. Block
+# 5's finding is DANGLING: reachable from nothing, absent from a fresh clone,
+# so an entry for it would be reported stale in every other checkout. This blob
+# is in the INDEX, which `git rev-list --objects --all --reflog
+# --indexed-objects` counts as reachable, and the objects-range gate — the
+# range where staleness is evaluated at all — finds it. Verified both ways
+# before the line was written, rather than after.
 #
 # THE OBVIOUS ALTERNATIVE IS REFUSED BY THE REMOVAL CONDITION BELOW: assembling
 # the sentinel at run time would stop new blobs from being reported, and it
@@ -155,15 +169,34 @@ e946b984e4410aa72ea9ec3c2de442c1f5831c23:oncotriage:credential_assignment:11794
 # every blob already in history still carries the literal and this gate scans
 # the whole object database.
 #
-# REMOVAL CONDITION: these five go when history is rewritten, or when the
+# REMOVAL CONDITION: these six go when history is rewritten, or when the
 # sentinel is changed to a shape no detector matches — for which the honest
 # instrument is the staging exclusion manifest rather than a shape chosen to
 # slip past a scanner.
+#
+# THE RESHAPE WAS RE-EXAMINED WHEN THE SIXTH LINE WAS ADDED, AND MEASURED
+# RATHER THAN ASSUMED. The question asked was whether the KEY SHAPE is
+# load-bearing for what the test proves. Mechanically it is not: checks 2g, 2h
+# and 2i use the sentinel only as a SUBSTRING NEEDLE, and driving the real
+# `tracking.configuration_params` with a prefix-carrying value and a
+# prefix-free one gives the same 48 parameters with zero key hits and zero
+# value hits either way — the enumeration is a closed allowlist of named
+# constants and inspects no value's shape. What the assertion needs is that the
+# value be UNIQUE and be seeded under a credential-named variable, not that it
+# look like a key.
+#
+# IT IS KEPT ANYWAY, FOR THE TWO REASONS THIS BLOCK ALREADY GAVE. Changing it
+# would retire NONE of the lines below — five historical blobs still carry the
+# literal and the objects-range gate scans the whole database — so it buys
+# nothing at this gate; and a value edited so a scanner stops seeing it is the
+# shape this removal condition refuses on its own terms. The honest retirement
+# is still the one named above.
 30b65d019735cb0002941f876b51e28f5b4b00e3:oncotriage:openai_anthropic_key:18436
 5698d07120cc8eb1ff473b60019697d23c5844ec:oncotriage:openai_anthropic_key:21703
 e5932da50468c43e944c296ab71b468a91e2d193:oncotriage:openai_anthropic_key:18436
 f4171675799c6da37ae72bba19b1afd929b1c9b8:oncotriage:openai_anthropic_key:24435
 8c9c5211dbe50cb13454b734dbef248e637766d5:oncotriage:openai_anthropic_key:27814
+6fa44592136039fbaaa6cd3f86f08487fa78a464:oncotriage:openai_anthropic_key:29397
 
 # ===========================================================================
 # BLOCK 3 — A QUERY REGISTRY KEY. NOT A CREDENTIAL. ALREADY ARGUED IN

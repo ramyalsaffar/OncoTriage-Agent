@@ -111,6 +111,7 @@ from oncotriage.agent.evaluation import (
     stage5_shutdown_reason,
     stage5_shutdown_requested,
 )
+from oncotriage import provider_resilience
 from oncotriage import spend
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.readiness import (
@@ -516,6 +517,10 @@ async def lifespan(_app):
     spend.SPEND_STOP.reset()
     spend.set_policy(spend.SPEND_POLICY_WINDOW, "oncotriage.api.server")
     console.out(spend.describe_serving_cap())
+    # THE PACER IS PROCESS-LOCAL, AND A SERVER IS THE PROCESS MOST LIKELY TO BE
+    # RUN BESIDE A BATCH RUN against the same account -- which is exactly the
+    # arrangement the announcement's halve-or-run-one rule is for.
+    console.out(provider_resilience.describe_pacing())
 
     console.out("[Startup] Compiling LangGraph pipeline...")
     graph = build_matching_graph()

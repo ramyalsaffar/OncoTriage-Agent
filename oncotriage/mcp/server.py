@@ -160,6 +160,7 @@ from typing import Any
 
 from oncotriage import __version__
 from oncotriage import deid
+from oncotriage import provider_resilience
 from oncotriage import spend
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.patient import compute_patient_hash
@@ -1169,6 +1170,8 @@ def main():
     spend.SPEND_STOP.reset()
     spend.set_policy(spend.SPEND_POLICY_WINDOW, "oncotriage.mcp.server")
     _log(spend.describe_serving_cap())
+    # To stderr through `_log`, like the cap: stdout is the protocol stream.
+    _log(provider_resilience.describe_pacing())
 
     server = build_server()
     _log(f"serving {len(TOOL_SPECS)} tools on stdio: "

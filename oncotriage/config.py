@@ -1023,6 +1023,36 @@ def qdrant_endpoint_sources() -> dict:
 OPENAI_SDK_MAX_RETRIES = 1
 
 
+# THE COVERED HALF OF THE SPLIT, AND IT IS A DIFFERENT NUMBER FOR A DIFFERENT
+# REASON RATHER THAN A TIGHTENING OF THE ONE ABOVE.
+#
+# `OPENAI_SDK_MAX_RETRIES` governs `get_openai_client()`, which now serves ONLY
+# the paths OUTSIDE the retry policy -- Stage 2's dense-retrieval embedding and
+# the index build. For those the SDK's retry is the only resilience there is
+# (item 29d removed get_embedding()'s tenacity decorator and put this in its
+# place), so it stays at 1.
+#
+# THIS ONE GOVERNS `get_openai_inference_client()`, which serves Stage 5's chat
+# completion -- and Stage 5 is COVERED by `oncotriage/provider_resilience.py`.
+# That policy's attempt budget is a TOTAL OVER WIRE ATTEMPTS: it decides how
+# many requests may reach the provider and paces them against the account's
+# allowance. An SDK retrying underneath it does not add resilience, it makes
+# the accounting false -- the policy schedules one attempt and two are sent,
+# so the rate bound is true of the policy and wrong about the wire, which is
+# the one thing a pacer must not be.
+#
+# SO 0 IS NOT "NO RETRIES", IT IS "THE RETRIES ARE SOMEWHERE THE PROJECT CAN
+# SEE". `provider_resilience.execute` re-invokes `send` per policy attempt and
+# counts what it did; `sdk_attempts=1` is the caller's declaration that the
+# layer beneath it makes exactly one wire attempt per send, and this constant
+# is what makes that declaration true.
+#
+# CHANGING IT IS NOT A LOCAL EDIT. Any value above 0 must be passed as
+# `sdk_attempts` at every covered call site, or the policy's budget silently
+# under-counts the wire by that factor.
+OPENAI_INFERENCE_SDK_MAX_RETRIES = 0
+
+
 # ---------------------------------------------------------------------------
 # Request timeouts: STRUCTURED, not a bare number
 # ---------------------------------------------------------------------------
@@ -1173,6 +1203,46 @@ def get_openai_client() -> OpenAI:
     return _OPENAI_CLIENT_CACHE
 
 
+_OPENAI_INFERENCE_CLIENT_CACHE = None
+
+
+def get_openai_inference_client() -> OpenAI:
+    """The OpenAI client STAGE 5 uses. Its own cache, and SDK retries OFF.
+
+    WHY A SECOND CLIENT RATHER THAN A PARAMETER ON THE FIRST. The two consumers
+    of an OpenAI client in this project want opposite retry behaviour and are
+    reachable in the same process and the same run:
+
+      * STAGE 5's chat completion is COVERED by the one retry policy
+        (`oncotriage/provider_resilience.py`). That policy's attempt budget is a
+        TOTAL over WIRE attempts, so an SDK retrying underneath it makes the
+        rate bound true of the policy and false of the wire -- the policy would
+        schedule one attempt while the SDK quietly sent two. `max_retries=0` is
+        what makes the budget mean what it says.
+      * STAGE 2's dense-retrieval embedding and the index build are NOT covered
+        by that policy (argued at `OPENAI_SDK_MAX_RETRIES`), so they keep the
+        SDK's retry as their only resilience. Taking it away would make a
+        transient blip fail a patient's retrieval outright.
+
+    `with_options(max_retries=...)` IS NOT THE ANSWER, and that is recorded at
+    Stage 5's call site rather than rediscovered: the covered call is built to
+    be byte-identical to what the fixtures recorded, and `with_options` returns
+    a DIFFERENT client object -- which the fixture harness's identity assertion
+    would then not recognise as the installed hook.
+
+    SEPARATE CACHE, DELIBERATELY. Sharing `_OPENAI_CLIENT_CACHE` would mean
+    whichever consumer asked first decided the retry count for both, which is
+    the silent-wrong-behaviour this split exists to remove.
+    """
+    global _OPENAI_INFERENCE_CLIENT_CACHE
+    if _OPENAI_INFERENCE_CLIENT_CACHE is None:
+        _OPENAI_INFERENCE_CLIENT_CACHE = OpenAI(
+            api_key=get_openai_api_key(),
+            max_retries=OPENAI_INFERENCE_SDK_MAX_RETRIES,
+            timeout=get_matching_request_timeout())
+    return _OPENAI_INFERENCE_CLIENT_CACHE
+
+
 def get_qdrant_client() -> QdrantClient:
     """The one Qdrant client this process uses. Built on first call, cached."""
     global _QDRANT_CLIENT_CACHE
@@ -1191,7 +1261,11 @@ def get_qdrant_client() -> QdrantClient:
 # ---------------------------------------------------------------------------
 
 MAX_LLM_CLASSIFIER_RETRIES = 3
-RETRY_BASE_DELAY = 1  # seconds, doubles each retry
+# RETRY_BASE_DELAY (1 s, doubling) was the patient-level backoff and is DELETED.
+# The patient-level path now takes its backoff from the ONE retry policy --
+# MATCHING_RETRY_BASE_SECONDS, full jitter, capped at the quota window -- see
+# "PROVIDER RESILIENCE" below. A transport failure no longer reaches the
+# patient-level path at all: the policy's total budget already covered it.
 
 
 # ---------------------------------------------------------------------------
@@ -1872,14 +1946,19 @@ wall-clock time, and too high costs VERDICTS -- and the verdicts are lost
 without failing the patient, which is the class of failure this project exists
 to remove.
 
-THE ESCALATION PATH IS UNCHANGED AND IS THE PROBE'S OWN DOCTRINE. When 429s
-appear, `bedrock_probe.py --probe-throttle` separates BURSTY from SUSTAINED: a
-bursty account rides them out on a larger `BEDROCK_ANTHROPIC_MAX_ATTEMPTS`, and
-a sustained one needs a SMALLER value HERE, because botocore's retry quota
-drains under sustained throttling and no retry budget can compensate for a
-parallel bound set too wide. `BEDROCK_ANTHROPIC_RETRY_MODE`'s `"adaptive"` --
-AWS's own documented answer for a throttled account, and deliberately not the
-default -- is the third step, after both of these.
+THE ESCALATION PATH CHANGED WITH THE PROVIDER-RESILIENCE PASS. When 429s
+appear, `bedrock_probe.py --probe-throttle` still separates BURSTY from
+SUSTAINED, and neither is answered here any more by an SDK attempt budget:
+botocore's own retries are off (see `BEDROCK_ANTHROPIC_MAX_ATTEMPTS`) and every
+retry belongs to `oncotriage/provider_resilience.py`, which paces every wire
+attempt against `PROVIDER_REQUESTS_PER_MINUTE`. So the first lever is that
+quota figure -- set it to what the account really has -- the second is a
+SMALLER value HERE, and `MATCHING_CALL_MAX_ATTEMPTS` is last, because a larger
+budget only waits longer against a limit. `BEDROCK_ANTHROPIC_RETRY_MODE`'s
+`"adaptive"` stays off for a sharper reason than before: it would put
+botocore's own client-side rate limiter UNDER this project's pacer -- a second
+pacer the run-end report cannot see. (That is read from botocore's documented
+adaptive mode, not measured here.)
 
 WHY A SECOND NAME FOR A NUMBER THAT ALREADY HAS ONE.
 `MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS` is derived from an estimated OpenAI
@@ -1897,33 +1976,72 @@ until the sample run above. `config.per_trial_parallel_bound()` is the ONE place
 the two are reconciled, and setting this back to None restores the shared
 bound's value exactly.
 
-WHAT HAPPENS WHEN THE QUOTA IS HIT, AND IT IS NOT SILENT. Converse answers
-`ThrottlingException` with HTTP 429 (`API_runtime_Converse.html`, read
-2026-08-30). botocore's `standard` retry mode classifies that as a THROTTLING
-error and retries it with a 1,000 ms base delay, exponential backoff and full
-jitter, capped at 20 s, honouring any `x-amz-retry-after` header
-(`feature-retry-behavior.html`, read 2026-08-30) -- so a burst that clips the
-limit degrades to a slower campaign rather than to failed patients, up to
-`bedrock_anthropic_max_attempts()` TOTAL attempts. Past that the exception
-reaches the node: on a TRIAL call the trial is recorded `per_trial_call_failed`
-and the patient completes without it; on the WARMUP the patient fails cleanly
-and the batch checkpoint resumes it, which is cache-or-nothing working.
+IT IS NO LONGER THE RATE CONTROL, AND THE 2026-09-11 SMOKE RUN IS WHY. This
+constant caps what ONE patient has in flight; the RATE is emergent from it,
+from `MAX_WORKERS` and from latency, and the smoke run measured that emergence
+failing: 5 patients x 2 = 10 requests in flight against a 10 requests/minute
+allowance, `ThrottlingException` storms, and 64 of the run's 98 trials
+recorded `per_trial_call_failed` -- 37 of the MAIN pass's 61 and 27 of the
+RESAMPLE pass's 37. That last figure read as "64 of 98 main-pass trials" here
+for one edit, which is the whole run's number wearing one pass's name; the
+main pass alone lost 37. The rate is now OWNED by the client-side pacer --
+`PROVIDER_REQUESTS_PER_MINUTE` and `oncotriage/provider_resilience.py`, see
+"PROVIDER RESILIENCE" below -- which spaces every wire attempt whatever this
+says. This number now decides only how many of one patient's calls may be
+WAITING in the pacer at once.
 
-AND THERE IS A SECOND, LESS OBVIOUS FLOOR. Standard mode also carries a retry
-QUOTA -- a 500-token bucket charged 5 tokens per throttling retry, refunded on
-success -- and "when the available tokens are exhausted, the SDK returns the
-error without retrying". Sustained throttling above roughly 32% of requests
-drains it, and at that point retries stop entirely and patients start failing
-fast. On a quota-restricted account that is the mechanism to expect, and the
-remedy is a SMALLER value here rather than a larger retry budget.
+WHAT HAPPENS WHEN THE QUOTA IS HIT ANYWAY. Converse answers
+`ThrottlingException` with HTTP 429 (`API_runtime_Converse.html`, read
+2026-08-30). botocore's own retries are DISABLED (`BEDROCK_ANTHROPIC_MAX_ATTEMPTS`
+is 1): its backoff capped at 20 s, it could not be paced, its sleep could not
+be cancelled by a shutdown, and its retry QUOTA -- a 500-token bucket that
+stops retrying entirely under sustained throttling -- is a second, invisible
+budget. The one retry policy in `provider_resilience.execute` owns retries now:
+full jitter, capped at the 60-second quota window so a late retry reaches the
+NEXT window, at most `MATCHING_CALL_MAX_ATTEMPTS` wire attempts per logical
+call, every one of them paced. Past that the exception reaches the node: on a
+TRIAL call the trial is recorded `per_trial_call_failed` and the patient
+completes without it; on the WARMUP the patient fails cleanly and the batch
+checkpoint resumes it, which is cache-or-nothing working.
 
 SET IT TO 1 FOR SEQUENTIAL, which is the honest way to turn the scheduling off
 without turning the mode off. 0 or a negative value is refused at import."""
 
-BEDROCK_ANTHROPIC_MAX_ATTEMPTS = 4
+BEDROCK_ANTHROPIC_MAX_ATTEMPTS = 1
 """botocore's TOTAL attempt budget, or None to follow the OpenAI derivation.
 
-IT SHIPS 4 RATHER THAN None, WHICH WOULD RESOLVE TO 2. The 2026-09-03 sample
+IT SHIPS 1 -- SDK RETRIES DISABLED -- AND THE ONE RETRY POLICY OWNS THEM. The
+provider-resilience pass (2026-09-11) moved it from 4, on botocore's own
+documented behaviour rather than a preference: its standard-mode retries back
+off with a 1 s base capped at 20 s, so a throttled request retries INSIDE the
+60-second quota window that refused it; the sleep between its attempts is a
+plain blocking sleep inside the SDK that no shutdown flag can reach; and each
+of its attempts bypasses any client-side pacer, so the rate bound would hold of
+the policy and not of the wire. With 1, every wire attempt is a
+`provider_resilience.execute` attempt: paced, jittered up to the full window,
+cancellable within `PROVIDER_WAIT_POLL_SECONDS`, and counted against
+`MATCHING_CALL_MAX_ATTEMPTS`. "Set max attempts to 1 to disable retries
+entirely" is botocore's own sentence, quoted below.
+
+A VALUE ABOVE 1 IS STILL SAFE, AND THAT IS DESIGNED RATHER THAN HOPED. The
+policy reads it through `matching_sdk_attempts_per_call()`, divides the total
+budget by it, and has the pacer reserve that many slots per attempt, so the
+budget stays TOTAL and the rate bound stays true of the wire. What a value
+above 1 gives up is cancellability and full-window backoff for the SDK's own
+retries. A value ABOVE `MATCHING_CALL_MAX_ATTEMPTS` is refused at import,
+because then no division can keep the budget total.
+
+AND THE SHIPPED 4 WAS REALLY 5, WHICH IS A MEASUREMENT RATHER THAN A
+RE-READING. The client builder passed this number as botocore's
+`retries["max_attempts"]`, and in a `botocore.config.Config` that key counts
+RETRIES -- measured offline against botocore 1.42.42 with a 429-answering
+`before-send` hook, `max_attempts: 4` made 5 wire attempts and `max_attempts: 1`
+made 2. The builder now passes `total_max_attempts`, which counts what this
+constant's name says; `total_max_attempts: 1` made exactly 1. So every number
+below that says "attempts 4" describes a client that made five.
+
+THE HISTORY BELOW IS KEPT AS WRITTEN; IT RECORDS WHY 4 WAS RIGHT FOR A CLIENT
+WITH NO PACER. The 2026-09-03 sample
 run measured at `BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS` above is the evidence
 for both numbers together, and they were not moved independently: at the
 fall-through pair (bound 4, attempts 2) that run exceeded the account's 10 RPM
@@ -2020,15 +2138,741 @@ def per_trial_parallel_bound():
 
 
 def bedrock_anthropic_max_attempts():
-    """botocore's `retries.max_attempts` for the Converse client. ONE OWNER.
+    """TOTAL wire attempts one Converse ``send`` may make. ONE OWNER.
 
-    The override, or the OpenAI derivation. See both constants; the +1 is the
-    retries-versus-attempts conversion and is the whole reason this is a
-    function rather than a subtraction repeated at the client builder.
+    The client builder passes it as botocore's ``retries.total_max_attempts``.
+    NOT ``max_attempts``: in botocore's retries dict ``max_attempts`` counts
+    RETRIES and ``total_max_attempts`` counts ATTEMPTS -- measured, and the
+    shipped 4 under the wrong key really made 5. The override, or the OpenAI
+    derivation; the +1 is that derivation's retries-to-attempts conversion.
     """
     if BEDROCK_ANTHROPIC_MAX_ATTEMPTS is not None:
         return BEDROCK_ANTHROPIC_MAX_ATTEMPTS
     return OPENAI_SDK_MAX_RETRIES + 1
+
+
+# ===========================================================================
+# PROVIDER RESILIENCE — CLIENT-SIDE PACING AND THE ONE RETRY POLICY
+# ===========================================================================
+#
+# THE MEASURED ARGUMENT. The operator's 2026-09-11 five-patient smoke run
+# against us.anthropic.claude-sonnet-4-6, on this project's account whose
+# Bedrock allowance is applied at 10 requests per minute, put
+# min(MAX_WORKERS, patients) x per_trial_parallel_bound() = 5 x 2 = 10 Converse
+# requests in flight at once with nothing spacing them. The throttle text was
+# "Too many requests", so the binding quota was REQUESTS per minute. Read from
+# that run's own rows: 64 of the run's 98 trials recorded
+# `per_trial_call_failed` -- 37 of the main pass's 61 and 27 of the resample
+# pass's 37, counted per pass because 64 of 98 is BOTH passes and stood here
+# as the main pass's own figure -- and the resample pass lost two patients whose
+# warmups exhausted 3 node attempts x 4 botocore attempts with 1 s and 2 s of
+# patient-level backoff -- every retry inside the one 60-second window that had
+# refused it. The semantics were right; the timing and the pacing were not.
+# That log proves quota throttling under burst; it establishes no provider-side
+# incident.
+#
+# THE MECHANISM LIVES IN oncotriage/provider_resilience.py AND THESE ARE ITS
+# ONLY INPUTS. It is at the Stage 5 DISPATCH seam (evaluation.call_matching_model
+# and its warmup), not inside an adapter, so a new provider or a cloud migration
+# brings a classifier and a reservation rule and keeps both mechanisms.
+#
+# WHAT CHANGES WHEN THE QUOTA INCREASE LANDS: one number,
+# PROVIDER_REQUESTS_PER_MINUTE[MATCHING_PROVIDER_BEDROCK_ANTHROPIC], to the new
+# allowance read off the Service Quotas console. WHAT CHANGES WHEN THE PROVIDER
+# CHANGES: that provider's row in both quota dicts, and -- if its SDK retries
+# internally -- the arm's entry in matching_sdk_attempts_per_call(). Nothing
+# else in this section is per-provider.
+
+PROVIDER_QUOTA_WINDOW_SECONDS = 60.0
+"""The window a per-minute quota is measured over. A DEFINITION, not a tunable.
+
+It is named so the pacer, the backoff cap and the tests all read one owner:
+"requests per minute" means per this many seconds, and the full-jitter backoff
+is capped here so a late retry can reach the NEXT window rather than landing in
+the one that refused it -- which is what botocore's 20 s cap could not do."""
+
+PROVIDER_QUOTA_SCOPE_OPENAI_BATCH = "openai_batch"
+"""The OpenAI Batch API's SUBMISSION endpoints, as a quota scope of their own.
+
+NOT THE SAME QUOTA AS SYNCHRONOUS INFERENCE, which is the whole reason it is a
+separate key rather than a reuse of `MATCHING_PROVIDER_OPENAI`. `files.create`,
+`batches.create`, `batches.retrieve` and `files.content` are MANAGEMENT calls;
+they are governed by the account's request limits for those endpoints, not by
+the per-model requests-per-minute allowance that governs
+`chat.completions.create`. Pacing them under the inference scope would state a
+limit that is wrong in both directions -- too tight for management calls, and
+polluting the inference scope's spacing with requests that do not consume it.
+
+AND LIMITING SUBMISSION REQUESTS DOES NOT LIMIT THE WORK SUBMITTED. One
+`batches.create` enqueues up to `rater.MAX_REQUESTS_PER_BATCH` inference
+requests that the provider runs on its own schedule inside the completion
+window. This scope paces how fast this project may ASK; it says nothing about
+the queued inference workload behind an accepted batch, which is bounded by the
+batch caps and by the spend gate, not by any number here."""
+
+PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE = "ragas_judge"
+"""The Ragas judge's SYNCHRONOUS completions, as a quota scope of its own.
+
+A SEPARATE KEY FROM `MATCHING_PROVIDER_OPENAI` FOR THE REASON THE BATCH SCOPE IS
+SEPARATE, AND ONE MORE. The judge reaches `chat.completions.create` on the same
+vendor Stage 5's dormant OpenAI arm would, so a reader might expect one scope --
+but the two are different ACCOUNTS' worth of pressure on the same allowance and,
+more decisively, they run in different PROCESSES. `ragas_run.py` is its own
+program; pacing it under the inference scope would make its pacer state (which
+is process-local by design) describe a scope a batch run is simultaneously
+pacing to the same number, which is the double-pacing this module exists to
+stop. A scope of its own is what lets the per-scope lock refuse the real
+collision instead of an imagined one.
+
+IT IS A SCOPE EVEN THOUGH ITS QUOTA IS UNKNOWN, and that is the point rather
+than an omission: a scope with no row is neither configured, unknown nor argued
+inapplicable, so the pacer cannot be ASKED about it and the path cannot be
+covered at all. Naming it is what makes the refusal reachable."""
+
+PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING = "ragas_embedding"
+"""The Ragas embedder's `embeddings.create`, as a quota scope of its own.
+
+NOT FOLDED INTO THE JUDGE'S SCOPE, AND THE ARGUMENT IS THE ONE
+`PROVIDER_QUOTA_SCOPE_OPENAI_BATCH` ALREADY MAKES. `embeddings.create` is a
+different endpoint with its own per-model allowance; a provider throttling the
+judge says nothing about the embedder and vice versa, so one shared scope would
+state a limit wrong in both directions and interleave two endpoints' spacing.
+
+NOT FOLDED INTO STAGE 2's EMBEDDING PATH EITHER. That one runs inside a campaign
+against `get_openai_client()` and is deliberately EXCLUDED from the policy (see
+`OPENAI_SDK_MAX_RETRIES`); this one runs in the ragas process against its own
+client. Two paths, two processes, two scopes."""
+
+PROVIDER_QUOTA_SCOPES = MATCHING_PROVIDERS + (
+    PROVIDER_QUOTA_SCOPE_OPENAI_BATCH,
+    PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE,
+    PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING,
+)
+"""Every scope the pacer can be asked about. A CLOSED vocabulary.
+
+SIX MEMBERS, AND THE THREE NON-MATCHING ONES ARE WHY THIS IS NOT
+`MATCHING_PROVIDERS`. A quota scope names one CALLER that may be paced, which is
+a finer thing than a Stage 5 provider: the batch API's submission endpoints and
+the ragas judge and embedder are each dispatched by a program of their own, and
+none of them is a judge Stage 5 could dispatch to. `matching_quota_scope()`
+picks the Stage 5 one; the other three are named by the harness that owns them.
+
+A SCOPE IS NOT AN ALLOWANCE, AND THIS DOCSTRING SAID IT WAS. It read "the batch
+API's submission endpoints and the ragas judge and embedder each have their own
+allowance", which is FALSE for the judge and was the premise the whole
+three-scope arrangement rested on -- see `PROVIDER_QUOTA_BUCKETS` below, which
+is the measurement that overturned it. A caller is a scope; the allowance it
+draws on is its BUCKET, and two scopes can share one."""
+
+# ===========================================================================
+# WHICH SCOPES SHARE ONE PROVIDER ALLOWANCE
+# ===========================================================================
+#
+# THE DEFECT THIS CLOSES, MEASURED RATHER THAN ARGUED. A quota is a property of
+# an ACCOUNT, an ENDPOINT CLASS and a MODEL. It is not a property of a process,
+# and it is not a property of a name in this file. Three scopes above name the
+# same OpenAI account and the same model:
+#
+#     Stage 5's `openai` arm   chat.completions.create   MATCHING_MODEL
+#     the ragas judge          chat.completions.create   ragas DEFAULT_JUDGE_MODEL
+#     the rater's queued work  /v1/chat/completions      rater DEFAULT_MODEL
+#
+# and all three of those model ids are `gpt-5.6-terra` today -- read from the
+# three constants on 2026-09-11, not assumed. So a pacer that gave each scope
+# its own schedule would let two of them run at the configured rate EACH and
+# send twice it, which is precisely the burst this module exists to prevent,
+# reached through the naming rather than through the concurrency.
+#
+# THE RATER IS THE ONE THAT IS NOT IN THAT BUCKET, AND ITS REASON IS THE API's.
+# `openai_batch` paces the four SUBMISSION calls -- upload, enqueue, poll,
+# download -- which are management endpoints under their own request limits and
+# consume no model tokens (argued at PROVIDER_QUOTA_SCOPE_OPENAI_BATCH). The
+# INFERENCE behind an accepted batch is run by the provider's own scheduler
+# against the account's enqueued-token allowance, on a timetable no client-side
+# pacer participates in, so there is nothing here to share with the judge even
+# though the model id is the same.
+#
+# AND THE EMBEDDER SHARES AN ALLOWANCE WITH A PATH THIS POLICY DOES NOT COVER.
+# `ragas_embedding` resolves its model to `config.EMBEDDING_MODEL` (measured:
+# ragas_harness.main() assigns exactly that when `--embedding-model` is unset),
+# which is the SAME model Stage 2's dense retrieval calls through
+# `agent/models.py:get_embedding`. That path is deliberately excluded from the
+# policy (see OPENAI_SDK_MAX_RETRIES), so this bucket is paced on one side and
+# unpaced on the other. That is a REAL residual and it is stated rather than
+# glossed: pacing the embedder does not bound the account's embeddings rate
+# while a campaign is running beside it. It is not closed here because closing
+# it means pacing Stage 2, which is a change to the retrieval path with its own
+# blast radius.
+
+PROVIDER_QUOTA_BUCKET_OPENAI_SYNC = "openai:chat-completions"
+"""One account's synchronous chat-completions allowance, for ONE model.
+
+SHARED BY `MATCHING_PROVIDER_OPENAI` AND `PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE`,
+which is the whole point of the bucket layer: they are two CALLERS of one
+allowance, so they get one schedule between them rather than one each."""
+
+PROVIDER_QUOTA_BUCKET_OPENAI_EMBEDDINGS = "openai:embeddings"
+"""One account's embeddings allowance, for ONE model. See the residual above:
+Stage 2's dense retrieval draws on this and is not paced."""
+
+PROVIDER_QUOTA_BUCKET_OPENAI_BATCH = "openai:batch-management"
+"""The Batch API's submission endpoints. Management, not inference."""
+
+PROVIDER_QUOTA_BUCKETS = {
+    MATCHING_PROVIDER_OPENAI: PROVIDER_QUOTA_BUCKET_OPENAI_SYNC,
+    PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE: PROVIDER_QUOTA_BUCKET_OPENAI_SYNC,
+    PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING:
+        PROVIDER_QUOTA_BUCKET_OPENAI_EMBEDDINGS,
+    PROVIDER_QUOTA_SCOPE_OPENAI_BATCH: PROVIDER_QUOTA_BUCKET_OPENAI_BATCH,
+    # THE TWO BEDROCK ARMS ARE THEIR OWN BUCKETS, one each, and that is a fact
+    # about the vendor rather than a default: a Bedrock quota is per account,
+    # per Region and per model, and nothing else in this project dispatches to
+    # either arm. Naming them explicitly rather than falling back to "the scope
+    # is the bucket" is what makes the table TOTAL over PROVIDER_QUOTA_SCOPES,
+    # so a scope added without a bucket is refused at import instead of
+    # silently getting an allowance of its own.
+    MATCHING_PROVIDER_BEDROCK: "bedrock:responses",
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: "bedrock:converse",
+}
+"""``{scope: bucket}`` -- which ALLOWANCE each caller draws on. TOTAL, guarded.
+
+A SCOPE NAMES A CALLER; A BUCKET NAMES THE PROVIDER LIMIT IT CONSUMES. The
+pacer schedules against the BUCKET, so two scopes that share one cannot gain
+independent allowances by having two names -- which is the defect this table
+exists to remove, not a tidiness.
+
+THE MAPPING IS A RULING AND ITS PREMISE IS CHECKABLE. It rests on the three
+model ids above being equal, and that is measured by
+`tests/test_provider_resilience.py`'s bucket section, which reads
+`MATCHING_MODEL`, ragas' `DEFAULT_JUDGE_MODEL` and the rater's `DEFAULT_MODEL`
+out of their own sources by AST and FAILS if they stop agreeing. So a future
+edit that points the judge at a different model does not silently leave it
+sharing Stage 5's schedule: it fails, and whoever made it re-rules this table.
+
+EVERY SCOPE IN ONE BUCKET MUST CARRY THE SAME QUOTA ROW, refused at import by
+`validate_provider_resilience_config()`. Without that a reader could set
+`PROVIDER_REQUESTS_PER_MINUTE['ragas_judge']` to one number and the `openai`
+row to another, and the pacer -- which reads the row of whichever scope asked
+-- would pace one allowance to two different rates depending on the caller."""
+
+
+def provider_quota_bucket(scope):
+    """The ALLOWANCE ``scope`` draws on. Raises for a scope with no bucket.
+
+    Raising rather than defaulting to the scope itself is the direction this
+    whole table is for: a silent fallback would give a newly-added scope its own
+    allowance, which is exactly the "independent allowance from a separate name"
+    the bucket layer removes.
+    """
+    if scope not in PROVIDER_QUOTA_BUCKETS:
+        raise ValueError(
+            f"no quota bucket for scope {scope!r}; PROVIDER_QUOTA_BUCKETS is "
+            f"keyed by {PROVIDER_QUOTA_SCOPES} and says which provider "
+            f"allowance each caller draws on")
+    return PROVIDER_QUOTA_BUCKETS[scope]
+
+
+def provider_quota_bucket_members(bucket):
+    """Every scope sharing ``bucket``, sorted. Read by the pacer's report."""
+    return sorted(s for s, b in PROVIDER_QUOTA_BUCKETS.items() if b == bucket)
+
+
+QUOTA_NOT_APPLICABLE = "not_applicable"
+"""This quota FAMILY does not govern this scope. Argued per row, never assumed.
+
+THREE STATES, NOT TWO, AND THE THIRD IS WHAT KEEPS A REFUSAL HONEST. A number
+is a configured limit. `None` is UNKNOWN and REFUSES before the first request.
+This is "the provider does not meter this scope on this axis at all", so there
+is nothing to wait for and nothing to look up -- without it, a scope would be
+blocked forever waiting on a console value that does not exist, which is a
+refusal that can never be satisfied and teaches an operator to bypass it.
+
+IT IS NOT AN UNLIMITED SENTINEL AND MUST NOT BE USED AS ONE. "We have not
+measured this yet" is `None`; "we would rather not pace this" is not
+expressible here at all, deliberately. Every row carrying this value states the
+API semantics that make the family inapplicable, and a row whose argument is
+"it would be inconvenient to configure" is a row that should read `None`."""
+PROVIDER_REQUESTS_PER_MINUTE = {
+    MATCHING_PROVIDER_OPENAI: None,
+    MATCHING_PROVIDER_BEDROCK: None,
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: 10,
+    PROVIDER_QUOTA_SCOPE_OPENAI_BATCH: None,
+    # UNKNOWN, AND THEREFORE REFUSING, ON THE SAME RULING AS EVERY OTHER `None`
+    # HERE. OpenAI publishes per-tier request limits on a documentation page and
+    # in response headers rather than through an API this project reads, so the
+    # figure is one an operator types after reading their own account's limits
+    # page. Until then the ragas harness refuses before its first request, which
+    # is the ruled behaviour and is announced by `describe_pacing`. The tests
+    # that drive these paths install EXPLICIT test limits
+    # (`tests/_provider_pin.install_test_quotas`) rather than relying on a
+    # default, so nothing in the suite is measuring a number nobody chose.
+    PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE: None,
+    PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING: None,
+}
+"""The account's requests-per-minute QUOTA per scope, or None: UNKNOWN.
+
+None MEANS UNKNOWN AND REFUSES BEFORE THE FIRST REQUEST IS SENT. It used to
+mean "not paced", so a scope nobody had measured dispatched at whatever rate
+this process could produce -- an unknown quota converted silently into
+unrestricted dispatch, which is the one outcome a rate limiter must not have.
+`provider_resilience` raises `QuotaUnknown` at RESERVATION, above the send,
+naming this constant and the scope. `QUOTA_NOT_APPLICABLE` is the only other
+value, and it means the family does not govern the scope -- never "unlimited".
+
+KEYED BY SCOPE, WHICH IS THE QUOTA BOUNDARY THIS PROJECT CAN NAME. A Bedrock
+quota is per account, per Region and per model; this project runs one model
+per provider in one Region (`BEDROCK_REGION`), so the provider IS the scope.
+Changing the Region or the model is changing the quota, and whoever makes that
+edit re-reads the Service Quotas console and edits this row. The Batch scope is
+separate for the reason argued at `PROVIDER_QUOTA_SCOPE_OPENAI_BATCH`.
+
+10 FOR THE SHIPPED ARM, PROVISIONAL AND OPERATOR-CONFIGURED -- NOT
+PROVIDER-CONFIRMED. It is the figure the smoke era ran at and the 2026-09-03
+sample corroborates (clean at 8.6 requests/minute, throttled at 12.6 against
+the same allowance), and it is what an operator ruled this arm may run at until
+a console-confirmed value replaces it. IT HAS NOT BEEN READ BACK FROM THE
+PROVIDER: `provider_quotas.lookup_applied_quotas()` is the read that would
+confirm it, and on this machine it answers `credentials_absent` -- a bearer
+token authenticates `bedrock-runtime` only and cannot sign a Service Quotas
+call. Replace it with the console value and drop the word provisional.
+
+None FOR EVERY OTHER SCOPE because no quota for them is recorded anywhere in
+this repository, and inventing one is worse than refusing: `describe_pacing`
+says UNKNOWN at run start and the first reservation refuses by name.
+
+PROCESS-LOCAL, AND ONE PROCESS PER SCOPE IS **ASKED FOR RATHER THAN ENFORCED**
+AS SHIPPED. This number is what ONE process paces to, so two processes against
+one account each pace to the whole of it and together send twice it.
+
+THAT PARAGRAPH CLAIMED THE OPPOSITE AND IS CORRECTED RATHER THAN DELETED. It
+read "ONE PROCESS PER SCOPE IS ENFORCED RATHER THAN ASKED FOR ...
+`provider_resilience` takes a per-scope lock so a second live process on this
+host is refused", and it was written before any such lock existed. The
+mechanism exists now -- `provider_resilience.exclusive_scope_lock`, with
+`tests/test_provider_scope_lock.py` driving the refusal, the crash recovery and
+the CWD-independence of its key -- and NOTHING CALLS IT YET, so the promise is
+still unkept. Wiring it into `main()` would refuse the second of the two
+concurrent runner subprocesses
+`tests/test_runner_preflight_and_state_faults.py` deliberately drives, which is
+argued at that function. Until it is wired, the operator's rule is the
+divide-by-N one: N processes against one account each get 1/N of this number,
+or run one process."""
+
+PROVIDER_TOKENS_PER_MINUTE = {
+    MATCHING_PROVIDER_OPENAI: None,
+    MATCHING_PROVIDER_BEDROCK: None,
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: None,
+    PROVIDER_QUOTA_SCOPE_OPENAI_BATCH: QUOTA_NOT_APPLICABLE,
+    # `None` AND NOT `QUOTA_NOT_APPLICABLE`, AND THE DIFFERENCE FROM THE BATCH
+    # ROW ABOVE IS THE WHOLE POINT OF THAT SENTINEL. The batch row is argued
+    # inapplicable from the API's semantics: its four calls consume no model
+    # tokens. These two DO -- a judge completion and an embedding both burn a
+    # tokens-per-minute allowance -- so "we have not measured it" is `None`,
+    # which refuses, and writing the sentinel here to make a run start would be
+    # exactly the misuse that constant's own docstring forbids.
+    PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE: None,
+    PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING: None,
+}
+"""The account's tokens-per-minute QUOTA per scope, or None: UNKNOWN.
+
+None REFUSES, exactly as it does for requests above -- an unmeasured token
+quota is not a licence to dispatch.
+
+`QUOTA_NOT_APPLICABLE` FOR THE BATCH SCOPE, ARGUED FROM THE API'S SEMANTICS AND
+NOT FROM CONVENIENCE. The four calls that scope covers -- `files.create`,
+`batches.create`, `batches.retrieve`, `files.content` -- consume no model
+tokens: they upload a file, enqueue it, read a status and download a result.
+The tokens in a submitted batch are consumed by the provider's own scheduler
+inside the completion window, against the account's ENQUEUED-token allowance
+rather than against any per-minute rate this process can pace. So there is no
+tokens-per-minute figure for an operator to fetch, and a `None` here would
+block every batch submission forever waiting on a console value that does not
+exist. What DOES bound that work is the batch caps and the spend gate.
+
+None FOR EVERY ARM, AND THAT IS AN UNRESOLVED PREMISE STATED RATHER THAN A
+NUMBER GUESSED. The account's tokens-per-minute quota is not recorded anywhere
+in this repository, and the smoke run's throttle text ("Too many requests")
+names the REQUEST quota. When it is read off the Service Quotas console, set it
+here and the pacer enforces it by RESERVATION: each attempt reserves its
+estimated input plus its `max_tokens` at dispatch -- the way Bedrock burns
+token quota -- and the reservation is adjusted to actual usage on completion.
+
+BEFORE ENABLING, CONFIRM ONE THING THIS PROJECT HAS NOT VERIFIED: whether AWS
+applies an output-token burndown multiplier for this model. If it does, the
+reservation rule under-reserves by that factor and must carry it.
+
+A reservation LARGER than the whole window is refused by name
+(`provider_resilience.ReservationExceedsQuota`) rather than waited on forever.
+`MATCHING_MAX_TOKENS` is part of request identity and is never lowered to make
+pacing easier."""
+
+PROVIDER_PACING_HEADROOM = 0.9
+"""The fraction of each quota the pacer targets. 10 x 0.9 = 9 starts per minute.
+
+WHY BELOW 1, AND THE EVIDENCE IS THE PROJECT'S OWN. The pacer measures when a
+request LEAVES this process; the provider counts when it ARRIVES, and network
+latency varies between the two, so two starts spaced exactly one interval apart
+here can arrive closer together there. The 2026-09-03 sample run ran clean at
+8.6 requests/minute and throttled at 12.6 against the same 10; 9 sits under both
+data points. Uncalibrated beyond that and labelled so: nobody has measured the
+arrival jitter directly."""
+
+PROVIDER_RESERVATION_CHARS_PER_TOKEN = 3.0
+"""Characters per token for the pacer's INPUT reservation. Deliberately LOW.
+
+A reservation must over-estimate: an under-estimate lets the token window be
+exceeded by exactly the error. The two measurements this project has are 3.50
+characters per token on Claude Sonnet 4.6 (32,495 characters / 9,281 tokens,
+read out of a real Converse usage block on 2026-09-03) and 4.2-4.4 on
+gpt-5.6-terra, so 3.0 over-reserves on both. It is NOT `CHARS_PER_TOKEN`, which
+under-states the Claude tokenizer by 12.5% and is shared with the input packer,
+where an estimate in the other direction would change the partition. Read only
+while a token quota is configured."""
+
+MATCHING_CALL_MAX_ATTEMPTS = 6
+"""The ONE TOTAL wire-attempt budget per logical Stage 5 call. Every layer in it.
+
+ONE BUDGET, AND "TOTAL" IS ENFORCED RATHER THAN DESCRIBED. It spans the SDK's
+own retries (divided out by `matching_sdk_attempts_per_call()` -- 1 on the
+Converse arm, where botocore's are disabled), the policy's retries, and the
+patient-level path: a call that exhausts it is a TRANSPORT failure, and
+`graph.route_after_llm_classifier` sends it to the error handler instead of
+re-entering Stage 5 for another full budget. That is the one change to the
+patient-level retries, and it is what "one budget" means; MAX_LLM_CLASSIFIER_
+RETRIES still governs a response that ARRIVED and would not parse.
+
+WHY 6. Under the pacer a throttle should be rare -- it means the configured
+quota is wrong or another process shares the account -- so this budget is for
+riding out a transient burst, and it has to be able to wait for the NEXT quota
+window: with `MATCHING_RETRY_BASE_SECONDS` = 4 the five retries' full-jitter
+ceilings are 4, 8, 16, 32 and 60 s (capped at the window), so the last retry can
+land in a fresh window. The old effective budget was 3 node attempts x 4
+botocore attempts = 12 wire attempts for a warmup, spent in about ten seconds;
+this is fewer attempts over more time, which is the trade a per-minute quota
+wants. Uncalibrated beyond that argument."""
+
+MATCHING_RETRY_BASE_SECONDS = 4.0
+"""The full-jitter backoff's base: retry n waits uniform(0, min(window, base x 2^(n-1))).
+
+Used by the policy's retries AND the patient-level path's backoff, so the two
+retry layers that remain share one schedule. See `MATCHING_CALL_MAX_ATTEMPTS`
+for why 4: it is what lets the fifth retry's ceiling reach the 60-second
+window."""
+
+PROVIDER_WAIT_POLL_SECONDS = 0.25
+"""How promptly a pacing or backoff wait notices a shutdown, a spend stop or
+the operator's STOP. The waits are POLLED rather than event-driven because the
+Stage 5 shutdown flag is a plain module boolean set from a signal handler, and
+`threading.Event.set()` takes a lock a handler must not take."""
+
+PROVIDER_QUOTA_LOOKUP_CODES = {
+    MATCHING_PROVIDER_OPENAI: None,
+    MATCHING_PROVIDER_BEDROCK: None,
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: None,
+    PROVIDER_QUOTA_SCOPE_OPENAI_BATCH: None,
+    # BOTH ARE OPENAI SCOPES, so they are `None` for the reason the paragraph
+    # below already gives for the other two: there is no quota-management
+    # endpoint a (ServiceCode, QuotaCode) pair could address, and inventing one
+    # would make the lookup contradict the configured figure for the wrong
+    # reason. They report `code_not_recorded` by name, like every other row.
+    PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE: None,
+    PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING: None,
+}
+"""``{scope: (ServiceCode, QuotaCode)}`` for `provider_quotas`, or None.
+
+WHAT THIS IS FOR. `PROVIDER_REQUESTS_PER_MINUTE` is a figure an OPERATOR typed;
+this is the address at which the PROVIDER can be asked what it is actually
+applying, so the two can be compared. `provider_quotas.lookup_applied_quotas()`
+is the read and it is READ ONLY -- it never writes a row here, because a figure
+that disagrees is an edit somebody makes deliberately.
+
+`None` FOR EVERY SCOPE, AND THAT IS NOT A PLACEHOLDER TO BE FILLED IN BY
+GUESSING. AWS's `GetServiceQuota` is addressed by an opaque per-quota code
+(`L-…`) that differs per model and per quota, and nothing in this repository
+records one. Inventing a pair would make the read return a confident number
+about a quota nobody identified, which is strictly worse than no read: the
+whole value of the lookup is that it can CONTRADICT the configured figure, and
+a lookup pointed at the wrong quota contradicts it for the wrong reason. So
+`None` means "not recorded", `provider_quotas` reports that state BY NAME
+(`code_not_recorded`), and an operator fills in the pair they read off the
+Service Quotas console -- it is in that page's own URL.
+
+THE OPENAI SCOPES HAVE NO EQUIVALENT ENDPOINT AND ARE ALSO `None`. OpenAI
+publishes per-tier rate limits on a documentation page and in response headers,
+not through a quota-management API this module could address with a code pair.
+Their row is `None` for the same reason and reports the same state; a future
+reader for that provider is a different mechanism, not a code pair here."""
+
+BEDROCK_RESPONSES_SDK_MAX_RETRIES = 0
+"""The OpenAI SDK's own retries on the BEDROCK RESPONSES client. DISABLED.
+
+WHY THIS ARM CAN BE DISABLED AND THE `openai` ARM CANNOT, WHICH IS THE WHOLE
+REASON THIS IS A SECOND CONSTANT RATHER THAN A CHANGE TO
+`OPENAI_SDK_MAX_RETRIES`. `max_retries` is a CLIENT-WIDE argument -- the SDK
+has no per-request form, and `with_options()` hands the fixture harness an
+unwrapped client (argued at `evaluation._send_matching_call`) -- so the number
+that governs a client governs every call that client serves.
+
+  * `get_bedrock_client()` serves STAGE 5 AND NOTHING ELSE. It refuses to
+    build unless `MATCHING_PROVIDER` is this arm, so its only consumer is the
+    dispatch `provider_resilience.execute` wraps. Every wire attempt it makes
+    is therefore a policy attempt: paced, jittered up to the full quota
+    window, cancellable within `PROVIDER_WAIT_POLL_SECONDS`, and counted
+    against `MATCHING_CALL_MAX_ATTEMPTS`.
+  * `get_openai_client()` serves Stage 5 AND Stage 2's dense retrieval
+    embedding (`agent/models.py:get_embedding`), the indexer and the index
+    validator. Item 29d removed `get_embedding`'s tenacity decorator and left
+    `OPENAI_SDK_MAX_RETRIES` as that call's ONLY retry, so setting it to 0
+    would silently remove a retry from three paths the policy does not cover.
+    That arm keeps its SDK retry and the policy DIVIDES the total budget by it
+    instead -- `matching_sdk_attempts_per_call()` -- which keeps the budget
+    TOTAL and the rate bound true of the wire without touching the embedding
+    path.
+
+SO THE SHAPE IS NOT A PREFERENCE: SDK retries are disabled exactly where the
+replacement policy covers every consumer of the client, and left alone where
+the client has a consumer the policy does not reach. Giving Stage 5's OpenAI
+arm its own zero-retry client would mean a second `deps` key, and the fixture
+harness hooks `deps.OPENAI_CLIENT` -- so a capture would spend real calls and
+record nothing. That is the pass-20c-2c regression and it is not worth a
+retry.
+
+0 AND NOT 1: with the policy in front of it there is nothing for an in-SDK
+retry to add that the policy does not do better. Its backoff cannot reach the
+next quota window, its sleep is a plain blocking sleep no shutdown flag can
+reach, and its attempts bypass the pacer -- so the rate bound would hold of
+the policy and not of the wire. See `BEDROCK_ANTHROPIC_MAX_ATTEMPTS`, which
+made the same move on botocore for the same three reasons."""
+
+
+def provider_quota(scope):
+    """``(requests_per_minute, tokens_per_minute)`` for a quota scope.
+
+    Each member is an int (configured), ``None`` (UNKNOWN -- the pacer refuses
+    before dispatch) or ``QUOTA_NOT_APPLICABLE`` (this family does not govern
+    this scope, argued at the row).
+
+    Raises ValueError for a scope outside ``PROVIDER_QUOTA_SCOPES``: an unknown
+    scope read as "not paced" would silently un-pace a scope added without
+    a row, which is the wrong direction for a rate limit to fail in.
+    """
+    if scope not in PROVIDER_REQUESTS_PER_MINUTE:
+        raise ValueError(
+            f"no quota row for scope {scope!r}; PROVIDER_REQUESTS_PER_MINUTE and "
+            f"PROVIDER_TOKENS_PER_MINUTE are keyed by {PROVIDER_QUOTA_SCOPES}")
+    return (PROVIDER_REQUESTS_PER_MINUTE[scope],
+            PROVIDER_TOKENS_PER_MINUTE.get(scope))
+
+
+def matching_quota_scope():
+    """The quota scope Stage 5 is paced under: the configured provider."""
+    return MATCHING_PROVIDER
+
+
+def matching_sdk_attempts_per_call():
+    """How many WIRE attempts one Stage 5 send may make inside its own SDK.
+
+    THREE ARMS, THREE ANSWERS, AND THE TWO THAT USE THE SAME SDK DIFFER --
+    which is why this is a three-branch function and not a two-branch one.
+
+      * the Converse arm: `bedrock_anthropic_max_attempts()`, 1 as shipped
+        (botocore's own retries disabled);
+      * the Bedrock RESPONSES arm: `BEDROCK_RESPONSES_SDK_MAX_RETRIES` + 1,
+        which is 1 -- that client serves Stage 5 and nothing else, so its SDK
+        retries are disabled and every wire attempt is a policy attempt;
+      * the `openai` arm: `OPENAI_INFERENCE_SDK_MAX_RETRIES` + 1, which is 1.
+        Stage 5's chat completion is served by `get_openai_inference_client()`
+        -- its OWN client, with its OWN cache and `max_retries=0` -- so every
+        wire attempt is a policy attempt on this arm too.
+
+    THE NUMBER MUST BE THE COVERED CLIENT'S, AND THIS BULLET NAMED THE OTHER
+    ONE FOR A WHOLE PASS. It read `OPENAI_SDK_MAX_RETRIES` + 1 (2), and argued
+    -- correctly, for the client it was describing -- that the retry "CANNOT be
+    disabled" because that client also serves Stage 2's embedding, the indexer
+    and the validator, whose only retry it is. That was true while Stage 5 and
+    the embedding path SHARED one client. The client split
+    (`get_openai_inference_client`) ended the sharing: Stage 5 now has a client
+    whose only consumer is Stage 5, and its retries ARE disabled. The shared
+    client keeps its retry, and `OPENAI_SDK_MAX_RETRIES` keeps governing it --
+    that half of the old argument is unchanged and is pinned at
+    `tests/test_provider_resilience.py` section 1a-ii.
+
+    WHAT THE STALE NUMBER COST, STATED RATHER THAN IMPLIED. It is read at
+    exactly two places and both were wrong in the SAME direction, which is why
+    nothing failed: `matching_policy_attempts()` divided the total budget by 2
+    and gave the policy 3 attempts where 6 were available, and
+    `provider_resilience.execute` passed it as `slots=` to `pacer.reserve`, so
+    the pacer reserved TWO rate slots for every send that makes ONE request.
+    The budget was under-spent and the configured rate was over-reserved by a
+    factor of two -- a pacer that is wrong about the wire, which is the one
+    thing this module says it must not be.
+
+    The full argument for the asymmetry is at
+    `BEDROCK_RESPONSES_SDK_MAX_RETRIES`; the reason Stage 5 has a second client
+    at all is at `get_openai_inference_client`.
+    """
+    if MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK_ANTHROPIC:
+        return bedrock_anthropic_max_attempts()
+    if MATCHING_PROVIDER == MATCHING_PROVIDER_BEDROCK:
+        return BEDROCK_RESPONSES_SDK_MAX_RETRIES + 1
+    return OPENAI_INFERENCE_SDK_MAX_RETRIES + 1
+
+
+def matching_policy_attempts():
+    """How many attempts the policy itself makes: the budget over the SDK's."""
+    return max(1, MATCHING_CALL_MAX_ATTEMPTS // matching_sdk_attempts_per_call())
+
+
+def _is_number(value) -> bool:
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and value == value and value not in (float("inf"), float("-inf")))
+
+
+def validate_provider_resilience_config():
+    """Refuse a malformed pacing or retry setting. Called once, at import.
+
+    A FUNCTION RATHER THAN MODULE-LEVEL ``if``s so a test can drive it with a
+    bad value and watch it refuse, instead of exec'ing a patched copy of this
+    file. Every refusal names the constant. ``True`` is refused wherever an int
+    is wanted: it is an int to Python, and a quota of ``True`` would pace at one
+    request a minute while every report said a number had been configured.
+    """
+    if not _is_number(PROVIDER_QUOTA_WINDOW_SECONDS) or PROVIDER_QUOTA_WINDOW_SECONDS <= 0:
+        raise RuntimeError(
+            f"PROVIDER_QUOTA_WINDOW_SECONDS must be a positive number; it is "
+            f"{PROVIDER_QUOTA_WINDOW_SECONDS!r}")
+    for _name, _table in (("PROVIDER_REQUESTS_PER_MINUTE", PROVIDER_REQUESTS_PER_MINUTE),
+                          ("PROVIDER_TOKENS_PER_MINUTE", PROVIDER_TOKENS_PER_MINUTE)):
+        if not isinstance(_table, dict) or set(_table) != set(PROVIDER_QUOTA_SCOPES):
+            raise RuntimeError(
+                f"{_name} must be a dict keyed by exactly {PROVIDER_QUOTA_SCOPES} "
+                f"-- a scope with no row would be neither configured, unknown "
+                f"nor argued inapplicable; it is {_table!r}")
+        _bad = {k: v for k, v in _table.items()
+                if v is not None and v != QUOTA_NOT_APPLICABLE
+                and (not isinstance(v, int) or isinstance(v, bool) or v < 1)}
+        if _bad:
+            raise RuntimeError(
+                f"{_name} values must be None (UNKNOWN -- refuses before "
+                f"dispatch), {QUOTA_NOT_APPLICABLE!r} (this family does not "
+                f"govern the scope) or an int >= 1; {_bad!r} are not")
+    # THE LOOKUP TABLE IS KEYED BY EXACTLY THE SAME SCOPES, for the reason the
+    # two quota tables are: a scope with no row would be neither "not recorded"
+    # nor addressable, and `provider_quotas` would omit it from its answer
+    # rather than reporting it -- a scope silently absent from a diagnostic is
+    # the shape that made this whole section necessary.
+    if (not isinstance(PROVIDER_QUOTA_LOOKUP_CODES, dict)
+            or set(PROVIDER_QUOTA_LOOKUP_CODES) != set(PROVIDER_QUOTA_SCOPES)):
+        raise RuntimeError(
+            f"PROVIDER_QUOTA_LOOKUP_CODES must be a dict keyed by exactly "
+            f"{PROVIDER_QUOTA_SCOPES}; it is {PROVIDER_QUOTA_LOOKUP_CODES!r}")
+    _bad_codes = {
+        k: v for k, v in PROVIDER_QUOTA_LOOKUP_CODES.items()
+        if v is not None and not (isinstance(v, tuple) and len(v) == 2
+                                  and all(isinstance(p, str) and p for p in v))}
+    if _bad_codes:
+        raise RuntimeError(
+            f"PROVIDER_QUOTA_LOOKUP_CODES values must be None (not recorded -- "
+            f"provider_quotas reports it by name) or a (ServiceCode, "
+            f"QuotaCode) pair of non-empty strings; {_bad_codes!r} are not")
+    if (not _is_number(PROVIDER_PACING_HEADROOM)
+            or not 0 < PROVIDER_PACING_HEADROOM <= 1):
+        raise RuntimeError(
+            f"PROVIDER_PACING_HEADROOM must be a number in (0, 1]; it is "
+            f"{PROVIDER_PACING_HEADROOM!r}. Above 1 would pace ABOVE the quota.")
+    if (not _is_number(PROVIDER_RESERVATION_CHARS_PER_TOKEN)
+            or PROVIDER_RESERVATION_CHARS_PER_TOKEN <= 0):
+        raise RuntimeError(
+            f"PROVIDER_RESERVATION_CHARS_PER_TOKEN must be a positive number; "
+            f"it is {PROVIDER_RESERVATION_CHARS_PER_TOKEN!r}")
+    if (not isinstance(MATCHING_CALL_MAX_ATTEMPTS, int)
+            or isinstance(MATCHING_CALL_MAX_ATTEMPTS, bool)
+            or MATCHING_CALL_MAX_ATTEMPTS < 1):
+        raise RuntimeError(
+            f"MATCHING_CALL_MAX_ATTEMPTS must be an int >= 1; it is "
+            f"{MATCHING_CALL_MAX_ATTEMPTS!r}")
+    # EVERY ARM, NAMED SEPARATELY. The Responses arm used to be folded into
+    # "the OpenAI-SDK arms" because it shared that number; it has its own now
+    # (BEDROCK_RESPONSES_SDK_MAX_RETRIES, disabled), and a loop that still
+    # named two arms would leave the third unchecked -- so a budget below its
+    # SDK's attempts would pass validation for an arm nobody enumerated.
+    for _arm, _sdk in (("the Converse arm (bedrock_anthropic_max_attempts())",
+                        bedrock_anthropic_max_attempts()),
+                       ("the Bedrock Responses arm "
+                        "(BEDROCK_RESPONSES_SDK_MAX_RETRIES + 1)",
+                        BEDROCK_RESPONSES_SDK_MAX_RETRIES + 1),
+                       # THE COVERED CLIENT'S CONSTANT, NOT THE SHARED ONE.
+                       # This row named OPENAI_SDK_MAX_RETRIES while
+                       # matching_sdk_attempts_per_call() answered from it too,
+                       # so the pair agreed and the validator was checking the
+                       # arm it described. Once Stage 5 moved to its own client
+                       # the function changed and this row did not, which would
+                       # have left the validator guarding a number no arm
+                       # reports -- it must ask the same question the arm
+                       # answers, or it is validating nothing that runs.
+                       ("the openai arm "
+                        "(OPENAI_INFERENCE_SDK_MAX_RETRIES + 1)",
+                        OPENAI_INFERENCE_SDK_MAX_RETRIES + 1)):
+        if isinstance(_sdk, int) and _sdk > MATCHING_CALL_MAX_ATTEMPTS:
+            raise RuntimeError(
+                f"{_arm} makes {_sdk} wire attempts per send and "
+                f"MATCHING_CALL_MAX_ATTEMPTS is {MATCHING_CALL_MAX_ATTEMPTS}: no "
+                f"division keeps the budget TOTAL. Lower the SDK's attempts or "
+                f"raise the budget.")
+    if not _is_number(MATCHING_RETRY_BASE_SECONDS) or MATCHING_RETRY_BASE_SECONDS <= 0:
+        raise RuntimeError(
+            f"MATCHING_RETRY_BASE_SECONDS must be a positive number; it is "
+            f"{MATCHING_RETRY_BASE_SECONDS!r}")
+    if not _is_number(PROVIDER_WAIT_POLL_SECONDS) or PROVIDER_WAIT_POLL_SECONDS <= 0:
+        raise RuntimeError(
+            f"PROVIDER_WAIT_POLL_SECONDS must be a positive number; it is "
+            f"{PROVIDER_WAIT_POLL_SECONDS!r}. Zero would make every wait spin.")
+    # ── THE BUCKET TABLE IS TOTAL, AND ROWS INSIDE ONE BUCKET AGREE ──────────
+    #
+    # TOTAL FIRST, for the reason the three tables above are: a scope with no
+    # bucket would fall through `provider_quota_bucket` as a ValueError at the
+    # first reservation -- during a run, on a billed path -- rather than here,
+    # before anything starts.
+    if (not isinstance(PROVIDER_QUOTA_BUCKETS, dict)
+            or set(PROVIDER_QUOTA_BUCKETS) != set(PROVIDER_QUOTA_SCOPES)):
+        raise RuntimeError(
+            f"PROVIDER_QUOTA_BUCKETS must be a dict keyed by exactly "
+            f"{PROVIDER_QUOTA_SCOPES} -- a scope with no bucket would get an "
+            f"allowance of its own, which is the defect the bucket layer "
+            f"exists to remove; it is {PROVIDER_QUOTA_BUCKETS!r}")
+    _bad_buckets = {k: v for k, v in PROVIDER_QUOTA_BUCKETS.items()
+                    if not isinstance(v, str) or not v}
+    if _bad_buckets:
+        raise RuntimeError(
+            f"PROVIDER_QUOTA_BUCKETS values must be non-empty strings naming a "
+            f"provider allowance; {_bad_buckets!r} are not")
+    # AND THE ROWS AGREE. Two scopes sharing one allowance must carry the same
+    # quota figures, because the pacer reads the row of WHICHEVER SCOPE ASKED
+    # and schedules against the shared bucket -- so disagreeing rows would pace
+    # one allowance to two different rates depending on the caller, with
+    # nothing anywhere reporting it. This is the guard that makes the bucket
+    # layer safe rather than merely well-intentioned.
+    for _family, _table in (("PROVIDER_REQUESTS_PER_MINUTE",
+                             PROVIDER_REQUESTS_PER_MINUTE),
+                            ("PROVIDER_TOKENS_PER_MINUTE",
+                             PROVIDER_TOKENS_PER_MINUTE)):
+        _by_bucket = {}
+        for _scope, _bucket in PROVIDER_QUOTA_BUCKETS.items():
+            _by_bucket.setdefault(_bucket, {})[_scope] = _table.get(_scope)
+        for _bucket, _rows in sorted(_by_bucket.items()):
+            if len({repr(v) for v in _rows.values()}) > 1:
+                raise RuntimeError(
+                    f"{_family} disagrees inside one quota bucket: scopes "
+                    f"{sorted(_rows)} all draw on the provider allowance "
+                    f"{_bucket!r} and must carry the SAME figure, but they "
+                    f"carry {_rows!r}. The pacer schedules against the bucket, "
+                    f"so two figures would pace one allowance at two rates "
+                    f"depending on which caller asked. Set them equal, or give "
+                    f"one of them its own bucket in PROVIDER_QUOTA_BUCKETS and "
+                    f"argue there why it is a separate provider limit.")
+
+
+validate_provider_resilience_config()
 
 
 
@@ -2983,10 +3827,19 @@ def get_bedrock_client() -> OpenAI:
     `get_openai_client()`'s precedent in every respect that matters, and the
     three arguments it carries are inherited rather than re-decided:
 
-      max_retries   OPENAI_SDK_MAX_RETRIES, the TRANSPORT budget. The same
-                    number for the same reason -- anything that fails twice in
-                    a row is not transient. Note it is what makes a Bedrock 429
-                    or 5xx retried in-SDK exactly as an OpenAI one is.
+      max_retries   BEDROCK_RESPONSES_SDK_MAX_RETRIES -- ZERO, so the one
+                    retry policy owns every wire attempt this client makes.
+                    THIS BULLET USED TO READ `OPENAI_SDK_MAX_RETRIES`, "the
+                    same number for the same reason", and noted that it made a
+                    Bedrock 429 or 5xx "retried in-SDK exactly as an OpenAI
+                    one is". That was right for a client with no pacer in
+                    front of it and is wrong now: an in-SDK retry cannot reach
+                    the next quota window, sleeps where no shutdown flag can
+                    reach it, and bypasses the pacer -- so the rate bound
+                    would hold of the policy and not of the wire. This client
+                    serves Stage 5 alone, which is what makes disabling it
+                    possible here and impossible on `get_openai_client()`; the
+                    asymmetry is argued at the constant.
       timeout       get_matching_request_timeout(), the STRUCTURED httpx
                     Timeout. A bare float here would flatten the connect phase
                     from the SDK's 5 seconds to 300, which is the regression
@@ -3029,7 +3882,7 @@ def get_bedrock_client() -> OpenAI:
         console.out(f"🔐 Bedrock API key from: {source}")
         _BEDROCK_CLIENT_CACHE = OpenAI(api_key=key,
                                        base_url=base_url,
-                                       max_retries=OPENAI_SDK_MAX_RETRIES,
+                                       max_retries=BEDROCK_RESPONSES_SDK_MAX_RETRIES,
                                        timeout=get_matching_request_timeout())
     return _BEDROCK_CLIENT_CACHE
 
@@ -3151,7 +4004,21 @@ def get_bedrock_anthropic_client():
                 # both values are read at that moment and a later edit does not
                 # move them; that is the same contract every other field on
                 # this constructor already has.
-                retries={"max_attempts": bedrock_anthropic_max_attempts(),
+                # `total_max_attempts`, NOT `max_attempts`, AND THE KEY IS THE
+                # WHOLE CORRECTION (the provider-resilience pass). In a
+                # `botocore.config.Config` retries dict `max_attempts` counts
+                # RETRIES and `total_max_attempts` counts TOTAL attempts.
+                # MEASURED offline against botocore 1.42.42 -- a real client,
+                # fake static credentials, a `before-send` hook answering 429
+                # so no socket is opened: {"max_attempts": 1} made 2 wire
+                # attempts and the shipped {"max_attempts": 4} made 5, while
+                # {"total_max_attempts": 1} made 1 and {"total_max_attempts": 4}
+                # made 4. So the "+1, botocore counts TOTAL attempts" doctrine
+                # beside `bedrock_anthropic_max_attempts()` was true of the
+                # config-FILE setting it quoted and false of the key this line
+                # passed, and every Converse call made one more attempt than
+                # the record said.
+                retries={"total_max_attempts": bedrock_anthropic_max_attempts(),
                          "mode": BEDROCK_ANTHROPIC_RETRY_MODE},
             ),
         )
@@ -6785,6 +7652,12 @@ TUNABLE_NAMES = (
     # Whether an empty verdict is asked again -- which decides which trials
     # leave Stage 5 with a verdict at all.
     "MATCHING_PER_TRIAL_EMPTY_RETRIES",
+    # THE ONE RETRY POLICY'S TOTAL BUDGET. A member under this tuple's rule --
+    # "the Stage 5 request's shape, arm and retry policy" -- because it decides
+    # which trials leave Stage 5 as `per_trial_call_failed` rather than with a
+    # verdict. The PACING limits beside it are deliberately NOT members: they
+    # move how long a run takes, never what it produces.
+    "MATCHING_CALL_MAX_ATTEMPTS",
     # WHICH PROVIDER SERVED STAGE 5. A flip changes the endpoint, the request
     # form, the wire model id and -- because `seed` is not expressible on the
     # Responses API -- the determinism of the answer.

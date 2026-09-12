@@ -66,6 +66,22 @@ Exit codes:
 import os
 import sys
 
+# ── THE ONE OUTBOUND ATTEMPT THIS FILE USED TO MAKE, REMOVED ────────────────
+#
+# MEASURED under a network tripwire over a full bucket-A run: one
+# `create_connection -> ('config.mlflow-telemetry.io', 443)` from this file.
+# MLflow 3.x starts a telemetry client on import and fetches a remote config;
+# that is a third party neither this file's subject nor this project's
+# deployment has anything to do with, and on a host with no egress it is a
+# connect that hangs until it times out.
+#
+# `MLFLOW_DISABLE_TELEMETRY` IS MLFLOW'S OWN DOCUMENTED OPT-OUT -- read off the
+# installed distribution (mlflow-skinny 3.15.1) rather than guessed -- and it is
+# set BEFORE the bootstrap, because `oncotriage/tracking.py` imports mlflow
+# inside its function bodies and this file masks `sys.modules["mlflow"]`, so the
+# first real import can happen at any point below.
+os.environ.setdefault("MLFLOW_DISABLE_TELEMETRY", "true")
+
 try:
     import oncotriage  # noqa: F401
 except ImportError:
@@ -83,6 +99,15 @@ except ImportError:
     else:
         raise
     del _candidate, _how
+    # THE NAME HAS TO BE BOUND ON THIS PATH TOO, AND IT WAS NOT. The `import`
+    # above is what binds `oncotriage`; on this branch it RAISED, so only
+    # sys.path was repaired and the name is still unbound. `_PKG_DIR` below
+    # reads `oncotriage.__file__` -- so the fallback branch ended in a
+    # NameError, in a file whose bootstrap had just printed that it FOUND the
+    # package. Reachable whenever the editable install's finder is absent (a
+    # plain checkout, a copy of the tree, a child whose meta_path was
+    # stripped), which is exactly when the fallback exists to help.
+    import oncotriage  # noqa: F401
 
 import ast
 import contextlib

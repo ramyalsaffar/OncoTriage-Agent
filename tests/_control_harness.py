@@ -131,6 +131,111 @@ def isolate_qdrant(env):
     return env
 
 
+LOCK_DIR_ENV = "ONCOTRIAGE_LOCK_DIR"
+"""Where a child under test puts its lock files. Named here, set by four files.
+
+WHY A HARNESS SETS IT AT ALL, AND IT IS NOT ABOUT THE RUN LOCK. Every run lock
+in this project is keyed on state the harness already makes unique -- a
+checkpoint directory, a database file -- so two harnesses' children never
+collided on one. The PROVIDER SCOPE lock is keyed on a quota ALLOWANCE, which
+is a property of the account rather than of any directory, so once it is wired
+into `25- Batch Runner.py` and `26- Ablation Study.py` EVERY child of EVERY
+harness guards the same allowance. Bucket A runs its files concurrently; two of
+them would then refuse each other, and the refusal would be produced by the
+suite's own parallelism rather than by anything the code does wrong.
+
+THE ANSWER IS A PRIVATE DIRECTORY PER FILE, NOT A WEAKER LOCK. The mechanism
+each harness exercises stays the real one -- the real allowance name, the real
+flock, the real refusal -- and only the directory the lock file lands in is
+this file's own. `oncotriage/control.py:lock_directory` reads this variable on
+every call and is unset in every production invocation, so nothing an operator
+runs is affected.
+
+PER FILE AND NOT PER INVOCATION, AND THE DIFFERENCE IS LOAD-BEARING. A
+per-invocation directory would make the scope lock unable to refuse anything
+INSIDE a harness -- and one harness needs exactly that refusal:
+`tests/test_runner_preflight_and_state_faults.py` section 5 launches a second
+run against a DIFFERENT checkpoint directory while a holder is parked, which
+two run-lock keys do not catch and one allowance does. A per-file directory is
+what lets that check be about the shipped ruling instead of about the suite.
+"""
+
+
+def isolate_locks(env, directory):
+    """Point `env`'s lock directory at `directory`. Mutates and returns it.
+
+    HARD-SET RATHER THAN `setdefault`, for `isolate_qdrant`'s reason one
+    variable over: a `setdefault` fills a hole and leaves an exported value
+    standing, and an operator who had exported `ONCOTRIAGE_LOCK_DIR` for their
+    own reasons would put every child of every harness back into one shared
+    directory -- which is the collision this exists to remove.
+
+    THE DIRECTORY IS THE CALLER'S AND IS NOT CREATED HERE. `control.
+    ensure_lock_directory` creates it, 0700, and verifies its ownership and
+    mode; creating it here would be a second creation site with none of those
+    checks, and `control.lock_directory` is documented PURE for exactly that
+    reason.
+
+    Pure with respect to output: the announcement is `lock_isolation_note`,
+    which a caller prints ONCE. Printing here would emit one identical line per
+    call for a caller that builds a child environment per drive.
+    """
+    env[LOCK_DIR_ENV] = str(directory)
+    return env
+
+
+def lock_isolation_note(env, who):
+    """What to tell an operator whose exported lock directory was overridden.
+
+    None when there is nothing to say, which is every CI environment and every
+    shell that did not export one -- so the absence of this line is not
+    evidence that the isolation did not happen. `who` is the name that did the
+    overriding, on `qdrant_isolation_note`'s footing: a reader meeting this
+    line needs to know which of the four callers it came from.
+
+    Read BEFORE `isolate_locks` has run, or from a separate mapping: it reports
+    what WAS there.
+    """
+    external = env.get(LOCK_DIR_ENV)
+    if external is None:
+        return None
+    return (f"[isolation] {who}: {LOCK_DIR_ENV}={external!r} was exported; it "
+            f"was overridden with this file's own directory so its children's "
+            f"provider-allowance locks cannot collide with anything else on "
+            f"this machine.")
+
+
+def without_lock_isolation(fn, *args, **kwargs):
+    """Call `fn` with `LOCK_DIR_ENV` temporarily unset, then restore it.
+
+    FOR A CHECK WHOSE SUBJECT IS THE **DEFAULT** DERIVATION. Two of these
+    harnesses assert what `control.lock_directory()` answers when nothing
+    overrides it -- that it is a PER-USER subdirectory of the system temp
+    directory and that it is named by the UID rather than by the login name,
+    both of which are real security properties with real arguments behind them.
+    A file that sets the override process-wide would have those checks
+    measuring its own temp directory and PASSING for the wrong reason, which is
+    strictly worse than failing: the property would be unguarded and would look
+    guarded. MEASURED -- they FAILED when this file first set the variable
+    process-wide, which is the good direction and is why the seam exists.
+
+    `control` takes no argument for this and should not: an accessor that could
+    be told to ignore its own override would be a second way to answer one
+    question. The variable is the seam, so lifting it here is the honest form.
+
+    THE CALLABLE IS PASSED IN rather than imported, because this module imports
+    nothing from the project -- it is loaded by `usercustomize` stand-ins at
+    interpreter startup, and an `oncotriage` import here would change what the
+    process under test had already loaded before its own first line.
+    """
+    saved = os.environ.pop(LOCK_DIR_ENV, None)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        if saved is not None:
+            os.environ[LOCK_DIR_ENV] = saved
+
+
 def qdrant_isolation_note(env, who):
     """What to tell an operator whose exported endpoint was overridden.
 

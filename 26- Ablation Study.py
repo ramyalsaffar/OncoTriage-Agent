@@ -111,6 +111,16 @@ from oncotriage.agent.evaluation import request_stage5_shutdown
 # mechanism and is 3 in every program that has one; EXIT_LOCK_UNAVAILABLE is NOT,
 # because its value is read off THIS entry point's own exit vocabulary.
 from oncotriage.control import EXIT_LOCKED
+# THE PROVIDER ALLOWANCE LOCK AND THE SCOPE IT IS KEYED ON. The same allowance
+# a batch run takes -- a study dispatches the same judge through the same pacer.
+from oncotriage.config import matching_quota_scope
+from oncotriage.provider_resilience import (
+    AlreadyPacing,
+    ScopeLockUnavailable,
+    exclusive_scope_lock,
+    scope_lock_refusal_lines,
+    scope_lock_unavailable_lines,
+)
 from oncotriage.ablation.study import (
     AlreadyRunning,
     EXIT_LOCK_UNAVAILABLE,
@@ -275,9 +285,25 @@ if __name__ == "__main__":
     # is a redesign of a file whose contract is that it takes no arguments.
     _db_path = parse_args().db
 
+    # ── AND THE PROVIDER ALLOWANCE, NESTED INSIDE IT ────────────────────────
+    #
+    # TWO MANAGERS ON ONE `with`, WHICH IS NESTING AND NOT A PAIR: Python
+    # enters them left to right, so the study lock is acquired first and the
+    # allowance lock second. Written this way rather than as a second indented
+    # `with` so the body below is not reindented -- the operation that silently
+    # rewrote two nested docstrings in the run-identity pass.
+    #
+    # THE ALLOWANCE IS STAGE 5's, WHICH IS THE SAME ONE A BATCH RUN TAKES, and
+    # that is the ruling rather than an accident: a study dispatches the same
+    # judge through the same pacer, so a study beside a campaign on one machine
+    # is two processes each pacing to the whole configured quota. One of them
+    # is now refused by name instead.
     try:
-        with exclusive_run_lock(db_path=_db_path) as _lock_file:
+        with exclusive_run_lock(db_path=_db_path) as _lock_file, \
+                exclusive_scope_lock(matching_quota_scope()) as _scope_lock:
             console.out(f"[Lock] Held for this study: {_lock_file}")
+            console.out(f"[Pacing] Provider allowance held for this study: "
+                        f"{_scope_lock}")
             try:
                 main()
             except KeyboardInterrupt:
@@ -306,6 +332,32 @@ if __name__ == "__main__":
                             "terminal, touch the sentinel the run banner "
                             "names.")
                 sys.exit(_EXIT_SIGINT)
+
+    except AlreadyPacing as _pacing:
+        # ANOTHER PROCESS IS ALREADY PACING THIS PROVIDER ALLOWANCE, and it may
+        # be a BATCH RUN rather than another study -- which is exactly what the
+        # study lock above cannot see, because two programs' state directories
+        # are two keys and one account is one allowance. A SIBLING of
+        # `AlreadyRunning` rather than a subclass, so neither clause catches the
+        # other; asserted in tests/test_provider_scope_lock.py.
+        #
+        # EXIT_LOCKED for the batch runner's stated reason: the holder finishes
+        # and the allowance frees itself, which is what that code means.
+        console.out()
+        for _line in scope_lock_refusal_lines(_pacing):
+            console.out(_line)
+        sys.exit(EXIT_LOCKED)
+
+    except ScopeLockUnavailable as _pacing_error:
+        # THE ALLOWANCE LOCK COULD NOT BE ATTEMPTED. Same finding and same exit
+        # as `LockUnavailable` one lock over; a separate clause because the two
+        # are siblings under different bases and name different locks. It also
+        # carries the scope-with-no-declared-allowance case, which would
+        # otherwise escape every clause here as a bare ValueError traceback.
+        console.out()
+        for _line in scope_lock_unavailable_lines(_pacing_error):
+            console.out(_line)
+        sys.exit(EXIT_LOCK_UNAVAILABLE)
 
     except AlreadyRunning as _held:
         # THE REFUSAL, ON THE SAME CHANNEL EVERYTHING ELSE THIS FILE SAYS GOES

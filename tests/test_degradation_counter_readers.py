@@ -89,6 +89,16 @@ except ImportError:
     else:
         raise
     del _candidate, _how
+    # THE NAME HAS TO BE BOUND ON THIS PATH TOO, AND IT WAS NOT. The `import`
+    # above is what binds `oncotriage`; on this branch it RAISED, so only
+    # sys.path was repaired and the name is still unbound. Every use below
+    # reads `oncotriage.__file__` -- so the fallback branch ended in a
+    # NameError hundreds of lines later, in a file whose bootstrap had just
+    # printed that it FOUND the package. Reachable whenever the editable
+    # install's finder is absent (a plain checkout, a copy of the tree, a
+    # child whose meta_path was stripped), which is exactly when the fallback
+    # exists to help.
+    import oncotriage  # noqa: F401
 
 from oncotriage import degradation
 from oncotriage import paths
@@ -1063,8 +1073,14 @@ check("the census registry holds exactly the six counters the degradation "
       "EXACT rather than a superset, so a counter added to either registry "
       "without an argument fails here",
       sorted(degradation.census_names()),
+      # PROVIDER_PACING_WAITS IS THE SEVENTH (the provider-resilience pass),
+      # on the same argument: a pacing wait is the client-side pacer holding
+      # the configured rate, which is its job, while the counter that names
+      # the fault -- PROVIDER_RETRY_OUTCOMES, a provider pushing back -- is in
+      # the degradation block. The label above still says "six"; this list is
+      # the exact pin and it moved deliberately.
       ["DEID_CENSUS", "PER_TRIAL_EMPTY_RETRY_RECOVERIES",
-       "PROCEDURE_RENDER_COUNTS",
+       "PROCEDURE_RENDER_COUNTS", "PROVIDER_PACING_WAITS",
        "TEMPORAL_CONFLICT_ACTIVE_MARKERS",
        "TEMPORAL_CONFLICT_RESOLVED_MARKERS", "TEMPORAL_RENDER_COUNTS"])
 

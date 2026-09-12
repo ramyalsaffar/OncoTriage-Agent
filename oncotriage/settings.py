@@ -779,6 +779,34 @@ def resolve_log_level():
         f"  Unset or empty means {DEFAULT_LOG_LEVEL}.")
 
 
+ENV_LOCK_DIRECTORY = "ONCOTRIAGE_LOCK_DIR"
+"""Where this user's run-lock files live, overriding the per-uid temp default.
+
+DECLARED HERE AND READ NOWHERE IN THIS MODULE, which is the one departure this
+variable makes and the reason it is worth naming. ``oncotriage/control.py``
+owns every lock and imports NOTHING from the project -- deliberately, so a
+``usercustomize`` hook can load it at interpreter startup -- so it cannot ask
+``settings`` for the name and writes the literal itself.
+``tests/run_serial_tests.py`` keeps a pinned COPY of that half for the same
+reason and writes it a third time. This declaration is what puts the variable
+where every other ``ONCOTRIAGE_*`` name is documented, and a test pins all
+three spellings against each other so they cannot drift apart silently.
+
+IT IS FOR THE TEST SUITE, NOT FOR AN OPERATOR. Bucket A runs its files
+concurrently and several spawn real ``main()`` subprocesses; with a
+per-quota-scope lock wired into those entry points, two such children would
+guard the same scope and refuse each other for a reason that is a property of
+the suite rather than of the code. Each harness hands its own children a
+private lock directory. Unset -- every production invocation -- changes nothing.
+
+NO RESOLVER HERE, and that is not an omission. Every other variable on this
+page is resolved by a function in this module because a consumer in the package
+asks for it; this one's only consumer may not import this module at all, so a
+resolver here would be a function nothing could call. The normalisation --
+strip, ``expanduser``, ``abspath``, and empty read as unset -- lives in
+``control.lock_directory`` beside the read."""
+
+
 #------------------------------------------------------------------------------
 
 

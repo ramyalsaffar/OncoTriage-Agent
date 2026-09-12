@@ -169,6 +169,18 @@ from oncotriage import degradation as _degradation
 from oncotriage import spend as _spend
 from oncotriage.agent import evaluation as _evaluation
 from oncotriage.fixtures import capture as _capture
+# READ BY c32, AND THE REASON IS A MEASUREMENT. The pacer in
+# `oncotriage/provider_resilience.py` consults a cancellation predicate during
+# every wait, and `evaluation._stage5_cancellation` returns a
+# Stage5ShutdownRequested the moment the flag is set -- so it is a SECOND,
+# independent brake on the drain. That makes "how many wave requests went out"
+# unable to see the wave worker's own flag check being removed: the pacer
+# cancels the queued calls instead, and how many depends on whether a stub
+# reply takes more or less than one paced interval. MEASURED: with the plant
+# applied this file reports 6 requests under CI's loaded runner and 5 on an
+# idle machine -- the same plant, two answers. `reserve` counts an attempt
+# BEFORE it waits, so the reservation count is invariant to that.
+from oncotriage import provider_resilience as _pr
 from oncotriage.storage import database_logger as _dl
 from oncotriage.agent.evaluation import (
     NOT_EVALUABLE_CALL_FAILED,
@@ -4725,10 +4737,48 @@ def _shutdown_probe(module, *, before=False, trials=None, parallel=1):
         module.clear_stage5_shutdown()
 
 
+def _shutdown_reach(module):
+    """``(wire attempts RESERVED, wave-phase skips)`` for a mid-wave shutdown.
+
+    THE OBSERVABLE MOVED FROM REQUESTS TO RESERVATIONS AND THAT IS A MEASURED
+    CORRECTION. c32 used to read `(len(wave_requests()), bool(error))` and
+    expect `(6, False)`; it got `(5, True)` on an idle machine and `(6, False)`
+    under CI's loaded runner, from the same plant -- see the `_pr` import at the
+    top of this file. `reserve` counts an attempt before it waits, so this is
+    "every queued request reached the wire path" without depending on whether
+    the pacer then cancelled some of them; and the `error` half went with it,
+    because whether the patient fails now depends on that same cancellation and
+    is c33's subject rather than this one's.
+
+    THE SKIP COUNT IS READ OFF THE MODULE IT DROVE, never off a fixed one:
+    each control drives its own module object with its own counter, and section
+    8B's readings above are taken from the shipped one.
+
+    BOTH FIGURES ARE DELTAS AND NEITHER COUNTER IS CLEARED. The first version
+    called `module.STAGE5_SHUTDOWN_SKIPS.clear()`, which is a mutation of
+    shared state when the module being driven IS the shipped one -- as it is
+    for the clean-arm reading below -- so it would have wiped a counter section
+    8B had already read and any later section might. A delta needs no
+    permission.
+    """
+    _scope = config.matching_quota_scope()
+    _acquired_before = _pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"]
+    _skips_before = sum(
+        v for k, v in module.STAGE5_SHUTDOWN_SKIPS.items()
+        if k.startswith(module.SHUTDOWN_SKIP_WAVE_KEY_PREFIX))
+    _shutdown_probe(module)
+    return (_pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"] - _acquired_before,
+            sum(v for k, v in module.STAGE5_SHUTDOWN_SKIPS.items()
+                if k.startswith(module.SHUTDOWN_SKIP_WAVE_KEY_PREFIX))
+            - _skips_before)
+
+
 control(
-    "c32 a wave worker that does not consult the flag is CAUGHT [8b-k] -- "
-    "every queued request goes out at full price after the operator asked the "
-    "run to stop, which is the whole drain this pass bounds",
+    "c32 a wave worker that does not consult the flag is CAUGHT [8b-k/8b-l] -- "
+    "every queued request reaches the wire at full price after the operator "
+    "asked the run to stop, and the wave phase stops counting the skips it no "
+    "longer makes. The clean arm is 8b-k/8b-l: one wave request issued and "
+    "five counted under `wave:`",
     [('            if _SHUTDOWN_REQUESTED:\n'
       '                STAGE5_SHUTDOWN_SKIPS[\n'
       '                    f"{SHUTDOWN_SKIP_WAVE_KEY_PREFIX}"\n'
@@ -4737,10 +4787,15 @@ control(
       '                    f"the request was not issued: {_SHUTDOWN_REASON}"))',
       '            if False:\n'
       '                pass')],
-    lambda m: (lambda r: (len(r[1].wave_requests()),
-                          bool(at(r[0], "error"))))(_shutdown_probe(m)),
-    (6, False),
+    _shutdown_reach,
+    (1 + len(_SIX), 0),
 )
+check("c32-i CLEAN CONTROL for c32, in the SAME UNITS: the unplanted module "
+      "reserves only the warmup and the one trial already in flight, and "
+      "counts the other five under `wave:` -- so the expectation above is "
+      "measured against a probe that can tell the difference, rather than "
+      "being a pair a broken probe could return unconditionally",
+      _shutdown_reach(_evaluation), (2, len(_SIX) - 1))
 
 control(
     "c33 *** a send loop that ISOLATES a shutdown to its trial is CAUGHT "
@@ -4763,12 +4818,12 @@ control(
     "patient entered after the shutdown pays for one infrastructure request to "
     "warm a prefix no trial request will ever use, and pays it again on every "
     "one of MAX_LLM_CLASSIFIER_RETRIES re-entries",
-    [('            if _SHUTDOWN_REQUESTED:\n'
-      '                STAGE5_SHUTDOWN_SKIPS[\n'
-      '                    f"{SHUTDOWN_SKIP_WARMUP_KEY_PREFIX}"',
+    # THE GATE'S CONDITION GAINED THE OPERATOR-STOP DRAIN in the provider-
+    # resilience pass; the plant still disables the whole gate.
+    [('            if _SHUTDOWN_REQUESTED or _DRAIN_REQUESTED:\n'
+      '                _gate_reason = (_SHUTDOWN_REASON if _SHUTDOWN_REQUESTED\n',
       '            if False:\n'
-      '                STAGE5_SHUTDOWN_SKIPS[\n'
-      '                    f"{SHUTDOWN_SKIP_WARMUP_KEY_PREFIX}"')],
+      '                _gate_reason = (_SHUTDOWN_REASON if _SHUTDOWN_REQUESTED\n')],
     lambda m: (lambda r: (len(r[1].warmup_requests()),
                           len(r[1].wave_requests())))(
         _shutdown_probe(m, before=True)),

@@ -131,6 +131,7 @@ from oncotriage import environment as _environment
 from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage import spend as _spend
 from oncotriage import spend_journal as _spend_journal
+from oncotriage import provider_resilience as _provider_resilience
 from oncotriage import tracking as _tracking
 
 
@@ -384,6 +385,26 @@ _REGISTRY_SPEC = (
      "vocabulary; the assessment for that trial is the weakest of its cases"),
     ("REFUSALS_OBSERVED", _agent_evaluation.REFUSALS_OBSERVED,
      "the model DECLINED to answer; that patient ended at the error handler"),
+    ("PROVIDER_RETRY_OUTCOMES", _provider_resilience.PROVIDER_RETRY_OUTCOMES,
+     "the one Stage 5 retry policy met a failed provider attempt. Keyed "
+     "{outcome}:{scope}:{category}: `retried:` is one full-jitter backoff, "
+     "`recovered:` a call that retried and then answered, `exhausted:` a call "
+     "that spent config.MATCHING_CALL_MAX_ATTEMPTS on a still-transient error "
+     "(its trial is per_trial_call_failed, or its patient failed at the "
+     "warmup), `not_retried:` a non-transient error raised at once, and "
+     "`cancelled:` a wait a shutdown, a spend stop or the operator's STOP "
+     "ended. On a correctly paced run `retried:throttled` reads zero; a "
+     "non-zero value means config.PROVIDER_REQUESTS_PER_MINUTE is above the "
+     "account's real quota or another process shares the account"),
+    ("PROVIDER_UNCONFIRMED_BILLING",
+     _provider_resilience.PROVIDER_UNCONFIRMED_BILLING,
+     "a failed Stage 5 attempt that MAY have been billed -- a timeout after "
+     "acceptance, a dropped connection, a server error, an unreadable "
+     "response, or an error nothing classifies -- keyed {scope}:{category}. "
+     "Each was charged an UPPER BOUND (its estimated input plus its "
+     "max_tokens) to the spend ledger instead of the zero it used to assume, "
+     "so the cap may stop a run early rather than late; the dollar figure is "
+     "in the PROVIDER PACING AND RETRIES block"),
     ("PER_TRIAL_CALL_FAILURES", _agent_evaluation.PER_TRIAL_CALL_FAILURES,
      "a Stage 5 PER-TRIAL request raised and was isolated to its own trial, "
      "which is recorded as not evaluable while the rest of the patient "
@@ -859,6 +880,14 @@ _CENSUS_SPEC = (
      "and rendered as deid.AGE_CAP_LABEL instead of a number. NOT a "
      "degradation -- a capped age is the stage working -- which is why it is "
      "here and DEID_REFUSALS is not"),
+    ("PROVIDER_PACING_WAITS", _provider_resilience.PROVIDER_PACING_WAITS,
+     "Stage 5 wire attempts the client-side pacer scheduled, keyed "
+     "{scope}:acquired / {scope}:waited / {scope}:cancelled / "
+     "{scope}:tokens_underreserved. NOT a degradation -- a wait is the pacer "
+     "holding the configured rate, which is its job; a run with many waits "
+     "and no `retried:throttled` in PROVIDER_RETRY_OUTCOMES is the healthy "
+     "shape. `tokens_underreserved` is the one key worth reading as a fault: "
+     "a success that burned more tokens than it reserved"),
     ("PER_TRIAL_EMPTY_RETRY_RECOVERIES",
      _agent_evaluation.PER_TRIAL_EMPTY_RETRY_RECOVERIES,
      "a Stage 5 PER-TRIAL empty-verdict retry that came back WITH verdicts, "

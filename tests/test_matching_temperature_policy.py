@@ -81,10 +81,29 @@ except ImportError:
     else:
         raise
     del _candidate, _how
+    # THE NAME HAS TO BE BOUND ON THIS PATH TOO, AND IT WAS NOT. The `import`
+    # above is what binds `oncotriage`; on this branch it RAISED, so only
+    # sys.path was repaired and the name is still unbound. `_PKG` below reads
+    # `oncotriage.__file__` -- so the fallback branch ended in a NameError, in
+    # a file whose bootstrap had just printed that it FOUND the package.
+    # Reachable whenever the editable install's finder is absent (a plain
+    # checkout, a copy of the tree, a child whose meta_path was stripped),
+    # which is exactly when the fallback exists to help.
+    import oncotriage  # noqa: F401
 
 from oncotriage import config
 from oncotriage import degradation
 from oncotriage import run_fingerprint as _fp
+# EXPLICIT TEST LIMITS -- see tests/_provider_pin.py. Section 4 drives the real
+# `call_matching_model` on the OpenAI arm, which RESERVES before it sends, and
+# that scope ships UNKNOWN: unknown REFUSES rather than dispatching unpaced.
+# MEASURED before this line existed: the recorder saw zero calls and 4c read a
+# dropped-temperature count of 0 against an expected 1 -- a silent counter
+# indistinguishable from a call that never happened, which is what 4c-iii's
+# non-degeneracy probe exists to catch. The pacer has no stub-detection bypass.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _provider_pin import install_test_quotas, restore_test_quotas  # noqa: E402
+install_test_quotas(os.path.basename(__file__))
 from oncotriage.agent import bedrock_adapter as _ba
 from oncotriage.agent import bedrock_anthropic_adapter as _bac
 from oncotriage.agent import deps
@@ -626,6 +645,27 @@ for _label, _path in _WATCHED.items():
 check("6d-i ...and the two hashes differ from each other, so 6d is not one "
       "file compared with itself",
       len(set(_HASHES_AT_IMPORT.values())), len(_HASHES_AT_IMPORT))
+
+
+# ── THE TEST QUOTA LIMITS ARE RELEASED, AND THE RELEASE IS MEASURED ─────────
+#
+# ABOVE THE SUMMARY, NEVER BELOW IT, on `release_openai_arm`'s own argument: a
+# release below the results line still decides the exit code while being
+# absent from the number the summary printed -- a run reporting "0 failed" and
+# exiting non-zero, a defect this project has shipped three times.
+#
+# WITHOUT THIS THE TABLES STAY MUTATED FOR THE LIFE OF THE PROCESS. All four
+# files that call `install_test_quotas` imported `restore_test_quotas` and none
+# of them called it. One-file-per-process in bucket A that is invisible; under
+# `pytest tests/`, which imports every one of them into ONE interpreter, the
+# SECOND install raises ProviderPinError and aborts collection. The collision
+# and its removal are driven in tests/test_provider_quotas_lookup.py section 6.
+_QUOTA_OWNER, _QUOTA_RESTORED = restore_test_quotas()
+check("6e the test quota limits this file installed are RELEASED, and both "
+      "tables are back to what _provider_pin read at its OWN import -- "
+      "compared against that independent reading rather than against the value "
+      "the restore just assigned",
+      (_QUOTA_OWNER, _QUOTA_RESTORED), (os.path.basename(__file__), True))
 
 
 # ===========================================================================

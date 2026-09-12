@@ -199,6 +199,7 @@ from oncotriage.utils import (
     resolve_qdrant_collection,
 )
 from oncotriage import run_fingerprint
+from oncotriage import provider_resilience
 from oncotriage import spend
 from oncotriage import tracking
 from oncotriage.observability import console, correlation_scope, get_logger
@@ -3364,6 +3365,10 @@ def main():
         # uncapped one, on `describe_cap()`'s argument: the dangerous state
         # must not be the quiet one.
         console.out(spend.describe_cap())
+        # Beside the cap, on the batch runner's argument; the concurrency is
+        # this study's own pool.
+        console.out(provider_resilience.describe_pacing(
+            concurrency=provider_resilience.stage5_concurrency(MAX_WORKERS)))
         spend.SPEND_LEDGER.seed(ablation_spend_before(db_path))
         console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
 

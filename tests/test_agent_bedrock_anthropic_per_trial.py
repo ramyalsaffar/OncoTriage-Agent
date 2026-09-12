@@ -106,6 +106,36 @@ from oncotriage.agent import bedrock_anthropic_adapter as bac    # noqa: E402
 from oncotriage.agent import prompts as _prompts                 # noqa: E402
 from oncotriage.agent.evaluation import (                        # noqa: E402
     node_llm_classifier_evaluation)
+from oncotriage import provider_resilience as _pr                # noqa: E402
+
+
+# VIRTUAL TIME FOR THE PACER AND THE RETRY BACKOFF, FOR THE WHOLE FILE (the
+# provider-resilience pass). This file drives the REAL Stage 5 node on the
+# Converse arm, and that arm is now paced at the account's recorded quota --
+# nine starts a minute -- so every wave here waited real seconds per call: the
+# file went from ~6 s to 328 s under CI bucket A. The pacing is not this file's
+# subject (tests/test_provider_resilience.py measures it); the dispatch is. A
+# virtual clock keeps the SCHEDULE real -- every attempt still goes through the
+# pacer and every retry still backs off -- and makes the waiting instant.
+# `threading.Barrier` timeouts in section 9 read the REAL clock and are
+# unaffected. Restored, and the restore asserted, above the summary.
+class _VirtualClock:
+    def __init__(self):
+        self._t = 1000.0
+        self._lock = threading.Lock()
+
+    def now(self):
+        with self._lock:
+            return self._t
+
+    def sleep(self, seconds):
+        with self._lock:
+            self._t += max(0.0, float(seconds))
+
+
+_PACING_CLOCK = _VirtualClock()
+_PREVIOUS_TIME_SOURCE = _pr.set_time_source(_PACING_CLOCK.now,
+                                            _PACING_CLOCK.sleep)
 
 
 # ===========================================================================
@@ -251,6 +281,17 @@ _KNOB_NAMES = tuple(sorted(
     if n.startswith(("BEDROCK_ANTHROPIC_", "MATCHING_PER_TRIAL_"))))
 _SHIPPED_AT_IMPORT = {n: getattr(config, n)
                       for n in ("MATCHING_PROVIDER",) + _KNOB_NAMES}
+
+# EXPLICIT TEST LIMITS. This file drives the real Stage 5 node, which reserves
+# before it sends, and at the shipped config every scope but one is UNKNOWN --
+# which REFUSES, correctly, because an unmeasured quota is not a licence to
+# dispatch. This file's subject is the Converse request shape rather than the
+# rate, so it states a limit and drives under it. There is no stub-detection
+# bypass in the pacer and there must not be: the refusal has to fire the same
+# way for a stand-in as for a provider, or it is not a guard.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _provider_pin import install_test_quotas, restore_test_quotas  # noqa: E402
+install_test_quotas(os.path.basename(__file__))
 
 
 # ===========================================================================
@@ -1349,20 +1390,28 @@ with settings(BEDROCK_ANTHROPIC_MAX_PARALLEL_CALLS=None):
           "this check protected before the override shipped a value",
           config.per_trial_parallel_bound(),
           config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
-check("the retry budget ships the MEASURED 4 rather than None",
-      config.BEDROCK_ANTHROPIC_MAX_ATTEMPTS, 4)
+# THE SHIPPED VALUE MOVED 4 -> 1 IN THE PROVIDER-RESILIENCE PASS, AND THIS PIN
+# MOVING IS THE CHECK WORKING. botocore's own retries are DISABLED: the one
+# retry policy in oncotriage/provider_resilience.py owns them, paced and
+# cancellable, and the client builder now passes botocore's
+# `total_max_attempts` -- `max_attempts` counts RETRIES, measured, so the 4
+# that shipped made five wire attempts. tests/test_provider_resilience.py
+# section 9 measures the real SDK's attempt count.
+check("the SDK attempt budget ships 1 -- botocore retries disabled, the one "
+      "policy owns them", config.BEDROCK_ANTHROPIC_MAX_ATTEMPTS, 1)
 check("...and it is what `bedrock_anthropic_max_attempts()` answers",
-      config.bedrock_anthropic_max_attempts(), 4)
+      config.bedrock_anthropic_max_attempts(), 1)
 with settings(BEDROCK_ANTHROPIC_MAX_ATTEMPTS=None):
     check("...and None STILL resolves through botocore's TOTAL-attempt "
           "convention, OPENAI_SDK_MAX_RETRIES + 1 -- the conversion is the "
-          "whole reason it is a function, and the shipped 4 must not be "
+          "whole reason it is a function, and the shipped value must not be "
           "allowed to hide that the fall-through still works",
           config.bedrock_anthropic_max_attempts(),
           config.OPENAI_SDK_MAX_RETRIES + 1)
     check("...NON-DEGENERACY: the fall-through differs from the shipped value, "
           "so the two checks above cannot both pass by coincidence",
-          config.OPENAI_SDK_MAX_RETRIES + 1 == 4, False)
+          config.OPENAI_SDK_MAX_RETRIES + 1
+          == _SHIPPED_AT_IMPORT["BEDROCK_ANTHROPIC_MAX_ATTEMPTS"], False)
 with settings(BEDROCK_ANTHROPIC_MAX_ATTEMPTS=7):
     check("...and the override wins when set",
           config.bedrock_anthropic_max_attempts(), 7)
@@ -1704,9 +1753,35 @@ check("...and no local model was loaded either",
       ("torch" in sys.modules, "transformers" in sys.modules), (False, False))
 
 
+# ── THE TEST QUOTA LIMITS ARE RELEASED, AND THE RELEASE IS MEASURED ─────────
+#
+# ABOVE THE SUMMARY, NEVER BELOW IT, on `release_openai_arm`'s own argument: a
+# release below the results line still decides the exit code while being
+# absent from the number the summary printed -- a run reporting "0 failed" and
+# exiting non-zero, a defect this project has shipped three times.
+#
+# WITHOUT THIS THE TABLES STAY MUTATED FOR THE LIFE OF THE PROCESS. All four
+# files that call `install_test_quotas` imported `restore_test_quotas` and none
+# of them called it. One-file-per-process in bucket A that is invisible; under
+# `pytest tests/`, which imports every one of them into ONE interpreter, the
+# SECOND install raises ProviderPinError and aborts collection. The collision
+# and its removal are driven in tests/test_provider_quotas_lookup.py section 6.
+_QUOTA_OWNER, _QUOTA_RESTORED = restore_test_quotas()
+check("the test quota limits this file installed are RELEASED, and both tables "
+      "are back to what _provider_pin read at its OWN import -- compared "
+      "against that independent reading rather than against the value the "
+      "restore just assigned",
+      (_QUOTA_OWNER, _QUOTA_RESTORED), (os.path.basename(__file__), True))
+
+
 # ===========================================================================
 
 print(f"\n{'=' * 74}")
+_pr.set_time_source(*_PREVIOUS_TIME_SOURCE)
+check("the pacer's REAL time source is restored before the summary",
+      (_pr._CLOCK is _PREVIOUS_TIME_SOURCE[0],
+       _pr._SLEEP is _PREVIOUS_TIME_SOURCE[1]), (True, True))
+
 print("RESULTS:")
 print(f"  passed: {_RESULTS['passed']}")
 print(f"  failed: {_RESULTS['failed']}")

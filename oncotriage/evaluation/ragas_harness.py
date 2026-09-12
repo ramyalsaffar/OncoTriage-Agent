@@ -58,11 +58,141 @@ import statistics
 import sys
 import time
 
-from oncotriage import config, paths, spend, spend_journal
+from oncotriage import config, paths, provider_resilience, spend, spend_journal
 from oncotriage.evaluation import judge_independence
 from oncotriage.observability import console, get_logger
 
 log = get_logger(__name__)
+
+
+# ===========================================================================
+# THE PACER, ON THIS HARNESS'S TWO SCOPES
+# ===========================================================================
+
+def _refuse_unpaced_scope(scope, what):
+    """Refuse, as a ``RagasRefusal``, if ``scope``'s request quota is UNKNOWN.
+
+    **WHY THIS IS A CONSTRUCTION-TIME REFUSAL AND NOT THE PACER'S OWN, WHICH IS
+    A FACT ABOUT ``_score_one`` RATHER THAN A PREFERENCE.** ``QuotaPacer``
+    already refuses an unknown quota at reservation, by raising ``QuotaUnknown``
+    above the send -- and on THIS path that raise would be swallowed:
+    ``_score_one`` wraps every ``metric.ascore`` in ``except Exception`` and
+    records the failure as an UNSCORED sample. So a run against an unpaced
+    scope would not refuse; it would score nothing, report ~700 unscored
+    samples each carrying a one-line reason, write its artifacts and exit 0.
+    That is the loudest possible way to look like a broken judge while the
+    fault is one missing integer.
+
+    SO IT IS ASKED WHERE THE ANSWER STILL REACHES AN OPERATOR: inside the two
+    builders, which ``main()`` calls inside its ``except RagasRefusal`` block,
+    before a client is used and before a cent is spent. The pacer's own refusal
+    stays exactly where it is and remains the backstop for any caller that
+    reaches ``execute_async`` another way.
+
+    IT ASKS THE REQUESTS FAMILY ONLY, matching ``require_known_quota``: every
+    reservation consumes a request slot by definition, while the TOKEN family
+    is only consulted when tokens are actually reserved, and refusing here for
+    an unknown TPM would be a refusal the operator could not satisfy for a
+    scope whose token axis may genuinely not be metered.
+    """
+    state = provider_resilience.quota_state(scope, "requests")
+    if state != provider_resilience.QUOTA_STATE_UNKNOWN:
+        return
+    raise RagasRefusal(
+        f"{what} is paced under quota scope {scope!r}, whose requests/minute "
+        f"is UNKNOWN -- so nothing may be dispatched under it and NOTHING HAS "
+        f"BEEN SENT. Set config.PROVIDER_REQUESTS_PER_MINUTE[{scope!r}] to the "
+        f"value this account's provider console reports (an int, per minute), "
+        f"or -- only if that family genuinely does not govern this scope -- to "
+        f"config.QUOTA_NOT_APPLICABLE with the API semantics argued at the "
+        f"row. This is the same refusal oncotriage/provider_resilience.py's "
+        f"pacer would make at the first reservation; it is made HERE because "
+        f"_score_one catches every Exception and would record it as ~one "
+        f"unscored sample per (sample, metric) pair instead of as a refusal.",
+        code="provider_quota_unknown")
+
+
+def _request_input_tokens(kwargs):
+    """An input-token estimate for ONE request, from the request itself.
+
+    THE PACER RESERVES PER ATTEMPT, so the figure has to be about THIS request
+    rather than about the run. ``estimate_tokens`` is the plan's per-metric
+    total and is the wrong quantity here by orders of magnitude in both
+    directions -- it would reserve a whole metric's budget for one call, and it
+    knows nothing about a retry.
+
+    MEASURED FROM THE TEXT THAT IS ACTUALLY BEING SENT, at
+    ``CHARS_PER_TOKEN``, which is this harness's own declared ratio and is
+    labelled an estimate where it is defined. Two shapes, because the two
+    endpoints take different arguments: ``messages`` for a completion and
+    ``input`` for an embedding.
+
+    IT ROUNDS UP AND NEVER RETURNS ZERO. ``execute_async`` refuses a
+    non-positive INFERENCE reservation by name, and a request whose estimate
+    came back zero is an estimate that did not happen rather than a free call
+    -- so the floor is one token and the caller's own ``max(1, ...)`` is a
+    second line of the same defence.
+
+    AN UNRECOGNISED SHAPE FALLS BACK TO THE SERIALISED LENGTH rather than to a
+    guess: it is an over-estimate of the text and therefore errs toward
+    reserving too much, which is the safe direction for a rate limit.
+    """
+    text_len = 0
+    messages = kwargs.get("messages")
+    if isinstance(messages, (list, tuple)):
+        for message in messages:
+            content = (message or {}).get("content") if isinstance(
+                message, dict) else None
+            if isinstance(content, str):
+                text_len += len(content)
+            elif isinstance(content, (list, tuple)):
+                for part in content:
+                    if isinstance(part, dict):
+                        text_len += len(str(part.get("text") or ""))
+    payload = kwargs.get("input")
+    if isinstance(payload, str):
+        text_len += len(payload)
+    elif isinstance(payload, (list, tuple)):
+        text_len += sum(len(p) for p in payload if isinstance(p, str))
+    if text_len == 0:
+        # NOTHING THIS FUNCTION RECOGNISES. Serialising what was passed is an
+        # over-estimate of the text inside it, which is the direction a
+        # reservation should be wrong in.
+        try:
+            text_len = len(json.dumps(kwargs, default=str))
+        except Exception:                                       # noqa: BLE001
+            text_len = 0
+    return max(1, int(math.ceil(text_len / CHARS_PER_TOKEN)))
+
+
+def _paced(send, *, scope, reservation_tokens, label):
+    """One awaitable provider call, under the pacer and the one retry policy.
+
+    A THIN NAMED WRAPPER rather than the call spelled out at both sites: the
+    two closures differ only in scope, reservation and label, and a second copy
+    of the argument list is a second place for ``reservation_kind`` or
+    ``classify`` to drift.
+
+    ``RESERVATION_INFERENCE`` FOR BOTH, DECLARED AND NEVER INFERRED FROM THE
+    NUMBER. A judge completion generates tokens; an embedding consumes them.
+    Neither is a management call, and ``execute_async`` refuses a non-positive
+    inference reservation BY NAME rather than letting it slip past
+    ``require_known_quota``, which asks the number rather than the kind.
+
+    ``sdk_attempts`` IS LEFT AT 1 BECAUSE THE CLIENTS ARE BUILT WITH
+    ``max_retries=0``. The policy's budget is a TOTAL over WIRE attempts, so an
+    SDK that retried underneath it would make the rate bound true of the policy
+    and false of the wire -- which is the whole reason those two constructions
+    changed in the same pass as this one.
+    """
+    return provider_resilience.execute_async(
+        send,
+        scope=scope,
+        reservation_tokens=max(1, int(reservation_tokens)),
+        reservation_kind=provider_resilience.RESERVATION_INFERENCE,
+        classify=provider_resilience.classify_openai_failure,
+        sdk_attempts=1,
+        label=label)
 
 
 #------------------------------------------------------------------------------
@@ -1295,8 +1425,34 @@ def build_judge(model, temperature, max_tokens, tally, max_retries,
     from openai import AsyncOpenAI
     from ragas.llms import llm_factory
 
+    # ── BEFORE A CLIENT IS BUILT AND BEFORE A CENT IS SPENT ────────────────
+    _refuse_unpaced_scope(config.PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE,
+                          "the ragas judge")
+
+    # `max_retries=0`: THE SDK'S OWN RETRIES ARE DISABLED BECAUSE THE POLICY
+    # REPLACED THEM, and this client serves ONE covered path -- the closure
+    # below, wrapped in `provider_resilience.execute_async`. That is the
+    # condition `config.BEDROCK_RESPONSES_SDK_MAX_RETRIES` states for turning a
+    # client's SDK retries off: disabled exactly where the replacement policy
+    # covers every consumer of the client. Left at `max_retries` the two layers
+    # would multiply -- the policy's TOTAL budget would be a budget of policy
+    # attempts rather than of WIRE attempts, its backoff could not reach the
+    # next quota window, and the SDK's own sleep is a plain blocking sleep no
+    # shutdown flag can reach.
+    #
+    # `--max-retries` SURVIVES AS THE KNOB AND IS REPORTED RATHER THAN SILENTLY
+    # IGNORED: an operator who set it is entitled to know it no longer reaches
+    # the SDK, and `config.MATCHING_CALL_MAX_ATTEMPTS` is what governs now.
+    if max_retries:
+        log.info("ragas.sdk_retries_disabled", stage="judge",
+                 reason="policy_owns_retries")
+        console.out(
+            f"  NOTE: --max-retries {max_retries} no longer reaches the SDK. "
+            f"Retries are the one policy in oncotriage/provider_resilience.py "
+            f"(config.MATCHING_CALL_MAX_ATTEMPTS wire attempts per logical "
+            f"call, transient errors only, full jitter, every attempt paced).")
     client = AsyncOpenAI(api_key=resolve_api_key("OPENAI_API_KEY"),
-                         max_retries=max_retries)
+                         max_retries=0)
 
     real_create = client.chat.completions.create
     seen = {"models": {}}
@@ -1317,9 +1473,35 @@ def build_judge(model, temperature, max_tokens, tally, max_retries,
         # SAFE, because every later ask meets this same gate and is declined
         # too, so the worst case is a run that reports a wall of failed samples
         # having spent nothing further.
-        spend.require_budget(spend.SPEND_SOURCE_RAGAS_JUDGE,
-                             "the ragas judge")
-        response = await real_create(*args, **kwargs)
+        # ── THE GATE IS INSIDE `send`, WHICH IS A CORRECTNESS FIX AND NOT A
+        #    RELOCATION ─────────────────────────────────────────────────────
+        #
+        # `execute_async` RE-INVOKES `send` ON EVERY POLICY ATTEMPT. With the
+        # gate left above the `execute_async` call it would be asked ONCE and
+        # every retry would be UNGATED -- so a run that crossed its cap while
+        # a throttled call was being retried would go on spending on that call
+        # for the whole attempt budget. Inside `send`, every WIRE attempt is
+        # gated, which is what the bracket is for.
+        #
+        # `spend.BILLED_SITES`' `gated_here` scan walks the whole subtree of
+        # the declared qualname, so it is satisfied by either position --
+        # measured, not assumed. Correctness is what decides it.
+        async def _send():
+            spend.require_budget(spend.SPEND_SOURCE_RAGAS_JUDGE,
+                                 "the ragas judge")
+            return await real_create(*args, **kwargs)
+
+        # THE RESERVATION IS THIS REQUEST'S OWN, not the plan's per-metric
+        # estimate: the plan is about the whole run and the pacer reserves per
+        # attempt. The input term is measured from the messages actually being
+        # sent and the output term is the ceiling the request carries, which
+        # is the one figure that cannot be an under-estimate.
+        response = await _paced(
+            _send,
+            scope=config.PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE,
+            reservation_tokens=(_request_input_tokens(kwargs)
+                                + int(max_tokens or DEFAULT_MAX_TOKENS)),
+            label="ragas_judge")
         # THE ANSWERING MODEL, READ OFF THE RESPONSE. This is the ONLY place on
         # the ragas path where it is reachable -- `InstructorLLM.agenerate`
         # returns the parsed Pydantic model and discards the raw response -- so
@@ -1460,15 +1642,40 @@ def build_embeddings(model, tally):
     from openai import AsyncOpenAI
     from ragas.embeddings.base import embedding_factory
 
-    client = AsyncOpenAI(api_key=resolve_api_key("OPENAI_API_KEY"))
+    # BEFORE A CLIENT IS BUILT AND BEFORE A CENT IS SPENT. A SEPARATE SCOPE
+    # from the judge's: `embeddings.create` is a different endpoint with its
+    # own per-model allowance, so a provider throttling the judge says nothing
+    # about the embedder and one shared scope would state a limit wrong in both
+    # directions.
+    _refuse_unpaced_scope(config.PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING,
+                          "the ragas embedder")
+
+    # `max_retries=0`, for `build_judge`'s stated reason: this client serves
+    # one covered path and the policy is the only retry layer.
+    client = AsyncOpenAI(api_key=resolve_api_key("OPENAI_API_KEY"),
+                         max_retries=0)
 
     real_create = client.embeddings.create
 
     async def recording_create(*args, **kwargs):
-        # The judge's gate, on the other vendor. See `build_judge`.
-        spend.require_budget(spend.SPEND_SOURCE_RAGAS_EMBEDDING,
-                             "the ragas embedder")
-        response = await real_create(*args, **kwargs)
+        # THE GATE INSIDE `send`, for `build_judge`'s reason: `execute_async`
+        # re-invokes it on every policy attempt, so a gate outside would leave
+        # every retry ungated.
+        async def _send():
+            spend.require_budget(spend.SPEND_SOURCE_RAGAS_EMBEDDING,
+                                 "the ragas embedder")
+            return await real_create(*args, **kwargs)
+
+        # AN EMBEDDING RESERVES ITS INPUT AND NOTHING ELSE: it produces no
+        # completion, which is why `record_embedding` prices `total_tokens` at
+        # the input rate one method down. The reservation is still an
+        # INFERENCE one -- it consumes model tokens -- and `execute_async`
+        # refuses a non-positive inference reservation by name.
+        response = await _paced(
+            _send,
+            scope=config.PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING,
+            reservation_tokens=_request_input_tokens(kwargs),
+            label="ragas_embedding")
         tally.record_embedding(getattr(response, "usage", None))
         return response
 
@@ -1515,8 +1722,48 @@ def build_metrics(llm, embeddings, selected=ALL_METRICS):
 #------------------------------------------------------------------------------
 
 
-# Only used by --dry-run, and only for the token figures it labels as
-# estimates. Nothing that is actually spent is computed from these.
+# TWO CONSUMERS, AND THIS LINE USED TO NAME ONLY THE FIRST. It read "Only used
+# by --dry-run ... Nothing that is actually spent is computed from these",
+# which was true until `_request_input_tokens` was added and is now false in
+# the half that matters: that helper divides by this ratio to size the PACER
+# RESERVATION on the live dispatch path, so this number helps decide when a
+# billed request is allowed out. The value did not move; the claim about it
+# was wrong, and a constant whose comment forbids the use its own module makes
+# of it is the stale-declaration shape this project removes.
+#
+# THE TWO CONSUMERS WANT IT WRONG IN OPPOSITE DIRECTIONS, which is why they are
+# named separately rather than merged into "an estimate":
+#   --dry-run wants ACCURACY -- it prices a range an operator decides on, and
+#     an over-estimate there is a gate that refuses a run that would have been
+#     affordable.
+#   the reservation wants to NEVER UNDER-COUNT -- a reservation smaller than
+#     the request actually costs lets the pacer admit more than the allowance,
+#     which is the failure a rate limit exists to prevent.
+# 3.6 IS AN ESTIMATE AND IS NOT A BOUND ON EITHER CONSUMER. It was calibrated
+# against dry-run PRICING over two measured runs (the note below), not against
+# this judge's tokenizer, and no measurement in this project compares it with
+# what the OpenAI judge actually counts. So nothing here may claim it "always
+# exceeds actual": for text that tokenizes at fewer than 3.6 chars/token --
+# JSON, code, identifiers, non-English -- dividing by 3.6 UNDER-states tokens
+# and the reservation is therefore smaller than the request really costs.
+#
+# WHAT IS MEASURED, AND ONLY THIS: the one ratio this project has measured end
+# to end is 3.50 chars/token, and it was taken on Claude Sonnet 4.6 -- the
+# Bedrock CLASSIFIER, a different provider and a different tokenizer from this
+# OpenAI judge -- so it does not transfer and is recorded here as a limit
+# rather than as support.
+#
+# THE PACER IS NOT LEFT RESTING ON IT. An under-reservation slows nothing and
+# breaks no invariant on its own: execute_async settles the reservation against
+# the response's REPORTED usage where the caller supplies `usage_tokens_of`,
+# and the requests family -- which is exact, one slot per attempt -- is
+# enforced regardless of this ratio. This number sizes the TOKEN reservation
+# only, and the token family is itself refused as UNKNOWN until an operator
+# configures it, so no live run is paced on this estimate alone today.
+#
+# IF IT IS RE-CALIBRATED, CHECK THE RESERVATION FIRST: raising it makes every
+# reservation smaller, which is the direction that matters and the one the
+# dry run has no opinion about.
 CHARS_PER_TOKEN = 3.6
 
 # CALIBRATED AGAINST TWO MEASURED RUNS OVER eval_run_20260817_195423 (1.9.0),
@@ -3159,6 +3406,24 @@ def _parse_args(argv=None):
                         "are not reproducible sample to sample, so a replaced "
                         "one cannot be recovered by re-running.")
     return p.parse_args(argv)
+
+
+def dispatches_billed_calls(argv=None):
+    """Can this invocation reach the provider? Read by ``ragas_run.py``.
+
+    WHY THE ENTRY POINT ASKS. It takes this harness's allowance locks around
+    ``main()``, and holding them for a ``--dry-run`` would refuse a free
+    operation -- the counts, the pricing and the resume preview are filesystem
+    and arithmetic and call nothing -- because a paid session holds allowances
+    the dry run does not use.
+
+    IT USES THIS MODULE'S OWN PARSER rather than testing ``sys.argv``: argparse
+    accepts unambiguous abbreviations, so a substring test would hand the locks
+    to a dry run. Parsing twice is safe -- argparse is a pure function of argv
+    whose only side effects (``--help``, a usage error) exit.
+    """
+    args = _parse_args(argv)
+    return not bool(getattr(args, "dry_run", False))
 
 
 def main(argv=None):

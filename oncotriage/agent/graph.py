@@ -111,6 +111,17 @@ def route_after_llm_classifier(state: TrialMatchState) -> str:
     if state.get("llm_classifier_refusal"):
         return "error_handler"
 
+    # A TRANSPORT FAILURE THE ONE RETRY POLICY ALREADY EXHAUSTED IS TERMINAL
+    # TOO (the provider-resilience pass). oncotriage/provider_resilience.py
+    # gives every Stage 5 call ONE total wire-attempt budget spanning the SDK,
+    # its own retries and this router's; re-entering the node here would grant
+    # a second full budget and multiply the attempts the budget exists to
+    # bound -- which is how the 2026-09-11 smoke run's warmups reached 3 x 4 = 12
+    # attempts inside one quota window. See llm_classifier_transport_exhausted
+    # in oncotriage/agent/state.py.
+    if state.get("llm_classifier_transport_exhausted"):
+        return "error_handler"
+
     # Failure but retries remaining: loop back
     if retries < MAX_LLM_CLASSIFIER_RETRIES:
         return "llm_classifier_retry"

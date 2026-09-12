@@ -204,7 +204,28 @@ def lock_directory() -> str:
     ablation study and a serial test run must not refuse each other, because
     they guard different things. ``lock_file_path``'s prefix argument is what
     keeps them apart and it is load-bearing.
+
+    ``ONCOTRIAGE_LOCK_DIR`` MOVES IT, AND THAT EXISTS FOR THE TEST SUITE RATHER
+    THAN FOR AN OPERATOR. Bucket A runs its files CONCURRENTLY, and several of
+    them spawn real ``main()`` subprocesses; once a per-quota-scope lock is
+    wired into those entry points, two such children would guard the same scope
+    name and refuse each other -- a suite-wide collision produced by the suite's
+    own parallelism rather than by anything the code does wrong. Each harness
+    therefore hands ITS OWN children a private lock directory, so their scope
+    locks cannot collide while the mechanism under test is still the real one.
+    UNSET -- which is every production invocation -- changes nothing at all.
+    The name is declared in ``oncotriage/settings.py`` beside every other
+    ``ONCOTRIAGE_*`` variable and written out here as a literal, because this
+    module imports nothing from the project; a test pins the two spellings
+    against each other.
+
+    IT IS STILL PURE. An override is normalised and returned; nothing is
+    created, and ``ensure_lock_directory`` applies the same ownership and mode
+    checks to it that it applies to the default.
     """
+    override = os.environ.get("ONCOTRIAGE_LOCK_DIR")
+    if override and override.strip():
+        return os.path.abspath(os.path.expanduser(override.strip()))
     return os.path.join(tempfile.gettempdir(), f"oncotriage-{os.getuid()}")
 
 

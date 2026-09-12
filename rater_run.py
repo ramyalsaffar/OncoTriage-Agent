@@ -146,9 +146,73 @@ if __name__ == "__main__":
     # here: reading this file must not import the anthropic SDK, langgraph or
     # the OpenAI client, and `--help` must not either. main() parses its
     # arguments before it resolves anything.
-    from oncotriage.evaluation.rater import main
+    from oncotriage import config
+    from oncotriage.control import EXIT_LOCKED
+    from oncotriage.evaluation.rater import dispatches_billed_calls, main
+    from oncotriage.observability import console
+    from oncotriage.provider_resilience import (
+        AlreadyPacing,
+        ScopeLockUnavailable,
+        exclusive_scope_lock,
+        scope_lock_refusal_lines,
+        scope_lock_unavailable_lines,
+    )
 
-    sys.exit(main())
+    # ── ONE PROCESS PER PROVIDER ALLOWANCE ─────────────────────────────────
+    #
+    # THE ALLOWANCE IS THE BATCH API's MANAGEMENT ENDPOINTS, NOT THE JUDGE's
+    # INFERENCE QUOTA. `files.create`, `batches.create`, `batches.retrieve` and
+    # `files.content` are governed by the account's request limits for those
+    # endpoints; the inference the batch enqueues runs on the provider's own
+    # schedule inside the completion window and is bounded by the batch caps
+    # and the spend gate, not by anything here. That is argued at
+    # `config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH`, and taking the SYNC
+    # allowance instead would refuse a campaign for a scope this program never
+    # touches.
+    #
+    # NOT TAKEN FOR A DRY RUN. `dispatches_billed_calls` asks this module's own
+    # parser whether a spending mode was requested; a dry run issues no request
+    # and must stay runnable while a live session holds the allowance. See that
+    # function for why it is a parser call rather than a test on sys.argv.
+    #
+    # `contextlib.ExitStack` RATHER THAN A CONDITIONAL `with`, so there is ONE
+    # call to main() and one exit path. Two branches each calling main() is two
+    # places for the exit code to be got wrong.
+    if not dispatches_billed_calls():
+        sys.exit(main())
+
+    import contextlib
+
+    try:
+        with contextlib.ExitStack() as _stack:
+            _held = _stack.enter_context(exclusive_scope_lock(
+                config.PROVIDER_QUOTA_SCOPE_OPENAI_BATCH))
+            console.out(f"[Pacing] Provider allowance held for this session: "
+                        f"{_held}")
+            sys.exit(main())
+    except AlreadyPacing as _pacing:
+        # ANOTHER PROCESS ON THIS HOST IS ALREADY PACING THIS ALLOWANCE.
+        # EXIT_LOCKED, on `25- Batch Runner.py`'s stated reason: the holder
+        # finishes and the allowance frees itself, which is what that code
+        # means. It does not collide with this program's own vocabulary -- 0,
+        # 1, 2 and 3 are documented at the top of this file and 3 there means
+        # "the run happened and some decisions are unrated", so the CONSOLE
+        # LINE is what distinguishes them and it is unambiguous. Widening the
+        # vocabulary for a refusal that spends nothing would be a contract
+        # change to a program whose exit codes a person reads.
+        console.out()
+        for _line in scope_lock_refusal_lines(_pacing):
+            console.out(_line)
+        sys.exit(EXIT_LOCKED)
+    except ScopeLockUnavailable as _pacing_error:
+        # THE LOCK COULD NOT BE ATTEMPTED -- a different finding from "somebody
+        # holds it", and waiting does not fix it. 1 is what every other refusal
+        # in this program returns and carries the same standing: nothing was
+        # submitted and nothing was spent.
+        console.out()
+        for _line in scope_lock_unavailable_lines(_pacing_error):
+            console.out(_line)
+        sys.exit(1)
 
 
 #------------------------------------------------------------------------------

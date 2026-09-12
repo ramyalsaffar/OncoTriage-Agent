@@ -125,6 +125,18 @@ from oncotriage.agent.evaluation import request_stage5_shutdown
 # has one; EXIT_LOCK_UNAVAILABLE is NOT, because its value is read off THIS
 # entry point's own exit vocabulary, so it stays with the runner.
 from oncotriage.control import EXIT_LOCKED, STOP_CLEAR_ABSENT, STOP_CLEAR_FAILED
+# THE PROVIDER ALLOWANCE LOCK AND THE SCOPE IT IS KEYED ON. `matching_quota_scope`
+# is imported as a NAME rather than through the module, matching everything else
+# this guard reads; it answers which quota scope Stage 5 is paced under, which is
+# the configured provider.
+from oncotriage.config import matching_quota_scope
+from oncotriage.provider_resilience import (
+    AlreadyPacing,
+    ScopeLockUnavailable,
+    exclusive_scope_lock,
+    scope_lock_refusal_lines,
+    scope_lock_unavailable_lines,
+)
 from oncotriage.batch.runner import (
     AlreadyRunning,
     EXIT_LOCK_UNAVAILABLE,
@@ -460,9 +472,35 @@ if __name__ == "__main__":
     # The mechanism, the key, and why it is not a pid file are argued at
     # oncotriage/batch/runner.py's THE RUN LOCK section. The lock is released
     # by the kernel when this process exits, however it exits.
+    # ── AND THE PROVIDER ALLOWANCE, NESTED INSIDE IT ────────────────────────
+    #
+    # TWO MANAGERS ON ONE `with`, WHICH IS NESTING AND NOT A PAIR. Python
+    # enters them left to right, so the run lock is acquired first and the
+    # allowance lock second, and both are released in reverse order by the
+    # kernel however this process exits. Written this way rather than as a
+    # second indented `with` because the body below is ~130 lines carrying
+    # multi-line f-strings, and a reindent of that block is the operation that
+    # silently rewrote two nested docstrings in the run-identity pass.
+    #
+    # WHY THE RUN LOCK IS FIRST. It is the narrower and cheaper refusal -- it
+    # names a checkpoint directory an operator owns -- so an operator starting
+    # the same run twice is told the specific thing rather than the general
+    # one. The allowance refusal is the wider fact and is reached only once the
+    # specific one is satisfied.
+    #
+    # WHAT THIS NOW REFUSES THAT THE RUN LOCK DOES NOT: a second run against a
+    # DIFFERENT checkpoint directory, and an ablation study, and a ragas pass
+    # on the same arm. All three are two run-lock keys and ONE provider
+    # allowance, and the pacer's state is this process's memory -- so each
+    # would pace to the whole configured quota and together they would send
+    # twice it, which is the burst `oncotriage/provider_resilience.py` was
+    # written after a real throttling storm to prevent.
     try:
-        with exclusive_run_lock() as _lock_file:
+        with exclusive_run_lock() as _lock_file, \
+                exclusive_scope_lock(matching_quota_scope()) as _scope_lock:
             console.out(f"[Lock] Held for this run: {_lock_file}")
+            console.out(f"[Pacing] Provider allowance held for this run: "
+                        f"{_scope_lock}")
 
             # ── THE STALE-SENTINEL PREFLIGHT, ABOVE THE DESTRUCTIVE FLAG ────
             #
@@ -593,6 +631,52 @@ if __name__ == "__main__":
                             f"touch {describe_stop_switch_path()}")
                 sys.exit(_EXIT_SIGINT)
             sys.exit(reconciliation_exit_code())
+
+    except AlreadyPacing as _pacing:
+        # ANOTHER PROCESS ON THIS HOST IS ALREADY PACING THIS PROVIDER
+        # ALLOWANCE. A DIFFERENT FINDING FROM `AlreadyRunning`, AND NEITHER
+        # CLAUSE CATCHES THE OTHER: both classes subclass
+        # `control.AlreadyRunning` and neither subclasses the other, so they are
+        # siblings and the two clauses are genuinely separate. That is asserted
+        # rather than assumed -- see tests/test_provider_scope_lock.py.
+        #
+        # THE HOLDER MAY BE A DIFFERENT PROGRAM, which is the whole point: a
+        # batch run, an ablation study and a ragas pass on the same arm all draw
+        # on one allowance, and the record names the SCOPE so an operator can
+        # tell which. The run-lock refusal above can only ever name another
+        # batch run.
+        #
+        # EXIT_LOCKED, THE SAME CODE THE RUN-LOCK REFUSAL USES, AND THAT IS
+        # ARGUED RATHER THAN INHERITED. That constant's own docstring gives its
+        # meaning as "another copy is already running, which a supervisor may
+        # reasonably treat as benign and retry later" -- true here word for
+        # word: the holder finishes and the allowance frees itself. Giving this
+        # a fifth code while the stale sentinel, the failed --clear-stop and the
+        # unopenable lock all share 1 would make the vocabulary less legible
+        # rather than more, which is the argument EXIT_LOCK_UNAVAILABLE's own
+        # docstring already makes about not adding a fourth. The console line is
+        # unambiguous either way, and it is what names the remedy.
+        console.out()
+        for _line in scope_lock_refusal_lines(_pacing):
+            console.out(_line)
+        sys.exit(EXIT_LOCKED)
+
+    except ScopeLockUnavailable as _pacing_error:
+        # THE ALLOWANCE LOCK COULD NOT BE ATTEMPTED, which is the same finding
+        # `LockUnavailable` names one lock over and exits the same way: waiting
+        # does not fix it and it needs a person. It is a separate clause because
+        # the two are siblings under different bases and because the diagnosis
+        # names a different lock and a different consequence.
+        #
+        # IT ALSO CARRIES THE SCOPE-WITH-NO-DECLARED-ALLOWANCE CASE.
+        # `scope_lock_path` converts `config.provider_quota_bucket`'s
+        # `ValueError` into this class deliberately, so a configuration defect
+        # reaches this clause as a diagnosis instead of escaping every clause
+        # here as a traceback.
+        console.out()
+        for _line in scope_lock_unavailable_lines(_pacing_error):
+            console.out(_line)
+        sys.exit(EXIT_LOCK_UNAVAILABLE)
 
     except AlreadyRunning as _held:
         # THE REFUSAL, ON THE SAME CHANNEL EVERYTHING ELSE THIS FILE SAYS GOES

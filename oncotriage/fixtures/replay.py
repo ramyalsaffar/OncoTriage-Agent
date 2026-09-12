@@ -499,7 +499,7 @@ class _OpenAITripwire:
 
 
 def install_replay_hooks(fixture: Dict, sink) -> tuple:
-    """Point all four seams at the recording. Returns (saved, replay_state).
+    """Point all five seams at the recording. Returns (saved, replay_state).
 
     INSTALLED THROUGH oncotriage.agent.deps SINCE PASS 20c-2c. This used to
     rebind four names in this module's globals(), which worked only because
@@ -528,13 +528,23 @@ def install_replay_hooks(fixture: Dict, sink) -> tuple:
 
     state = _ReplayState(fixture, sink)
 
+    # ONE HANDLER EACH, SHARED BY BOTH OPENAI PROXIES. `_replay_chat` advances
+    # `state.chat_cursor`; two independently-built handlers would be two
+    # cursors over one recording, so a fixture would replay its first call
+    # twice and report a miss on its last. Built once, the cursor is the run's.
+    on_embedding = _replay_embedding(state)
+    on_chat = _replay_chat(state)
+
     proxies = {
         deps.OPENAI_CLIENT: OpenAIProxy(
             # NOT the real client. See _OpenAITripwire.
-            _OpenAITripwire(),
-            _replay_embedding(state),
-            _replay_chat(state),
-        ),
+            _OpenAITripwire(), on_embedding, on_chat),
+        # STAGE 5's CLIENT, ALSO TRIPWIRED. Leaving this key unhooked would
+        # send all twelve fixtures' Stage 5 prompts to a live billed endpoint
+        # while the replay reported clean -- the precise failure the tripwire
+        # and the identity assertion exist to make impossible.
+        deps.OPENAI_INFERENCE_CLIENT: OpenAIProxy(
+            _OpenAITripwire(), on_embedding, on_chat),
         deps.QDRANT_CLIENT: QdrantProxy(deps.get_qdrant_client(), sink),
         deps.BM25_QUERY_MODEL: ReplaySparseModel(state),
         deps.MEDCPT_SCORER: _replay_medcpt(state),
@@ -1081,10 +1091,18 @@ def main() -> int:
         },
         _probe_sink,
     )
+    _probe_on_embedding = _replay_embedding(_probe_state)
+    _probe_on_chat = _replay_chat(_probe_state)
     _probe_proxies = {
         deps.OPENAI_CLIENT: OpenAIProxy(_OpenAITripwire(),
-                                        _replay_embedding(_probe_state),
-                                        _replay_chat(_probe_state)),
+                                        _probe_on_embedding, _probe_on_chat),
+        # EVERY KEY IN _HOOK_KEYS MUST BE HERE. `_probe_expected` below is built
+        # by indexing this dict with that mapping, so a seam added there and
+        # missed here is a KeyError in the negative control -- the check that
+        # proves the identity assertion can FAIL -- rather than a clean report.
+        deps.OPENAI_INFERENCE_CLIENT: OpenAIProxy(_OpenAITripwire(),
+                                                  _probe_on_embedding,
+                                                  _probe_on_chat),
         deps.QDRANT_CLIENT: QdrantProxy(deps.get_qdrant_client(), _probe_sink),
         deps.BM25_QUERY_MODEL: ReplaySparseModel(_probe_state),
         deps.MEDCPT_SCORER: _replay_medcpt(_probe_state),

@@ -1,0 +1,921 @@
+[Paths] Settings module loaded from /Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/oncotriage/settings.py (via the oncotriage package)
+💻 Running on local machine
+[Paths] Project root: /Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/ (from fallback)
+
+======================================================================
+CANCER CODE REGISTRY AUDIT — File 08 SNOMED sets vs UMLS
+======================================================================
+  MRCONSO:  /Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/02- Data/04- MeSH/MRCONSO_2025AB.RRF
+  SNOMED primary:   34 codes
+  SNOMED secondary: 6 codes
+  ICD-10 categories: 5 hand-typed prefixes
+
+  Cache:    /Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/02- Data/04- MeSH/MRCONSO_2025AB.RRF.oncotriage_audit_cache.json
+  Status:   hit (47 cached, 6 known-absent)
+  No MRCONSO scan needed: every code was already looked up
+  Resolved 40/40 SNOMED codes under SAB=SNOMEDCT_US
+
+----------------------------------------------------------------------
+Set-level invariants
+----------------------------------------------------------------------
+  (6 set-level assertions passed)
+
+----------------------------------------------------------------------
+Per-code audit
+----------------------------------------------------------------------
+
+----------------------------------------------------------------------
+Verified codes
+----------------------------------------------------------------------
+  OK prim 91861009         [FN]   Acute myeloid leukemia (disorder)
+  OK prim 92814006         [FN]   Chronic lymphoid leukemia, disease (disorder)
+  OK prim 92818009         [FN]   Chronic myeloid leukemia (disorder)
+  OK prim 93761005         [FN]   Primary malignant neoplasm of colon (disorder)
+  OK prim 109838007        [FN]   Overlapping malignant neoplasm of colon (disorder)
+  OK prim 109989006        [FN]   Multiple myeloma (disorder)
+  OK prim 118600007        [FN]   Malignant lymphoma (disorder)
+  OK prim 126906006        [FN]   Neoplasm of prostate (disorder)
+  OK prim 126952004        [FN]   Neoplasm of brain (disorder)
+  OK prim 254632001        [FN]   Small cell carcinoma of lung (disorder)
+  OK prim 254637007        [FN]   Non-small cell lung cancer (disorder)
+  OK prim 254837009        [FN]   Malignant neoplasm of breast (disorder)
+  OK prim 363346000        [FN]   Malignant neoplastic disease (disorder)
+  OK prim 363358000        [FN]   Malignant neoplasm of lung (disorder)
+  OK prim 363406005        [FN]   Malignant neoplasm of colon (disorder)
+  OK prim 363414004        [FN]   Malignant neoplasm of rectosigmoid junction (disorder)
+  OK prim 363415003        [FN]   Malignant neoplasm of biliary tract (disorder)
+  OK prim 363418001        [FN]   Malignant neoplasm of pancreas (disorder)
+  OK prim 363443007        [FN]   Malignant neoplasm of ovary (disorder)
+  OK prim 363478007        [FN]   Malignant neoplasm of thyroid gland (disorder)
+  OK prim 372003004        [FN]   Primary malignant neoplasm of pancreas (disorder)
+  OK prim 372064008        [OAF]  Malignant neoplasm of female breast (disorder)
+  OK prim 372244006        [FN]   Malignant melanoma (disorder)
+  OK prim 393563007        [FN]   Glioblastoma multiforme (disorder)
+  OK prim 399068003        [FN]   Malignant neoplasm of prostate (disorder)
+  OK prim 408643008        [FN]   Infiltrating duct carcinoma of breast (disorder)
+  OK prim 422968005        [FN]   Non-small cell carcinoma of lung, TNM stage 3 (disorder)
+  OK prim 423121009        [FN]   Non-small cell carcinoma of lung, TNM stage 4 (disorder)
+  OK prim 424132000        [FN]   Non-small cell carcinoma of lung, TNM stage 1 (disorder)
+  OK prim 425048006        [FN]   Non-small cell carcinoma of lung, TNM stage 2 (disorder)
+  OK prim 67811000119102   [FN]   Primary small cell malignant neoplasm of lung, TNM stage 1 (disorder)
+  OK prim 67821000119109   [FN]   Primary small cell malignant neoplasm of lung, TNM stage 2 (disorder)
+  OK prim 67831000119107   [FN]   Primary small cell malignant neoplasm of lung, TNM stage 3 (disorder)
+  OK prim 67841000119103   [FN]   Primary small cell malignant neoplasm of lung, TNM stage 4 (disorder)
+  OK seco 94222008         [FN]   Metastatic malignant neoplasm to bone (disorder)
+  OK seco 94225005         [FN]   Metastatic malignant neoplasm to brain (disorder)
+  OK seco 94229004         [FN]   Metastatic malignant neoplasm to bronchus of left upper lobe (disorder)
+  OK seco 94260004         [FN]   Metastatic malignant neoplasm to colon (disorder)
+  OK seco 94503003         [FN]   Metastatic malignant neoplasm to prostate (disorder)
+  OK seco 128462008        [FN]   Metastatic malignant neoplasm (disorder)
+
+  RETIRED concepts (no active fully specified name) — kept on purpose,
+  legacy real-EHR records still carry them:
+    372064008        [OAF] Malignant neoplasm of female breast (disorder)
+
+----------------------------------------------------------------------
+ICD-10 category prefixes
+----------------------------------------------------------------------
+  OK C4A   -> PRIMARY       Merkel cell carcinoma
+        confirmed by: UMLS SAB=ICD10CM [HT]
+  OK C7A   -> PRIMARY       Malignant neuroendocrine tumors
+        confirmed by: UMLS SAB=ICD10CM [HT]
+  OK C7B   -> SECONDARY     Secondary neuroendocrine tumors
+        confirmed by: UMLS SAB=ICD10CM [HT]
+  OK C97   -> PRIMARY       Malignant neoplasms of independent (primary) multiple sites
+        confirmed by: UMLS SAB=ICD10 [PT]
+  OK D3A   -> NON_INVASIVE  Benign neuroendocrine tumors
+        confirmed by: UMLS SAB=ICD10CM [HT]
+
+----------------------------------------------------------------------
+ICD-10 block boundaries
+----------------------------------------------------------------------
+  OK _ICD10_C_BLOCK_MAX = 97: release C-blocks run 00-96, none above
+  OK ...highest C-block in the release is C96
+  OK constants vs standard: C_BLOCK_MAX=97, SECONDARY=77-79, D_BLOCK_MAX=49
+  OK C76 (C76) -> ['PRIMARY'], expected PRIMARY
+  OK C77 (C77) -> ['SECONDARY'], expected SECONDARY
+  OK C79 (C79) -> ['SECONDARY'], expected SECONDARY
+  OK C80 (C80) -> ['PRIMARY'], expected PRIMARY
+  OK D49 (D49) -> ['NON_INVASIVE'], expected NON_INVASIVE
+  OK D50 (D50) -> ['NO SET'], expected NO SET
+
+----------------------------------------------------------------------
+ICD-10 coverage: every chapter-2 code lands in exactly one set
+----------------------------------------------------------------------
+  codes checked: 2094 (1469 C-codes + 625 D-codes)
+  missing from all three sets: 0
+  in more than one set:        0
+
+======================================================================
+SUMMARY
+======================================================================
+Codes audited: 40  (34 primary, 6 secondary)
+Passed: 197
+Failed: 0
+
+==============================================================================
+NEGATIVE CONTROL — File 42 must catch every planted defect
+==============================================================================
+  target:   oncotriage/registries/cancer_code_registry.py
+  sha256:   8e4c3aafc0119fd32a59c5c162510a67c5c8a58e215cee5c9314819364e41251
+  backup:   /var/folders/l6/6z3vc5_95_ddnwd6ndd16h000000gn/T/oncotriage_negctrl_o6x_r0d4/08_pristine.py
+  cases:    14
+
+  Baseline: running File 42 unmodified...
+  Baseline OK (exit 0).
+
+  [ 1/14] MISSED  alpha PRIMARY: C7A -> C7B (a secondary category placed in the pr
+  [ 2/14] MISSED  alpha SECONDARY: C7B -> C4A (a primary category placed in the se
+  [ 3/14] MISSED  alpha NON_INVASIVE: D3A -> D4A (a category that does not exist)
+  [ 4/14] MISSED  seed PRIMARY: C97 -> C99 (seeding a category that is not real)
+  [ 5/14] MISSED  boundary _ICD10_C_BLOCK_MAX 97 -> 95 (C96 falls off the end of t
+  [ 6/14] MISSED  boundary _ICD10_C_SECONDARY_LO 77 -> 78 (C77 stops classifying s
+  [ 7/14] MISSED  boundary _ICD10_C_SECONDARY_HI 79 -> 78 (C79 stops classifying s
+  [ 8/14] MISSED  boundary _ICD10_D_NEOPLASM_BLOCK_MAX 49 -> 50 (D50, chapter 3, w
+  [ 9/14] MISSED  comment title: C4A 'Merkel cell carcinoma' -> 'Merkel cell lymph
+  [10/14] MISSED  comment set: D3A relabelled NON_INVASIVE -> PRIMARY
+  [11/14] MISSED  SNOMED: AML code 91861009 -> 20312006 (absent from SNOMED entire
+  [12/14] MISSED  SNOMED: breast code 254837009 -> 396275006 (real code, not a mal
+  [13/14] MISSED  SNOMED: 363406005 comment renamed colon -> stomach (right code, 
+  [14/14] MISSED  SNOMED: brain code 126952004 -> 94381002 (a metastasis in the PR
+
+------------------------------------------------------------------------------
+Per-case detail
+------------------------------------------------------------------------------
+  MISSED <-- BUG  alpha PRIMARY: C7A -> C7B (a secondary category placed in the primary set)
+  MISSED <-- BUG  alpha SECONDARY: C7B -> C4A (a primary category placed in the secondary set)
+  MISSED <-- BUG  alpha NON_INVASIVE: D3A -> D4A (a category that does not exist)
+  MISSED <-- BUG  seed PRIMARY: C97 -> C99 (seeding a category that is not real)
+  MISSED <-- BUG  boundary _ICD10_C_BLOCK_MAX 97 -> 95 (C96 falls off the end of the range)
+  MISSED <-- BUG  boundary _ICD10_C_SECONDARY_LO 77 -> 78 (C77 stops classifying secondary)  [exposed the tautology]
+  MISSED <-- BUG  boundary _ICD10_C_SECONDARY_HI 79 -> 78 (C79 stops classifying secondary)  [exposed the tautology]
+  MISSED <-- BUG  boundary _ICD10_D_NEOPLASM_BLOCK_MAX 49 -> 50 (D50, chapter 3, wrongly admitted)  [exposed the tautology]
+  MISSED <-- BUG  comment title: C4A 'Merkel cell carcinoma' -> 'Merkel cell lymphoma'
+  MISSED <-- BUG  comment set: D3A relabelled NON_INVASIVE -> PRIMARY
+  MISSED <-- BUG  SNOMED: AML code 91861009 -> 20312006 (absent from SNOMED entirely)
+  MISSED <-- BUG  SNOMED: breast code 254837009 -> 396275006 (real code, not a malignancy)
+  MISSED <-- BUG  SNOMED: 363406005 comment renamed colon -> stomach (right code, wrong claim)
+  MISSED <-- BUG  SNOMED: brain code 126952004 -> 94381002 (a metastasis in the PRIMARY set)
+
+==============================================================================
+SUMMARY
+==============================================================================
+Cases planted: 14
+Caught:        0
+Missed:        14
+File 08 sha256 before: 8e4c3aafc0119fd32a59c5c162510a67c5c8a58e215cee5c9314819364e41251
+File 08 sha256 after:  8e4c3aafc0119fd32a59c5c162510a67c5c8a58e215cee5c9314819364e41251
+Restored byte-identical: True
+Passed: 2
+Failed: 14
+
+Failures:
+  - caught: alpha PRIMARY: C7A -> C7B (a secondary category placed in the primary set)
+          expected: True
+          actual:   False
+  - caught: alpha SECONDARY: C7B -> C4A (a primary category placed in the secondary set)
+          expected: True
+          actual:   False
+  - caught: alpha NON_INVASIVE: D3A -> D4A (a category that does not exist)
+          expected: True
+          actual:   False
+  - caught: seed PRIMARY: C97 -> C99 (seeding a category that is not real)
+          expected: True
+          actual:   False
+  - caught: boundary _ICD10_C_BLOCK_MAX 97 -> 95 (C96 falls off the end of the range)
+          expected: True
+          actual:   False
+  - caught: boundary _ICD10_C_SECONDARY_LO 77 -> 78 (C77 stops classifying secondary)  [exposed the tautology]
+          expected: True
+          actual:   False
+  - caught: boundary _ICD10_C_SECONDARY_HI 79 -> 78 (C79 stops classifying secondary)  [exposed the tautology]
+          expected: True
+          actual:   False
+  - caught: boundary _ICD10_D_NEOPLASM_BLOCK_MAX 49 -> 50 (D50, chapter 3, wrongly admitted)  [exposed the tautology]
+          expected: True
+          actual:   False
+  - caught: comment title: C4A 'Merkel cell carcinoma' -> 'Merkel cell lymphoma'
+          expected: True
+          actual:   False
+  - caught: comment set: D3A relabelled NON_INVASIVE -> PRIMARY
+          expected: True
+          actual:   False
+  - caught: SNOMED: AML code 91861009 -> 20312006 (absent from SNOMED entirely)
+          expected: True
+          actual:   False
+  - caught: SNOMED: breast code 254837009 -> 396275006 (real code, not a malignancy)
+          expected: True
+          actual:   False
+  - caught: SNOMED: 363406005 comment renamed colon -> stomach (right code, wrong claim)
+          expected: True
+          actual:   False
+  - caught: SNOMED: brain code 126952004 -> 94381002 (a metastasis in the PRIMARY set)
+          expected: True
+          actual:   False
+[Paths] Settings module loaded from /Users/ramyalsaffar/Ramy/C.V..V/07- LLM Projects/03- Clinical Trial Patient Match/03- Code/oncotriage/settings.py (via the oncotriage package)
+{"ts": "2026-09-12T21:19:49.569Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM: seeded ['C97'] into the primary set — absent from the installed icd10-cm table, valid in ICD-10-CM 2024."}
+{"ts": "2026-09-12T21:19:49.569Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM loaded: 1402 primary, 68 secondary, 625 non-invasive (in-situ/benign/uncertain) codes."}
+{"ts": "2026-09-12T21:19:49.650Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM: seeded ['C97'] into the primary set — absent from the installed icd10-cm table, valid in ICD-10-CM 2024."}
+{"ts": "2026-09-12T21:19:49.650Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM loaded: 1402 primary, 68 secondary, 625 non-invasive (in-situ/benign/uncertain) codes."}
+{"ts": "2026-09-12T21:19:49.656Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM: seeded ['C97'] into the primary set — absent from the installed icd10-cm table, valid in ICD-10-CM 2024."}
+{"ts": "2026-09-12T21:19:49.656Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM loaded: 1402 primary, 68 secondary, 625 non-invasive (in-situ/benign/uncertain) codes."}
+{"ts": "2026-09-12T21:19:49.656Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "CancerCodeRegistry ready: 34 SNOMED + 1402 ICD-10-CM primary codes indexed (625 non-invasive codes rejected)."}
+{"ts": "2026-09-12T21:19:49.725Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM: seeded ['C97'] into the primary set — absent from the installed icd10-cm table, valid in ICD-10-CM 2024."}
+{"ts": "2026-09-12T21:19:49.725Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM loaded: 1 primary, 0 secondary, 0 non-invasive (in-situ/benign/uncertain) codes."}
+{"ts": "2026-09-12T21:19:49.725Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM: seeded ['C97'] into the primary set — absent from the installed icd10-cm table, valid in ICD-10-CM 2024."}
+{"ts": "2026-09-12T21:19:49.725Z", "level": "INFO", "logger": "oncotriage.registries.cancer_code_registry", "correlation_id": "-", "message": "ICD-10-CM loaded: 3 primary, 1 secondary, 1 non-invasive (in-situ/benign/uncertain) codes."}
+
+==============================================================================
+DEGRADED DEPENDENCY TEST — item 11a
+==============================================================================
+  opt-out variable: ONCOTRIAGE_ALLOW_DEGRADED_REGISTRIES
+  currently set to: '(unset)'
+
+==============================================================================
+1. The non-degraded path: nothing raises, nothing is recorded
+==============================================================================
+  PASS  the opt-out is off for section 1
+  PASS  load_mesh_filter returns a filter, not None
+  PASS  and it is a MeSHCancerFilter
+  PASS  the filter carries C04 descriptors (non-degeneracy)
+  PASS  a nonsense opt-out value does not break an INTACT ICD-10 build
+  PASS  nor an intact MeSH load
+  PASS  no core-layer degradation was recorded
+  PASS  the ICD-10 build reports no degraded layer
+  PASS  and it produced primary codes (non-degeneracy)
+  PASS  and secondary codes
+  PASS  and non-invasive codes
+  PASS  the shared registry reports no degraded layer
+  PASS  no ICD-10 degradation was recorded
+  PASS  require_intact_registry() accepts the real registry
+
+==============================================================================
+2. The opt-out variable: both directions, and no silent third state
+==============================================================================
+  PASS  '1' permits a degraded run
+  PASS  'true' permits a degraded run
+  PASS  'TRUE' permits a degraded run
+  PASS  'Yes' permits a degraded run
+  PASS  'on' permits a degraded run
+  PASS  ' 1 ' permits a degraded run
+  PASS  '0' forbids one
+  PASS  'false' forbids one
+  PASS  'No' forbids one
+  PASS  'OFF' forbids one
+  PASS  '' is unset, so the default applies
+  PASS  '   ' is unset, so the default applies
+  PASS  'maybe' raises rather than being read as off
+  PASS  and the message for 'maybe' names the accepted values
+  PASS  '$FLAG' raises rather than being read as off
+  PASS  and the message for '$FLAG' names the accepted values
+  PASS  '2' raises rather than being read as off
+  PASS  and the message for '2' names the accepted values
+  PASS  'y' raises rather than being read as off
+  PASS  and the message for 'y' names the accepted values
+  PASS  _from_env would have corrupted the value (why it is not used)
+  PASS  and specifically: _from_env('1') -> '1' + sep
+  PASS  while the real resolver returns a bool
+
+==============================================================================
+3. MeSH: raises with the lookups absent, degrades with the variable set
+==============================================================================
+  PASS  the shadowed MeSH directory is empty (non-degeneracy)
+  PASS  and load_mesh_filter reads the shadowed path
+  PASS  missing core lookups raise DegradedDependencyError
+  PASS  the message names mesh_c04_lookup.json
+  PASS  and mesh_tree_to_name.json
+  PASS  and the command that builds them
+  PASS  and the opt-out variable
+  PASS  and says the opt-out does not reach the deletion path
+  PASS  and it carries the layer name
+  PASS  DegradedDependencyError is a RuntimeError
+  PASS  and NOT an OSError (a stray except OSError must not eat it)
+  PASS  and NOT an ImportError
+  PASS  with the variable set it returns None instead of raising
+  PASS  and records the core layer exactly once
+  PASS  and logs at WARNING
+  PASS  naming the layer that is absent
+  PASS  and the variable that permitted it
+  PASS  and saying what the consequence is (every trial passes)
+  PASS  and it prints as well as logs
+  PASS  outside the block the real filter loads again
+
+==============================================================================
+4. ICD-10: raises with the package absent and when it yields nothing
+==============================================================================
+  PASS  icd10 is genuinely unimportable in this block (non-degeneracy)
+  PASS  a missing icd10-cm raises DegradedDependencyError
+  PASS  the message names the package
+  PASS  and the install command
+  PASS  and the opt-out variable
+  PASS  and says the EXCLUSION sets go too, not just the primary ones
+  PASS  and it carries the layer name
+  PASS  CancerCodeRegistry() raises rather than building empty
+  PASS  with the variable set the build returns instead of raising
+  PASS  and names the absent layer
+  PASS  and records it exactly once
+  PASS  and logs at WARNING naming the layer
+  PASS  and the variable that permitted it
+  PASS  a degraded registry reports the absent layer
+  PASS  and its 'ready' line is a WARNING saying DEGRADED
+  PASS  SNOMED classification still works on a degraded registry
+  PASS  an ICD-10-coded breast cancer is NOT recognised by a degraded registry (this is the damage)
+  PASS  ...while the intact registry DOES recognise it (non-degeneracy)
+  PASS  an installed release that yields no primary codes raises too
+  PASS  and the message distinguishes it from a missing package
+  PASS  the seed set is non-empty, which is why the guard cannot ask about `primary` (non-degeneracy of the fix)
+  PASS  a release that yields codes does not raise
+  PASS  and reports no degraded layer
+  PASS  primary picked up the C50/C34 codes, plus the C97 seed
+  PASS  secondary picked up C77.0
+  PASS  non-invasive picked up D05.11
+
+==============================================================================
+5. The deletion path refuses a degraded registry WITH the opt-out SET
+==============================================================================
+  PASS  the stand-in registry really is degraded (non-degeneracy)
+  PASS  the opt-out is ON while these checks run
+  PASS  require_intact_registry() refuses anyway
+  PASS  the message says it is refusing to delete
+  PASS  and names the absent layer
+  PASS  and says the variable does not apply here
+  PASS  and points at the dry run
+  PASS  filter_cancer_patients_inplace() refuses
+  PASS  ...and so does the dry run (a plan from a degraded registry is a wrong plan)
+  PASS  a registry that does not report degraded_layers is refused
+  PASS  and the message says why
+  PASS  ...and the real registry is accepted
+
+==============================================================================
+6. dry_run deletes nothing; a real run on a second copy does
+==============================================================================
+  PASS  there are real bundles to copy (non-degeneracy): 12
+  PASS  the two copies start identical
+  PASS  the dry run returned stats
+  PASS  stats say dry_run
+  PASS  every *_deleted count is zero
+  PASS  NOT ONE FILE WAS TOUCHED — same names, same bytes
+  PASS  the file count is unchanged
+  PASS  the real manifest path was NOT written
+  PASS  the dry run touched no real deletion counter
+  PASS  ...only would_delete moved
+  PASS  the plan was written to the .dryrun path
+  PASS  and stats name that file
+  PASS  the console said nothing was deleted
+  PASS  the plan is marked dry_run
+  PASS  and its status is 'planned', never 'complete'
+  PASS  it scanned every copied bundle
+  PASS  every phase in it is marked dry_run
+  PASS  and no phase claims a deletion
+  PASS  the plan's would_delete list matches the reported total
+  PASS  and every planned name is a file that is still there
+  PASS  the real run on the twin copy DID delete something (so the dry run's 'nothing deleted' is meaningful)
+  PASS  and it deleted exactly what the dry run planned
+  PASS  the same FILENAMES the plan listed are the ones now gone
+  PASS  ...while the dry-run copy still has all of them
+  PASS  the real run wrote the real manifest path
+  PASS  and its status is not 'planned'
+  PASS  the production corpus file count is unchanged
+  PASS  and clean.patients_dir() points back at it
+
+==============================================================================
+7. _normalize_lab_unit: three exits, three counters
+==============================================================================
+  PASS  a supported unit converts
+  PASS  and records no degradation
+  PASS  a None value returns unchanged
+  PASS  a None unit returns unchanged
+  PASS  both are counted under no_value_or_unit
+  PASS  a non-numeric value returns unchanged
+  PASS  and is counted under conversion_error, WITH the exception type
+  PASS  an empty-string unit returns unchanged
+  PASS  and is counted as no_value_or_unit, not as unconverted
+  PASS  nothing landed in unconverted for it
+  PASS  an unknown unit returns unchanged
+  PASS  and is counted under unconverted, naming the lab AND the unit
+  PASS  and the unconverted bucket holds ONLY that — the unit-less rows did not dilute it
+  PASS  all three exits are present and distinguishable
+  PASS  and the harmless exit does not hide the meaningful one
+  PASS  a non-string display no longer reaches .lower() unguarded
+
+==============================================================================
+8. Age-parse counters at filter time and at index time
+==============================================================================
+  PASS  a parseable min_age parses
+  PASS  and records nothing
+  PASS  an empty bound takes the default without recording
+  PASS  still nothing recorded
+  PASS  a digit-less bound returns None
+  PASS  and is recorded with the bound, the exception and the text
+  PASS  a digit-less max_age is recorded under its own bound
+  PASS  a pathological value is truncated in the key
+  PASS  no index-time age counter survives
+  PASS  Stage 4 is now the only age-parse record in the project
+  PASS  the scraper makes NO age comparison in executable code
+  PASS  ...and that walk found comparisons at all (non-degeneracy)
+  PASS  no `except: pass` survives in indexer.py either
+  PASS  no `except: pass` survives in filtering.py
+  PASS  nor in patient.py's lab normaliser
+
+==============================================================================
+9. Histology unconditional, result dict unchanged, shim surface intact
+==============================================================================
+  PASS  extract_patient_histology is called in node_rule_based_filter
+  PASS  and it is inside NO `if` at all — in particular not the mesh_filter one
+  PASS  NEGATIVE CONTROL: the pre-11a shape IS reported as guarded
+  PASS  the stand-in patient really carries a histology tag (non-degeneracy)
+  PASS  and the mismatched trial really conflicts with it (non-degeneracy)
+  PASS  the override really removes the filter (non-degeneracy)
+  PASS  with NO MeSH filter the histology filter still runs and drops the mismatched trial
+  PASS  and the compatible trial survives
+  PASS  the run is recorded as having skipped the cancer site filter
+  PASS  ...and mesh_filter_applied is False, as before item 11a
+  PASS  NEGATIVE CONTROL: a patient with no histology tags keeps both trials, which is what the pre-11a degraded path did for EVERY patient
+  PASS  the Stage 4 return dict was found (non-degeneracy)
+  PASS  and its keys are exactly the pinned set
+  PASS  no degradation counter leaked into it
+  PASS  File 05 imports only what its __main__ block calls
+  PASS  ...and the scan parsed a real file (non-degeneracy)
+  PASS  no helper is exported alongside them -- require_intact_registry and DRY_RUN_MANIFEST_SUFFIX in particular
+  PASS  ...and File 05 binds no module-level name of its own
+  PASS  filter_cancer_patients_inplace takes dry_run
+  PASS  and it defaults to False, so the documented command is unchanged
+
+==============================================================================
+SUMMARY
+==============================================================================
+  passed: 174
+  failed: 0
+
+
+==============================================================================
+SNAPSHOT DATE ROT TEST — Files 38 and 39 must pass at every date
+==============================================================================
+  config file:        oncotriage/config.py
+  sha256 before:      159f141c23b8ea337ad259fdb29cf8736c092e9789e0133d8ed7b5287c3804dc
+  committed value:    DATA_SNAPSHOT_DATE = "2026-08-03"
+  dates under test:   2026-03-11, 2027-12-31, 2031-07-04
+  suites:             test_fhir_birth_date_and_demographics.py, test_fhir_ecog_surfacing.py
+
+  Baseline: running both suites unmodified...
+    test_fhir_birth_date_and_demographics.py  exit=0  passed=172  failed=0
+    test_fhir_ecog_surfacing.py  exit=0  passed=113  failed=0
+  Baseline OK.
+
+  2026-03-11  test_fhir_birth_date_and_demographics.py  exit=0  passed=172  failed=0
+  2026-03-11  test_fhir_ecog_surfacing.py  exit=0  passed=113  failed=0
+  2027-12-31  test_fhir_birth_date_and_demographics.py  exit=0  passed=172  failed=0
+  2027-12-31  test_fhir_ecog_surfacing.py  exit=0  passed=113  failed=0
+  2031-07-04  test_fhir_birth_date_and_demographics.py  exit=0  passed=172  failed=0
+  2031-07-04  test_fhir_ecog_surfacing.py  exit=0  passed=113  failed=0
+
+------------------------------------------------------------------------------
+Per-run detail
+------------------------------------------------------------------------------
+  snapshot date  suite  exit  passed  failed 
+  2026-03-11     test_fhir_birth_date_and_demographics.py 0     172     0      
+  2026-03-11     test_fhir_ecog_surfacing.py 0     113     0      
+  2027-12-31     test_fhir_birth_date_and_demographics.py 0     172     0      
+  2027-12-31     test_fhir_ecog_surfacing.py 0     113     0      
+  2031-07-04     test_fhir_birth_date_and_demographics.py 0     172     0      
+  2031-07-04     test_fhir_ecog_surfacing.py 0     113     0      
+
+==============================================================================
+SUMMARY
+==============================================================================
+Dates tested:  3  (2026-03-11, 2027-12-31, 2031-07-04)
+Runs:          6
+Runs exit 0:   6
+config sha256 before: 159f141c23b8ea337ad259fdb29cf8736c092e9789e0133d8ed7b5287c3804dc
+config sha256 after:  159f141c23b8ea337ad259fdb29cf8736c092e9789e0133d8ed7b5287c3804dc
+Restored byte-identical: True
+DATA_SNAPSHOT_DATE now: DATA_SNAPSHOT_DATE = "2026-08-03"
+Passed: 10
+Failed: 0
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+<unknown>:1: SyntaxWarning: invalid decimal literal
+
+==============================================================================
+PACKAGE SPLIT TEST — item 20c
+==============================================================================
+  code directory:  /private/tmp/claude-501/-Users-ramyalsaffar-Ramy-C-V--V-07--LLM-Projects-03--Clinical-Trial-Patient-Match-03--Code/85ad7840-cb2a-451e-bc68-0d1075297b8a/scratchpad/bucketB_copy/Code/
+  package:         /private/tmp/claude-501/-Users-ramyalsaffar-Ramy-C-V--V-07--LLM-Projects-03--Clinical-Trial-Patient-Match-03--Code/85ad7840-cb2a-451e-bc68-0d1075297b8a/scratchpad/bucketB_copy/Code/oncotriage
+
+==============================================================================
+0. `pip install -e .` — import oncotriage.config from anywhere
+==============================================================================
+  PASS  import oncotriage.config succeeds from a foreign working directory, with PYTHONPATH unset
+  PASS  ...and the module that answered is the real one
+
+==============================================================================
+1. config and utils import in both orders; config never imports utils
+==============================================================================
+  PASS  oncotriage.config then oncotriage.utils imports cleanly
+  PASS  oncotriage.utils then oncotriage.config imports cleanly
+  PASS  oncotriage/config.py does not import oncotriage.utils, anywhere
+  PASS  ...and the detector is not vacuous: config DOES import oncotriage.paths
+  PASS  ...and utils DOES import oncotriage.config (the surviving direction)
+
+  Negative control: reintroducing the cycle in a COPY of the package
+  PASS  the structural detector CATCHES a reintroduced config -> utils import
+  PASS  with the cycle back, `import oncotriage.utils` FAILS
+  PASS  ...and it fails AS a circular import, not as something else
+  PASS  ...while `import oncotriage.config` still succeeds, which is exactly why the structural check is the guard
+
+==============================================================================
+1b. every oncotriage -> oncotriage import is at module scope
+==============================================================================
+  PASS  the package file list is non-empty and covers all six subpackages
+  PASS  the tree has the subpackages this pass expects (non-degeneracy)
+  PASS  the scan reaches NESTED subpackages, not just the top level -- oncotriage.dashboard.tabs is two deep and setuptools does not recurse into a listed package
+  PASS  every subpackage on disk is declared in pyproject.toml, so a built wheel carries it
+  PASS  the recursive scan FINDS a subpackage planted three deep, where a one-level os.listdir would see nothing (negative control)
+  PASS  ...and it is undeclared in pyproject.toml, so the wheel check catches it too
+  PASS  ...while the one-level listdir the old scan used misses it entirely, which is what makes this control discriminating
+  PASS  the walker finds function-body imports at all (non-degeneracy)
+  PASS  ...specifically the deliberate third-party one, `import icd10` inside _build_icd10_cancer_sets
+  PASS  no oncotriage module imports another oncotriage module from a function body
+
+  Negative control: reintroducing a deferred package import in a COPY
+  PASS  the scan CATCHES a reintroduced deferred package import
+  PASS  ...and names the file, the function and the module it found
+  PASS  ...while the copy still imports cleanly in both directions, which is why a runtime check could never find this
+
+==============================================================================
+1c. nothing exec's a numbered file, chains one, or loads one by location
+==============================================================================
+  PASS  the scan corpus covers the whole repository, not just the package
+  PASS  ...including the numbered entry points
+  PASS  ...and tests/
+  PASS  nothing in the repository calls exec_chain, calls exec(), or loads a module by location
+  PASS  ...and every allowlisted file still needs its entry, so the allowlist cannot go stale unnoticed
+  PASS  every shim pass 20e deleted is actually absent from the code directory
+  PASS  ...while the numbered entry points that survived are still present
+  PASS  oncotriage.utils no longer defines exec_chain
+  PASS  negative control fires: bare exec_chain call
+  PASS  negative control fires: subscript exec_chain call
+  PASS  negative control fires: the real bootstrap shape: open() on one line, exec() on the next
+  PASS  negative control fires: the real loop shape
+  PASS  negative control fires: by-location load
+  PASS  negative control fires: hidden in a probe string
+  PASS  ...and prose about exec_chain is NOT reported, so the scan does not punish keeping the argument for a deleted mechanism
+
+==============================================================================
+2. importing every package module under a socket / sqlite trap
+==============================================================================
+  PASS  all 48 package modules import with open, io.open, socket.socket, socket.create_connection, sqlite3.connect, subprocess.run and subprocess.Popen patched to raise
+  PASS  every trap was ARMED after the imports (socket, sqlite3, open, io.open, subprocess.run/Popen, os.system/popen/posix_spawn/execv/fork)
+  PASS  no model-bearing library was imported (torch / transformers / sentence_transformers / streamlit / langgraph / icd10)
+  PASS  the subprocess trap catches all three reference forms -- attribute, module alias and from-import -- each fired rather than argued
+  PASS  no module holds a pre-bound reference to the real subprocess.run or subprocess.Popen after the closure pass -- the only from-import form an attribute patch cannot reach
+  PASS  ...and the closure CATCHES a planted holder (negative control)
+  PASS  ...and the planted holder's reference RAISES afterwards, so the closure rebinds rather than merely listing
+
+==============================================================================
+2b. oncotriage.config imports with the project root made unreachable
+==============================================================================
+  PASS  the lazy-paths probe ran
+  PASS  oncotriage.config imports with the project root unreachable
+  PASS  ...and a tunable is readable out of it (12 = MAX_WORKERS)
+  PASS  ...and importing oncotriage.paths resolved NO path
+  PASS  ...and importing load_env_keys resolved no path either
+  PASS  ...while actually READING a path still raises
+  PASS  ...and the message names ONCOTRIAGE_MAIN_PATH, so the fix is findable
+  PASS  ...and it did NOT quietly return a path
+  PASS  with the root reachable again, the same read succeeds
+  PASS  ...and returns a directory that exists
+  PASS  ...and importing was STILL lazy on the machine that has the tree
+
+==============================================================================
+2c. every package module imports without resolving a single path
+==============================================================================
+  PASS  the module list is the size the tree says it is (non-degeneracy)
+  PASS  ...and includes the one that used to resolve a path at import
+  PASS  ...and covers oncotriage.embedding (new in pass 20c-3a)
+  PASS  ...and covers oncotriage.fhir.clean (new in pass 20c-3a)
+  PASS  ...and covers oncotriage.fhir.generate (new in pass 20c-3a)
+  PASS  ...and covers oncotriage.fhir.explore (new in pass 20c-3a)
+  PASS  ...and covers oncotriage.retrieval.indexer (new in pass 20c-3a)
+  PASS  ...and covers oncotriage.retrieval.index_validator (new in pass 20c-3a)
+  PASS  ...and covers oncotriage.storage.maintenance (new in pass 20c-3b)
+  PASS  ...and covers oncotriage.storage.queries (new in pass 20c-3b)
+  PASS  ...and covers oncotriage.api.server (new in pass 20c-3b)
+  PASS  ...and covers oncotriage.monitoring.drift (new in pass 20c-3b)
+  PASS  ...and covers oncotriage.batch.runner (new in pass 20c-3b)
+  PASS  ...and covers all thirteen dashboard modules (new in pass 20c-3c-1)
+  PASS  ...and covers all six pass-20c-3d modules
+  PASS  ...and covers oncotriage.retrieval.qdrant_backup (new in pass 20c-3c-2)
+  PASS  ...and covers oncotriage.orchestration.home (new in pass 20c-3c-2)
+  PASS  ...and covers oncotriage.orchestration.airflow_setup (new in pass 20c-3c-2)
+  PASS  ...and covers oncotriage.orchestration.dag_generator (new in pass 20c-3c-2)
+  PASS  ...and covers oncotriage.orchestration.airflow_manager (new in pass 20c-3c-2)
+  PASS  no package module resolves a path (or fails) when imported with the project root unreachable
+
+==============================================================================
+2d. the agent imports with ONCOTRIAGE_DEFER_LOCAL_MODELS unset
+==============================================================================
+  PASS  the agent imports with the deferral switch unset
+  PASS  ...with the switch genuinely OFF, so this is not the placeholder path
+  PASS  ...and the switch still exists, as the second line of defence
+  PASS  ...and NO model-bearing library was imported
+  PASS  ...and deps built and cached nothing at all
+
+==============================================================================
+2e. deps overrides are what the agent reaches, and they are checkable
+==============================================================================
+  PASS  the seam probe ran
+  PASS  no override is installed on a fresh import
+  PASS  an unknown override key raises rather than being ignored
+  PASS  every typed accessor returns the installed override, by identity
+  PASS  models.score_pairs dispatches to the MEDCPT_SCORER override
+  PASS  ...and hands it (query, trial_texts) unchanged
+  PASS  restore_overrides clears every override that had no previous value
+  PASS  ...and active_overrides() then reports none
+  PASS  the override context manager installs inside the block
+  PASS  ...and restores even when the block raises
+
+==============================================================================
+2f. the FastEmbed BM25 sparse model is constructed in exactly one place
+==============================================================================
+  PASS  exactly one package file constructs SparseTextEmbedding
+  PASS  ...and it constructs it exactly once
+  PASS  the detector CATCHES a bare-name construction planted in a copy
+  PASS  ...and the ATTRIBUTE form, fastembed.SparseTextEmbedding(...), which the pass-3a bare-name detector was blind to
+  PASS  ...and the shipped indexer has none of either, which is what makes the planted ones the only difference
+  PASS  the agent's query encoder reaches the one accessor
+  PASS  ...and so does the indexer, which wrote the vectors it is scored against
+  PASS  ...and the validator reaches it through the agent's own accessor, so it tests the encoder the agent actually uses
+
+==============================================================================
+2f(ii). the MedCPT cross-encoder checkpoint is named in exactly one place
+==============================================================================
+  PASS  exactly one package file writes the MedCPT checkpoint as a literal
+  PASS  ...and it writes it exactly once
+  PASS  ...and that literal is the value of config.CROSS_ENCODER_MODEL
+  PASS  the two MedCPT loads in deps.py are both handed CROSS_ENCODER_MODEL, so the tokenizer and the weights cannot be edited apart
+  PASS  ...and there are exactly two of them, so a third load cannot appear unnamed
+  PASS  ...and no other package module calls from_pretrained at all
+  PASS  the checkpoint detector reports NOTHING on the shipped deps.py, which is what makes each plant below the only difference
+  PASS  ...CATCHES a bare literal planted in a copy
+  PASS  ...and the F-STRING form, which needs no assignment and is what anyone interpolating the name into a message writes
+  PASS  ...and a DOCSTRING mention is still not reported, so the prose that argues for this check does not fail it
+  PASS  from_pretrained scan: a literal argument is REPORTED AS THE LITERAL, so the regression names itself
+  PASS  from_pretrained scan: the BARE-NAME reference form is recognised
+  PASS  from_pretrained scan: the ATTRIBUTE reference form is recognised -- the one this package actually uses
+
+==============================================================================
+2f(iii). the cross-encoder sequence limit has one owner
+==============================================================================
+  PASS  config declares CROSS_ENCODER_MAX_LENGTH at module scope
+  PASS  ...and it is a plain positive integer literal, not an expression that could be derived from something that moves
+  PASS  ...and CROSS_ENCODER_REVISION and CROSS_ENCODER_MAX_LENGTH are the two module-level statements IMMEDIATELY after CROSS_ENCODER_MODEL, in that order, so a checkpoint edit cannot miss either
+  PASS  ...and CROSS_ENCODER_REVISION is a 40-hex commit id literal, never a branch or a tag, which could be moved onto different bytes
+  PASS  exactly these package files pass max_length= at all
+  PASS  ...and every one of them is handed CROSS_ENCODER_MAX_LENGTH, so no bare 512 survives at a tokenizer call
+  PASS  ...and there are exactly two, so a third tokenizer call cannot appear unnamed (non-degeneracy: an empty scan satisfies the list check above only if the list is empty, which it is not -- say so anyway)
+  PASS  both MedCPT factories call the sequence-limit verifier
+  PASS  max_length scan: a bare 512 is REPORTED AS THE LITERAL, so the shape this pass removed from BOTH tokenizer call sites names itself
+  PASS  max_length scan: the BARE-NAME reference form is recognised -- the one the validator uses, because a function-local `config` forbids the attribute form there (check 2g)
+  PASS  max_length scan: the ATTRIBUTE reference form is recognised -- the one models.py uses
+  PASS  max_length scan: a call with no max_length at all is not reported, so the scan is not simply matching every call
+  PASS  ...and the shipped models.py has exactly one max_length site to derive the plant's location from (non-degeneracy)
+  PASS  ...CATCHES the literal restored in a COPY of models.py, and names it
+
+==============================================================================
+2g. no function binds a local with the same name as a module-level import
+==============================================================================
+  PASS  no function in the package shadows one of its module's imports
+  PASS  shadow scan: the real `config` local in stage1_index_health
+  PASS  shadow scan: the real `embedding` loop variable in a nested flush function
+  PASS  shadow scan: a shadowing PARAMETER, which is the same defect by another route
+  PASS  shadow scan: a nested-only local does NOT flag its enclosing function
+  PASS  shadow scan: a comprehension target shadows nothing (its own scope since Python 3)
+  PASS  shadow scan: a clean function is reported clean
+  PASS  ...and the shipped validator imports the config NAMES, not the module, which is what makes its `config` local harmless
+  PASS  ...while still reading COLLECTION_NAME out of the config module
+
+==============================================================================
+2h. no unused import, no module constant that nothing anywhere reads
+==============================================================================
+  PASS  no package module binds an import it never reads
+  PASS  every module-level constant in the package is read by something, somewhere in the repository (or is exempted with an argument)
+  PASS  ...and every exemption is still needed -- an exempted constant that something now reads must lose its exemption, not keep it
+  PASS  ...and every exempted constant still exists, so the exemption list cannot go stale unnoticed
+  PASS  unused-import scan: a bound-and-never-read import is REPORTED
+  PASS  unused-import scan: an import read only through an attribute is NOT reported
+  PASS  unused-import scan: an aliased import read under its alias is NOT reported
+  PASS  unused-import scan: an aliased import NEVER read is REPORTED under its alias
+  PASS  unused-import scan: a from-import read as a bare name is NOT reported
+  PASS  unused-import scan: a noqa line is exempt, as declared
+  PASS  unread-constant scan: a constant nothing reads is REPORTED
+  PASS  unread-constant scan: ...read as a bare name is not
+  PASS  unread-constant scan: ...read as an attribute is not
+  PASS  unread-constant scan: ...read through a string literal is not (getattr, or a name inside the source of a subprocess probe)
+  PASS  unread-constant scan: ...named only in a COMMENT is still REPORTED, because a comment is not a read
+  PASS  unread-constant scan: an assignment TARGET is not a read -- the defect that made the first version of this scan vacuous
+  PASS  ...while a genuine load in the same file IS a read, so the ctx test did not simply blind the scanner
+  PASS  unread-constant scan: a name is NOT considered read because a longer name contains it
+  PASS  ...while the name itself, on a boundary, IS found
+
+==============================================================================
+2i. the decorator inventory of the whole package, pinned
+==============================================================================
+  PASS  the decorator inventory of the package is exactly what it was after the conversion passes -- same definitions, same decorators, at every depth
+  PASS  ...and it is non-degenerate: the four @st.fragment tabs pass 20c-3c-1 silently dropped are in it, and so is the run-reader pass's fifth
+  PASS  ...and it reaches definitions NESTED inside a function, which a top-level walk cannot see -- the four api/server.py endpoints live inside create_app() and carry the most decorators in the package
+  PASS  the control found the definition it strips (non-degeneracy)
+  PASS  the inventory CATCHES a decorator removed from a copy: the definition disappears from the decorated set
+  PASS  ...while the three other endpoints in the same copy keep theirs, so the control removed one thing rather than breaking the parser
+
+==============================================================================
+3. get_openai_client / get_qdrant_client build once, on first call
+==============================================================================
+  PASS  the laziness probe ran
+  PASS  no client was constructed at import time
+  PASS  get_openai_client: 2 constructions on first call (client + the throwaway the timeout reads), 2 after the second, same object, non-None
+  PASS  get_qdrant_client: 1 construction on first call, 1 after the second, same object, non-None
+
+==============================================================================
+4. get_age_reference_date reads config, and raises rather than today()
+==============================================================================
+  PASS  get_age_reference_date does not call globals()
+  PASS  ...and it does not call today() or now()
+  PASS  ...and it does resolve the constant through the config module
+  PASS  the copied config carries the snapshot-date assignment to rewrite
+  PASS  a partial DATA_SNAPSHOT_DATE raises ValueError
+  PASS  ...and the message names the constant, so the fix is findable
+  PASS  ...and it did NOT quietly return a date
+  PASS  the copy is restored byte-for-byte
+  PASS  with the constant restored, the reference date is 2026-08-03
+  PASS  ...and that is not simply today's date
+
+==============================================================================
+5. no numbered file re-exports; every `from oncotriage... import` resolves
+==============================================================================
+  PASS  the repository imports at least 200 names out of the package (a probe over an empty set would prove nothing)
+  PASS  ...spread over at least 20 package modules
+  PASS  the package-surface probe ran
+  PASS  every name imported anywhere in the repository exists on the package module it is imported from
+  PASS  ...and every one of those modules imported at all
+  PASS  ...and the lazy path names were checked by membership rather than by hasattr, so a broken tree cannot abort this probe
+  PASS  the numbered-file scan found the entry points
+  PASS  no numbered file imports a package name at module scope that it never reads, i.e. none of them is a re-export shim (no exemptions)
+  PASS  negative control: a planted re-export IS reported
+  PASS  ...and the name the planted file genuinely uses is NOT reported, so the detector distinguishes a re-export from an import
+
+==============================================================================
+5b. stage and histology share exactly one name, and it lives in negation
+==============================================================================
+  PASS  stage.py, histology.py and negation.py all define a plausible number of top-level names (non-degeneracy)
+  PASS  histology.py references nothing that stage.py defines
+  PASS  stage.py references nothing that histology.py defines
+  PASS  the one name they DO share is _is_negated, and it lives in negation.py
+  PASS  ...and both halves import it rather than redefining it
+
+==============================================================================
+5c. deps.peek / resolution_state / RESOLUTION_STATES: answers, no build
+==============================================================================
+  PASS  the deps-seam demonstration ran
+  PASS  an untouched key reports 'unresolved'
+  PASS  ...and peek returns UNSET for it, NOT None -- MESH_FILTER may be legitimately None, so the two have to be distinguishable
+  PASS  ...and UNSET is not None, so the distinction is real
+  PASS  ...and is_resolved agrees
+  PASS  an installed override reports 'override'
+  PASS  ...and peek returns the installed object
+  PASS  ...and is_resolved agrees
+  PASS  a cached value reports 'cached'
+  PASS  ...and peek returns it
+  PASS  ...and cached_keys() lists the key
+  PASS  the accessor hands back the override, so peek is reporting the seam rather than a private dict
+  PASS  ...and removing the override puts the key back to unresolved, so the state query reads live state rather than a constant
+  PASS  NOT ONE of the unresolved-state queries called a factory
+  PASS  ...nor did the override-state queries
+  PASS  ...nor did the cached-state queries
+  PASS  all three observed states are members of deps.RESOLUTION_STATES, which is what makes that tuple a closed set rather than a comment
+  PASS  ...and the set is the size it claims (non-degeneracy: membership in an empty or one-element tuple would prove nothing)
+  PASS  ...and all three of its members were actually observed, so the tuple is exhausted rather than sampled
+  PASS  an override for an unknown key raises KeyError rather than being silently ignored
+
+==============================================================================
+5d. MAX_WORKERS threads through every accessor: one object, one build
+==============================================================================
+  PASS  the deps concurrency probe ran
+  PASS  it ran with MAX_WORKERS threads, and MAX_WORKERS is more than one
+  PASS  every accessor key was exercised
+  PASS  every key was observed by every worker (no worker died silently)
+  PASS  every key handed the same object to all MAX_WORKERS threads
+  PASS  ...for every one of the ten keys, not just the ones that happened to be fast
+  PASS  each factory ran EXACTLY ONCE, so 'same object' is not twelve builds with eleven thrown away
+  PASS  ...and deps reports exactly those ten keys as cached, through the non-building query added in pass 20c-3b
+
+==============================================================================
+5e. concurrent log_inference writes are serialized, and every row lands
+==============================================================================
+  PASS  the write-lock demonstration ran
+  PASS  it ran with more than one thread
+  PASS  ...writing more than one row
+  PASS  ...over more than one trial, because a race is not deterministic
+  PASS  the control actually removed the lock (all seven sites)
+  PASS  steady state, WITH the lock: every row lands
+  PASS  steady state, WITHOUT the lock: every row ALSO lands -- SQLite's own file locking already serializes two connections on one file, so this is not what the lock is for
+  PASS  fresh database, WITH the lock: zero lossy trials out of 8
+  PASS  ...and nothing raised in any of them
+  PASS  fresh database, WITHOUT the lock: rows are LOST (negative control)
+       control: 8/8 trials lost rows, worst loss 46 of 48; locked arm lost nothing in 8/8 trials
+
+==============================================================================
+6. the dashboard: mutable state, the cache contract, and import purity
+==============================================================================
+  PASS  the dashboard has the eighteen modules the conversion, run-reader, campaign and call-mode-labelling passes created (non-degeneracy: a scan over an empty file list proves nothing)
+  PASS  nothing in the dashboard mutates MATCH_TIERS or MATCH_TIER_COLORS, directly or through an alias
+  PASS  ...and the scanner CATCHES a planted mutation of each of the three shapes it claims to cover (method, subscript, alias)
+  PASS  the tiers module still holds the tier vocabulary the tabs import (non-degeneracy for the scan above)
+  PASS  the streamlit cache-key probe ran
+  PASS  streamlit keys a cached function on (module, qualname, source) and NOT on the function object's identity, which is what makes the 60s TTL survive the move into a module
+  PASS  every loader in data.py carries @st.cache_data(ttl=60), and the five private/derivation helpers deliberately carry nothing
+  PASS  the sidebar's Refresh button still calls the cache-wide clear
+  PASS  st.cache_data.clear() is a cache-wide clear, so it reaches loaders defined in a different module than the button
+  PASS  all fifteen dashboard modules import with open, io.open, socket.socket, socket.create_connection and sqlite3.connect patched to raise
+  PASS  every trap was ARMED after the dashboard imports
+  PASS  importing the dashboard loads no model-bearing library
+  PASS  importing the dashboard resolves NO path -- data.py reads paths.inferences_path inside the function body, not at module scope
+  PASS  data.py does NOT import inferences_path by name (that would be an attribute read, and would resolve the tree at import)
+  PASS  ...it imports the paths MODULE instead
+  PASS  ...and all three loaders read the attribute at call time
+  PASS  the three loaders' SQL is byte-for-byte what File 21 had
+  PASS  File 21 calls neither exec() nor exec_chain()
+  PASS  ...and does not reference either name in any other position
+  PASS  File 21 binds no function of its own
+  PASS  File 21 imports main from the package
+  PASS  ...and guards the call, so reading the file still does nothing
+  PASS  docker-compose still launches the dashboard by the same command
+  PASS  ...and the command was actually parsed (not an empty token list)
+  PASS  ...control: a compose file running a DIFFERENT script does not pass
+  PASS  ...control: dropping `run` from the command does not pass
+  PASS  ...control: the shell-string form is still recognised (it is the form this file shipped with before item 21)
+  PASS  the recorded File 21 name list is the size it was extracted at, less the one name pass 20f-3 deleted with an argument
+  PASS  ...and every one of them has a recorded home in the package
+  PASS  the File 21 surface probe ran
+  PASS  every name File 21 bound before this pass is still exported by the module that now owns it
+  PASS  ...over all 21 names (a probe over an empty set proves nothing)
+
+==============================================================================
+SUMMARY
+==============================================================================
+Passed: 261
+Failed: 0
+Skipped: 0   (a skip is NOT a pass and is not counted as one)
+==============================================================================
+SERIAL TEST RUN — 5 tests, one at a time
+==============================================================================
+Code directory: /private/tmp/claude-501/-Users-ramyalsaffar-Ramy-C-V--V-07--LLM-Projects-03--Clinical-Trial-Patient-Match-03--Code/85ad7840-cb2a-451e-bc68-0d1075297b8a/scratchpad/bucketB_copy/Code
+
+
+------------------------------------------------------------------------------
+[1/5] tests/test_registries_cancer_code_claims_audit.py
+        audits the registry's inline claims; must see a PRISTINE source
+------------------------------------------------------------------------------
+[1/5] tests/test_registries_cancer_code_claims_audit.py: PASS in 0.1s
+
+------------------------------------------------------------------------------
+[2/5] tests/test_registries_cancer_code_claims_audit_control.py
+        plants defects into the registry IN PLACE and hashes the restore
+------------------------------------------------------------------------------
+[2/5] tests/test_registries_cancer_code_claims_audit_control.py: FAIL (exit 1) in 1.4s
+
+------------------------------------------------------------------------------
+[3/5] tests/test_degraded_dependencies.py
+        asserts on the ICD-10 seed and a SNOMED code the control above plants into
+------------------------------------------------------------------------------
+[3/5] tests/test_degraded_dependencies.py: PASS in 10.6s
+
+------------------------------------------------------------------------------
+[4/5] tests/test_config_snapshot_date_rot.py
+        rewrites DATA_SNAPSHOT_DATE in oncotriage/config.py IN PLACE
+------------------------------------------------------------------------------
+[4/5] tests/test_config_snapshot_date_rot.py: PASS in 333.9s
+
+------------------------------------------------------------------------------
+[5/5] tests/test_package_invariants.py
+        copytree()s the package five times; must copy a RESTORED tree
+------------------------------------------------------------------------------
+[5/5] tests/test_package_invariants.py: PASS in 52.3s
+
+==============================================================================
+SERIAL TEST SUMMARY
+==============================================================================
+  PASS  exit=0       0.1s  tests/test_registries_cancer_code_claims_audit.py
+  FAIL  exit=1       1.4s  tests/test_registries_cancer_code_claims_audit_control.py
+  PASS  exit=0      10.6s  tests/test_degraded_dependencies.py
+  PASS  exit=0     333.9s  tests/test_config_snapshot_date_rot.py
+  PASS  exit=0      52.3s  tests/test_package_invariants.py
+
+Total wall time: 398.3s
+FAILED: 1 of 5
+  - tests/test_registries_cancer_code_claims_audit_control.py

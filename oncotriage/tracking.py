@@ -340,6 +340,12 @@ CONFIGURATION_PARAM_NAMES = (
     "MATCHING_MAX_TOKENS",
     "MAX_LLM_CLASSIFIER_RETRIES",
     "MAX_TRUNCATION_SPLITS",
+    # THE ONE RETRY POLICY'S TOTAL WIRE-ATTEMPT BUDGET (the provider-resilience
+    # pass). A named constant nothing at a command line overrides, and it
+    # decides which trials leave Stage 5 as per_trial_call_failed rather than
+    # with a verdict. The pacing limits are dicts that move only how long a
+    # run takes, and are announced at run start rather than indexed here.
+    "MATCHING_CALL_MAX_ATTEMPTS",
     # WHETHER AN EMPTY VERDICT IS ASKED AGAIN. It qualifies under this tuple's
     # stated rule -- nothing at any command line overrides it -- and it is
     # UNLIKE `MATCHING_PER_TRIAL_CALLS_ENABLED` two paragraphs down: that flag

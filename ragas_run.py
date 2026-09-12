@@ -164,9 +164,77 @@ if __name__ == "__main__":
     # here: reading this file must not import ragas, the anthropic SDK or the
     # OpenAI client, and `--help` must not either. main() parses its arguments
     # and prices the plan before it constructs anything.
-    from oncotriage.evaluation.ragas_harness import main
+    from oncotriage import config
+    from oncotriage.control import EXIT_LOCKED
+    from oncotriage.evaluation.ragas_harness import (dispatches_billed_calls,
+                                                     main)
+    from oncotriage.observability import console
+    from oncotriage.provider_resilience import (
+        AlreadyPacing,
+        ScopeLockUnavailable,
+        exclusive_scope_lock,
+        scope_lock_refusal_lines,
+        scope_lock_unavailable_lines,
+    )
 
-    sys.exit(main())
+    # ── ONE PROCESS PER PROVIDER ALLOWANCE, AND THIS HARNESS DRAWS ON TWO ──
+    #
+    # THE JUDGE AND THE EMBEDDER ARE DIFFERENT ENDPOINTS WITH DIFFERENT
+    # ALLOWANCES, so this is two locks rather than one:
+    # `ragas_judge` -> `openai:chat-completions`, shared with Stage 5's OpenAI
+    # arm, and `ragas_embedding` -> `openai:embeddings`. Taking one would leave
+    # the other endpoint unguarded; taking a single "ragas" lock would be a
+    # third name for two allowances, which is the defect the bucket table
+    # exists to remove.
+    #
+    # BOTH ARE TAKEN UNCONDITIONALLY RATHER THAN ONLY WHEN AN EMBEDDER WILL BE
+    # BUILT, AND THAT IS A DELIBERATE OVER-REFUSAL. Whether one is built
+    # depends on which metrics are selected, which `main()` decides tens of
+    # lines in -- so asking here would mean a second copy of that derivation
+    # (`METRICS_NEEDING_EMBEDDINGS` against the parsed `--metrics`) in a file
+    # that must not import ragas. The cost is that a judge-only run also holds
+    # the embeddings allowance; the cost of getting the copy wrong is an
+    # unguarded endpoint, which is the failure this lock exists to stop.
+    #
+    # ORDERED, AND THE ORDER IS THE ONE THING TWO LOCKS MUST AGREE ON. Two
+    # programs taking the same pair in opposite orders deadlock -- except that
+    # this flock is NON-BLOCKING, so the second is REFUSED rather than hung.
+    # Sorting the scope names makes every future taker of a pair agree by
+    # construction rather than by everyone remembering.
+    #
+    # NOT TAKEN FOR A DRY RUN: it issues no request, and its resume preview is
+    # the one free way to see what a resume would cost.
+    if not dispatches_billed_calls():
+        sys.exit(main())
+
+    import contextlib
+
+    _SCOPES = sorted((config.PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE,
+                      config.PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING))
+
+    try:
+        with contextlib.ExitStack() as _stack:
+            for _scope in _SCOPES:
+                _held = _stack.enter_context(exclusive_scope_lock(_scope))
+                console.out(f"[Pacing] Provider allowance held for "
+                            f"{_scope}: {_held}")
+            sys.exit(main())
+    except AlreadyPacing as _pacing:
+        # EXIT_LOCKED, on `25- Batch Runner.py`'s stated reason. The refusal
+        # names the SCOPE, which matters more here than anywhere else: the
+        # judge's allowance is SHARED WITH STAGE 5's OpenAI arm, so the holder
+        # this names may be a campaign rather than another ragas run.
+        console.out()
+        for _line in scope_lock_refusal_lines(_pacing):
+            console.out(_line)
+        sys.exit(EXIT_LOCKED)
+    except ScopeLockUnavailable as _pacing_error:
+        # The lock could not be attempted; waiting does not fix it. 1 is what
+        # every other refusal in this harness returns.
+        console.out()
+        for _line in scope_lock_unavailable_lines(_pacing_error):
+            console.out(_line)
+        sys.exit(1)
 
 
 #------------------------------------------------------------------------------

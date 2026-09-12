@@ -633,7 +633,9 @@ def _create_keywords(source_path: str):
     with open(source_path, "r", encoding="utf-8") as handle:
         tree = ast.parse(handle.read())
     for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef) and node.name == "call_matching_model":
+        # `_send_matching_call` since the provider-resilience pass: the create()
+        # call moved one frame below the retry-policy wrapper, unchanged.
+        if isinstance(node, ast.FunctionDef) and node.name == "_send_matching_call":
             for inner in ast.walk(node):
                 if (isinstance(inner, ast.Call)
                         and isinstance(inner.func, ast.Attribute)
@@ -900,7 +902,8 @@ check("the bare-array response still parses end to end",
 # ---- the parse-error path, driven, to DERIVE the key set ------------------
 _parse_result, _ = run_stage5("this is not json")
 check("non-degeneracy: the parse-error path was actually reached",
-      _parse_result.get("error", "").startswith("GPT-4o JSON parse error"), True)
+      _parse_result.get("error", "").startswith(
+          "LLM classifier JSON parse error"), True)
 
 # THE NON-LIST DIAGNOSIS STILL NAMES THE TYPE THE MODEL SENT. The unwrap
 # returns None when neither envelope is present, so assigning its result over
@@ -1266,7 +1269,7 @@ check("control 8i: ...and the unplanted source still agrees",
 # 8j -- the create() keyword check, against an AST copy with the keyword removed.
 _ast_copy = ast.parse(_eval_src)
 for _node in ast.walk(_ast_copy):
-    if isinstance(_node, ast.FunctionDef) and _node.name == "call_matching_model":
+    if isinstance(_node, ast.FunctionDef) and _node.name == "_send_matching_call":
         for _inner in ast.walk(_node):
             if (isinstance(_inner, ast.Call)
                     and isinstance(_inner.func, ast.Attribute)
@@ -1275,7 +1278,7 @@ for _node in ast.walk(_ast_copy):
                                    if k.arg != "response_format"]
 _stripped_kws = []
 for _node in ast.walk(_ast_copy):
-    if isinstance(_node, ast.FunctionDef) and _node.name == "call_matching_model":
+    if isinstance(_node, ast.FunctionDef) and _node.name == "_send_matching_call":
         for _inner in ast.walk(_node):
             if (isinstance(_inner, ast.Call)
                     and isinstance(_inner.func, ast.Attribute)
@@ -1300,7 +1303,8 @@ check("control 8k: ...whereas a genuine empty list IS a result",
 _none_content, _ = run_stage5(None)
 check("control 8l: content=None with no refusal is a parse error, not a refusal",
       (_none_content.get("error", "").startswith(REFUSAL_ERROR_PREFIX),
-       _none_content.get("error", "").startswith("GPT-4o JSON parse error")),
+       _none_content.get("error", "").startswith(
+           "LLM classifier JSON parse error")),
       (False, True))
 
 # 8m -- the derived key-set comparison. A refusal return missing one of the

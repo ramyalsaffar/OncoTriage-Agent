@@ -902,25 +902,42 @@ def _recording_medcpt(inner, sink: RecordingSink):
 
 _HOOKED_NAMES = (
     "openai_client",
+    "openai_inference_client",
     "qdrant_client",
     "_bm25_query_model",
     "medcpt_score_pairs",
 )
-"""The four seams, under their pre-2c names. Kept because fixture_replay.py
-imports it and because the fixture schema and every diagnostic message in both
-files speak in these terms. _HOOK_KEYS below is the mapping to the deps keys
-that actually install them."""
+"""The FIVE seams, under their pre-2c names where they had one.
+
+WAS FOUR, AND THE FIFTH IS NOT A NEW KIND OF SEAM -- it is the OpenAI client
+split in two. Stage 5's chat completion moved to
+`deps.OPENAI_INFERENCE_CLIENT` (SDK retries 0, because the retry policy covers
+it) while Stage 2's embedding stayed on `deps.OPENAI_CLIENT` (SDK retries on,
+because it is outside that policy). BOTH MUST BE HOOKED: a capture that wrapped
+only the old key would let every Stage 5 call go to the real endpoint, billed,
+while recording nothing and still passing the identity assertion -- which is
+the pass-20c-2c regression reached through a second client instead of a second
+provider.
+
+`openai_inference_client` HAS NO PRE-2c NAME because it did not exist then; it
+is spelled as its deps key. _HOOK_KEYS below is the mapping to the keys that
+actually install them.
+
+ONE CLAIM RETIRED: this docstring said the tuple is "kept because
+fixture_replay.py imports it". Measured -- replay.py imports `_HOOK_KEYS` and
+does NOT import this tuple; the only readers are in this module."""
 
 _HOOK_KEYS = {
-    "openai_client":      deps.OPENAI_CLIENT,
-    "qdrant_client":      deps.QDRANT_CLIENT,
-    "_bm25_query_model":  deps.BM25_QUERY_MODEL,
-    "medcpt_score_pairs": deps.MEDCPT_SCORER,
+    "openai_client":           deps.OPENAI_CLIENT,
+    "openai_inference_client": deps.OPENAI_INFERENCE_CLIENT,
+    "qdrant_client":           deps.QDRANT_CLIENT,
+    "_bm25_query_model":       deps.BM25_QUERY_MODEL,
+    "medcpt_score_pairs":      deps.MEDCPT_SCORER,
 }
 
 
 def current_hook_targets() -> dict:
-    """What the agent would reach RIGHT NOW for each of the four seams.
+    """What the agent would reach RIGHT NOW for each of the five seams.
 
     Asked of deps, not of this namespace, because deps is what the agent asks.
     That is the whole point: a check that reads this module's globals would
@@ -932,15 +949,16 @@ def current_hook_targets() -> dict:
     below compare against.
     """
     return {
-        "openai_client":      deps.get_openai_client(),
-        "qdrant_client":      deps.get_qdrant_client(),
-        "_bm25_query_model":  deps.get_bm25_query_model(),
-        "medcpt_score_pairs": deps.get_override(deps.MEDCPT_SCORER),
+        "openai_client":           deps.get_openai_client(),
+        "openai_inference_client": deps.get_openai_inference_client(),
+        "qdrant_client":           deps.get_qdrant_client(),
+        "_bm25_query_model":       deps.get_bm25_query_model(),
+        "medcpt_score_pairs":      deps.get_override(deps.MEDCPT_SCORER),
     }
 
 
 def assert_hooks_reach_the_agent(expected: dict, what: str) -> None:
-    """Refuse to run unless the agent reaches EXACTLY these four objects.
+    """Refuse to run unless the agent reaches EXACTLY these five objects.
 
     Identity, not equality: a proxy forwards __eq__ to the object it wraps, so
     an equality test would happily accept the real client.
@@ -1253,7 +1271,7 @@ def pin_call_mode_for_fixture_process(what: str, out=None) -> str:
 
 def install_recording_hooks(sink: RecordingSink,
                             truncate_first_call: bool = False) -> dict:
-    """Redirect all four seams to recorders. Returns the saved override state.
+    """Redirect all five seams to recorders. Returns the saved override state.
 
     The return value goes to restore_hooks(), which is deps.restore_overrides()
     -- so a seam that had no override before is CLEARED rather than pinned to
@@ -1266,12 +1284,23 @@ def install_recording_hooks(sink: RecordingSink,
     assert_provider_is_hookable("install_recording_hooks")
     assert_call_mode_is_hookable("install_recording_hooks")
 
+    # ONE HANDLER EACH, SHARED BY BOTH OPENAI PROXIES. `_recording_chat` keeps
+    # a call counter (it is what `truncate_first_call` indexes) and the sink
+    # numbers recordings by arrival, so two independently-built handlers would
+    # be two counters over one fixture -- and `truncate_first_call` would apply
+    # to whichever client happened to be called first. Built once, the
+    # numbering is a property of the run rather than of which client served it.
+    on_embedding = _recording_embedding(sink)
+    on_chat = _recording_chat(sink, truncate_first_call)
+
     proxies = {
         deps.OPENAI_CLIENT: OpenAIProxy(
-            deps.get_openai_client(),
-            _recording_embedding(sink),
-            _recording_chat(sink, truncate_first_call),
-        ),
+            deps.get_openai_client(), on_embedding, on_chat),
+        # STAGE 5's CLIENT. Hooking the old key alone would leave every Stage 5
+        # call going to the real endpoint while this harness reported a clean
+        # capture -- see _HOOKED_NAMES.
+        deps.OPENAI_INFERENCE_CLIENT: OpenAIProxy(
+            deps.get_openai_inference_client(), on_embedding, on_chat),
         deps.QDRANT_CLIENT: QdrantProxy(deps.get_qdrant_client(), sink),
         deps.BM25_QUERY_MODEL: SparseModelProxy(deps.get_bm25_query_model(), sink),
         # Wraps the RAW function, not models.score_pairs, or the override would
