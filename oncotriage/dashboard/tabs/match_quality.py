@@ -8,12 +8,21 @@ import plotly.express as px
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
+from oncotriage.dashboard.populations import (
+    ensure_evaluated,
+    first_attempts,
+    incomplete_caption,
+    patient_outcomes,
+)
 from oncotriage.dashboard.tiers import (
+    ALL_MATCH_TIER_VALUES,
     MATCH_TIERS,
     MATCH_TIER_COLORS,
     PATIENT_OUTCOME_FULL,
+    PATIENT_OUTCOME_INCOMPLETE,
     PATIENT_OUTCOME_LABELS,
     display_trial_title,
+    rate_text,
 )
 
 
@@ -21,10 +30,17 @@ def render_match_quality_tab(df):
     """Render Match Quality tab."""
     
     st.header("🔍 Match Quality Analysis")
+
+    # INCOMPLETENESS DOES NOT DEPEND ON THE CALLER (the dashboard-truthfulness
+    # pass). A no-op under main(), which annotated already; see
+    # populations.ensure_evaluated.
+    df = ensure_evaluated(df, load_trial_matches_data())
     
     st.subheader("Patient Complexity vs Match Success")
     
-    tier_order = list(MATCH_TIERS)
+    # ROWS BY TIER, INCOMPLETE INCLUDED AS ITS OWN CATEGORY: an errored or
+    # verdict-less row is 'Incomplete Evaluation', never 'No Match'.
+    tier_order = list(ALL_MATCH_TIER_VALUES)
     tier_colors = MATCH_TIER_COLORS
     
     col1, col2 = st.columns(2)
@@ -80,7 +96,15 @@ def render_match_quality_tab(df):
     if trial_matches is not None and not trial_matches.empty:
         filtered_ids = df['id'].tolist()
         filtered_matches = trial_matches[trial_matches['inference_id'].isin(filtered_ids)]
-        eligible_inferences = filtered_matches[filtered_matches['eligible'] == 'eligible'].copy()
+        # ONE ROW PER PATIENT, AND THE UNIT NAMED (the dashboard-truthfulness
+        # pass). The panel counted eligible trial VERDICTS and labelled them
+        # "inferences", and a re-run patient contributed each of their
+        # patient-trial pairs once per run. It is restricted to each patient's
+        # first attempt and labelled as verdicts.
+        _first_ids = first_attempts(df)['id']
+        eligible_inferences = filtered_matches[
+            (filtered_matches['eligible'] == 'eligible')
+            & (filtered_matches['inference_id'].isin(_first_ids))].copy()
         
         if not eligible_inferences.empty:
             st.subheader("Match Score Distribution")
@@ -93,9 +117,9 @@ def render_match_quality_tab(df):
                 fig_score_dist = px.histogram(
                     x=scores_pct,
                     nbins=20,
-                    labels={'x': 'Match Score (%)', 'count': 'Inferences'},
+                    labels={'x': 'Match Score (%)', 'count': 'Eligible trial verdicts'},
                     template='plotly_white',
-                    title='Match Scores Across All Eligible Inferences'
+                    title='Match Scores Across Eligible Trial Verdicts (first attempt per patient)'
                 )
                 fig_score_dist.update_traces(marker_color='#2ca02c')
                 fig_score_dist.update_layout(
@@ -103,7 +127,7 @@ def render_match_quality_tab(df):
                     margin=dict(l=20, r=20, t=40, b=20),
                     showlegend=False,
                     xaxis=dict(range=[0, 105], dtick=10),
-                    yaxis_title="Inferences",
+                    yaxis_title="Eligible trial verdicts",
                     bargap=0.05
                 )
                 st.plotly_chart(fig_score_dist, use_container_width=True)
@@ -114,22 +138,23 @@ def render_match_quality_tab(df):
                 st.metric(
                     "Full Match Rate",
                     f"{full_match_pct:.1f}%",
-                    delta=f"{full_match_inferences:,} / {len(scores_pct):,} inferences",
-                    help="Percentage of eligible inferences with 100% match score (all criteria confirmed met)"
+                    delta=f"{full_match_inferences:,} / {len(scores_pct):,} eligible trial verdicts",
+                    help="Share of eligible trial verdicts, from each patient's first attempt, with a 100% match score (all criteria confirmed met)"
                 )
                 st.metric(
                     "Median Score",
                     f"{scores_pct.median():.0f}%",
-                    help="Median match score across all eligible inferences"
+                    help="Median match score across eligible trial verdicts, first attempt per patient"
                 )
                 st.metric(
                     "Score Spread",
                     f"{scores_pct.min():.0f}% – {scores_pct.max():.0f}%",
-                    help="Range from lowest to highest match score among eligible inferences"
+                    help="Range from lowest to highest match score among eligible trial verdicts, first attempt per patient"
                 )
             
             st.caption(
-                "Each bar counts eligible patient-trial inferences at that match score. "
+                "Each bar counts eligible patient-trial VERDICTS at that match score, from each "
+                "patient's first attempt, so a re-run patient is counted once. "
                 "100% = all criteria confirmed met. Scores below 100% indicate missing patient data "
                 "prevented full evaluation. One patient can appear multiple times across different trials."
             )
@@ -250,26 +275,38 @@ def render_match_quality_tab(df):
     st.markdown("---")
     st.subheader("Quality Monitoring")
     
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     err_cnt = (df['error'].fillna('') != '').sum()
     err_rate = err_cnt / len(df) * 100 if len(df) > 0 else 0
 
-    full_cnt = (df['match_tier'] == 'Full Match').sum()
-    partial_cnt = (df['match_tier'] == 'Partial Match').sum()
-    unconfirmed_cnt = (df['match_tier'] == 'Unconfirmed Match').sum()
-    no_match_cnt = (df['match_tier'] == 'No Match').sum()
+    # TIER COUNTS ARE PATIENTS, OVER COMPLETE FIRST ATTEMPTS (the dashboard-
+    # truthfulness pass). They counted ROWS, so the smoke run's two errored
+    # retries were two more "No Match" patients and every re-run patient was
+    # counted twice. The error rate beside them stays per inference ROW, and
+    # its help text says so.
+    _outcomes = patient_outcomes(df)
+    _c = _outcomes['complete']
+    full_cnt = _outcomes['tier_counts']['Full Match']
+    partial_cnt = _outcomes['tier_counts']['Partial Match']
+    unconfirmed_cnt = _outcomes['tier_counts']['Unconfirmed Match']
+    no_match_cnt = _outcomes['tier_counts']['No Match']
+    _rates = _outcomes['tier_rates']
+    _of = f" of {_c} complete"
 
     with col1:
-        st.metric("Error Rate", f"{err_rate:.1f}%", delta=f"{err_cnt} errors" if err_cnt > 0 else None, delta_color="inverse", help="Percentage of inferences that encountered pipeline errors")
+        st.metric("Error Rate", f"{err_rate:.1f}%", delta=f"{err_cnt} errors" if err_cnt > 0 else None, delta_color="inverse", help="Percentage of inference ROWS that encountered pipeline errors — re-runs and retries are rows too")
     with col2:
-        st.metric(PATIENT_OUTCOME_FULL, f"{full_cnt}", delta=f"{full_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
+        st.metric(PATIENT_OUTCOME_FULL, f"{full_cnt}", delta=rate_text(_rates['Full Match']) + _of, help="Patients (complete first attempt) with at least 1 trial where ALL criteria confirmed (100% score)")
     with col3:
-        st.metric("🟡 Partial Match", f"{partial_cnt}", delta=f"{partial_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", help="Patients whose best trial had SOME criteria confirmed (0% < score < 100%)")
+        st.metric("🟡 Partial Match", f"{partial_cnt}", delta=rate_text(_rates['Partial Match']) + _of, help="Patients (complete first attempt) whose best trial had SOME criteria confirmed (0% < score < 100%)")
     with col4:
-        st.metric("🔶 Unconfirmed", f"{unconfirmed_cnt}", delta=f"{unconfirmed_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", delta_color="inverse", help="Patients whose only eligible trials scored 0% — no disqualifier found, no criterion confirmed")
+        st.metric("🔶 Unconfirmed", f"{unconfirmed_cnt}", delta=rate_text(_rates['Unconfirmed Match']) + _of, delta_color="inverse", help="Patients (complete first attempt) whose only eligible trials scored 0% — no disqualifier found, no criterion confirmed")
     with col5:
-        st.metric("❌ No Match", f"{no_match_cnt}", delta=f"{no_match_cnt / len(df) * 100:.1f}%" if len(df) > 0 else "0%", delta_color="inverse", help="Patients with no eligible trial matches")
+        st.metric("❌ No Match", f"{no_match_cnt}", delta=rate_text(_rates['No Match']) + _of, delta_color="inverse", help="Patients whose COMPLETE first-attempt evaluation found no eligible trial")
+    with col6:
+        st.metric(PATIENT_OUTCOME_INCOMPLETE, f"{_outcomes['incomplete']}", delta=f"of {_outcomes['first_attempts']} first attempts", delta_color="off", help="First attempts that errored or have at least one trial with no usable verdict. Excluded from every tier count and percentage.")
+    st.caption(incomplete_caption(_outcomes))
 # =============================================================================
 #     with col5:
 #         total_evaluated = df['candidates_evaluated'].sum()
@@ -307,28 +344,39 @@ def render_match_quality_tab(df):
         # vocabulary (TRIAL_STATUS_PARTIAL). Same strings, same colours, one
         # place to change them, and the per-patient chart no longer moves when
         # the per-trial labels do.
-        sd = pd.DataFrame({
-            'Outcome': list(PATIENT_OUTCOME_LABELS),
-            'Count': [full_cnt, partial_cnt, unconfirmed_cnt, no_match_cnt]
-        })
+        # COMPLETE FIRST ATTEMPTS ONLY, so the slice percentages are clinical-
+        # tier percentages over the population they claim. The incomplete count
+        # is in the title rather than a fifth slice, which would put it in the
+        # denominator of every tier percentage.
+        if _c == 0:
+            st.info(f"No complete first-attempt evaluation to distribute: all "
+                    f"{_outcomes['first_attempts']} first attempt(s) in this "
+                    f"selection are incomplete.")
+        else:
+            sd = pd.DataFrame({
+                'Outcome': list(PATIENT_OUTCOME_LABELS),
+                'Count': [full_cnt, partial_cnt, unconfirmed_cnt, no_match_cnt]
+            })
 
-        fig_s = px.pie(sd, values='Count', names='Outcome', template='plotly_white',
-                       title='Patient Match Distribution', color='Outcome',
-                       color_discrete_map={
-                           label: MATCH_TIER_COLORS[tier]
-                           for label, tier in zip(PATIENT_OUTCOME_LABELS,
-                                                  MATCH_TIERS)
-                       })
-        fig_s.update_traces(
-            textposition='inside',
-            textinfo='percent+label',
-            textfont_size=13,
-        )
-        fig_s.update_layout(
-            height=350, margin=dict(l=20, r=20, t=60, b=10),
-            legend=dict(orientation='h', yanchor='top', y=-0.05, xanchor='center', x=0.5)
-        )
-        st.plotly_chart(fig_s, use_container_width=True)
+            fig_s = px.pie(sd, values='Count', names='Outcome', template='plotly_white',
+                           title=(f'Patient Match Distribution — {_c} complete first '
+                                  f'attempt(s), {_outcomes["incomplete"]} incomplete excluded'),
+                           color='Outcome',
+                           color_discrete_map={
+                               label: MATCH_TIER_COLORS[tier]
+                               for label, tier in zip(PATIENT_OUTCOME_LABELS,
+                                                      MATCH_TIERS)
+                           })
+            fig_s.update_traces(
+                textposition='inside',
+                textinfo='percent+label',
+                textfont_size=13,
+            )
+            fig_s.update_layout(
+                height=350, margin=dict(l=20, r=20, t=60, b=10),
+                legend=dict(orientation='h', yanchor='top', y=-0.05, xanchor='center', x=0.5)
+            )
+            st.plotly_chart(fig_s, use_container_width=True)
     
     st.markdown("---")
     
@@ -374,6 +422,12 @@ def render_match_quality_tab(df):
                 # same score as one confirmed on every criterion. The count of
                 # zero-score inferences is reported beside it instead.
                 elig = elig.copy()
+                # PATIENTS, NOT ROWS (the dashboard-truthfulness pass). The
+                # caption promised "how many patients they matched" and the
+                # count was of eligible verdict ROWS, so a re-run patient
+                # matched a trial twice. The patient id is joined on.
+                elig = elig.merge(df[['id', 'patient_id']], left_on='inference_id',
+                                  right_on='id', how='left', suffixes=('', '_inf'))
                 # GROUPED BY TRIAL ID ALONE, the pattern the Trial Explorer's
                 # selector was repaired to in the same item. The title is a
                 # DISPLAY attribute of a trial and not part of its identity;
@@ -401,12 +455,12 @@ def render_match_quality_tab(df):
                 # of the label an untitled trial is named by.
                 top = elig.groupby('nct_id').agg(
                     trial_title=('trial_title', display_trial_title),
-                    match_count=('inference_id', 'count'),
+                    match_count=('patient_id', 'nunique'),
                     avg_score=('match_score', 'mean'),
                     unconfirmed=('match_score', lambda s: int((s <= 0).sum())),
                 ).reset_index()
-                top.columns = ['NCT ID', 'Trial', 'Match Count', 'Avg Score', 'Unconfirmed']
-                top = top.sort_values('Match Count', ascending=False).head(10)
+                top.columns = ['NCT ID', 'Trial', 'Patients Matched', 'Avg Score', 'Unconfirmed']
+                top = top.sort_values(['Patients Matched', 'NCT ID'], ascending=[False, True]).head(10)
 
                 # `.astype(int)` RAISED HERE on a group whose every
                 # `match_score` is NULL -- pandas refuses "Cannot convert
@@ -426,15 +480,16 @@ def render_match_quality_tab(df):
                                  'Avg Score': st.column_config.NumberColumn(format='%d%%'),
                                  'Trial': st.column_config.TextColumn(width='large'),
                                  'Unconfirmed': st.column_config.NumberColumn(
-                                     help='Eligible inferences scoring 0% — no criterion confirmable'),
+                                     help='Eligible verdict rows scoring 0% — no criterion confirmable'),
                              })
 
                 st.caption(
-                    "Trials ranked by how many patients they matched (eligible). "
-                    "Avg Score is the mean match score across ALL eligible inferences for that "
-                    "trial, including those scoring 0%. Unconfirmed counts how many of those "
-                    "inferences confirmed nothing at all: a high Unconfirmed count next to a "
-                    "high Match Count means the trial passes patients through without the "
+                    "Trials ranked by how many DISTINCT patients they matched (eligible in at "
+                    "least one run). Avg Score and Unconfirmed are over every eligible VERDICT "
+                    "row for that trial, re-runs included, and Avg Score includes those scoring "
+                    "0%. Unconfirmed counts the verdicts that confirmed nothing at all: a high "
+                    "Unconfirmed count next to many Patients Matched means the trial passes "
+                    "patients through without the "
                     "pipeline establishing anything about their fit."
                 )
                 

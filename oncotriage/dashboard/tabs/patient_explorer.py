@@ -64,9 +64,19 @@ from oncotriage.dashboard.nullsafe import (
     is_absent,
     optional_int_text,
 )
-from oncotriage.dashboard.tiers import (TRIAL_STATUS_NO_SCORE, TRIAL_STATUS_PARTIAL,
-                                        TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED,
-                                        classify_trial_score)
+from oncotriage.dashboard.populations import (display_score, ensure_evaluated,
+                                              DEFINITE_VERDICT_LABEL,
+                                              reason_text,
+                                              trial_display_status,
+                                              with_trial_status)
+from oncotriage.dashboard.tiers import (MATCH_TIER_INCOMPLETE,
+                                        TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN,
+                                        TRIAL_STATUS_NOT_EVALUATED_FAILED,
+                                        TRIAL_STATUS_NOT_EVALUATED_UNKNOWN,
+                                        TRIAL_STATUS_NO_SCORE, TRIAL_STATUS_ORDER,
+                                        TRIAL_STATUS_PARTIAL, TRIAL_STATUS_REJECTED,
+                                        TRIAL_STATUS_UNCONFIRMED,
+                                        TRIAL_STATUS_UNRECOGNISED)
 
 
 
@@ -123,6 +133,11 @@ def render_patient_explorer_tab(df):
     """Render Patient Explorer tab for individual patient drill-down."""
     
     st.header("🔎 Patient Explorer")
+
+    # INCOMPLETENESS DOES NOT DEPEND ON THE CALLER (the dashboard-truthfulness
+    # pass). A no-op under main(), which annotated already; see
+    # populations.ensure_evaluated.
+    df = ensure_evaluated(df, load_trial_matches_data())
     
     patient_ids = sorted(df['patient_id'].unique().tolist())
     selected_patient = st.selectbox("Select Patient ID", patient_ids, key="patient_explorer_select")
@@ -175,7 +190,16 @@ def render_patient_explorer_tab(df):
         st.metric("✅ Full Matches", optional_int_text(patient_df.get('full_match_count')), help="Trials where ALL criteria were confirmed met (100% score)")
         st.metric("🟡 Partial Matches", optional_int_text(patient_df.get('partial_match_count')), help="Trials eligible with SOME criteria confirmed but not all (0% < score < 100%)")
         st.metric("🔶 Unconfirmed", optional_int_text(patient_df.get('unconfirmed_match_count')), help="Trials eligible but scoring 0% — no disqualifier found and no criterion confirmed either")
-        st.metric("Match Tier", as_text(patient_df.get('match_tier'), ABSENT_TEXT), help="Overall patient classification: Full Match > Partial Match > Unconfirmed Match > No Match")
+        st.metric("Match Tier", as_text(patient_df.get('match_tier'), ABSENT_TEXT), help="Overall classification of THIS inference row: Full Match > Partial Match > Unconfirmed Match > No Match, or Incomplete Evaluation when the attempt errored or at least one trial has no usable verdict")
+        if patient_df.get('match_tier') == MATCH_TIER_INCOMPLETE:
+            # SAID ON THE ROW, because the three counts above can read like a
+            # finished result for an evaluation that lost verdicts.
+            st.caption(
+                f"Incomplete evaluation ({as_text(patient_df.get('evaluation_state'), ABSENT_TEXT)}): "
+                f"{optional_int_text(patient_df.get('trials_definite_verdict'))} "
+                f"trial(s) with a {DEFINITE_VERDICT_LABEL}, "
+                f"{optional_int_text(patient_df.get('trials_no_usable_verdict'))} with no usable verdict. "
+                f"No clinical tier is assigned.")
     
     st.markdown("---")
     
@@ -215,24 +239,23 @@ def render_patient_explorer_tab(df):
     # Trial match rows
     if not patient_trials_export.empty:
         for _, t in patient_trials_export.iterrows():
-            if is_absent(t.get('match_score')):
-                # SAME RULE AS THE TABLE BELOW: a trial with no recorded score
-                # is not an unconfirmed match, and calling classify_trial_score
-                # on it either raises (None) or answers 'Unconfirmed Match'
-                # (NaN) about a measurement nobody made.
-                status = TRIAL_STATUS_NO_SCORE
-            elif t['eligible'] == 'eligible':
-                status = classify_trial_score(t['match_score'])
-            else:
-                status = 'Not Eligible'
+            # THE ONE PER-TRIAL CLASSIFIER (the dashboard-truthfulness pass).
+            # This exported 'Not Eligible' for every row that was not eligible,
+            # so a trial whose Stage 5 call FAILED reached the CSV as a clinical
+            # rejection with a 0% score. The status, the verbatim reason and the
+            # displayed score now come from oncotriage/dashboard/populations.py.
+            _verdict = t.get('eligible')
+            _reason = t.get('not_evaluable_reason')
+            _score = display_score(_verdict, t.get('match_score'))
             export_rows.append({
                 'Section':     'Trial Match',
                 'NCT ID':      t.get('nct_id', ''),
                 'Trial Title': t.get('trial_title', ''),
                 'Phase':       t.get('trial_phase', ''),
-                'Status':      status,
-                'Match Score':  (ABSENT_TEXT if is_absent(t.get('match_score'))
-                                 else format_number(as_float(t['match_score']) * 100, ".0f") + "%"),
+                'Status':      trial_display_status(_verdict, t.get('match_score'), _reason),
+                'Not Evaluated Reason': reason_text(_verdict, _reason),
+                'Match Score':  (ABSENT_TEXT if _score is None
+                                 else format_number(_score * 100, ".0f") + "%"),
                 'Assessment': t.get('assessment', ''),
             })
     
@@ -408,19 +431,13 @@ def render_patient_explorer_tab(df):
         if not patient_matches.empty:
             # Build display table
             
-            def classify_status(row):
-                if row['eligible'] != 'eligible':
-                    return TRIAL_STATUS_REJECTED
-                if is_absent(row.get('match_score')):
-                    return TRIAL_STATUS_NO_SCORE
-                tier = classify_trial_score(row['match_score'])
-                if tier == 'Full Match':
-                    return '✅ Eligible'
-                if tier == 'Partial Match':
-                    return TRIAL_STATUS_PARTIAL
-                return TRIAL_STATUS_UNCONFIRMED
-
-            patient_matches['Status'] = patient_matches.apply(classify_status, axis=1)
+            # THE ONE PER-TRIAL CLASSIFIER (the dashboard-truthfulness pass).
+            # `classify_status` returned '❌ Not Eligible' for every row whose
+            # `eligible` was not 'eligible' -- measured on the smoke run, one
+            # patient row read "14 not eligible · 15 total" where 11 of the 14
+            # were failed calls. A not-evaluated trial now carries its own
+            # status, its stored reason verbatim, and no score.
+            patient_matches = with_trial_status(patient_matches)
             
             # Extract diagnostic fields from criterion_details JSON
             def _extract_diag(cd_raw, field, default):
@@ -432,14 +449,16 @@ def render_patient_explorer_tab(df):
                 return default
             
             display_df = patient_matches[[
-                'Status', 'nct_id', 'trial_title', 'trial_phase', 'match_score', 'assessment'
+                'Status', 'nct_id', 'trial_title', 'trial_phase', 'display_score',
+                'reason', 'assessment'
             ]].copy()
             
             display_df = display_df.rename(columns={
                 'nct_id':      'NCT ID',
                 'trial_title': 'Trial Title',
                 'trial_phase': 'Phase',
-                'match_score': 'Match Score',
+                'display_score': 'Match Score',
+                'reason':      'Not Evaluated Reason',
                 'assessment': 'Assessment'
             })
             
@@ -459,16 +478,10 @@ def render_patient_explorer_tab(df):
             ).round(0).astype('Int64')
             
             # Default sort: eligible first, then by match score descending
-            status_order = {'✅ Eligible': 0, TRIAL_STATUS_PARTIAL: 1,
-                            TRIAL_STATUS_UNCONFIRMED: 2, TRIAL_STATUS_REJECTED: 3,
-                            # LAST, and it has to be IN this map: `_sort` is
-                            # `.map(status_order)`, which yields NaN for an
-                            # unlisted status, and `sort_values` puts NaN last
-                            # only by accident of its default -- while the
-                            # rendered order would then depend on a default
-                            # nothing here states.
-                            TRIAL_STATUS_NO_SCORE: 4}
-            display_df['_sort'] = display_df['Status'].map(status_order)
+            # EVERY STATUS IS IN THE ORDER, and a status outside it sorts LAST
+            # rather than by an accident of `sort_values`' NaN default.
+            status_order = {s: i for i, s in enumerate(TRIAL_STATUS_ORDER)}
+            display_df['_sort'] = display_df['Status'].map(status_order).fillna(len(TRIAL_STATUS_ORDER))
             
             display_df = display_df.sort_values(
                 by=['_sort', 'Match Score'],
@@ -489,23 +502,38 @@ def render_patient_explorer_tab(df):
                 }
             )
             
-            eligible_count = (patient_matches['Status'] == '✅ Eligible').sum()
-            partial_count = (patient_matches['Status'] == TRIAL_STATUS_PARTIAL).sum()
-            unconfirmed_count = (patient_matches['Status'] == TRIAL_STATUS_UNCONFIRMED).sum()
-            not_eligible_count = (patient_matches['Status'] == TRIAL_STATUS_REJECTED).sum()
-            no_score_count = (patient_matches['Status'] == TRIAL_STATUS_NO_SCORE).sum()
+            _by_status = patient_matches['Status'].value_counts()
 
+            def _n(status):
+                return int(_by_status.get(status, 0))
+
+            _not_evaluated = patient_matches[patient_matches['reason'] != '']
+            _reasons = ", ".join(
+                f"{reason} ×{int(count)}"
+                for reason, count in _not_evaluated['reason'].value_counts().items())
+
+            # EACH NOT-EVALUATED KIND IS NAMED WHEN IT OCCURS AND THE REASONS
+            # ARE QUOTED VERBATIM. The counts above sum to the total either way.
             st.caption(
-                f"{eligible_count} eligible · "
-                f"{partial_count} partial matches · "
-                f"{unconfirmed_count} unconfirmed (eligible, 0% of criteria confirmed) · "
-                f"{not_eligible_count} not eligible · "
+                f"{_n('✅ Eligible')} eligible · "
+                f"{_n(TRIAL_STATUS_PARTIAL)} partial matches · "
+                f"{_n(TRIAL_STATUS_UNCONFIRMED)} unconfirmed (eligible, 0% of criteria confirmed) · "
+                f"{_n(TRIAL_STATUS_REJECTED)} not eligible · "
                 # PRINTED EVEN AT ZERO would be noise on the ordinary row, so
-                # this term appears only when there IS such a trial -- and the
-                # counts above already sum to the total when it is absent, so a
-                # reader can tell the difference without being told.
-                + (f"{no_score_count} with no recorded score · " if no_score_count else "")
+                # these terms appear only when there IS such a trial.
+                + (f"{_n(TRIAL_STATUS_NO_SCORE)} with no recorded score · " if _n(TRIAL_STATUS_NO_SCORE) else "")
+                + (f"{_n(TRIAL_STATUS_NOT_EVALUATED_FAILED)} not evaluated — no usable verdict · "
+                   if _n(TRIAL_STATUS_NOT_EVALUATED_FAILED) else "")
+                + (f"{_n(TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN)} not evaluable — clinical uncertainty · "
+                   if _n(TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN) else "")
+                + (f"{_n(TRIAL_STATUS_NOT_EVALUATED_UNKNOWN)} not evaluated — reason unknown · "
+                   if _n(TRIAL_STATUS_NOT_EVALUATED_UNKNOWN) else "")
+                + (f"{_n(TRIAL_STATUS_UNRECOGNISED)} with an unrecognised verdict · "
+                   if _n(TRIAL_STATUS_UNRECOGNISED) else "")
                 + f"{len(patient_matches)} total"
+                + (f". Stored reasons: {_reasons}. A trial that was not "
+                   f"evaluated is not a rejection and carries no score."
+                   if _reasons else "")
             )
             
             # --- Criterion-Level Breakdown ---

@@ -51,7 +51,13 @@ import streamlit as st
 from oncotriage.storage import queries
 from oncotriage.utils import UnknownModelPricingError
 from oncotriage.dashboard import call_mode
-from oncotriage.dashboard.tiers import MATCH_TIERS, MATCH_TIER_COLORS
+from oncotriage.dashboard.data import load_trial_matches_data
+from oncotriage.dashboard.populations import (
+    annotate_evaluation_state,
+    first_attempts,
+    DEFINITE_VERDICT_LABEL,
+)
+from oncotriage.dashboard.tiers import ALL_MATCH_TIER_VALUES, MATCH_TIER_COLORS
 
 
 def render_cost_tokens_tab(df):
@@ -61,19 +67,51 @@ def render_cost_tokens_tab(df):
     
     st.subheader("Cost Analysis")
     
-    # Exclude failed inferences (API errors) from cost analysis
-    df = df[df['error'].fillna('') == ''].copy()
-    
+    # THREE POPULATIONS, EACH NAMED WHERE IT IS USED (the dashboard-truthfulness
+    # pass). This tab dropped errored rows at the top and then called its mean
+    # "per patient", which was wrong twice: the total silently excluded the
+    # money errored attempts had spent, and every mean was over inference ROWS
+    # with re-runs counted as extra patients.
+    #
+    #   `_all_rows`  every row in the selection -- the TOTAL spent
+    #   `_pdf`       one row per patient per campaign, errored first attempts
+    #                INCLUDED (they cost money) -- every PER-PATIENT figure
+    #   `df`         completed rows only -- the per-model token repricing, which
+    #                is a breakdown of the completed work and is labelled so
+    #
+    # The evaluation state is attached here when the caller did not, so the
+    # per-trial figures below have a count of trials with a definite
+    # eligibility verdict to divide by.
+    _all_rows = df
+    if 'trials_definite_verdict' not in _all_rows.columns:
+        _all_rows = annotate_evaluation_state(_all_rows, load_trial_matches_data())
+    _pdf = first_attempts(_all_rows)
+    _errored = _all_rows['error'].fillna('') != ''
+    df = _all_rows[~_errored].copy()
+
+    def _mean(frame, column):
+        if column not in frame.columns or len(frame) == 0:
+            return float('nan')
+        return pd.to_numeric(frame[column], errors='coerce').mean()
+
+    def _dollars(value, digits=4):
+        return "—" if pd.isna(value) else f"${value:,.{digits}f}"
+
     # WHICH STAGE 5 ARM PRODUCED THESE ROWS. Read once, at the top, because
     # every panel below is qualified by it and two readings of one frame that
     # disagreed would be worse than one that is wrong.
-    _mix = call_mode.describe(df)
+    _mix = call_mode.describe(_pdf)
 
     col1, col2, col3, col4 = st.columns(4)
     
-    total_cost = df['estimated_cost_usd'].sum()
-    avg_cost = df['estimated_cost_usd'].mean()
-    median_cost = df['estimated_cost_usd'].median()
+    total_cost = pd.to_numeric(_all_rows['estimated_cost_usd'], errors='coerce').sum()
+    total_cached = (pd.to_numeric(_all_rows['estimated_cost_cached_usd'], errors='coerce').sum(min_count=1)
+                    if 'estimated_cost_cached_usd' in _all_rows.columns else float('nan'))
+    errored_cost = pd.to_numeric(_all_rows.loc[_errored, 'estimated_cost_usd'], errors='coerce').sum()
+    avg_cost = _mean(_pdf, 'estimated_cost_usd')
+    avg_cached = _mean(_pdf, 'estimated_cost_cached_usd')
+    median_cost = (pd.to_numeric(_pdf['estimated_cost_usd'], errors='coerce').median()
+                   if len(_pdf) else float('nan'))
     projected_1000 = avg_cost * 1000
     
     # THE TOTAL IS NOT QUALIFIED BY THE MODE AND THE OTHER THREE ARE, and the
@@ -96,35 +134,52 @@ def render_cost_tokens_tab(df):
     _arm = (f" All rows are {_mix['sole_bucket']}."
             if _mix["sole_bucket"] and not _mix["is_mixed"] else "")
 
+    _pop = (f" Population: {len(_pdf):,} first attempt(s), one per patient per "
+            f"campaign, errored first attempts included; UNCACHED rates.")
+
     with col1:
         st.metric("Total Cost", f"${total_cost:.2f}",
-                  help="Total API cost for all inferences in this selection. "
-                       "A sum of dollars actually spent, so it is correct "
-                       "whichever Stage 5 arm produced the rows.")
-    
+                  delta=(f"cached-rate est. {_dollars(total_cached, 2)}"
+                         if not pd.isna(total_cached) else None),
+                  delta_color="off",
+                  help=(f"Sum of estimated_cost_usd over ALL {len(_all_rows):,} "
+                        f"inference row(s) in this selection, at UNCACHED input "
+                        f"rates, INCLUDING {int(_errored.sum()):,} errored row(s) "
+                        f"({_dollars(errored_cost)}) and every re-run. It is an "
+                        f"estimate from token counts, not an invoice. The delta "
+                        f"is the same rows priced at the cached-read rate. A sum "
+                        f"is correct whichever Stage 5 arm produced the rows."))
+
     with col2:
-        st.metric("Average Cost" + ("  ⚠" if _mix["is_mixed"] else ""),
-                  f"${avg_cost:.4f}",
-                  help="Average cost per patient inference." + (
+        st.metric("Average Cost/Patient" + ("  ⚠" if _mix["is_mixed"] else ""),
+                  _dollars(avg_cost),
+                  delta=(f"cached-rate est. {_dollars(avg_cached)}"
+                         if not pd.isna(avg_cached) else None),
+                  delta_color="off",
+                  help="Mean cost per patient, first attempt." + _pop + (
                       f" BLENDED ACROSS CALL MODES{_q} — see the per-mode "
                       f"table below." if _mix["is_mixed"] else _arm))
-    
+
     with col3:
-        st.metric("Median Cost" + ("  ⚠" if _mix["is_mixed"] else ""),
-                  f"${median_cost:.4f}",
-                  help="Median cost per patient." + (
+        st.metric("Median Cost/Patient" + ("  ⚠" if _mix["is_mixed"] else ""),
+                  _dollars(median_cost),
+                  help="Median cost per patient, first attempt." + _pop + (
                       f" BLENDED ACROSS CALL MODES{_q}." if _mix["is_mixed"]
                       else _arm))
-    
+
     with col4:
         st.metric("Projected (1000)" + ("  ⚠" if _mix["is_mixed"] else ""),
-                  f"${projected_1000:.2f}",
-                  help="Estimated cost for 1000 patients, from the average to "
-                       "its left." + (
+                  _dollars(projected_1000, 2),
+                  delta=(f"cached-rate est. {_dollars(avg_cached * 1000, 2)}"
+                         if not pd.isna(avg_cached) else None),
+                  delta_color="off",
+                  help="Estimated cost for 1000 patients, from the per-patient "
+                       "average to its left." + _pop + (
                       " BLENDED ACROSS CALL MODES — this projects a cohort "
                       "that is part per-trial and part grouped, which is not a "
                       "cohort anybody will run. Use the per-mode table below."
                       if _mix["is_mixed"] else _arm))
+
 
     st.caption(call_mode.caption(_mix, "per-patient average, median and projection"))
 
@@ -144,18 +199,19 @@ def render_cost_tokens_tab(df):
             return None if pd.isna(value) else round(float(value), digits)
 
         _per_mode = []
-        for _bucket, _sub in call_mode.split(df):
+        for _bucket, _sub in call_mode.split(_pdf):
             _sub_avg = _sub['estimated_cost_usd'].mean()
             _per_mode.append({
                 "call mode": _bucket,
-                "patients": int(len(_sub)),
+                "first attempts": int(len(_sub)),
                 "total $": _money(_sub['estimated_cost_usd'].sum(), 4),
                 "avg $/patient": _money(_sub_avg),
                 "median $/patient": _money(_sub['estimated_cost_usd'].median()),
                 "projected $/1000": (None if pd.isna(_sub_avg)
                                      else round(float(_sub_avg) * 1000, 2)),
             })
-        st.markdown("**Cost per call mode** — the figures above, unblended:")
+        st.markdown("**Cost per call mode** — the per-patient figures above, "
+                    "unblended (first attempt per patient):")
         st.dataframe(pd.DataFrame(_per_mode), use_container_width=True,
                      hide_index=True)
     
@@ -301,6 +357,10 @@ def render_cost_tokens_tab(df):
     _partial_rows = (int(_incomplete_groups["rows"].sum())
                      if len(_incomplete_groups) else 0)
     _total_rows = int(_priced["rows"].sum()) if len(_priced) else 0
+    _breakdown_scope = (
+        f"Priced over {len(df):,} COMPLETED inference row(s); "
+        f"{int(_errored.sum()):,} errored row(s) ({_dollars(errored_cost)}) are "
+        f"excluded from this breakdown and included in Total Cost above.")
     if len(_incomplete_groups):
         st.subheader(
             f"Cost Breakdown by Model — PARTIAL "
@@ -308,6 +368,7 @@ def render_cost_tokens_tab(df):
             f"{_partial_rows:,} of {_total_rows:,} rows excluded)")
     else:
         st.subheader("Cost Breakdown by Model")
+    st.caption(_breakdown_scope)
 
     # THE TWO WARNINGS ABOVE NAME THE CAUSES; THIS ONE QUALIFIES THE NUMBERS.
     # Both of them describe groups whose recomputed cost is $0.00 for want of
@@ -470,11 +531,18 @@ def render_cost_tokens_tab(df):
     col1, col2 = st.columns(2)
     
     with col1:
-        df_tpt = df[df['candidates_evaluated'] > 0].copy()
-        df_tpt['input_per_trial'] = df_tpt['llm_classifier_input_tokens'] / df_tpt['candidates_evaluated']
-        df_tpt['output_per_trial'] = df_tpt['llm_classifier_output_tokens'] / df_tpt['candidates_evaluated']
+        # PER TRIAL WITH A DEFINITE ELIGIBILITY VERDICT, PER PATIENT (the
+        # dashboard-truthfulness pass).
+        # This divided by `candidates_evaluated`, which counts every trial SENT
+        # -- measured on the smoke run, 5,377 tokens per "trial" against 15,187
+        # per trial with a definite verdict, because 64 failed calls had no tokens
+        # and still sat in the denominator. The population is first attempts
+        # with at least one such trial.
+        df_tpt = _pdf[_pdf['trials_definite_verdict'] > 0].copy()
+        df_tpt['input_per_trial'] = df_tpt['llm_classifier_input_tokens'] / df_tpt['trials_definite_verdict']
+        df_tpt['output_per_trial'] = df_tpt['llm_classifier_output_tokens'] / df_tpt['trials_definite_verdict']
         
-        tier_order = list(MATCH_TIERS)
+        tier_order = list(ALL_MATCH_TIER_VALUES)
         tier_colors = MATCH_TIER_COLORS
         
         tpt_stats = df_tpt.groupby('match_tier').agg(
@@ -510,9 +578,10 @@ def render_cost_tokens_tab(df):
             # tier comparison -- which is its subject -- harder to read, for a
             # distinction the reader can act on by filtering. Stating the mix
             # is the other half of the rule and is what this panel takes.
-            title='Avg Tokens per Trial by Match Tier'
+            title='Avg Tokens per Trial with a Definite Eligibility Verdict, by '
+                  'Match Tier (first attempt)'
                   + call_mode.label_suffix(_mix),
-            yaxis_title='Tokens per Trial',
+            yaxis_title=f'Tokens per trial with a {DEFINITE_VERDICT_LABEL}',
             height=350,
             margin=dict(l=20, r=20, t=40, b=20),
             template='plotly_white',
@@ -521,8 +590,8 @@ def render_cost_tokens_tab(df):
         st.plotly_chart(fig_tpt, use_container_width=True)
     
     with col2:
-        df_efficiency = df[df['candidates_evaluated'] > 0].copy()
-        df_efficiency['tokens_per_trial'] = (df_efficiency['llm_classifier_input_tokens'] + df_efficiency['llm_classifier_output_tokens']) / df_efficiency['candidates_evaluated']
+        df_efficiency = _pdf[_pdf['trials_definite_verdict'] > 0].copy()
+        df_efficiency['tokens_per_trial'] = (df_efficiency['llm_classifier_input_tokens'] + df_efficiency['llm_classifier_output_tokens']) / df_efficiency['trials_definite_verdict']
         
         # THIS ONE IS SPLIT RATHER THAN LABELLED, because a histogram is the
         # one shape where the split IS the reading: two arms produce two
@@ -534,10 +603,11 @@ def render_cost_tokens_tab(df):
         fig_efficiency = px.histogram(
             _eff, x='tokens_per_trial', nbins=30,
             color=('call_mode_label' if _mix["is_mixed"] else None),
-            labels={'tokens_per_trial': 'Tokens/Trial',
+            labels={'tokens_per_trial': f'Tokens per trial with a {DEFINITE_VERDICT_LABEL}',
                     'call_mode_label': 'Call mode'},
             template='plotly_white',
-            title='Token Efficiency (Total per Trial)'
+            title='Token Efficiency (Total per Trial with a Definite '
+                  'Eligibility Verdict, first attempt)'
                   + call_mode.label_suffix(_mix))
         # THE MEDIAN LINE IS DROPPED ON A MIXED SELECTION rather than drawn
         # across two distributions. A single median over a bimodal mixture is
@@ -573,21 +643,30 @@ def render_cost_tokens_tab(df):
 
     with col1:
         st.metric("Avg Input Tokens" + _mode_note,
-                  f"{df['llm_classifier_input_tokens'].mean():,.0f}",
-                  help="Average Stage 5 input tokens per patient (prompt + "
-                       "criteria + patient data), summed over every request "
-                       "the patient's Stage 5 issued." + _mode_help)
+                  f"{_mean(_pdf, 'llm_classifier_input_tokens'):,.0f}",
+                  help="Average Stage 5 input tokens per patient, first "
+                       "attempt (prompt + criteria + patient data), summed over "
+                       "every response the patient's Stage 5 received."
+                       + _pop + _mode_help)
     with col2:
         st.metric("Avg Output Tokens" + _mode_note,
-                  f"{df['llm_classifier_output_tokens'].mean():,.0f}",
-                  help="Average Stage 5 output tokens per patient (eligibility "
-                       "assessments, plus any reasoning tokens, which are a "
-                       "subset billed at the output rate)." + _mode_help)
+                  f"{_mean(_pdf, 'llm_classifier_output_tokens'):,.0f}",
+                  help="Average Stage 5 output tokens per patient, first "
+                       "attempt (eligibility assessments, plus any reasoning "
+                       "tokens, which are a subset billed at the output rate)."
+                       + _pop + _mode_help)
     with col3:
-        st.metric("Avg Tokens/Trial" + _mode_note,
+        st.metric("Avg Tokens/Definite-Verdict Trial" + _mode_note,
                   f"{df_efficiency['tokens_per_trial'].mean():.0f}"
                   if len(df_efficiency) > 0 else "N/A",
-                  help="Average total tokens per trial evaluated." + _mode_help)
+                  help=f"Average total tokens per trial with a "
+                       f"{DEFINITE_VERDICT_LABEL} (eligible or not eligible), "
+                       f"per patient first attempt. Trials without one are not "
+                       f"in the denominator: a failed call carries no tokens, "
+                       f"and a trial the model declared clinically uncertain is "
+                       f"not an eligibility decision (its tokens stay in the "
+                       f"numerator)."
+                       + _mode_help)
     with col4:
         # HOW MANY BILLED REQUESTS A PATIENT ACTUALLY COST, which is the single
         # figure that separates the two arms and which this tab has never shown.
@@ -600,16 +679,20 @@ def render_cost_tokens_tab(df):
         # ran and issued nothing. `.mean()` skips NULLs by default, which is the
         # right arithmetic, and the count of rows it skipped is stated below
         # rather than folded in as zeros.
-        _calls = (df['llm_classifier_calls']
-                  if 'llm_classifier_calls' in df.columns else None)
+        _calls = (_pdf['llm_classifier_calls']
+                  if 'llm_classifier_calls' in _pdf.columns else None)
         _calls_mean = _calls.mean() if _calls is not None else None
         st.metric("Avg Stage 5 Calls" + _mode_note,
                   "N/A" if _calls_mean is None or pd.isna(_calls_mean)
                   else f"{_calls_mean:,.1f}",
-                  help="Average billed Stage 5 requests per patient, from "
-                       "`llm_classifier_calls`. In per-trial mode this is one "
-                       "cache warmup plus one request per evaluated trial; in "
-                       "grouped mode it is one per packed chunk." + _mode_help)
+                  help="Average Stage 5 RESPONSES received per patient, "
+                       "first attempt, from `llm_classifier_calls`. The column "
+                       "is incremented only when a response arrives, so a "
+                       "request that failed adds nothing: in per-trial mode "
+                       "this is the cache warmup plus each trial call that "
+                       "returned, not one request per evaluated trial; in "
+                       "grouped mode it is one per packed chunk that returned."
+                       + _pop + _mode_help)
 
     # THE PER-MODE TOKEN TABLE, on the same skip_if_empty footing as the cost
     # one above: it renders only when there is a mix to unblend.
@@ -618,13 +701,13 @@ def render_cost_tokens_tab(df):
             return None if pd.isna(value) else round(float(value), 0)
 
         _tok_rows = []
-        for _bucket, _sub in call_mode.split(df):
-            _sub_eff = _sub[_sub['candidates_evaluated'] > 0]
+        for _bucket, _sub in call_mode.split(_pdf):
+            _sub_eff = _sub[_sub['trials_definite_verdict'] > 0]
             _sub_calls = (_sub['llm_classifier_calls']
                           if 'llm_classifier_calls' in _sub.columns else None)
             _tok_rows.append({
                 "call mode": _bucket,
-                "patients": int(len(_sub)),
+                "first attempts": int(len(_sub)),
                 # Same rule as the cost table above: an all-NULL token column
                 # means "no count was ever recorded", which is not 0 tokens.
                 "avg input tok": _tok(_sub['llm_classifier_input_tokens'].mean()),
@@ -632,7 +715,7 @@ def render_cost_tokens_tab(df):
                 "avg tok/trial": _tok((
                     (_sub_eff['llm_classifier_input_tokens']
                      + _sub_eff['llm_classifier_output_tokens'])
-                    / _sub_eff['candidates_evaluated']).mean())
+                    / _sub_eff['trials_definite_verdict']).mean())
                 if len(_sub_eff) else None,
                 "avg Stage 5 calls": (round(float(_sub_calls.mean()), 2)
                                       if _sub_calls is not None
@@ -648,11 +731,11 @@ def render_cost_tokens_tab(df):
     # a row written before that column existed, and a mean over the remainder
     # that did not say how many rows it skipped is a mean whose denominator the
     # reader cannot see.
-    if 'llm_classifier_calls' in df.columns:
-        _no_calls = int(df['llm_classifier_calls'].isna().sum())
+    if 'llm_classifier_calls' in _pdf.columns:
+        _no_calls = int(_pdf['llm_classifier_calls'].isna().sum())
         if _no_calls:
             st.caption(
-                f"{_no_calls:,} of {len(df):,} rows record no Stage 5 call "
+                f"{_no_calls:,} of {len(_pdf):,} first attempts record no Stage 5 call "
                 f"count (`llm_classifier_calls` is NULL — written before that "
                 f"column existed, or Stage 5 never reported). They are excluded "
                 f"from the call average, not counted as zero.")
@@ -679,16 +762,21 @@ def render_cost_tokens_tab(df):
 
     with col1:
         # --- Dumbbell Chart: Cost per Patient vs Cost per Match ---
-        tier_order = list(MATCH_TIERS)
+        # ONE ROW PER PATIENT, INCOMPLETE AS ITS OWN ROW (the dashboard-
+        # truthfulness pass). This grouped inference ROWS by tier, so on the
+        # smoke run "No Match n=1" was a patient with 12 of 15 trials with
+        # no usable verdict. An incomplete evaluation's cost is real; its tier is not
+        # a clinical outcome, so it is its own category and never No Match.
+        tier_order = list(ALL_MATCH_TIER_VALUES)
         tier_colors = MATCH_TIER_COLORS
 
-        tier_stats = df.groupby('match_tier').agg(
+        tier_stats = _pdf.groupby('match_tier').agg(
             avg_cost=('estimated_cost_usd', 'mean'),
-            count=('patient_id', 'count'),
+            count=('patient_id', 'nunique'),
         ).reindex(tier_order).dropna()
 
         # Cost per match for tiers with matches
-        df_with_matches = df[df['eligible_matches'] > 0].copy()
+        df_with_matches = _pdf[_pdf['eligible_matches'] > 0].copy()
         df_with_matches['cost_per_match'] = df_with_matches['estimated_cost_usd'] / df_with_matches['eligible_matches']
         cpm_by_tier = df_with_matches.groupby('match_tier')['cost_per_match'].mean()
 
@@ -760,7 +848,7 @@ def render_cost_tokens_tab(df):
             # so both carry the mix. Splitting them by mode as well as by tier
             # would give a dumbbell with two dots per arm per tier, which is
             # unreadable for a distinction the caption below states in words.
-            title='Cost Efficiency: Per Patient vs Per Match'
+            title='Cost Efficiency: Per Patient vs Per Match (first attempt)'
                   + call_mode.label_suffix(_mix),
             xaxis_title='Cost (USD)',
             height=380,
@@ -777,7 +865,7 @@ def render_cost_tokens_tab(df):
         fig_dist = go.Figure()
 
         for tier in tier_order:
-            tier_data = df[df['match_tier'] == tier]['estimated_cost_usd']
+            tier_data = _pdf[_pdf['match_tier'] == tier]['estimated_cost_usd']
             if len(tier_data) > 0:
                 fig_dist.add_trace(go.Histogram(
                     x=tier_data,
@@ -787,13 +875,14 @@ def render_cost_tokens_tab(df):
                     nbinsx=25,
                 ))
 
-        fig_dist.add_vline(x=avg_cost, line_dash="dash", line_color="black",
-                           annotation_text=f"Mean: ${avg_cost:.4f}",
-                           annotation_font_color="black")
+        if not pd.isna(avg_cost):
+            fig_dist.add_vline(x=avg_cost, line_dash="dash", line_color="black",
+                               annotation_text=f"Mean: ${avg_cost:.4f}",
+                               annotation_font_color="black")
 
         fig_dist.update_layout(
             barmode='overlay',
-            title='Cost Distribution by Match Tier'
+            title='Cost Distribution by Match Tier (first attempt)'
                   + call_mode.label_suffix(_mix),
             xaxis_title='Cost ($)',
             yaxis_title='Patient Count',
@@ -808,6 +897,8 @@ def render_cost_tokens_tab(df):
         st.caption(call_mode.caption(_mix, "per-tier cost average"))
 
     st.caption(
+        "Both charts: one row per patient (first attempt), uncached rates, errored first attempts included; "
+        "'Incomplete Evaluation' is its own category and never a clinical tier. "
         "**Left:** Colored circles show average cost per patient by tier. Black diamonds show cost per eligible match. "
         "The connecting line reveals the efficiency gap — shorter lines mean better cost efficiency. "
         "**Right:** Cost distributions colored by match tier — overlap shows that cost alone does not predict match success."

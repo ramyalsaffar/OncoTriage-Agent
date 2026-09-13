@@ -934,7 +934,13 @@ _RUN_HEALTH_DEGRADATION_SQL = f"""
 # number to say so. The count is what says so.
 _RUN_HEALTH_PATIENTS_SQL = """
         SELECT run_id,
-               COUNT(*)                                          AS patients,
+               -- PATIENTS ARE DISTINCT (the dashboard-truthfulness pass). This
+               -- was COUNT(*), so a run whose resample pass re-ran every
+               -- patient reported twice its cohort -- the defect
+               -- campaign_summary had already had fixed. Rows are kept beside
+               -- it, because every money column here is summed over ROWS.
+               COUNT(DISTINCT patient_id)                        AS patients,
+               COUNT(*)                                          AS inference_rows,
                SUM(CASE WHEN error IS NOT NULL AND error != ''
                         THEN 1 ELSE 0 END)                       AS errored,
                ROUND(SUM(COALESCE(estimated_cost_usd, 0)), 4)    AS cost_usd,
@@ -2556,7 +2562,8 @@ QUERIES = (
         requires_columns=(("inferences", "run_id"),
                           ("runs", "matching_call_mode"), ("runs", "resumed")),
         notes=(
-            "patients / errored / cost_usd are 0 for a run no inference row",
+            "patients (DISTINCT patient_id) / inference_rows / errored (ROWS",
+            "carrying an error) / cost_usd are 0 for a run no inference row",
             "references -- that is a measured zero, because a LEFT JOIN with no",
             "match here means no patient claimed the run.",
             "",
@@ -2575,6 +2582,7 @@ QUERIES = (
         r.started_at,
         r.finished_at,
         COALESCE(p.patients, 0)                         AS patients,
+        COALESCE(p.inference_rows, 0)                   AS inference_rows,
         COALESCE(p.errored, 0)                          AS errored,
         COALESCE(p.cost_usd, 0.0)                       AS cost_usd,
         COALESCE(p.rows_with_no_cost, 0)                AS rows_with_no_cost,

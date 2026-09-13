@@ -8,16 +8,42 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from oncotriage.dashboard.data import load_trial_matches_data
+from oncotriage.dashboard.populations import (ensure_evaluated,
+                                              first_attempts,
+                                              incomplete_caption,
+                                              patient_outcomes)
 from oncotriage.dashboard.tiers import (ANY_MATCH_COLUMN,
                                         PATIENT_OUTCOME_FULL,
-                                        any_match_rate,
-                                        any_match_series)
+                                        PATIENT_OUTCOME_INCOMPLETE,
+                                        any_match_series,
+                                        clinical_rows,
+                                        rate_text)
+
+
+def _axis_max(values, factor, floor):
+    """An axis upper bound that survives an empty or all-NaN series.
+
+    ``Series.max()`` over no rows is NaN, and ``max(nan * 1.2, 10)`` is NaN --
+    Python's ``max`` returns the first argument when every comparison is False.
+    A selection with no complete evaluation hands every chart below an empty
+    frame, which is now an ordinary state rather than a pathological one.
+    """
+    top = values.max() if len(values) else float("nan")
+    if top != top:
+        return floor
+    return max(top * factor, floor)
 
 
 def render_patient_demographics_tab(df):
     """Render Patient Demographics tab with equity analysis."""
     
     st.header("👥 Patient Demographics & Equity Analysis")
+
+    # INCOMPLETENESS DOES NOT DEPEND ON THE CALLER (the dashboard-truthfulness
+    # pass). A no-op under main(), which annotated already; see
+    # populations.ensure_evaluated.
+    df = ensure_evaluated(df, load_trial_matches_data())
 
     # EVERY "MATCH RATE" ON THIS TAB COMES FROM ONE PREDICATE (the
     # dashboard-fixes pass), and materialising it as a column is what makes
@@ -38,13 +64,22 @@ def render_patient_demographics_tab(df):
     df = df.copy()
     df[ANY_MATCH_COLUMN] = any_match_series(df)
 
-    # --- Summary Metrics ---
-    col1, col2, col3, col4, col5, col6, col7 = st.columns(7)
+    # THE MATCH-RATE POPULATION IS COMPLETE FIRST ATTEMPTS (the dashboard-
+    # truthfulness pass). Every rate on this tab was a mean over inference ROWS,
+    # so an errored retry counted as a non-match in its group and an "n=" label
+    # counted a re-run patient twice. Measured on the smoke run: "female 66.7%
+    # (n=6)" for three patients. `cdf` is one row per patient per campaign,
+    # restricted to evaluations complete enough to carry a tier.
+    _outcomes = patient_outcomes(df)
+    cdf = clinical_rows(first_attempts(df))
 
-    overall_match_rate = any_match_rate(df)
-    full_match_rate_demo = (df['match_tier'] == 'Full Match').mean() * 100
-    partial_match_rate_demo = (df['match_tier'] == 'Partial Match').mean() * 100
-    unconfirmed_match_rate_demo = (df['match_tier'] == 'Unconfirmed Match').mean() * 100
+    # --- Summary Metrics ---
+    col1, col2, col3, col4, col5, col6, col7, col8 = st.columns(8)
+
+    overall_match_rate = _outcomes['any_match_rate']
+    full_match_rate_demo = _outcomes['tier_rates']['Full Match']
+    partial_match_rate_demo = _outcomes['tier_rates']['Partial Match']
+    unconfirmed_match_rate_demo = _outcomes['tier_rates']['Unconfirmed Match']
 
     with col1:
         st.metric("Total Patients", df['patient_id'].nunique(),
@@ -56,21 +91,31 @@ def render_patient_demographics_tab(df):
         st.metric("Avg Conditions", f"{df['condition_count'].mean():.1f}",
                   help="Average number of conditions per patient")
     with col4:
-        st.metric(PATIENT_OUTCOME_FULL, f"{full_match_rate_demo:.1f}%",
+        st.metric(PATIENT_OUTCOME_FULL, rate_text(full_match_rate_demo),
                   help="Patients with at least 1 trial where ALL criteria confirmed (100% score)")
     with col5:
-        st.metric("🟡 Partial Match", f"{partial_match_rate_demo:.1f}%",
+        st.metric("🟡 Partial Match", rate_text(partial_match_rate_demo),
                   help="Patients whose best trial had SOME criteria confirmed (0% < score < 100%)")
     with col6:
-        st.metric("🔶 Unconfirmed", f"{unconfirmed_match_rate_demo:.1f}%",
+        st.metric("🔶 Unconfirmed", rate_text(unconfirmed_match_rate_demo),
                   help="Patients whose only eligible trials scored 0% — no disqualifier "
                        "found, but no criterion confirmed either")
     with col7:
-        st.metric("Any Match", f"{overall_match_rate:.1f}%",
+        st.metric("Any Match", rate_text(overall_match_rate),
                   help="Patients with at least 1 eligible trial (full, partial or "
                        "unconfirmed), derived from match_tier like every tile "
                        "beside it. Used as the baseline line in the charts "
-                       "below, which measure their bars the same way.")
+                       "below, which measure their bars the same way. Over "
+                       "COMPLETE first-attempt evaluations only.")
+    with col8:
+        st.metric(PATIENT_OUTCOME_INCOMPLETE, f"{_outcomes['incomplete']}",
+                  delta=f"of {_outcomes['first_attempts']} first attempts",
+                  delta_color="off",
+                  help="First attempts that errored or have a trial with no "
+                       "usable verdict. Excluded from every rate and n below.")
+    st.caption(incomplete_caption(_outcomes)
+               + " Every group chart below is computed over the same complete "
+                 "first attempts; n = complete first attempts in the group.")
     
     st.markdown("---")
     
@@ -82,7 +127,7 @@ def render_patient_demographics_tab(df):
     col1, col2 = st.columns(2)
     
     with col1:
-        df_age = df.copy()
+        df_age = cdf.copy()
         # ROWS WITH NO AGE ARE EXCLUDED AND COUNTED, NOT BUCKETED.
         # `(NaN // 10) * 10` is NaN and `.astype(int)` then RAISES "Cannot
         # convert non-finite values (NA or inf) to integer", which took the
@@ -123,11 +168,11 @@ def render_patient_demographics_tab(df):
             height=320, margin=dict(l=20, r=20, t=40, b=20),
             template='plotly_white', showlegend=False
         )
-        fig_age.update_yaxes(range=[0, max(age_stats['match_rate'].max() * 1.2, 10)])
+        fig_age.update_yaxes(range=[0, _axis_max(age_stats['match_rate'], 1.2, 10)])
         st.plotly_chart(fig_age, use_container_width=True)
     
     with col2:
-        sex_stats = df.groupby('sex').agg(
+        sex_stats = cdf.groupby('sex').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
             match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
@@ -146,7 +191,7 @@ def render_patient_demographics_tab(df):
             height=320, margin=dict(l=20, r=20, t=40, b=20),
             template='plotly_white', showlegend=False
         )
-        fig_sex.update_yaxes(range=[0, max(sex_stats['match_rate'].max() * 1.2, 10)])
+        fig_sex.update_yaxes(range=[0, _axis_max(sex_stats['match_rate'], 1.2, 10)])
         st.plotly_chart(fig_sex, use_container_width=True)
     
     st.markdown("---")
@@ -159,7 +204,7 @@ def render_patient_demographics_tab(df):
     col1, col2 = st.columns(2)
     
     with col1:
-        race_stats = df.groupby('race').agg(
+        race_stats = cdf.groupby('race').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
             match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
@@ -184,11 +229,11 @@ def render_patient_demographics_tab(df):
             template='plotly_white', showlegend=False,
             yaxis=dict(autorange='reversed', tickfont=dict(size=12))
         )
-        fig_race.update_xaxes(range=[0, max(race_stats['match_rate'].max() * 1.6, 10)])
+        fig_race.update_xaxes(range=[0, _axis_max(race_stats['match_rate'], 1.6, 10)])
         st.plotly_chart(fig_race, use_container_width=True)
     
     with col2:
-        eth_stats = df.groupby('ethnicity').agg(
+        eth_stats = cdf.groupby('ethnicity').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
             match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
@@ -212,11 +257,13 @@ def render_patient_demographics_tab(df):
             template='plotly_white', showlegend=False,
             yaxis=dict(autorange='reversed', tickfont=dict(size=12))
         )
-        fig_eth.update_xaxes(range=[0, max(eth_stats['match_rate'].max() * 1.6, 10)])
+        fig_eth.update_xaxes(range=[0, _axis_max(eth_stats['match_rate'], 1.6, 10)])
         st.plotly_chart(fig_eth, use_container_width=True)
     
     # Demographic Parity Metric
-    if len(race_stats) > 1:
+    # PARITY NEEDS TWO GROUPS WITH A RATE; a rate over no complete evaluation
+    # does not exist, so such a group is not a party to the ratio.
+    if len(race_stats) > 1 and race_stats['match_rate'].notna().all():
         max_rate = race_stats['match_rate'].max()
         min_rate = race_stats['match_rate'].min()
         parity_ratio = min_rate / max_rate if max_rate > 0 else 0
@@ -251,7 +298,7 @@ def render_patient_demographics_tab(df):
     col1, col2 = st.columns(2)
     
     with col1:
-        condition_stats = df.groupby('primary_condition').agg(
+        condition_stats = cdf.groupby('primary_condition').agg(
             patient_count=('patient_id', 'count'),
             avg_matches=('eligible_matches', 'mean'),
             match_rate=(ANY_MATCH_COLUMN, lambda x: x.mean() * 100)
@@ -276,7 +323,7 @@ def render_patient_demographics_tab(df):
             margin=dict(l=20, r=120, t=40, b=20),
             template='plotly_white', showlegend=False
         )
-        fig_cond.update_xaxes(range=[0, top_conditions['patient_count'].max() * 1.6])
+        fig_cond.update_xaxes(range=[0, _axis_max(top_conditions['patient_count'], 1.6, 1)])
         st.plotly_chart(fig_cond, use_container_width=True)
     
     with col2:
@@ -329,7 +376,7 @@ def render_patient_demographics_tab(df):
     col1, col2 = st.columns(2)
     
     with col1:
-        df_burden = df.copy()
+        df_burden = cdf.copy()
         df_burden['condition_bucket'] = pd.cut(
             df_burden['condition_count'],
             bins=[-1, 2, 5, 10, 20, 100],
@@ -356,11 +403,11 @@ def render_patient_demographics_tab(df):
             height=320, margin=dict(l=20, r=20, t=40, b=20),
             template='plotly_white', showlegend=False
         )
-        fig_burden.update_yaxes(range=[0, max(burden_stats['match_rate'].max() * 1.2, 10)])
+        fig_burden.update_yaxes(range=[0, _axis_max(burden_stats['match_rate'], 1.2, 10)])
         st.plotly_chart(fig_burden, use_container_width=True)
     
     with col2:
-        df_meds = df.copy()
+        df_meds = cdf.copy()
         df_meds['med_bucket'] = pd.cut(
             df_meds['medication_count'],
             bins=[-1, 3, 7, 12, 20, 100],
@@ -387,11 +434,13 @@ def render_patient_demographics_tab(df):
             height=320, margin=dict(l=20, r=20, t=40, b=20),
             template='plotly_white', showlegend=False
         )
-        fig_meds.update_yaxes(range=[0, max(med_stats['match_rate'].max() * 1.2, 10)])
+        fig_meds.update_yaxes(range=[0, _axis_max(med_stats['match_rate'], 1.2, 10)])
         st.plotly_chart(fig_meds, use_container_width=True)
     
     st.caption(
-        "Match rate = percentage of patients in each bucket with at least one eligible trial. "
+        "Match rate = percentage of COMPLETE first-attempt evaluations in each bucket with "
+        "at least one eligible trial; n = those evaluations. Incomplete evaluations are "
+        "excluded, not counted as non-matches. "
         )
      
     st.markdown("---")

@@ -34,12 +34,66 @@ pass 20f-3 had to come back and fix for '✅ Full Match'."""
 MATCH_TIERS = ['Full Match', 'Partial Match', 'Unconfirmed Match',
                MATCH_TIER_NO_MATCH]
 
+MATCH_TIER_INCOMPLETE = 'Incomplete Evaluation'
+"""The tier of a patient row whose evaluation cannot support a clinical tier.
+
+IT IS NOT A MEMBER OF ``MATCH_TIERS``, AND THAT IS THE WHOLE POINT. The four
+members of ``MATCH_TIERS`` are CLINICAL outcomes and they partition the rows
+that were fully evaluated. A row that errored, or whose Stage 5 call failed for
+some of its trials, was put in 'No Match' before the dashboard-truthfulness
+pass -- measured on the smoke run, a patient with 12 of 15 trials with no usable verdict
+read as a clinical No Match, and two errored retries read as two more. So this
+value sits OUTSIDE the clinical vocabulary: every clinical percentage excludes
+it, and every panel that shows tiers names it as its own count.
+
+WHO DECIDES IT: ``oncotriage/dashboard/populations.py`` computes the
+``evaluation_state`` column and ``enrich_match_tiers`` below reads it. The rule
+needs the not-evaluable reason vocabulary, which this module cannot import
+without ceasing to import nothing."""
+
 MATCH_TIER_COLORS = {
     'Full Match':        '#2ca02c',
     'Partial Match':     '#ffbb33',
     'Unconfirmed Match': '#e67e22',
     'No Match':          '#d62728',
+    'Incomplete Evaluation': '#7f7f7f',
 }
+
+ALL_MATCH_TIER_VALUES = tuple(MATCH_TIERS) + (MATCH_TIER_INCOMPLETE,)
+"""Every value ``match_tier`` can hold, clinical tiers first. A TUPLE, on
+``PATIENT_OUTCOME_LABELS``' argument: check 6a watches the two module-level
+mutables and an immutable container adds nothing for it to watch. Charts that
+group BY TIER use this, so an incomplete row is a visible category rather than
+a row silently dropped by a ``reindex(MATCH_TIERS)``."""
+
+
+# ---------------------------------------------------------------------------
+# The evaluation-state vocabulary (the dashboard-truthfulness pass)
+# ---------------------------------------------------------------------------
+#
+# Named here, beside the tier it decides, and COMPUTED in populations.py. A
+# closed vocabulary: a state outside it is a defect in the producer.
+EVALUATION_COMPLETE = 'complete'
+"""Every trial sent to Stage 5 carries a usable result, including clinical
+uncertainty -- a definite eligibility verdict or a model-declared uncertainty. The ONLY state a clinical tier is computed for."""
+
+EVALUATION_ERRORED = 'errored'
+"""The inference row carries an error: the pipeline did not finish this
+attempt, so it holds no verdicts to tier."""
+
+EVALUATION_MISSING_VERDICTS = 'missing_verdicts'
+"""The attempt finished and at least one trial has no usable verdict -- a failed
+call, an unusable response, a not-evaluable row whose reason cannot be
+classified, or fewer trial rows than trials evaluated. NOT the mere presence of
+a not_evaluable row: a trial the model itself declared not evaluable is a
+legitimate clinical result and leaves the evaluation complete."""
+
+EVALUATION_STATES = (EVALUATION_COMPLETE, EVALUATION_ERRORED,
+                     EVALUATION_MISSING_VERDICTS)
+
+EVALUATION_STATE_COLUMN = 'evaluation_state'
+"""The column ``populations.annotate_evaluation_state`` writes and
+``enrich_match_tiers`` reads."""
 
 # Per-trial status labels, same partition applied to a single trial row.
 #
@@ -81,6 +135,39 @@ TRIAL_STATUS_REJECTED    = '❌ Not Eligible'
 # is a pure function of a score and stays a partition of one.
 TRIAL_STATUS_NO_SCORE    = '❔ No Score Recorded'
 
+# NOT EVALUATED IS ITS OWN STATUS, IN THREE KINDS (the dashboard-truthfulness
+# pass). Every per-trial classifier in the dashboard read
+# `if row['eligible'] != 'eligible': return TRIAL_STATUS_REJECTED`, so a trial
+# whose Stage 5 REQUEST FAILED was displayed as a clinical rejection with a
+# score of 0 -- measured on the smoke run, 64 of 98 trial rows. `not_evaluable`
+# is not `not_eligible`, and the STORED REASON is what separates the two things
+# it can mean; `populations.not_evaluated_kind` owns that reading.
+TRIAL_STATUS_NOT_EVALUATED_FAILED = '⚠️ Not Evaluated — no usable verdict'
+"""The pipeline never obtained a usable verdict: the call failed, the response was
+truncated or omitted, or the response could not be used as written."""
+
+TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN = '❔ Not Evaluable — clinical uncertainty'
+"""The model itself declared the trial not evaluable for this patient. A
+legitimate clinical result, and deliberately a different label from a failure."""
+
+TRIAL_STATUS_NOT_EVALUATED_UNKNOWN = '⚪ Not Evaluated — reason unknown'
+"""A not_evaluable row whose reason was never recorded (a row written before the
+column) or is not a value this pipeline writes. Neither a failure nor an
+uncertainty can be asserted, so it is named as neither."""
+
+TRIAL_STATUS_UNRECOGNISED = '❓ Unrecognised Verdict'
+"""An ``eligible`` value outside eligible / not_eligible / not_evaluable. It was
+displayed as a rejection too; it is a record this dashboard cannot read."""
+
+TRIAL_STATUS_ORDER = (
+    '✅ Eligible', TRIAL_STATUS_PARTIAL, TRIAL_STATUS_UNCONFIRMED,
+    TRIAL_STATUS_REJECTED, TRIAL_STATUS_NO_SCORE,
+    TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN, TRIAL_STATUS_NOT_EVALUATED_FAILED,
+    TRIAL_STATUS_NOT_EVALUATED_UNKNOWN, TRIAL_STATUS_UNRECOGNISED,
+)
+"""Every per-trial display status, in the order a trial table sorts them.
+Definite eligibility verdicts first; every not-evaluated kind after them."""
+
 
 # Per-PATIENT outcome labels: the display form of each `match_tier` value that
 # `enrich_match_tiers()` assigns below.
@@ -121,6 +208,10 @@ PATIENT_OUTCOME_LABELS = (
 # two-table guard in oncotriage/paths.py. A tier added to MATCH_TIERS with no
 # label here would otherwise reach the pie chart as a silently shorter list,
 # whose slices would then be labelled by position with the wrong names.
+PATIENT_OUTCOME_INCOMPLETE = '⚪ Incomplete Evaluation'
+"""The display form of ``MATCH_TIER_INCOMPLETE``. Deliberately NOT in
+``PATIENT_OUTCOME_LABELS``, which is zipped with the four CLINICAL tiers."""
+
 if len(PATIENT_OUTCOME_LABELS) != len(MATCH_TIERS):
     raise RuntimeError(
         f"the per-patient label vocabulary has {len(PATIENT_OUTCOME_LABELS)} "
@@ -205,20 +296,48 @@ def any_match_series(df):
 
 
 def any_match_count(df) -> int:
-    """How many patients in ``df`` have at least one eligible trial."""
+    """How many rows in ``df`` are a clinical Any Match.
+
+    An incomplete row is never counted: ``MATCH_TIER_INCOMPLETE`` is not in
+    ``ANY_MATCH_TIERS``. Which ROWS ``df`` holds -- every inference, or one first
+    attempt per patient -- is the caller's population and the caller's label.
+    """
     return int(any_match_series(df).sum())
 
 
-def any_match_rate(df) -> float:
-    """The Any Match percentage of ``df``, or ``float('nan')`` when empty.
+def clinical_rows(df):
+    """The rows of ``df`` a clinical tier can be computed for.
 
-    NaN AND NOT 0.0 FOR AN EMPTY FRAME. ``Series.mean()`` over no rows is
-    already NaN and it is kept: 0.0% asserts that none of the patients matched,
-    which is a measurement, and there are no patients to have measured. Every
-    caller formats with an f-string, where NaN renders "nan%" -- visibly not a
-    number rather than a plausible wrong one.
+    Every row whose ``match_tier`` is not ``MATCH_TIER_INCOMPLETE``. Raises on a
+    frame with no ``match_tier`` for ``any_match_series``' reason.
     """
-    return float(any_match_series(df).mean() * 100)
+    if 'match_tier' not in df.columns:
+        any_match_series(df)                      # raises the named KeyError
+    return df[df['match_tier'] != MATCH_TIER_INCOMPLETE]
+
+
+def any_match_rate(df) -> float:
+    """The Any Match percentage over the COMPLETE rows of ``df``, or NaN.
+
+    THE DENOMINATOR EXCLUDES INCOMPLETE EVALUATIONS (the dashboard-truthfulness
+    pass). It was every row, so an errored retry and a patient whose calls
+    failed both counted as a clinical non-match.
+
+    NaN AND NOT 0.0 WHEN THERE IS NO COMPLETE ROW. 0.0% asserts that none of the
+    patients matched, which is a measurement, and there is nobody complete to
+    have measured. Callers render NaN through ``rate_text``.
+    """
+    complete = clinical_rows(df)
+    if len(complete) == 0:
+        return float('nan')
+    return float(any_match_series(complete).mean() * 100)
+
+
+def rate_text(rate, spec=".1f"):
+    """A percentage for a tile, or "—" when it is undefined (NaN)."""
+    if rate != rate:                               # NaN, with no numpy import
+        return "—"
+    return f"{format(rate, spec)}%"
 
 
 TRIAL_MISSING_TITLE_LABEL = "(no title recorded)"
@@ -343,7 +462,7 @@ def enrich_match_tiers(df, trial_matches):
         df['partial_match_count'] = 0
         df['unconfirmed_match_count'] = 0
         df['match_tier'] = MATCH_TIER_NO_MATCH
-        return df
+        return apply_evaluation_state(df)
 
     eligible = trial_matches[trial_matches['eligible'] == 'eligible'].copy()
 
@@ -373,6 +492,22 @@ def enrich_match_tiers(df, trial_matches):
 
     df['match_tier'] = df.apply(assign_tier, axis=1)
 
+    return apply_evaluation_state(df)
+
+
+def apply_evaluation_state(df):
+    """Overwrite ``match_tier`` with ``MATCH_TIER_INCOMPLETE`` where it applies.
+
+    Reads ``EVALUATION_STATE_COLUMN`` when the caller computed it -- which
+    ``oncotriage/dashboard/app.py:main()`` does before calling
+    ``enrich_match_tiers`` -- and leaves the four clinical tiers untouched when
+    the column is absent, which is every caller that has not asked the question.
+    The three match counts are left as computed: they describe what the trial
+    rows say, and the Patient Explorer shows them for an incomplete row too.
+    """
+    if EVALUATION_STATE_COLUMN in df.columns:
+        incomplete = df[EVALUATION_STATE_COLUMN] != EVALUATION_COMPLETE
+        df.loc[incomplete, 'match_tier'] = MATCH_TIER_INCOMPLETE
     return df
 
 

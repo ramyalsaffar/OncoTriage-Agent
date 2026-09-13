@@ -15,8 +15,10 @@ from datetime import datetime
 
 import streamlit as st
 
-from oncotriage.dashboard.tiers import (ANY_MATCH_TIERS, MATCH_TIER_NO_MATCH,
-                                        any_match_series)
+from oncotriage.dashboard.populations import (FIRST_ATTEMPT_COLUMN,
+                                              designate_first_attempts)
+from oncotriage.dashboard.tiers import (ANY_MATCH_TIERS, MATCH_TIER_INCOMPLETE,
+                                        MATCH_TIER_NO_MATCH, any_match_series)
 
 
 MATCH_FILTER_ALL = "All"
@@ -62,7 +64,16 @@ compares False to both -- so such a patient vanished from the page under EITHER
 selection, and appeared under "All". ``match_tier`` has no such third state:
 ``enrich_match_tiers`` assigns one of four values to every row."""
 
-MATCH_FILTER_OPTIONS = (MATCH_FILTER_ALL, MATCH_FILTER_ANY, MATCH_FILTER_NONE)
+MATCH_FILTER_INCOMPLETE = "Incomplete Evaluation Only"
+"""The third member of the partition (the dashboard-truthfulness pass).
+
+``MATCH_FILTER_NONE`` WAS ``~any_match``, which made every incomplete evaluation
+a "No Match" -- an errored retry, a patient whose calls failed. A clinical No
+Match is ``match_tier == 'No Match'`` now, and an incomplete evaluation is its
+own selection, so the three options still partition every row."""
+
+MATCH_FILTER_OPTIONS = (MATCH_FILTER_ALL, MATCH_FILTER_ANY, MATCH_FILTER_NONE,
+                        MATCH_FILTER_INCOMPLETE)
 """Every option the match-status filter offers. CLOSED: the branch below is
 exhaustive over it, and an unlisted value would fall through and filter
 nothing while the widget said it had."""
@@ -235,11 +246,22 @@ def render_sidebar(df):
     # the two selections partition by construction. Writing the second as its
     # own predicate is how the pair came to have a hole: NaN is neither `> 0`
     # nor `== 0`.
+    #
+    # FIRST ATTEMPTS ARE DESIGNATED HERE, AFTER EVERY NON-OUTCOME FILTER AND
+    # BEFORE THE OUTCOME FILTER (the dashboard-truthfulness pass). Designated
+    # after it, narrowing to "Any Match" would drop a patient's unmatched first
+    # attempt and promote their second attempt into "first" -- a population
+    # chosen by its outcome. See oncotriage/dashboard/populations.py.
+    filtered_df = designate_first_attempts(filtered_df)
+
     if match_tier_available and match_status_option != MATCH_FILTER_ALL:
-        _any_match = any_match_series(filtered_df)
-        filtered_df = filtered_df[
-            _any_match if match_status_option == MATCH_FILTER_ANY
-            else ~_any_match]
+        if match_status_option == MATCH_FILTER_ANY:
+            _mask = any_match_series(filtered_df)
+        elif match_status_option == MATCH_FILTER_NONE:
+            _mask = filtered_df['match_tier'] == MATCH_TIER_NO_MATCH
+        else:
+            _mask = filtered_df['match_tier'] == MATCH_TIER_INCOMPLETE
+        filtered_df = filtered_df[_mask]
     
     # Show filter stats
     st.sidebar.markdown("---")
@@ -247,8 +269,14 @@ def render_sidebar(df):
         "Showing", 
         f"{len(filtered_df):,} inferences",
         delta=f"{len(filtered_df) - len(df):+,}" if len(filtered_df) != len(df) else None,
-        help="Pipeline runs matching current filters"
+        help="Inference ROWS matching current filters. A patient re-run by the "
+             "resample pass, or retried after an error, is more than one row."
     )
+    st.sidebar.caption(
+        f"{filtered_df['patient_id'].nunique():,} distinct patient(s); "
+        f"{int(filtered_df[FIRST_ATTEMPT_COLUMN].sum()):,} first attempt(s) "
+        f"(one per patient per campaign), which is the population every "
+        f"patient-tier figure uses.")
     
     # Export section
     st.sidebar.markdown("---")

@@ -58,6 +58,10 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
+from oncotriage.dashboard.populations import (DEFINITE_VERDICT_LABEL,
+                                              DEFINITE_VERDICTS,
+                                              VERDICT_ELIGIBLE,
+                                              VERDICT_NOT_ELIGIBLE, reason_text)
 
 
 # ===========================================================================
@@ -267,8 +271,17 @@ def _build_comparisons(patient_groups, relevant_matches):
         col_name = pg['qdrant_collection']
         inf_ids = pg['inference_ids']
 
-        # Get all trial matches for this patient's inferences
-        patient_matches = relevant_matches[relevant_matches['inference_id'].isin(inf_ids)]
+        # DEFINITE ELIGIBILITY VERDICTS ONLY, REMOVED BEFORE ANYTHING IS COMPARED (the
+        # dashboard-truthfulness pass). A not_evaluable row carries no decision
+        # and a stored score of 0.0, so comparing it against a definite verdict
+        # reported a failed CALL as the model changing its mind -- measured on
+        # the smoke run, 30 of 37 comparisons involved a failed call and 4 of
+        # the 5 "flips" were a failed call against a definite verdict. A (patient,
+        # trial) now needs two runs with a definite eligibility verdict to be compared at all;
+        # `_comparison_exclusions` counts what this drops.
+        patient_matches = relevant_matches[
+            relevant_matches['inference_id'].isin(inf_ids)
+            & relevant_matches['eligible'].isin(DEFINITE_VERDICTS)]
 
         # Group by nct_id — each trial evaluated across multiple inferences
         for nct_id, trial_group in patient_matches.groupby('nct_id'):
@@ -286,14 +299,19 @@ def _build_comparisons(patient_groups, relevant_matches):
             all_scores_identical = len(set(scores)) == 1
             all_classifications_identical = len(set(classifications)) == 1
 
-            # Determine group category
+            # Determine group category. EXACTLY THREE SETS ARE POSSIBLE over
+            # definite verdicts, and each is named: the old `else` made every
+            # other set a flip, which is how {not_evaluable} alone -- 26 pairs
+            # on the smoke run -- came to be counted as a flipped decision.
             unique_classifications = set(classifications)
-            if unique_classifications == {'eligible'}:
+            if unique_classifications == {VERDICT_ELIGIBLE}:
                 category = 'eligible_all'
-            elif unique_classifications == {'not_eligible'}:
+            elif unique_classifications == {VERDICT_NOT_ELIGIBLE}:
                 category = 'not_eligible_all'
-            else:
+            elif unique_classifications == {VERDICT_ELIGIBLE, VERDICT_NOT_ELIGIBLE}:
                 category = 'flipped'
+            else:                                   # unreachable after the filter
+                continue
 
             comparisons.append({
                 'patient_id': pid,
@@ -310,6 +328,51 @@ def _build_comparisons(patient_groups, relevant_matches):
                 'category': category,
             })
     return comparisons
+
+
+def _comparison_exclusions(patient_groups, relevant_matches, comparisons):
+    """What the definite-verdict-only rule removed, as counts. Pure.
+
+    observations_without_definite_verdict  not-evaluated trial rows among the re-run
+                             patients' inferences, removed before comparing
+    pairs_without_two_definite_verdicts  (patient, trial) pairs evaluated in 2+ runs that
+                             have fewer than two definite-verdict runs, so are not
+                             compared
+    retested_without_comparison  re-run (patient, corpus) groups left with no
+                             comparable trial at all
+    """
+    without_definite = 0
+    lost = 0
+    for pg in patient_groups:
+        rows = relevant_matches[relevant_matches['inference_id'].isin(pg['inference_ids'])]
+        definite = rows['eligible'].isin(DEFINITE_VERDICTS)
+        without_definite += int((~definite).sum())
+        runs_all = rows.groupby('nct_id')['inference_id'].nunique()
+        runs_definite = rows[definite].groupby('nct_id')['inference_id'].nunique()
+        for nct, n_all in runs_all.items():
+            if n_all >= 2 and int(runs_definite.get(nct, 0)) < 2:
+                lost += 1
+    compared = {(c['patient_id'], c['qdrant_collection']) for c in comparisons}
+    without = sum(1 for pg in patient_groups
+                  if (pg['patient_id'], pg['qdrant_collection']) not in compared)
+    return {'observations_without_definite_verdict': without_definite,
+            'pairs_without_two_definite_verdicts': lost,
+            'retested_without_comparison': without}
+
+
+def _exclusion_caption(exclusions):
+    """The sentence the Summary prints about what was left out."""
+    return (
+        f"Comparisons are over {DEFINITE_VERDICT_LABEL}s (eligible / not "
+        f"eligible) only. Removed before comparing: "
+        f"{exclusions['observations_without_definite_verdict']} trial "
+        f"observation(s) without a {DEFINITE_VERDICT_LABEL} — a failed call, an "
+        f"unusable response or a declared clinical uncertainty is not an "
+        f"eligibility decision. "
+        f"{exclusions['pairs_without_two_definite_verdicts']} (patient, trial) "
+        f"pair(s) had fewer than two runs with a {DEFINITE_VERDICT_LABEL} and "
+        f"are not compared; {exclusions['retested_without_comparison']} re-run "
+        f"patient group(s) have no comparable trial at all.")
 
 
 def _group_metrics(group_df):
@@ -413,7 +476,12 @@ def _classify_flip_type(classifications, scores):
     """Classify the flip scenario from N runs."""
     tiers_seen = set()
     for cls, score in zip(classifications, scores):
-        if cls == 'not_eligible':
+        # A DEFINITE VERDICT OR NOTHING. A not-evaluated observation is neither a
+        # rejection nor a zero-score eligible verdict; it was treated as the
+        # second, which produced "Rejection ↔ Zero Score" from a failed call.
+        if cls not in DEFINITE_VERDICTS:
+            continue
+        if cls == VERDICT_NOT_ELIGIBLE:
             tiers_seen.add('Rejected')
         elif score >= 1.0:
             tiers_seen.add('Full Match')
@@ -858,10 +926,15 @@ def render_reproducibility_tab(df):
     # Build per-(patient, trial) comparisons across ALL inferences
     # For each (patient, nct_id), collect all scores and classifications from every inference
     comparisons = _build_comparisons(patient_groups, relevant_matches)
+    _exclusions = _comparison_exclusions(patient_groups, relevant_matches,
+                                         comparisons)
 
     if not comparisons:
-        st.info("No overlapping trials found across inferences. "
-                "This may happen if the trial corpus changed entirely between inferences.")
+        st.info(f"No overlapping trials with two runs carrying a "
+                f"{DEFINITE_VERDICT_LABEL} found across "
+                "inferences. This may happen if the trial corpus changed "
+                "entirely between inferences, or if the re-runs' calls failed.")
+        st.caption(_exclusion_caption(_exclusions))
         return
     
     comp_df = pd.DataFrame(comparisons)
@@ -885,9 +958,18 @@ def render_reproducibility_tab(df):
 
     # === Critical Alerts ===
     col1, col2, col3 = st.columns(3)
+    # PATIENTS WITH SOMETHING TO COMPARE (the dashboard-truthfulness pass).
+    # This counted every re-run group, including a completed run paired with an
+    # errored retry that wrote no trial rows -- nothing to compare, and on the
+    # smoke run two of the five groups were exactly that.
+    _compared_patients = len({(c['patient_id'], c['qdrant_collection'])
+                              for c in comparisons})
     with col1:
-        st.metric("Patients Re-Tested", total_patients_retested,
-                  help="Patients with 2+ inferences on the same trial corpus with identical patient data")
+        st.metric("Patients Re-Tested", _compared_patients,
+                  delta=(f"of {total_patients_retested} re-run"
+                         if _compared_patients != total_patients_retested else None),
+                  delta_color="off",
+                  help="Patients with 2+ inferences on the same trial corpus with identical patient data AND at least one trial with a definite eligibility verdict in two of them. Re-run patients with no comparable trial are counted in the caption below.")
     with col2:
         color = "normal" if identical_classification >= 98 else "inverse"
         st.metric("Identical Classification", f"{identical_classification:.1f}%",
@@ -897,10 +979,12 @@ def render_reproducibility_tab(df):
     with col3:
         color = "normal" if flip_rate < 2 else "inverse"
         st.metric("Eligibility Decision Changed", f"{flip_rate:.1f}%",
-                  delta=f"{flip_count} flips out of {total_comparisons} trail evaluations",
+                  delta=f"{flip_count} flips out of {total_comparisons} trial evaluations",
                   delta_color="inverse" if flip_count > 0 else "off",
                   help="A flip means GPT-4o classified the same trial differently across inferences (e.g. 'eligible' in one inference, 'not_eligible' in another). Target: <2%")
     
+    st.caption(_exclusion_caption(_exclusions))
+
     st.markdown("")
     
     # === All Trials ===
@@ -1044,23 +1128,28 @@ def render_reproducibility_tab(df):
         majority_eligible = len(flip_detail_df[flip_detail_df['n_eligible'] > flip_detail_df['n_not_eligible']])
         majority_not_eligible = len(flip_detail_df[flip_detail_df['n_not_eligible'] > flip_detail_df['n_eligible']])
         evenly_split = len(flip_detail_df[flip_detail_df['n_eligible'] == flip_detail_df['n_not_eligible']])
+        # THE DENOMINATOR IS THE FRAME THE NUMERATORS CAME FROM (the dashboard-
+        # truthfulness pass). It was `flip_count`, computed on a different
+        # frame, and the two disagreed by 26 rows on the smoke run: "Evenly
+        # Split 27 · 540% of flips".
+        _n_flips = len(flip_detail_df)
         
         col1, col2, col3 = st.columns(3)
         with col1:
             st.metric("Majority Eligible", majority_eligible,
-                      delta=f"{majority_eligible/flip_count*100:.0f}% of flips" if flip_count > 0 else "",
+                      delta=f"{majority_eligible/_n_flips*100:.0f}% of flips" if _n_flips > 0 else "",
                       delta_color="off",
                       help="Trials where MORE inferences said 'eligible' than 'not_eligible'. "
                            "The not_eligible inferences are likely GPT-4o errors — it found a false disqualifier.")
         with col2:
             st.metric("Majority Not Eligible", majority_not_eligible,
-                      delta=f"{majority_not_eligible/flip_count*100:.0f}% of flips" if flip_count > 0 else "",
+                      delta=f"{majority_not_eligible/_n_flips*100:.0f}% of flips" if _n_flips > 0 else "",
                       delta_color="off",
                       help="Trials where MORE inferences said 'not_eligible' than 'eligible'. "
                            "The eligible inferences are likely GPT-4o errors — it missed a disqualifier.")
         with col3:
             st.metric("Evenly Split", evenly_split,
-                      delta=f"{evenly_split/flip_count*100:.0f}% of flips" if flip_count > 0 else "",
+                      delta=f"{evenly_split/_n_flips*100:.0f}% of flips" if _n_flips > 0 else "",
                       delta_color="off",
                       help="Trials where equal numbers of inferences said 'eligible' and 'not_eligible'. "
                            "Maximum uncertainty — GPT-4o is genuinely inconsistent on these cases.")
@@ -1109,7 +1198,8 @@ def render_reproducibility_tab(df):
         type_counts = flipped_comps_enriched['flip_type'].value_counts()
         sorted_types = sorted(type_counts.index, key=lambda t: _FLIP_TYPE_SEVERITY.get(t, 0), reverse=True)
 
-        st.plotly_chart(_figure_flip_types(type_counts, sorted_types, flip_count),
+        st.plotly_chart(_figure_flip_types(type_counts, sorted_types,
+                                           len(flipped_comps_enriched)),
                         use_container_width=True)
         
         st.caption(
@@ -1253,7 +1343,12 @@ def render_reproducibility_tab(df):
                         'Run': f"Run {run_idx}",
                         'Inference ID': tm_row['inference_id'],
                         'Decision': tm_row['eligible'],
-                        'Score': f"{tm_row['match_score']:.2f}" if tm_row['eligible'] == 'eligible' else "0.00 (rejected)",
+                        # A NOT-EVALUATED RUN IS NOT A REJECTION (the dashboard-
+                        # truthfulness pass): it has no decision and no score,
+                        # and its stored reason is shown verbatim.
+                        'Score': (f"{tm_row['match_score']:.2f}" if tm_row['eligible'] == VERDICT_ELIGIBLE
+                                  else "0.00 (rejected)" if tm_row['eligible'] == VERDICT_NOT_ELIGIBLE
+                                  else f"— (not evaluated: {reason_text(tm_row['eligible'], tm_row.get('not_evaluable_reason'))})"),
                     })
                 
                 run_summary_df = pd.DataFrame(run_summary_rows)
@@ -1345,6 +1440,10 @@ def render_reproducibility_tab(df):
                                 row_data[f'Run {run_idx}'] = '🚫 Not Evaluated (Rejected)'
                                 statuses_across_runs.append('_rejected_')
                                 values_across_runs.append('')
+                            elif len(decision_rows) > 0 and decision_rows[0] not in DEFINITE_VERDICTS:
+                                row_data[f'Run {run_idx}'] = '⚪ No Verdict (not evaluated)'
+                                statuses_across_runs.append('_not_evaluated_')
+                                values_across_runs.append('')
                             else:
                                 row_data[f'Run {run_idx}'] = '—'
                                 statuses_across_runs.append('_missing_')
@@ -1381,7 +1480,9 @@ def render_reproducibility_tab(df):
                     with st.expander("💬 GPT-4o Explanations (per run)", expanded=True):
                         for run_idx in sorted(run_explanations.keys()):
                             decision = run_summary_rows[run_idx - 1]['Decision']
-                            emoji = '✅' if decision == 'eligible' else '❌'
+                            emoji = ('✅' if decision == VERDICT_ELIGIBLE
+                                     else '❌' if decision == VERDICT_NOT_ELIGIBLE
+                                     else '⚪')
                             st.markdown(f"**Run {run_idx}** ({emoji} {decision}):")
                             explanation = run_explanations.get(run_idx, '')
                             if explanation and str(explanation) != 'nan':

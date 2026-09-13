@@ -1223,6 +1223,30 @@ BUCKETS = {
         "modules -- are written by neither of the suite's two writers and are "
         "sha256-compared at the end. It EXECS NOTHING: every plant is a COPY "
         "written to the temp directory and imported from there"),
+    "test_dashboard_truthfulness.py": (
+        _A, None,
+        "ran green with 157 checks -- 157 passed, 0 failed, 0 skipped -- against "
+        "the developer tree, whose production inferences.db is the smoke "
+        "database section 10 reads; on a checkout without that file section 10 "
+        "records SKIPS, never passes. The dashboard-truthfulness pass: "
+        "not-evaluated trial verdicts as their own status with the stored "
+        "reason, first-attempt patient populations chosen before any outcome "
+        "filter, answered-only reproducibility comparisons, and the population "
+        "labels on every fixed figure. Sections 1-5 are pure functions over "
+        "literal frames; 6-9 render oncotriage.dashboard.app:main() and three "
+        "tab functions through AppTest against DISPOSABLE databases built by "
+        "initialize_database() inside a tempfile.mkdtemp it removes and asserts "
+        "gone, with paths._RESOLVED repointed and restored; section 10 renders "
+        "against the database at the recorded location with every "
+        "sqlite3.connect rewritten to mode=ro&immutable=1 and every other "
+        "connect REFUSED, and compares its sha256 before and after. No network "
+        "(measured -- every render runs under a socket guard that RAISES, fired "
+        "once as a control), no keys, no spend, no live Qdrant, no model load, "
+        "no corpus, no git history. NOT in the collision matrix: it writes "
+        "nothing in the repository and the ten package files it reads are "
+        "sha256-compared at the end. It EXECS NOTHING and loads no module by "
+        "location -- every plant is a COPY written to the temp directory and "
+        "imported by name from there"),
     "test_api_call_mode_and_db_health.py": (
         _A, None,
         # MEASURED BOTH WAYS RATHER THAN GUESSED, which is what this field
@@ -1234,7 +1258,7 @@ BUCKETS = {
         # still fails there. That gating shape is
         # tests/test_storage_write_durability.py's, adopted for its reason.
         "ran green in 13s against ONLY the directory skeleton (150 passed, 0 "
-        "failed, 1 skipped) and 151/0/0 against the developer tree: the Stage "
+        "failed, 1 skipped; not re-measured since the dashboard-truthfulness pass added one check) and 152/0/0 against the developer tree: the Stage "
         "5 call mode on the operator surfaces, and the serving-database "
         "refusal at GET /health. No network, no keys, NO SPEND (the API "
         "sections install a stub Qdrant client and a stub MeSH filter through "

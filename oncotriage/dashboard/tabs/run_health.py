@@ -85,6 +85,21 @@ from oncotriage.storage.queries import (
 # viewer of the server, which is what section 6a of
 # tests/test_package_invariants.py exists to catch. Nothing below is mutated.
 
+DEGRADATION_TOTAL_LABEL = "degradation total (mixed units)"
+"""How the SUM of every counter's total is named wherever it is shown.
+
+It was "degradation events", which reads as a count of one kind of thing. It
+adds unlike units -- lab-unit conversions, failed requests, warmup failures --
+so it is a total of totals and says so. The per-counter values are the reading;
+this is only a coarse run-over-run signal."""
+
+DEGRADATION_TOTAL_HELP = (
+    "The SUM of every non-zero degradation counter's total for this run. The "
+    "counters count different things -- a lab-unit conversion, a failed request, "
+    "a warmup failure -- so this sum mixes units and is not a count of any one "
+    "kind of event. Read the per-counter values below."
+)
+
 HEALTH_ICONS = {
     RUN_HEALTH_MEASURED_CLEAN: "✅",
     RUN_HEALTH_DEGRADED: "⚠️",
@@ -163,14 +178,24 @@ def _build_run_table(summary):
             "finalization": as_text(row.finalization),
             "started": as_text(row.started_at),
             "finished": as_text(row.finished_at, "—"),
+            # DISTINCT PATIENTS AND ROWS, BOTH (the dashboard-truthfulness
+            # pass). `patients` was COUNT(*) in the query, so a run with a
+            # resample pass reported its rows as patients; the campaign table on
+            # this same tab already said patients 5 / rows 10 for the smoke run.
             "patients": as_int(row.patients),
-            "errored": as_int(row.errored),
+            "inference rows": as_int(getattr(row, "inference_rows", None)),
+            "errored rows": as_int(row.errored),
             "cost $": round(as_float(row.cost_usd), 4),
             "unpriced rows": as_int(row.rows_with_no_cost),
             "health": f"{_health_icon(row.health_record)} "
                       f"{as_text(row.health_record)}",
             "counters consulted": optional_int_text(row.counters_registered),
-            "degradation events": optional_int_text(row.degradation_events),
+            # A SUM ACROSS COUNTERS OF DIFFERENT UNITS, AND LABELLED AS ONE
+            # (the dashboard-truthfulness pass). Measured on the smoke run: 207
+            # = 124 lab-unit conversions + 73 failed requests + 5 warmup
+            # failures + 3 + 1 + 1. The per-counter values are in the selected
+            # run's breakdown below; this column is only a total of totals.
+            DEGRADATION_TOTAL_LABEL: optional_int_text(row.degradation_events),
             "prompt": as_text(row.llm_classifier_prompt_version, "—"),
             "model": as_text(row.matching_model_configured, "—"),
             # WHICH STAGE 5 ARM, and it belongs beside `model` rather than in
@@ -659,8 +684,9 @@ def _render_selected_run(summary):
         st.metric("Counters consulted",
                   optional_int_text(row["counters_registered"]))
     with col3:
-        st.metric("Degradation events",
-                  optional_int_text(row["degradation_events"]))
+        st.metric("Degradation total (mixed units)",
+                  optional_int_text(row["degradation_events"]),
+                  help=DEGRADATION_TOTAL_HELP)
 
     breakdown = load_run_degradation_data()
     if breakdown.empty:
@@ -728,9 +754,12 @@ def _render_comparison(summary):
             )
         else:
             figure = px.bar(events, x="run", y="events", color="health",
-                            title="Total degradation events per run")
+                            title="Degradation total per run — sum across "
+                                  "counters, mixed units",
+                            labels={"events": DEGRADATION_TOTAL_LABEL})
             figure.update_layout(height=340)
             st.plotly_chart(figure, use_container_width=True)
+            st.caption(DEGRADATION_TOTAL_HELP)
         if dropped:
             st.caption(
                 f"{dropped} run(s) are not on this chart: they have no health "

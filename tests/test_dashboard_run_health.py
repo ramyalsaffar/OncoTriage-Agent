@@ -870,8 +870,11 @@ check("2h  ...newest first, which is what the run list is ordered by",
       (_select.get("options") or ["(absent)"])[0].startswith(
           f"#{max(_RUN_IDS['full'].values())}"), True)
 
+# RELABELLED "total (mixed units)" in the dashboard-truthfulness pass: the
+# figure sums counters of different kinds, and the label says so. The value
+# is unchanged and is still what this check asserts.
 check("2i  the selected run's degradation events come from run_metrics",
-      _metric(_full, "Degradation events"),
+      _metric(_full, "Degradation total (mixed units)"),
       str(sum(v for c, _n, v in _METRIC_SEED["DEGRADED"]
               if c == "degradation")))
 

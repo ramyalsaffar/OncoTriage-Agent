@@ -5907,14 +5907,19 @@ _DASH_FILES = sorted(
 # disagree about which bucket a row falls in -- while the query layer's
 # MODE_NOT_RECORDED_LABEL, which this module imports rather than retypes, is the
 # name File 16's arm table already uses for the same bucket.
+# NINETEEN AFTER THE DASHBOARD-TRUTHFULNESS PASS added populations.py, on the
+# same argument again: every tab asked "which rows is this figure over" and
+# "what is this trial row's verdict", and seven per-tab answers had drifted --
+# a failed Stage 5 call rendered as "Not Eligible" in three places and a
+# resample rerun counted as a second patient in five. One owner, read by all.
 # The number moves whenever a module joins,
 # and it is a NON-DEGENERACY PROBE rather than a claim about the right number of
 # modules -- its job is to say the walk below found files at all, so a scan that
 # silently covered nothing cannot report "[] mutations" and pass.
-check("the dashboard has the eighteen modules the conversion, run-reader, "
-      "campaign and call-mode-labelling passes created (non-degeneracy: a scan "
-      "over an empty file list proves nothing)",
-      len(_DASH_FILES), 18)
+check("the dashboard has the nineteen modules the conversion, run-reader, "
+      "campaign, call-mode-labelling and dashboard-truthfulness passes created "
+      "(non-degeneracy: a scan over an empty file list proves nothing)",
+      len(_DASH_FILES), 19)
 
 _TIER_NAMES = ("MATCH_TIERS", "MATCH_TIER_COLORS")
 check("nothing in the dashboard mutates MATCH_TIERS or MATCH_TIER_COLORS, "
@@ -6159,6 +6164,7 @@ import oncotriage.dashboard.tabs.drift
 import oncotriage.dashboard.tabs.reproducibility
 import oncotriage.dashboard.tabs.run_health
 import oncotriage.dashboard.nullsafe
+import oncotriage.dashboard.populations
 
 heavy = [m for m in ("torch", "transformers", "sentence_transformers", "icd10")
          if m in sys.modules]

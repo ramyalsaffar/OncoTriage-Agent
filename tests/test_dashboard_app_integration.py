@@ -79,6 +79,7 @@ from oncotriage.dashboard import app as _app
 from oncotriage.dashboard import nullsafe as _ns
 from oncotriage.dashboard.tabs import demographics as _demo
 from oncotriage.dashboard.tabs import match_quality as _mq
+from oncotriage.dashboard import populations as _pop
 from oncotriage.dashboard.tabs import patient_explorer as _pe
 from oncotriage.dashboard.tabs import performance as _perf
 from oncotriage.dashboard.tabs import trial_explorer as _te
@@ -189,6 +190,7 @@ _T_START = time.time()
 _WATCHED = {
     "app.py": os.path.abspath(_app.__file__),
     "nullsafe.py": os.path.abspath(_ns.__file__),
+    "populations.py": os.path.abspath(_pop.__file__),
     "patient_explorer.py": os.path.abspath(_pe.__file__),
     "performance.py": os.path.abspath(_perf.__file__),
     "trial_explorer.py": os.path.abspath(_te.__file__),
@@ -1022,13 +1024,22 @@ check_true("6b  ...and the shipped module does print it (the control)",
            "drawn at zero" in _joined(_pe_cap, "caption"))
 
 # P3 -- the unscored trial goes back to classify_trial_score.
+#
+# THE GUARD MOVED TO THE ONE PER-TRIAL CLASSIFIER (the dashboard-truthfulness
+# pass), `populations.trial_display_status`, which the tab now calls. So the
+# plant is two copies: populations with the guard removed, and the tab
+# importing that copy -- the defect, reached through the path the tab uses.
+_pop_p3, _pop_p3_made = _plant(
+    _WATCHED["populations.py"],
+    "        if is_absent(match_score):\n            return TRIAL_STATUS_NO_SCORE\n",
+    "", "pop")
+check("6  [P3] the populations plant matched the shipped source exactly 1 time(s)",
+      _pop_p3_made, 1)
 _p3 = _plant_render_tab(
     "P3 an unscored trial is classified as if it had a score",
     _WATCHED["patient_explorer.py"],
-    """                if is_absent(row.get('match_score')):
-                    return TRIAL_STATUS_NO_SCORE
-""",
-    "",
+    "from oncotriage.dashboard.populations import (display_score, ensure_evaluated,",
+    f"from {_pop_p3} import (display_score, ensure_evaluated,",
     # THE FULL PATIENT, because the unscored trial hangs off it -- the sparse
     # patient has no trial rows at all, so the table this plant is about is
     # never rendered for it and the plant would report as uncaught.
@@ -1079,14 +1090,20 @@ check("6e  ...and the plant takes the whole tab down when rendered, which is "
       "what it did inside main() for every reader",
       _p5_perf["exception"] != [], True)
 
-# P9 -- the Trial Explorer's absence guard is removed.
+# P9 -- the Trial Explorer's absence guard is removed. Same move as P3: the
+# guard is in populations.trial_display_status, so the tab imports a copy of
+# populations with it removed.
+_pop_p9, _pop_p9_made = _plant(
+    _WATCHED["populations.py"],
+    "        if is_absent(match_score):\n            return TRIAL_STATUS_NO_SCORE\n",
+    "", "pop")
+check("6  [P9] the populations plant matched the shipped source exactly 1 time(s)",
+      _pop_p9_made, 1)
 _p9 = _plant_render_tab(
     "P9 the trial explorer classifies an unscored trial",
     _WATCHED["trial_explorer.py"],
-    """        if is_absent(row.get('match_score')):
-            return TRIAL_STATUS_NO_SCORE
-""",
-    "",
+    "from oncotriage.dashboard.populations import (NOT_EVALUATED_CLINICAL_UNCERTAINTY,",
+    f"from {_pop_p9} import (NOT_EVALUATED_CLINICAL_UNCERTAINTY,",
     "render_trial_explorer_tab", _enriched(_UNSCORED_ONLY_DB), "te")
 check("6i  P9 is caught: the tab raises, or reports a verdict for a trial "
       "whose score was never recorded",

@@ -517,11 +517,16 @@ def build_era0(path):
 #     pre-fix     25 / 100 = 25.0%
 # A seed on which the two agree would report the defect as fixed whatever the
 # code did.
+# EVALUATED IS 1 FOR EACH, THE ONE TRIAL ROW EACH PATIENT CARRIES (the
+# dashboard-truthfulness pass). It was 12 and 13 with one trial row apiece,
+# which `populations.annotate_evaluation_state` reads as eleven and twelve
+# trials with no verdict -- an INCOMPLETE evaluation that carries no clinical
+# tier. The tiers checks below are about a COMPLETE evaluation.
 _FUNNEL = [
     # (patient, retrieved, reranked, after_rule, after_quality, filtered,
     #  evaluated, eligible_matches)
-    ("P-A", 200, 50, 30, 20, 12, 12, 2),
-    ("P-B", 200, 50, 30, 20, 13, 13, 0),
+    ("P-A", 200, 50, 30, 20, 12, 1, 2),
+    ("P-B", 200, 50, 30, 20, 13, 1, 0),
 ]
 _EXPECTED_RETRIEVED = sum(r[1] for r in _FUNNEL)
 _EXPECTED_RERANKED = sum(r[2] for r in _FUNNEL)
@@ -1013,9 +1018,20 @@ check_true("4b  ...and is NOT the pre-fix figure (non-degeneracy: the two "
 check("4c  the retrieved-to-reranked tile is unchanged in formula",
       at_(_ov["metrics"], "Retrieved → Reranked", ("(absent)", None))[0],
       f"{_EXPECTED_RERANKED / _EXPECTED_RETRIEVED * 100:.1f}%")
+# THE EVALUATED-TO-ELIGIBLE TILE DIVIDES BY TRIALS WITH A USABLE RESULT,
+# INCLUDING CLINICAL UNCERTAINTY (the dashboard-truthfulness pass), so its
+# expectation is derived from the seed's TRIAL ROWS rather than from
+# eligible_matches / candidates_evaluated -- which counted every trial sent,
+# whether or not it produced a usable result. The discriminating cases -- failed
+# calls excluded, a declared uncertainty kept -- are
+# tests/test_dashboard_truthfulness.py's.
+from oncotriage.storage.queries import NOT_EVALUABLE_REASONS_DECLARED as _DECLARED_REASONS
+_USABLE_ROWS = int((_matches["eligible"].isin(["eligible", "not_eligible"])
+                    | ((_matches["eligible"] == "not_evaluable")
+                       & _matches["not_evaluable_reason"].isin(_DECLARED_REASONS))).sum())
 check("4c  ...and the evaluated-to-eligible tile",
       at_(_ov["metrics"], "Evaluated → Eligible", ("(absent)", None))[0],
-      f"{_EXPECTED_ELIGIBLE_COL / _EXPECTED_EVALUATED * 100:.1f}%")
+      f"{int((_matches['eligible'] == 'eligible').sum()) / _USABLE_ROWS * 100:.1f}%")
 
 # --- A ZERO DENOMINATOR AND AN UNRECORDED MEASUREMENT -------------------
 _ZERO_DB = os.path.join(_TMP, "zero_denominator.db")
@@ -1147,8 +1163,10 @@ check_true("5f  ...and neither reports the column answer (two surfaces "
            "that proves which answer they agreed on)",
            _ov_any != f"{_COLUMN_ANY_MATCH_RATE:.1f}%")
 
+# "N of M complete" since the dashboard-truthfulness pass: the tile's
+# population is complete first-attempt evaluations and its delta says so.
 check("5g  the Overview tile's patient count comes from the same owner",
-      at_(_ov["metrics"], "Any Match", (None, "(absent)"))[1], "2 patients")
+      at_(_ov["metrics"], "Any Match", (None, "(absent)"))[1], "2 of 2 complete")
 
 check("5h  the per-group match rates aggregate the SAME predicate, so the "
       "average line is a mean of the bars it is drawn across",
@@ -1349,8 +1367,8 @@ if _trial_selects:
                    if s.key == "trial_explorer_status_filter"]
         if _status:
             check_true("7a  ...and the 'No Score Recorded' option is offered",
-                       _te.TRIAL_STATUS_NO_SCORE in _status[0].options)
-            _status[0].select(_te.TRIAL_STATUS_NO_SCORE).run()
+                       _tiers.TRIAL_STATUS_NO_SCORE in _status[0].options)
+            _status[0].select(_tiers.TRIAL_STATUS_NO_SCORE).run()
             _after = _capture(_te_at)
             check("7a  ...and selecting it renders rows rather than the "
                   "'no patients match' message, so the filter is REACHABLE "
@@ -1595,7 +1613,9 @@ if _c4:
 
 # --- C5: TWO OWNERS FOR ANY MATCH -----------------------------------------
 _c5 = _plant(_WATCHED["demographics.py"], [(
-    "    overall_match_rate = any_match_rate(df)",
+    # Re-anchored in the dashboard-truthfulness pass: the tile now reads the
+    # one population owner, populations.patient_outcomes.
+    "    overall_match_rate = _outcomes['any_match_rate']",
     "    overall_match_rate = (df['eligible_matches'] > 0).mean() * 100", 1)],
     "demographics_twoowners")
 if _c5:

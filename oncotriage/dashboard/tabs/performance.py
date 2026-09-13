@@ -13,6 +13,14 @@ from oncotriage.config import MAX_TRIALS_FOR_EVALUATION
 from oncotriage.dashboard import call_mode
 from oncotriage.dashboard.data import load_trial_matches_data
 from oncotriage.dashboard.nullsafe import is_absent
+from oncotriage.dashboard.populations import (
+    DEFINITE_VERDICT_LABEL,
+    NOT_EVALUATED_CLINICAL_UNCERTAINTY,
+    NOT_EVALUATED_NO_USABLE_VERDICT,
+    first_attempts,
+    is_definite_verdict,
+    not_evaluated_kind,
+)
 from oncotriage.dashboard.tiers import (MATCH_TIER_COLORS, TRIAL_STATUS_NO_SCORE,
                                         classify_trial_score)
 # THE RATE IS NOT REIMPLEMENTED HERE. oncotriage/monitoring/drift.py already
@@ -209,9 +217,9 @@ def _render_ecog_availability(df):
         _scored = int(df['ecog_value'].notna().sum()) \
             if 'ecog_value' in df.columns else 0
         st.metric(
-            "Patients with a Usable Score",
+            "Rows with a Usable Score",
             f"{_scored:,}",
-            help="Rows carrying an actual ECOG grade. NOTE: a grade of 0 is "
+            help="Inference ROWS carrying an actual ECOG grade (a re-run patient is several rows). NOTE: a grade of 0 is "
                  "counted here — ECOG 0 is 'fully active', the most eligible a "
                  "patient can be, and treating it as missing is the single "
                  "most common way to misread this column."
@@ -279,7 +287,7 @@ def _render_ecog_availability(df):
             if pd.isna(path) else str(path)
         rows.append({
             "Selection Path": label,
-            "Patients": int(n),
+            "Rows": int(n),
             "% of Rows": round(n / total * 100, 1) if total else 0.0,
             "What it means": _PATH_MEANING.get(
                 label, "unrecognised path — not one of the five this pipeline "
@@ -348,6 +356,20 @@ def render_performance_tab(df):
 
     st.header("⚡ Pipeline Performance")
 
+    # LATENCY PER PATIENT IS MEASURED OVER FIRST ATTEMPTS (the dashboard-
+    # truthfulness pass). The median, p95 and throughput were over every ROW,
+    # so the fast-failing errored retries pulled the median down -- measured on
+    # the smoke run, 140.4s over rows against 157.0s over first attempts -- and
+    # the slowest-patients table ranked each patient twice. `pdf` is one row per
+    # patient per campaign, errored first attempts included: their latency is
+    # real, and the table below names their state.
+    pdf = first_attempts(df)
+    _fa_label = (f"first attempt per patient — {len(pdf):,} of {len(df):,} "
+                 f"inference row(s)")
+
+    def _seconds(value):
+        return "—" if pd.isna(value) else f"{value:.1f}s"
+
     # Latency Overview
     st.subheader("Latency Distribution")
     
@@ -355,21 +377,21 @@ def render_performance_tab(df):
     
     with col1:
         fig_latency = px.histogram(
-            df,
+            pdf,
             x='total_time',
             nbins=30,
             labels={'total_time': 'Total Time (seconds)'},
             template='plotly_white',
-            title='Total Pipeline Latency'
+            title='Total Pipeline Latency (first attempt per patient)'
         )
         fig_latency.add_vline(
-            x=df['total_time'].median(),
+            x=pdf['total_time'].median(),
             line_dash="dash",
             line_color="red"
         )
         fig_latency.add_annotation(
-            x=df['total_time'].median(), y=1, yref="paper",
-            text=f"Median: {df['total_time'].median():.1f}s",
+            x=pdf['total_time'].median(), y=1, yref="paper",
+            text=f"Median: {_seconds(pdf['total_time'].median())}",
             showarrow=True, arrowhead=0, ax=45, ay=-25,
             font=dict(size=11, color="red"),
             bgcolor="white", borderpad=2
@@ -383,21 +405,21 @@ def render_performance_tab(df):
     
     with col2:
         fig_llm_classifier = px.histogram(
-            df,
+            pdf,
             x='llm_classifier_evaluation_time',
             nbins=30,
             labels={'llm_classifier_evaluation_time': f'{_judge} Time (seconds)'},
             template='plotly_white',
-            title=f'{_judge} Evaluation Latency'
+            title=f'{_judge} Evaluation Latency (first attempt per patient)'
         )
         fig_llm_classifier.add_vline(
-            x=df['llm_classifier_evaluation_time'].median(),
+            x=pdf['llm_classifier_evaluation_time'].median(),
             line_dash="dash",
             line_color="red"
         )
         fig_llm_classifier.add_annotation(
-            x=df['llm_classifier_evaluation_time'].median(), y=1, yref="paper",
-            text=f"Median: {df['llm_classifier_evaluation_time'].median():.1f}s",
+            x=pdf['llm_classifier_evaluation_time'].median(), y=1, yref="paper",
+            text=f"Median: {_seconds(pdf['llm_classifier_evaluation_time'].median())}",
             showarrow=True, arrowhead=0, ax=45, ay=-25,
             font=dict(size=11, color="red"),
             bgcolor="white", borderpad=2
@@ -415,30 +437,31 @@ def render_performance_tab(df):
     with col1:
         st.metric(
             "Median Total Time",
-            f"{df['total_time'].median():.1f}s",
-            help="Median end-to-end pipeline latency"
+            _seconds(pdf['total_time'].median()),
+            help=f"Median end-to-end pipeline latency, {_fa_label}."
         )
     
     with col2:
         st.metric(
             "95th Percentile",
-            f"{df['total_time'].quantile(0.95):.1f}s",
-            help="95% of patients complete within this time"
+            _seconds(pdf['total_time'].quantile(0.95)),
+            help=f"95% of patients complete within this time, {_fa_label}."
         )
     
     with col3:
         st.metric(
             "Max Latency",
-            f"{df['total_time'].max():.1f}s",
-            help="Slowest patient processing time"
+            _seconds(pdf['total_time'].max()),
+            help=f"Slowest patient processing time, {_fa_label}."
         )
 
     with col4:
-        throughput = 3600 / df['total_time'].median() if df['total_time'].median() > 0 else 0
+        _median = pdf['total_time'].median()
+        throughput = 3600 / _median if not pd.isna(_median) and _median > 0 else 0
         st.metric(
             "Throughput",
             f"{throughput:.0f}/hour",
-            help="Estimated sequential patients per hour (3600 / median latency)"
+            help=f"Estimated sequential patients per hour (3600 / median latency), {_fa_label}."
         )
     
     st.markdown("---")
@@ -525,6 +548,7 @@ def render_performance_tab(df):
     st.plotly_chart(fig_trend, use_container_width=True)
     
     st.caption(
+        "Per inference ROW, re-runs and retries included. "
         "Daily median pipeline latency with P25–P75 range. "
         "Gray bars show daily inference volume. "
         "Rising latency may indicate API degradation, increased trial database size, or more complex patient profiles."
@@ -600,6 +624,8 @@ def render_performance_tab(df):
         fig_max.update_xaxes(range=[0, max(max_times) * 1.2])
         st.plotly_chart(fig_max, use_container_width=True)
     
+    st.caption("Stage latencies above are per inference ROW, re-runs and retries included.")
+
     st.markdown("---")
     
     # Slowest Patients Table
@@ -650,30 +676,36 @@ def render_performance_tab(df):
     # `oncotriage/dashboard/tabs/overview.py:_retention` makes for a zero
     # denominator: "are there usable measurements" is the question, and a
     # predicate written against a dtype answers it for one of the two shapes.
-    _timings = pd.to_numeric(df['total_time'], errors='coerce')
+    # ONE ROW PER PATIENT (the dashboard-truthfulness pass): ranked over first
+    # attempts, with the evaluation state named on each row, because an errored
+    # attempt ranked beside a complete one is a different measurement.
+    _slow_frame = pdf
+    _timings = pd.to_numeric(_slow_frame['total_time'], errors='coerce')
     _measured_mask = _timings.notna()
     _measured = int(_measured_mask.sum())
-    _unmeasured = int(len(df) - _measured)
+    _unmeasured = int(len(_slow_frame) - _measured)
 
     if _measured == 0:
         st.info(
             f"**Timing unavailable.** No patient in this selection recorded a "
             f"`total_time`, so there is no latency to rank -- all "
-            f"{len(df):,} row(s) are unmeasured. That is not a ranking of "
+            f"{len(_slow_frame):,} first attempt(s) are unmeasured. That is not a ranking of "
             f"zero: a row with no timing is one nothing was measured for, and "
             f"showing it at rank 1 would assert a measurement that was never "
             f"taken."
         )
     else:
-        slowest = df[_measured_mask].nlargest(10, 'total_time').copy()
+        slowest = _slow_frame[_measured_mask].nlargest(10, 'total_time').copy()
         # ANNOTATE BEFORE SLICING, and from a COPY: `annotate` derives the display
         # bucket through the same mapping every other panel groups by, including
         # the column-absent case, so a database predating era 3 renders the
         # not-recorded bucket here rather than raising a KeyError.
-        slowest = call_mode.annotate(slowest)[_slow_cols + ['call_mode_label']]
+        _state_col = ['evaluation_state'] if 'evaluation_state' in slowest.columns else []
+        slowest = call_mode.annotate(slowest)[_slow_cols + ['call_mode_label'] + _state_col]
         slowest.insert(0, 'Rank', range(1, len(slowest) + 1))
 
-        slowest.columns = ['Rank'] + _slow_names + ['Call Mode']
+        slowest.columns = (['Rank'] + _slow_names + ['Call Mode']
+                           + (['Evaluation'] if _state_col else []))
 
         slowest['Total Time (s)'] = slowest['Total Time (s)'].round(1)
         slowest[f'{_judge} Time (s)'] = slowest[f'{_judge} Time (s)'].round(1)
@@ -689,10 +721,11 @@ def render_performance_tab(df):
         # identical on screen, and only one of them is a ranking of the cohort.
         st.caption(
             f"Top {min(10, _measured)} patients by total end-to-end pipeline "
-            f"latency, ranked over the {_measured:,} of {len(df):,} row(s) that "
+            f"latency, one row per patient ({_fa_label}), ranked over the "
+            f"{_measured:,} of {len(_slow_frame):,} first attempt(s) that "
             f"recorded a `total_time`. Rank 1 = slowest. High latency typically "
             f"correlates with more trials evaluated or larger {_judge} output."
-            + (f" **{_unmeasured:,} row(s) recorded no timing and are not "
+            + (f" **{_unmeasured:,} first attempt(s) recorded no timing and are not "
                f"ranked** -- they are excluded, not placed last."
                if _unmeasured else "")
         )
@@ -734,6 +767,12 @@ def render_performance_tab(df):
             # with a 90%-confirmed trial would put two different findings on the
             # same point of the rerank-score axis.
             def classify_match(row):
+                # A TRIAL WITHOUT A DEFINITE VERDICT IS NOT A REJECTION (the dashboard-
+                # truthfulness pass). This returned 'Not Eligible' for every
+                # non-eligible row, so the strip plot drew 78 "Not Eligible"
+                # dots on the smoke run of which 64 were failed calls.
+                if not is_definite_verdict(row['eligible']):
+                    return _NO_DEFINITE_VERDICT
                 if row['eligible'] != 'eligible':
                     return 'Not Eligible'
                 # ABSENCE FIRST -- see TRIAL_STATUS_NO_SCORE in tiers.py.
@@ -745,7 +784,37 @@ def render_performance_tab(df):
                 tier = classify_trial_score(row['match_score'])
                 return 'Eligible' if tier == 'Full Match' else tier
 
+            _NO_DEFINITE_VERDICT = 'No definite eligibility verdict'
             tm_perf['match_status'] = tm_perf.apply(classify_match, axis=1)
+            # EXCLUDED AND COUNTED, on the unscored rule below: a trial with no
+            # definite eligibility verdict has no outcome to relate a rerank score to, and it must
+            # not sit in the "Trials Sent" denominator as though it were one.
+            _no_definite = int((tm_perf['match_status'] == _NO_DEFINITE_VERDICT).sum())
+            if _no_definite:
+                # THE KINDS ARE NAMED APART. A row the model DECLARED not
+                # evaluable has no eligibility outcome either, so it leaves this
+                # panel with the failed calls -- but it is a clinical result, not
+                # an infrastructure failure, and one sentence calling all of them
+                # "for example a failed call" said otherwise. The stored reason
+                # decides, through the one reader of it.
+                _excluded = tm_perf[tm_perf['match_status'] == _NO_DEFINITE_VERDICT]
+                _kinds = [not_evaluated_kind(r) for r in (
+                    _excluded['not_evaluable_reason']
+                    if 'not_evaluable_reason' in _excluded.columns
+                    else [None] * len(_excluded))]
+                _n_failed = sum(k == NOT_EVALUATED_NO_USABLE_VERDICT for k in _kinds)
+                _n_uncertain = sum(k == NOT_EVALUATED_CLINICAL_UNCERTAINTY
+                                   for k in _kinds)
+                tm_perf = tm_perf[tm_perf['match_status'] != _NO_DEFINITE_VERDICT]
+                st.caption(
+                    f"⚠️ {_no_definite} trial row(s) in the current selection have "
+                    f"no {DEFINITE_VERDICT_LABEL} — {_n_failed} with no usable verdict (for example "
+                    f"a failed call), {_n_uncertain} declared clinically uncertain "
+                    f"by the model, {_no_definite - _n_failed - _n_uncertain} with "
+                    f"no classifiable reason — and are EXCLUDED from every chart "
+                    f"and denominator in this panel: none has an eligibility "
+                    f"outcome to relate a score to. None is counted as not-eligible."
+                )
             # UNSCORED TRIALS ARE EXCLUDED FROM THIS PANEL AND COUNTED, NOT
             # GIVEN A COLOUR. Every chart below relates the cross-encoder score
             # to the OUTCOME -- recall against a threshold, density by outcome,
@@ -824,6 +893,12 @@ def render_performance_tab(df):
                 try:
                     # Safe score threshold: lowest threshold where recall >= 95%
                     RECALL_FLOOR = 95.0
+                    # PER INFERENCE ROW, AND NAMED SO (the dashboard-truthfulness
+                    # pass). The annotation read "trials/patient" and divided by
+                    # inference rows. The numerator counts trials across every
+                    # row, re-runs included, so the honest denominator is rows
+                    # too; dividing by distinct patients instead would count a
+                    # re-run patient's trials twice over one patient.
                     patients_count = tm_perf['inference_id'].nunique()
                     safe_threshold = None
                     safe_trials_sent = None
@@ -860,7 +935,7 @@ def render_performance_tab(df):
                             y=safe_recall,
                             text=(
                                 f"✅ Safe score cutoff (≥95% recall):<br>"
-                                f"~{avg_safe_trials} trials/patient avg<br>"
+                                f"~{avg_safe_trials} trials per inference row avg<br>"
                                 f"Saves {cost_saved_safe}% {_judge} cost"
                             ),
                             showarrow=True,

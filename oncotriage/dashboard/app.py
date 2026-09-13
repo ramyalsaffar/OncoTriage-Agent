@@ -28,6 +28,7 @@ import streamlit as st
 from oncotriage.config import Project_Name
 from oncotriage.constants import NOT_FOR_CLINICAL_USE
 from oncotriage.dashboard.data import (
+    RUN_TRACKING_PRESENT,
     SCHEMA_COLUMNS_MISSING,
     SCHEMA_NO_DATABASE,
     SCHEMA_READY,
@@ -35,8 +36,12 @@ from oncotriage.dashboard.data import (
     SCHEMA_UNREADABLE,
     dashboard_schema_readiness,
     load_inferences_data,
+    load_run_campaign_data,
+    load_run_tracking_availability,
     load_trial_matches_data,
 )
+from oncotriage.dashboard.populations import (annotate_evaluation_state,
+                                              attach_campaign_key)
 from oncotriage.dashboard.sidebar import render_sidebar
 from oncotriage.dashboard.tabs.cost_tokens import render_cost_tokens_tab
 from oncotriage.dashboard.tabs.demographics import render_patient_demographics_tab
@@ -203,6 +208,19 @@ def _render_schema_diagnosis(readiness):
         else path + ".archive"))
 
 
+def _campaign_frame():
+    """The campaign stitch frame, or ``None`` when this database cannot answer.
+
+    Asked through the availability loader FIRST: ``load_run_campaign_data``
+    reports a failure with ``st.error``, and a database written before run
+    tracking is the ordinary state of an older file, not a fault to paint red
+    on every page. With no frame, every run keys as its own unstitched campaign.
+    """
+    if load_run_tracking_availability()["availability"] != RUN_TRACKING_PRESENT:
+        return None
+    return load_run_campaign_data()
+
+
 def main():
     """Main application."""
     
@@ -283,7 +301,15 @@ def main():
     # over the unfiltered frame instead of the filtered one, on a table this
     # dashboard already reads whole.
     trial_matches = load_trial_matches_data()
+    # THE EVALUATION STATE FIRST, THEN THE TIERS (the dashboard-truthfulness
+    # pass). `enrich_match_tiers` reads `evaluation_state` to put an errored or
+    # verdict-less row in 'Incomplete Evaluation' instead of 'No Match', so the
+    # state has to exist when it runs. The campaign key is attached here too,
+    # over the WHOLE frame, so the sidebar can designate first attempts per
+    # campaign without reading the database itself.
+    df = annotate_evaluation_state(df, trial_matches)
     df = enrich_match_tiers(df, trial_matches)
+    df = attach_campaign_key(df, _campaign_frame())
 
     filtered_df = render_sidebar(df)
     

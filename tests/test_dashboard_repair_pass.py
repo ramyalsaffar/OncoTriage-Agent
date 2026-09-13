@@ -448,8 +448,15 @@ _SAVED_RESOLVED = _paths._RESOLVED.get("inferences_path")
 
 
 def _insert_patient(cur, pid, timestamp, eligible_matches, total_time=20.0,
-                    age=60):
-    """One inference row. ``eligible_matches`` and ``total_time`` may be None."""
+                    age=60, evaluated=12):
+    """One inference row. ``eligible_matches`` and ``total_time`` may be None.
+
+    ``evaluated`` is ``candidates_evaluated``. It defaults to the 12 every
+    section used before the dashboard-truthfulness pass; a seed whose trial rows
+    are the evaluation must pass its real count, because
+    ``populations.annotate_evaluation_state`` reads fewer trial rows than
+    trials evaluated as MISSING VERDICTS -- an incomplete evaluation.
+    """
     cur.execute(
         "INSERT INTO inferences (patient_id, timestamp, age, sex, race, "
         "ethnicity, primary_condition, condition_count, medication_count, "
@@ -462,7 +469,7 @@ def _insert_patient(cur, pid, timestamp, eligible_matches, total_time=20.0,
         "rule_filter_time, matching_model, error) VALUES "
         "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (pid, timestamp, age, "female", "White", "Not Hispanic or Latino",
-         "Breast cancer", 4, 2, 200, 50, 30, 20, 12, 12, eligible_matches,
+         "Breast cancer", 4, 2, 200, 50, 30, 20, 12, evaluated, eligible_matches,
          total_time, 0.10, 9000, 900, 5.0, 0.1, 1.0, 2.0, 0.3,
          "gpt-5.6-terra", ""))
     return cur.lastrowid
@@ -497,10 +504,16 @@ _DIVERGENCE_DB = os.path.join(_TMP, "divergence.db")
 _quiet_initialize(_DIVERGENCE_DB)
 _conn = sqlite3.connect(_DIVERGENCE_DB)
 _cur = _conn.cursor()
+# THE EVALUATED COUNTS MATCH THE TRIAL ROWS (the dashboard-truthfulness pass).
+# With the old constant 12, each patient had 11 trials evaluated and no verdict
+# stored, which main() now reads as an INCOMPLETE evaluation -- every patient
+# left both clinical selections for the third, Incomplete, one. That is the
+# rule working on a seed that never meant to model missing verdicts; the
+# three-way partition is covered by tests/test_dashboard_truthfulness.py.
 _ids = {
-    _P_AGREE: _insert_patient(_cur, _P_AGREE, "2026-08-01 10:00:00", 2, 30.0, 50),
-    _P_COLZERO: _insert_patient(_cur, _P_COLZERO, "2026-08-02 10:00:00", 0, 20.0, 60),
-    _P_COLNULL: _insert_patient(_cur, _P_COLNULL, "2026-08-03 10:00:00", None, 10.0, 70),
+    _P_AGREE: _insert_patient(_cur, _P_AGREE, "2026-08-01 10:00:00", 2, 30.0, 50, evaluated=1),
+    _P_COLZERO: _insert_patient(_cur, _P_COLZERO, "2026-08-02 10:00:00", 0, 20.0, 60, evaluated=1),
+    _P_COLNULL: _insert_patient(_cur, _P_COLNULL, "2026-08-03 10:00:00", None, 10.0, 70, evaluated=0),
 }
 _insert_trial(_cur, _ids[_P_AGREE], "NCT-A", "Trial A", score=1.0)
 _insert_trial(_cur, _ids[_P_COLZERO], "NCT-B", "Trial B", score=0.5)
@@ -776,8 +789,10 @@ check("3b  the tab renders with every timing NULL -- before this it raised "
       "inside main(), taking all ten tabs down", _allnull_cap["exception"], [])
 check_true("3b  ...and says TIMING UNAVAILABLE rather than drawing a ranking",
            any("Timing unavailable" in i for i in _allnull_cap["info"]))
-check_true("3b  ...naming how many rows are unmeasured",
-           any("3 row(s) are unmeasured" in i or "3 row(s)" in i
+# FIRST ATTEMPTS, NOT ROWS (the dashboard-truthfulness pass): the ranking is
+# one row per patient now, and the count names that unit.
+check_true("3b  ...naming how many first attempts are unmeasured",
+           any("3 first attempt(s) are unmeasured" in i
                for i in _allnull_cap["info"]))
 
 # THE SECOND ALL-UNMEASURED SHAPE: float64 all-NaN, which did NOT raise and
@@ -842,9 +857,9 @@ else:
 _partial_caption = "\n".join(_partial_cap["caption"])
 check_true("3g  the caption STATES the unmeasured count -- a ranking over 4 of "
            "9 and a ranking over 4 of 4 look identical on screen",
-           f"{_UNMEASURED_N:,} row(s) recorded no timing" in _partial_caption)
+           f"{_UNMEASURED_N:,} first attempt(s) recorded no timing" in _partial_caption)
 check_true("3g  ...and states the denominator it ranked over",
-           f"{len(_MEASURED_TIMES):,} of {len(_PARTIAL):,} row(s)"
+           f"{len(_MEASURED_TIMES):,} of {len(_PARTIAL):,} first attempt(s)"
            in _partial_caption)
 
 # --- FULLY MEASURED: NO EXCLUSION CLAUSE --------------------------------
@@ -867,7 +882,7 @@ check_true("3h  ...and says nothing about excluded rows, because there are "
            "would satisfy 3g for free)",
            "recorded no timing" not in _full_caption)
 check_true("3h  ...while still stating the denominator",
-           f"{len(_MEASURED_TIMES):,} of {len(_FULL):,} row(s)" in _full_caption)
+           f"{len(_MEASURED_TIMES):,} of {len(_FULL):,} first attempt(s)" in _full_caption)
 
 
 #------------------------------------------------------------------------------
@@ -948,7 +963,9 @@ else:
                any(_RECORDED_TITLE in l and "NCT-MIXED" in l for l in _labels))
     check_true("4e  ...and the mixed trial's patient count is its TRUE one, "
                "which the pre-fix grouping halved",
-               any("NCT-MIXED" in l and "(2 patients)" in l for l in _labels))
+               # Since the dashboard-truthfulness pass the selector counts
+               # patients with a DEFINITE ELIGIBILITY VERDICT and names the rest.
+               any("NCT-MIXED" in l and "(2 with a definite eligibility verdict" in l for l in _labels))
 
     # --- EVERY PATIENT ROW IS REACHABLE UNDER THE ONE ENTRY --------------
     for _nct, _expected_rows in (("NCT-NULLT", 2), ("NCT-MIXED", 2)):
@@ -1119,7 +1136,7 @@ def _top_table(cap):
     for frame in cap["dataframe_objects"]:
         if (isinstance(frame, pd.DataFrame)
                 and "NCT ID" in frame.columns
-                and "Match Count" in frame.columns):
+                and "Patients Matched" in frame.columns):
             return frame
     return None
 
@@ -1131,7 +1148,9 @@ if _top is None:
 else:
     check("4h  it carries the five columns the panel names, in order",
           list(_top.columns),
-          ["NCT ID", "Trial", "Match Count", "Avg Score", "Unconfirmed"])
+          # "Patients Matched" since the dashboard-truthfulness pass: the
+          # count is DISTINCT patients, and the header says so.
+          ["NCT ID", "Trial", "Patients Matched", "Avg Score", "Unconfirmed"])
     check("4i  every eligible trial is ranked, the untitled ones included",
           sorted(_top["NCT ID"]), sorted(_MQ_TRUTH))
     check("4i  ...each EXACTLY ONCE",
@@ -1146,8 +1165,8 @@ else:
             fail(f"4j  {_nct} is absent from the rendered ranking",
                  "its displayed counts cannot be checked")
             continue
-        check(f"4j  {_nct}: the DISPLAYED Match Count is its constructed "
-              f"known truth", int(_row["Match Count"]), _count)
+        check(f"4j  {_nct}: the DISPLAYED Patients Matched is its constructed "
+              f"known truth", int(_row["Patients Matched"]), _count)
         check(f"4j  {_nct}: the DISPLAYED Unconfirmed count is too",
               int(_row["Unconfirmed"]), _unconf)
         if _pct is None:
@@ -1234,10 +1253,13 @@ print("=" * 74)
 # --- C1: THE THIRD DEFINITION RESTORED, BOTH SELECTIONS -------------------
 _c1 = _plant(_WATCHED["sidebar.py"], [(
     """    if match_tier_available and match_status_option != MATCH_FILTER_ALL:
-        _any_match = any_match_series(filtered_df)
-        filtered_df = filtered_df[
-            _any_match if match_status_option == MATCH_FILTER_ANY
-            else ~_any_match]""",
+        if match_status_option == MATCH_FILTER_ANY:
+            _mask = any_match_series(filtered_df)
+        elif match_status_option == MATCH_FILTER_NONE:
+            _mask = filtered_df['match_tier'] == MATCH_TIER_NO_MATCH
+        else:
+            _mask = filtered_df['match_tier'] == MATCH_TIER_INCOMPLETE
+        filtered_df = filtered_df[_mask]""",
     """    if match_status_option == MATCH_FILTER_ANY:
         filtered_df = filtered_df[filtered_df['eligible_matches'] > 0]
     elif match_status_option == MATCH_FILTER_NONE:
@@ -1282,8 +1304,8 @@ if _c1:
 # reproduce the defect reports a working guard as caught for the wrong reason.
 _c2 = _plant(_WATCHED["performance.py"], [
     ("    if _measured == 0:", "    if False:", 1),
-    ("        slowest = df[_measured_mask].nlargest(10, 'total_time').copy()",
-     "        slowest = df.nlargest(10, 'total_time').copy()", 1),
+    ("        slowest = _slow_frame[_measured_mask].nlargest(10, 'total_time').copy()",
+     "        slowest = _slow_frame.nlargest(10, 'total_time').copy()", 1),
 ], "perf_noguard")
 if _c2:
     _c2_cap, _, _ = render_tab(_c2, "render_performance_tab", _ALLNULL,
@@ -1305,8 +1327,8 @@ if _c2:
 
 # --- C3: THE UNMEASURED ROWS BACK IN THE RANKING -------------------------
 _c3 = _plant(_WATCHED["performance.py"], [(
-    "        slowest = df[_measured_mask].nlargest(10, 'total_time').copy()",
-    "        slowest = df.nlargest(10, 'total_time').copy()", 1)],
+    "        slowest = _slow_frame[_measured_mask].nlargest(10, 'total_time').copy()",
+    "        slowest = _slow_frame.nlargest(10, 'total_time').copy()", 1)],
     "perf_unfiltered")
 if _c3:
     _c3_cap, _, _ = render_tab(_c3, "render_performance_tab", _PARTIAL,
@@ -1334,13 +1356,18 @@ if _c4:
     check("C4  WITH the old grouping, the all-NULL-title trial DISAPPEARS from "
           "the selector -- the defect, reproduced",
           any("NCT-NULLT" in l for l in _labels_c4), False)
-    check("C4  ...and the mixed trial is undercounted",
-          any("NCT-MIXED" in l and "(1 patients)" in l for l in _labels_c4),
+    # THE UNDERCOUNT NOW SURFACES AS A CONTRADICTION (the dashboard-
+    # truthfulness pass). The definite-verdict count is derived per nct_id and
+    # does not pass through the grouping, so the planted split undercounts only
+    # the TOTAL -- and "without" = total - definite goes negative. A label
+    # carrying an impossible count is the old defect, still visible.
+    check("C4  ...and the mixed trial is undercounted (a negative 'without' count)",
+          any("NCT-MIXED" in l and "· -1 without" in l for l in _labels_c4),
           True)
     check_true("C4  CLEAN CONTROL: the shipped tab shows all three and counts "
                "the mixed one correctly",
                len(_labels) == 3
-               and any("NCT-MIXED" in l and "(2 patients)" in l
+               and any("NCT-MIXED" in l and "(2 with a definite eligibility verdict" in l
                        for l in _labels))
 
 # --- C5: A SPLIT ENTRY, WHICH IS THE OTHER WAY TO GET IT WRONG -----------
@@ -1350,10 +1377,8 @@ if _c4:
 # mixed trial into two selector entries -- one titled, one labelled -- which
 # is the defect the single-entry requirement exists to forbid.
 _c5 = _plant(_WATCHED["trial_explorer.py"], [
-    ("                                        classify_trial_score, "
-     "display_trial_title)",
-     "                                        classify_trial_score, "
-     "display_trial_title,\n"
+    ("                                        display_trial_title)",
+     "                                        display_trial_title,\n"
      "                                        TRIAL_MISSING_TITLE_LABEL)", 1),
     ("""    trial_summary = filtered_matches.groupby('nct_id').agg(
         trial_title=('trial_title', display_trial_title),
@@ -1385,9 +1410,9 @@ if _c5:
 _c6 = _plant(_WATCHED["match_quality.py"], [(
     """                top = elig.groupby('nct_id').agg(
                     trial_title=('trial_title', display_trial_title),
-                    match_count=('inference_id', 'count'),""",
+                    match_count=('patient_id', 'nunique'),""",
     """                top = elig.groupby(['nct_id', 'trial_title']).agg(
-                    match_count=('inference_id', 'count'),""", 1)],
+                    match_count=('patient_id', 'nunique'),""", 1)],
     "mq_oldgroup")
 if _c6:
     _at_c6, _, _ = render_tab(_c6, "render_match_quality_tab", _MQ, _MQ_DB,
@@ -1405,7 +1430,7 @@ if _c6:
           len([v for v in _ids_c6 if v == "NCT-Q-BLANK"]), 2)
     check("C6  ...and the mixed trial is ranked on its ONE titled row",
           int(_top_c6[_top_c6["NCT ID"] == "NCT-Q-MIXED"]
-              ["Match Count"].iloc[0]) if _top_c6 is not None else -1, 1)
+              ["Patients Matched"].iloc[0]) if _top_c6 is not None else -1, 1)
     check("C6  ...with an Avg Score of 100% where the truth is 25%",
           int(_top_c6[_top_c6["NCT ID"] == "NCT-Q-MIXED"]
               ["Avg Score"].iloc[0]) if _top_c6 is not None else -1, 100)
@@ -1413,7 +1438,7 @@ if _c6:
                "ONCE and gets the mixed one's three numbers right",
                _top is not None
                and sorted(_top["NCT ID"]) == sorted(_MQ_TRUTH)
-               and (int(_by_id["NCT-Q-MIXED"]["Match Count"]),
+               and (int(_by_id["NCT-Q-MIXED"]["Patients Matched"]),
                     int(_by_id["NCT-Q-MIXED"]["Avg Score"]),
                     int(_by_id["NCT-Q-MIXED"]["Unconfirmed"])) == (4, 25, 3))
 
@@ -1427,13 +1452,13 @@ if _c6:
 _c7 = _plant(_WATCHED["match_quality.py"], [(
     """                top = elig.groupby('nct_id').agg(
                     trial_title=('trial_title', display_trial_title),
-                    match_count=('inference_id', 'count'),""",
+                    match_count=('patient_id', 'nunique'),""",
     """                elig['trial_title'] = elig['trial_title'].fillna(
                     TRIAL_MISSING_TITLE_LABEL)
                 top = elig.groupby(['nct_id', 'trial_title']).agg(
-                    match_count=('inference_id', 'count'),""", 1),
-    ("    PATIENT_OUTCOME_LABELS,\n    display_trial_title,\n)",
-     "    PATIENT_OUTCOME_LABELS,\n    display_trial_title,\n"
+                    match_count=('patient_id', 'nunique'),""", 1),
+    ("    PATIENT_OUTCOME_LABELS,\n    display_trial_title,\n    rate_text,\n)",
+     "    PATIENT_OUTCOME_LABELS,\n    display_trial_title,\n    rate_text,\n"
      "    TRIAL_MISSING_TITLE_LABEL,\n)", 1)], "mq_split")
 if _c7:
     _at_c7, _, _ = render_tab(_c7, "render_match_quality_tab", _MQ, _MQ_DB,
@@ -1442,7 +1467,7 @@ if _c7:
     _top_c7 = _top_table(_cap_c7)
     _mixed_c7 = ([] if _top_c7 is None
                  else list(_top_c7[_top_c7["NCT ID"] == "NCT-Q-MIXED"]
-                           ["Match Count"]))
+                           ["Patients Matched"]))
     check("C7  WITH a fillna-before-grouping fix, the mixed trial is ranked "
           "TWICE, its four rows split across the two entries",
           sorted(int(v) for v in _mixed_c7), [1, 3])

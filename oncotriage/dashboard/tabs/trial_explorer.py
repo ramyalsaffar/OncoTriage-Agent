@@ -9,10 +9,18 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from oncotriage.dashboard.data import load_trial_matches_data
-from oncotriage.dashboard.nullsafe import is_absent
-from oncotriage.dashboard.tiers import (TRIAL_STATUS_NO_SCORE, TRIAL_STATUS_PARTIAL,
+from oncotriage.dashboard.populations import (NOT_EVALUATED_CLINICAL_UNCERTAINTY,
+                                              DEFINITE_VERDICT_LABEL,
+                                              VERDICT_NOT_EVALUABLE,
+                                              is_definite_verdict,
+                                              not_evaluated_kind,
+                                              with_trial_status)
+from oncotriage.dashboard.tiers import (TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN,
+                                        TRIAL_STATUS_NOT_EVALUATED_FAILED,
+                                        TRIAL_STATUS_NOT_EVALUATED_UNKNOWN,
+                                        TRIAL_STATUS_ORDER, TRIAL_STATUS_PARTIAL,
                                         TRIAL_STATUS_REJECTED, TRIAL_STATUS_UNCONFIRMED,
-                                        classify_trial_score, display_trial_title)
+                                        display_trial_title)
 
 
 @st.fragment
@@ -51,15 +59,37 @@ def render_trial_explorer_tab(df):
     # one two different trials -- of which pandas then kept one and dropped the
     # other. See tiers.TRIAL_MISSING_TITLE_LABEL for what that cost, and
     # tiers.display_trial_title for how the surviving entry is named.
+    # THE SELECTOR COUNTS PATIENTS WITH A DEFINITE ELIGIBILITY VERDICT AND
+    # NAMES THE REST (the dashboard-truthfulness pass). It printed "(1
+    # patients)" -- distinct patients with ANY row -- beside a tile reading
+    # "Total Patients Evaluated 0", and on the smoke run that disagreement held
+    # for 34 of 61 trials: every one of them had only failed calls. A patient
+    # counts for a trial when at least one of their rows for it is eligible or
+    # not_eligible; the rest -- failed calls AND declared clinical
+    # uncertainties, neither of which is an eligibility decision -- are named
+    # as "without", never dropped.
+    filtered_matches['_definite'] = [is_definite_verdict(v)
+                                     for v in filtered_matches['eligible']]
+    _definite_by_trial = (filtered_matches[filtered_matches['_definite']]
+                          .groupby('nct_id')['patient_id'].nunique())
     trial_summary = filtered_matches.groupby('nct_id').agg(
         trial_title=('trial_title', display_trial_title),
         total_patients=('patient_id', 'nunique'),
-        eligible_count=('eligible', lambda x: (x == 'eligible').sum()),
-        avg_score=('match_score', 'mean')
-    ).reset_index().sort_values('total_patients', ascending=False)
-    
+    ).reset_index()
+    trial_summary['definite_patients'] = (
+        trial_summary['nct_id'].map(_definite_by_trial).fillna(0).astype(int))
+    trial_summary['without_definite_patients'] = (
+        trial_summary['total_patients'] - trial_summary['definite_patients'])
+    trial_summary = trial_summary.sort_values(
+        ['definite_patients', 'total_patients', 'nct_id'],
+        ascending=[False, False, True])
+
     trial_options = trial_summary.apply(
-        lambda r: f"{r['nct_id']} — {r['trial_title'][:55]}  ({r['total_patients']} patients)",
+        lambda r: (f"{r['nct_id']} — {r['trial_title'][:55]}  "
+                   f"({r['definite_patients']} with a {DEFINITE_VERDICT_LABEL}"
+                   + (f" · {r['without_definite_patients']} without"
+                      if r['without_definite_patients'] else "")
+                   + ")"),
         axis=1
     ).tolist()
     
@@ -100,20 +130,37 @@ def render_trial_explorer_tab(df):
     unconfirmed_patients = (_elig_mask & (trial_dedup['match_score'] <= 0.0)).sum()
     full_eligible = eligible_patients - partial_patients - unconfirmed_patients
     not_eligible_patients = (trial_dedup['eligible'] == 'not_eligible').sum()
-    total_patients = eligible_patients + not_eligible_patients
+    definite_patients = eligible_patients + not_eligible_patients
+
+    # NOT EVALUATED IS COUNTED, NOT OMITTED. The de-duplication ranks every
+    # definite verdict above a not-evaluable row, so a patient lands here only
+    # when NO attempt produced a definite eligibility verdict for this trial. A model-declared clinical uncertainty is
+    # counted apart from a failure, because the two are different findings.
+    _without_definite = trial_dedup[~_elig_mask & (trial_dedup['eligible'] != 'not_eligible')]
+    _reasons = (_without_definite['not_evaluable_reason']
+                if 'not_evaluable_reason' in _without_definite.columns
+                else pd.Series([None] * len(_without_definite), index=_without_definite.index))
+    uncertain_patients = sum(
+        1 for v, r in zip(_without_definite['eligible'], _reasons)
+        if str(v) == VERDICT_NOT_EVALUABLE
+        and not_evaluated_kind(r) == NOT_EVALUATED_CLINICAL_UNCERTAINTY)
+    not_evaluated_patients = len(_without_definite) - uncertain_patients
 
     # `selected_trial['trial_title']` is the aggregated DISPLAY title, so it is
     # MISSING_TITLE_LABEL rather than a NaN for a trial that recorded none.
     st.subheader(f"{selected_trial['trial_title']}")
     st.caption(f"NCT ID: {selected_nct}  |  Phase: {trial_data['trial_phase'].iloc[0]}")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
+    col1, col2, col3, col4, col5, col6 = st.columns(6)
 
     with col1:
         st.metric(
-            "Total Patients Evaluated",
-            total_patients,
-            help="Number of patients whose pipeline evaluated this trial"
+            "Patients With a Definite Eligibility Verdict",
+            int(definite_patients),
+            help=f"Distinct patients with a {DEFINITE_VERDICT_LABEL} (eligible "
+                 f"or not eligible) on this trial. A patient whose every call "
+                 f"for this trial failed, or whom the model declared clinically "
+                 f"uncertain, is NOT here — see Not Evaluated."
         )
     with col2:
         st.metric(
@@ -133,6 +180,21 @@ def render_trial_explorer_tab(df):
             "Unconfirmed",
             unconfirmed_patients,
             help="Patients eligible at 0% — no disqualifier found, but no criterion confirmed either"
+        )
+
+    with col6:
+        st.metric(
+            "Not Evaluated",
+            int(not_evaluated_patients),
+            delta=(f"+{uncertain_patients} clinically uncertain"
+                   if uncertain_patients else None),
+            delta_color="off",
+            help="Distinct patients with no definite eligibility verdict on "
+                 "this trial: no attempt "
+                 "produced a usable verdict (for example, the call failed) or "
+                 "the stored reason cannot be classified. A model-declared "
+                 "clinical uncertainty is shown separately in the delta. "
+                 "Neither is a rejection."
         )
 
     with col5:
@@ -155,35 +217,22 @@ def render_trial_explorer_tab(df):
         suffixes=('', '_inf')
     )
     
-    def classify_trial_status(row):
-        if row['eligible'] != 'eligible':
-            return TRIAL_STATUS_REJECTED
-        # ABSENCE FIRST. `match_score` is a nullable REAL and
-        # `classify_trial_score` RAISES on None -- with no handler anywhere
-        # between here and main(), so one such row rendered a traceback where
-        # the whole dashboard should be. See TRIAL_STATUS_NO_SCORE in tiers.py.
-        if is_absent(row.get('match_score')):
-            return TRIAL_STATUS_NO_SCORE
-        tier = classify_trial_score(row['match_score'])
-        if tier == 'Full Match':
-            return '✅ Eligible'
-        if tier == 'Partial Match':
-            return TRIAL_STATUS_PARTIAL
-        return TRIAL_STATUS_UNCONFIRMED
-
-    patient_details['Status'] = patient_details.apply(classify_trial_status, axis=1)
+    # THE ONE PER-TRIAL CLASSIFIER (the dashboard-truthfulness pass). This
+    # mapped every non-eligible row to '❌ Not Eligible' -- measured on the
+    # smoke run, NCT03026140's caption read "2 not eligible · 2 total" for two
+    # failed calls from one patient.
+    patient_details = with_trial_status(patient_details)
     # `.astype(int)` RAISED on a NULL score: pandas refuses "Cannot convert
     # non-finite values (NA or inf) to integer". The nullable 'Int64' dtype
     # carries <NA> to the renderer as an empty cell, which is the honest
     # rendering; `.fillna(0)` would print 0% for a score nobody recorded.
     patient_details['Match Score'] = (
-        pd.to_numeric(patient_details['match_score'], errors='coerce') * 100
+        pd.to_numeric(patient_details['display_score'], errors='coerce') * 100
     ).round(0).astype('Int64')
 
     status_filter = st.selectbox(
         "Filter by Status",
-        ["All", "✅ Eligible", TRIAL_STATUS_PARTIAL, TRIAL_STATUS_UNCONFIRMED,
-         TRIAL_STATUS_REJECTED, TRIAL_STATUS_NO_SCORE],
+        ["All"] + list(TRIAL_STATUS_ORDER),
         key="trial_explorer_status_filter"
     )
     
@@ -194,18 +243,18 @@ def render_trial_explorer_tab(df):
         st.info("No patients match the selected status filter.")
         return
     
-    status_order = {'✅ Eligible': 0, TRIAL_STATUS_PARTIAL: 1,
-                    TRIAL_STATUS_UNCONFIRMED: 2, TRIAL_STATUS_REJECTED: 3}
-    patient_details['_sort'] = patient_details['Status'].map(status_order)
+    status_order = {s: i for i, s in enumerate(TRIAL_STATUS_ORDER)}
+    patient_details['_sort'] = (patient_details['Status'].map(status_order)
+                                .fillna(len(TRIAL_STATUS_ORDER)))
     patient_details = patient_details.sort_values(
         by=['_sort', 'Match Score'],
         ascending=[True, False]
     )
     
-    display_cols = ['Status', 'patient_id', 'age', 'sex', 'primary_condition', 'Match Score', 'assessment']
+    display_cols = ['Status', 'patient_id', 'age', 'sex', 'primary_condition', 'Match Score', 'reason', 'assessment']
     display_df = patient_details[display_cols].copy()
     
-    display_df.columns = ['Status', 'Patient ID', 'Age', 'Sex', 'Primary Condition', 'Match Score', 'Explanation']
+    display_df.columns = ['Status', 'Patient ID', 'Age', 'Sex', 'Primary Condition', 'Match Score', 'Not Evaluated Reason', 'Explanation']
     
     display_df = display_df.reset_index(drop=True)
     display_df.index = display_df.index + 1
@@ -228,7 +277,13 @@ def render_trial_explorer_tab(df):
         f"{(patient_details['Status'] == TRIAL_STATUS_PARTIAL).sum()} partial · "
         f"{(patient_details['Status'] == TRIAL_STATUS_UNCONFIRMED).sum()} unconfirmed · "
         f"{(patient_details['Status'] == TRIAL_STATUS_REJECTED).sum()} not eligible · "
-        f"{len(patient_details)} total"
+        f"{(patient_details['Status'] == TRIAL_STATUS_NOT_EVALUATED_FAILED).sum()} not evaluated (no usable verdict) · "
+        f"{(patient_details['Status'] == TRIAL_STATUS_NOT_EVALUABLE_UNCERTAIN).sum()} not evaluable (clinical uncertainty) · "
+        f"{(patient_details['Status'] == TRIAL_STATUS_NOT_EVALUATED_UNKNOWN).sum()} not evaluated (reason unknown) · "
+        # ROWS, AND SAID SO (the dashboard-truthfulness pass): the table has one
+        # row per inference x trial, so a re-run patient appears once per run.
+        f"{len(patient_details)} row(s) from {patient_details['patient_id'].nunique()} "
+        f"distinct patient(s) — one row per inference, so a re-run patient appears once per run"
     )
     
     st.markdown("---")

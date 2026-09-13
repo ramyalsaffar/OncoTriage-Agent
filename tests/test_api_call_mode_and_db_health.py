@@ -744,9 +744,12 @@ if len(_pm) == 3:
           round(float(_by["per-trial"]["avg $/patient"]), 4), 0.18)
     check("3f  the grouped average is the grouped rows' own",
           round(float(_by["grouped"]["avg $/patient"]), 4), 0.04)
+    # "first attempts" SINCE THE DASHBOARD-TRUTHFULNESS PASS: each per-mode row
+    # is computed over one row per patient per campaign, and the column names
+    # that unit rather than calling a count of rows "patients".
     check("3f  and the not-recorded row is kept as its own bucket rather than "
           "being dropped or assigned to an arm",
-          int(_by[MODE_NOT_RECORDED_LABEL]["patients"]), 1)
+          int(_by[MODE_NOT_RECORDED_LABEL]["first attempts"]), 1)
     check("3f  non-degeneracy: the two arms' averages really differ, so a "
           "blended figure could not have satisfied the two checks above",
           float(_by["per-trial"]["avg $/patient"])
@@ -803,12 +806,19 @@ _ov_single = _render("oncotriage.dashboard.tabs.overview",
                      "render_overview_tab", _frame(_SINGLE_DB), _SINGLE_DB)
 check("4a  the overview renders on both", 
       (_ov_mixed["exception"], _ov_single["exception"]), ([], []))
-check("4a  the headline Avg Cost/Patient says when it is blended -- a reader "
+# "Cost/Patient (first attempt)" SINCE THE DASHBOARD-TRUTHFULNESS PASS: the
+# headline tile is a mean over one row per patient per campaign and its label
+# names that population. The needle is the part both labels share.
+check("4a  the headline Cost/Patient says when it is blended -- a reader "
       "who never opens the Cost tab sees only this one",
       "BLENDED ACROSS STAGE 5 CALL MODES"
-      in metric_named(_ov_mixed, "Avg Cost/Patient")["help"], True)
+      in metric_named(_ov_mixed, "Cost/Patient")["help"], True)
 check("4a  ...and does not on one arm",
-      "BLENDED" in metric_named(_ov_single, "Avg Cost/Patient")["help"], False)
+      "BLENDED" in metric_named(_ov_single, "Cost/Patient")["help"], False)
+check("4a  non-degeneracy: the tile was found on both renders",
+      (metric_named(_ov_mixed, "Cost/Patient")["label"] != "(absent)",
+       metric_named(_ov_single, "Cost/Patient")["label"] != "(absent)"),
+      (True, True))
 
 _pf = _render("oncotriage.dashboard.tabs.performance",
               "render_performance_tab", _frame(_MIXED_DB), _MIXED_DB)
@@ -962,9 +972,11 @@ def control(label, planted, shipped):
     check(label, planted != shipped, True)
 
 
+# RE-ANCHORED IN THE DASHBOARD-TRUTHFULNESS PASS: the help text now names its
+# population ("first attempt") before the blend clause.
 _p1, _n1 = plant("dashboard/tabs/cost_tokens.py",
-                 'help="Average cost per patient inference." + (',
-                 'help="Average cost per patient inference." + (False and (')
+                 'help="Mean cost per patient, first attempt." + _pop + (',
+                 'help="Mean cost per patient, first attempt." + _pop + (False and (')
 check("5a  plant 1 matched the shipped source", _n1, 1)
 
 # A SIMPLER AND STRONGER PLANT FOR THE SAME CLAIM: make the mix reading always

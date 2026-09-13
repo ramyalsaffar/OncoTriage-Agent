@@ -658,7 +658,23 @@ python tests/test_dashboard_run_health.py                          # 196 (was 19
 # tempfile.mkdtemp it removes, and the six repository files it reads are
 # written by neither of the suite's two writers and are sha256-compared at the
 # end. It EXECS NOTHING: every plant is a COPY in that temp directory. ~2 s.
-python tests/test_dashboard_app_integration.py                     # 110 (this line said 155 and was stale by 12 before the campaign pass, which added section 8 over the campaigns panel and its two plants; MEASURED 2026-08-23)
+python tests/test_dashboard_app_integration.py                     # 113 (MEASURED 2026-09-13, was 110; the dashboard-truthfulness pass moved the P3/P9 plants into oncotriage/dashboard/populations.py -- the absence guard lives there now -- and watches that file. Before that 110; this line said 155 and was stale by 12 before the campaign pass, which added section 8 over the campaigns panel and its two plants; MEASURED 2026-08-23)
+
+# The dashboard-truthfulness pass. Same shape, same directory. No network
+# (MEASURED: every render runs under a socket guard that RAISES, fired once
+# as a control), no keys, NO SPEND, no live Qdrant, no model load, no corpus,
+# no git history. Sections 1-5 are pure functions over literal frames; 6-9
+# render oncotriage.dashboard.app:main() and three tab functions against
+# DISPOSABLE databases built by initialize_database() inside a
+# tempfile.mkdtemp it removes and asserts gone; section 10 renders against
+# the database at the recorded location with every sqlite3.connect rewritten
+# to mode=ro&immutable=1 and every other connect REFUSED, and compares its
+# sha256 before and after -- on a checkout without that file section 10
+# records SKIPS. The patient CSV export is RECORDED from the tab's own
+# st.download_button call, never rebuilt. It EXECS NOTHING: every plant is a
+# COPY imported by name from the temp directory. NOT in the collision matrix.
+# Bucket A.
+python tests/test_dashboard_truthfulness.py                        # 157 (MEASURED 2026-09-13 against the developer tree; 131 before the closing pass added the two population labels, the CSV export and the demographics chart checks)
 
 # The call-mode-labelling pass. Same shape, same directory. No network, no
 # keys, NO SPEND -- the API sections install a stub Qdrant client and a stub
@@ -676,7 +692,7 @@ python tests/test_dashboard_app_integration.py                     # 110 (this l
 # have; the COMPARISON it qualifies is NOT gated, so a run that CREATED a
 # production database still fails there (test_storage_write_durability.py's
 # gating shape, adopted for its reason). Bucket A, ~12 s.
-python tests/test_api_call_mode_and_db_health.py                    # 151/0/0 on the developer tree; 150 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton
+python tests/test_api_call_mode_and_db_health.py                    # 152/0/0 on the developer tree (MEASURED 2026-09-13, was 151; the dashboard-truthfulness pass renamed the per-mode table's 'patients' column to 'first attempts' and the Overview tile to 'Cost/Patient (first attempt)', and added a non-degeneracy check beside the re-anchored pin). The CI-skeleton reading of 150 passed / 0 failed / 1 SKIPPED predates that and has not been re-measured
 
 # The counter-reader pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no model load, no corpus, no git history, and NOT in
@@ -16559,6 +16575,112 @@ files, portably.
 # No new file: tests/test_spend_journal.py 10r-10u and
 # tests/test_rater_batch_spend_accounting.py 11c, 11c-i, 11i-11k.
 ```
+
+### A failed call is not a rejection, and a row is not a patient (the dashboard-truthfulness pass)
+
+**AN AUDIT OF THE RENDERED DASHBOARD AGAINST A FIVE-PATIENT SMOKE RUN FOUND TWO
+DEFECTS REPEATED ACROSS THE TABS, EACH WITH ONE ROOT.** No paid call, no schema
+change, no migration, no pipeline file. Every test ran inside an OS sandbox
+denying outbound traffic and under an import-time socket tripwire, which
+recorded zero attempts. The smoke database (the production `inferences.db`
+path) was opened read-only and immutable and its sha256 is unchanged.
+`llm_classifier_renderer_digest`, `PROMPT_VERSION` 1.11.0 and
+`FINGERPRINT_VERSION` 8 are unchanged: none of the six renderer modules was
+touched.
+
+| defect | measured on the smoke run |
+|---|---|
+| a trial whose Stage 5 call FAILED (`not_evaluable`, `per_trial_call_failed`) displayed as "Not Eligible" with a score of 0 | 64 of 98 trial rows |
+| the reproducibility tab compared a failed call against a real answer as the model changing its mind | 30 of 37 comparisons; 4 of 5 "flips" |
+| tier percentages divided by inference ROWS and called them patients | "No Match 30.0% · 3 patients", where 2 were errored retries and the third had 12 of 15 trials with no usable verdict |
+
+**`oncotriage/dashboard/populations.py` IS THE ONE OWNER, AND EVERY TAB READS
+IT.** A per-tab repair is how the Any Match figure came to have three
+definitions before the repair pass.
+
+* **A trial row's verdict.** `not_evaluable` is its own status, and the STORED
+  REASON decides which: `not_evaluated_kind` reads a constructed or corrected
+  reason as **no usable verdict** (an infrastructure or output failure) and the
+  declared reason as **clinical uncertainty** (a legitimate clinical result).
+  `trial_display_status` replaced three per-tab classifiers that mapped every
+  non-eligible value to a rejection. A not-evaluated row's stored 0.0 is never
+  displayed as a score, and its reason is shown verbatim.
+* **Which rows a patient figure covers.** One row per patient per campaign --
+  the FIRST ATTEMPT, `MIN(id)` -- designated in the sidebar AFTER its non-outcome
+  filters and BEFORE its match filter, so narrowing to "Any Match" cannot
+  promote a later attempt into "first".
+* **When a clinical tier exists.** Only for a COMPLETE evaluation. An errored
+  attempt, or one with a trial that has no usable verdict, is
+  `MATCH_TIER_INCOMPLETE` -- outside `MATCH_TIERS`, excluded from every tier
+  percentage and counted in its own tile. A declared clinical uncertainty does
+  not make an evaluation incomplete. `ensure_evaluated` is called by the four
+  tier-reading tabs, so a tab rendered outside `main()` cannot tier an
+  incomplete row.
+
+**TWO POPULATIONS, TWO LABELS, AND "ANSWERED" IS RETIRED.** The word meant a
+definite verdict on one tile and a verdict-or-uncertainty on another, and the
+difference is exactly a declared clinical uncertainty. `DEFINITE_VERDICT_LABEL`
+("definite eligibility verdict", `is_definite_verdict`) is what comparisons,
+flips, scores, tokens per trial and the Trial Explorer's patient counts use;
+`USABLE_RESULT_LABEL` ("usable result, including clinical uncertainty",
+`is_usable_result`) is the Evaluated → Eligible denominator. Check 6z-h-i scans
+the six touched tabs' rendered labels, deltas, captions and notices and finds
+the retired word nowhere.
+
+**TWO AUDIT FIGURES DISAGREE WITH THE DASHBOARD, AND BOTH ARE POPULATIONS, NOT
+ARITHMETIC.** F24: tokens per trial with a definite verdict is 15,767 over
+first attempts; the audit's 15,187 is the same metric over completed rows.
+Independent SQL gives 15,766.7 and 15,187.4 and the test pins both. F20: the
+Performance retrieval panel stays per inference row and says so, rather than
+distinct patients as the register asked.
+
+**THE TREE-LEVEL REVERT MATRIX FOUND A WEAK CHECK THAT READING DID NOT.** Each
+of nine production fixes was undone in a copy of the tree and the new test run
+against it: nine caught, none aborted. On the first run, removing the
+definite-verdict filter in `_build_comparisons` was caught only by a
+plant-anchor check, because every fixture group had two runs and the exact
+category rule already skips a mixed PAIR. A three-run case is where the filter
+matters -- `[eligible, eligible, failed call]` compares its two definite verdicts
+-- and it is now caught by four behavioural checks.
+
+**THE CLOSING PASS DROVE WHAT HAD ONLY BEEN READ.** The Demographics per-group
+charts (age, sex, race, ethnicity, condition count, medication count, top
+conditions, best and worst) are compared bar by bar with independent SQL over
+complete first attempts on a database where an incomplete patient, an errored
+patient and a rerun must all be absent, with a control that the every-row
+population disagrees. The patient CSV export is recorded from the tab's own
+`st.download_button` call and its Status, Not Evaluated Reason and Match Score
+columns compared with SQL on the synthetic and smoke databases.
+
+```bash
+python tests/test_dashboard_truthfulness.py      # 157
+```
+
+**PINS THAT MOVED, EACH THE CHECK WORKING.** `test_package_invariants.py`
+dashboard module count 18 → 19 (still 261/0/0); `test_dashboard_app_integration.py`
+110 → 113 (P3/P9 plants moved into `populations.py`);
+`test_api_call_mode_and_db_health.py` 151 → 152; the reproducibility snapshot
+regenerated, byte-stable across two regenerations, with a structural diff
+showing wording only; the repair-pass and schema-and-metrics seeds made
+internally consistent (`candidates_evaluated` equal to their trial rows) rather
+than loosening the incompleteness rule. CI bucket A on the final code: 127
+files ran, 0 failed.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **An older database that never stored every trial row reads as incomplete
+   wholesale**, because fewer trial rows than `candidates_evaluated` is
+   incomplete by rule 3. Honest, and a data-era note in the caption would help.
+2. **The smoke database has no complete evaluation, no declared uncertainty and
+   one campaign**, so tier percentages and multi-campaign labels are covered by
+   the synthetic databases only.
+3. **Tokens per definite-verdict trial keeps a declared-uncertainty trial's
+   tokens in the numerator** while excluding the trial from the denominator.
+   Labelled so in the tile's help; a third population ("a response was
+   received") would be the precise denominator and was not introduced.
+4. **The campaign key has not been driven against a real multi-campaign
+   database.**
+5. **Register items F4, F9, F12 and F17 remain backlog.**
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is
