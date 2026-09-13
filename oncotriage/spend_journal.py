@@ -65,12 +65,29 @@ the lock. A generated id would make the record honest about how many times the
 batch was collected and useless as a cap, which is the wrong trade for a file
 whose only consumer is a budget.
 
-**AND THE MIGRATION ENTRY CARRIES THE BATCH IDS IT ALREADY COVERS.** A state
+**AND THE MIGRATION ENTRY LISTS THE BATCH IDS OF ITS STATE FILE.** A state
 file that existed before this journal did has its whole spend in ONE migration
 entry; if that session is later resumed and re-collects one of its old batches,
-the per-batch entry would be new and would double-count against the migration
+the per-batch entry would be new and could double-count against the migration
 entry. ``covers_batch_ids`` is read out of ``state["batches"]`` at migration
-time and ``total`` skips any per-batch entry whose id is inside it.
+time.
+
+**A LISTED BATCH IS NOT A REPRESENTED ONE, AND ``total`` USED TO READ IT AS
+ONE.** The listing is every batch the state file named, including one that was
+submitted and not yet collected when the migration ran -- whose money is NOT in
+the migrated amount. Skipping every listed batch's later entry meant that
+money never reached the cap. Coverage is now PER BATCH and decided by
+``migration_coverage``: a batch is represented only when the migrated amount
+provably includes it, is countable when the amount provably does not, and makes
+the budget UNVERIFIED when neither can be established. See that function.
+
+**AND A STATE FILE IS IDENTIFIED, NOT SPELLED.** The rater names its state file
+as ``abspath(--output-dir)``; the migration names it by walking the
+evaluation-runs root. The two strings differ whenever a symlink, a ``..`` or a
+doubled separator is involved, and every comparison here used to be string
+equality. ``scope_identity`` is the one resolution rule, applied at READ time
+to every batch and migration entry, so historical entries are matched without
+being rewritten.
 """
 
 import fcntl
@@ -209,6 +226,87 @@ def entry_id(budget, source, scope, unit):
     """
     blob = "\x00".join((str(budget), str(source), str(scope), str(unit)))
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+# ── WHICH STATE FILE AN ENTRY IS ABOUT, WHATEVER IT WAS SPELLED AS ─────────
+
+IDENTITY_KINDS = (ENTRY_KIND_MIGRATION, ENTRY_KIND_BATCH)
+"""The entry kinds whose ``scope`` is a STATE FILE and is therefore matched by
+``scope_identity`` rather than by string. ``run`` is not among them: its scope
+is an output directory, its units carry a per-invocation prefix, and two
+spellings of one run scope cannot collide on a unit."""
+
+
+def _scope_identity_uncached(scope):
+    if not isinstance(scope, str) or not scope or "\x00" in scope:
+        return None
+    expanded = os.path.expanduser(scope)
+    # A RELATIVE scope resolves against whatever the reader's working directory
+    # happens to be, which is a different file for every caller. It is not a
+    # spelling of anything, so it is not identified.
+    if not os.path.isabs(expanded):
+        return None
+    try:
+        real = os.path.realpath(expanded)
+    except (OSError, ValueError):
+        return None
+    parent, base = os.path.split(real)
+    if not base:
+        return None
+    try:
+        st = os.stat(parent)
+    except (FileNotFoundError, NotADirectoryError):
+        # Nothing on disk to consult: the normalized, symlink-resolved string
+        # is the identity. Two spellings of a directory that does not exist
+        # still meet here whenever they differ only by `..`, `.`, `//` or a
+        # symlink above the missing part.
+        return ("path", real)
+    except (OSError, ValueError):
+        return None
+    # AN EXISTING PARENT DIRECTORY IS IDENTIFIED BY (device, inode). That
+    # also unifies spellings `realpath` cannot -- a case variant on a
+    # case-insensitive filesystem, a Unicode-normalization variant, a bind
+    # mount -- and it is the DIRECTORY'S inode, not the file's, because the
+    # rater replaces its state file atomically and a file inode changes on
+    # every write. The basename is kept verbatim: both writers use the rater's
+    # own two filename constants.
+    return ("dir", st.st_dev, st.st_ino, base)
+
+
+def scope_identity(scope, memo=None):
+    """The identity of the state file ``scope`` names, or None. NEVER RAISES.
+
+    **THE ONE RESOLUTION RULE**, applied everywhere two spellings of a state
+    file meet: ``total``, ``recorded_batch_ids``, the duplicate check inside
+    ``append_with_outcome``, and the journal-era recovery. It is applied at READ
+    time to what is already on disk; nothing historical is rewritten.
+
+    None means the identity cannot be established -- not a string, a RELATIVE
+    path, or a parent that exists and cannot be examined -- and every caller
+    treats that as unverified rather than guessing a match.
+
+    ``memo`` is a per-call ``{scope: identity}`` so a journal of many entries
+    naming a few files stats each file once. It is deliberately not a module
+    cache: a directory created between two calls must be seen.
+    """
+    if memo is not None and isinstance(scope, str):
+        if scope not in memo:
+            memo[scope] = _scope_identity_uncached(scope)
+        return memo[scope]
+    return _scope_identity_uncached(scope)
+
+
+def _describe_scope(scope):
+    """``scope`` resolved for a message; the raw value when it cannot be."""
+    try:
+        return os.path.realpath(os.path.expanduser(scope))
+    except Exception:                                           # noqa: BLE001
+        return repr(scope)
+
+
+def _valid_amount(amount):
+    return (not isinstance(amount, bool) and isinstance(amount, (int, float))
+            and amount == amount and amount >= 0)
 
 
 def decode_journal_line(raw):
@@ -390,7 +488,33 @@ see the result of.
 _AMOUNT_EPSILON = 1e-9
 
 
-def _same_charge(existing, payload):
+def _same_state_file(existing, payload, memo=None):
+    """Do two entries name the same state file? String first, then identity.
+
+    Identity is consulted only for ``IDENTITY_KINDS`` of one kind, and only
+    when BOTH identities are established: an unidentifiable scope matches
+    nothing but its own exact string.
+    """
+    if existing.get("scope") == payload.get("scope"):
+        return True
+    kind = payload.get("kind")
+    if kind not in IDENTITY_KINDS or existing.get("kind") != kind:
+        return False
+    a = scope_identity(existing.get("scope"), memo)
+    return a is not None and a == scope_identity(payload.get("scope"), memo)
+
+
+def _equivalent_charge(existing, payload, memo=None):
+    """Is ``existing`` the SAME CHARGE IDENTITY as ``payload`` under another
+    spelling of its state file? Amount not compared -- see ``_same_charge``."""
+    for field in ("budget", "source", "unit", "kind"):
+        if existing.get(field) != payload.get(field):
+            return False
+    return (existing.get("scope") != payload.get("scope")
+            and _same_state_file(existing, payload, memo))
+
+
+def _same_charge(existing, payload, memo=None):
     """Does an entry already in the file record the SAME charge as ``payload``?
 
     Compares the four fields ``entry_id`` is DERIVED from plus the amount --
@@ -398,10 +522,18 @@ def _same_charge(existing, payload):
     dict: ``recorded_at_utc`` differs on every attempt, so a whole-dict
     comparison would report every retry as a conflict, which is the one thing
     that must not happen to a retry.
+
+    THE SCOPE IS COMPARED AS A STATE FILE, NOT AS A STRING, for the kinds whose
+    scope is one (``_same_state_file``). Two spellings of one state file are
+    one charge identity; comparing their strings is what let a recovery under
+    the migration's spelling of a file re-record a batch the rater had already
+    recorded under its own.
     """
-    for field in ("budget", "source", "scope", "unit"):
+    for field in ("budget", "source", "unit"):
         if existing.get(field) != payload.get(field):
             return False
+    if not _same_state_file(existing, payload, memo):
+        return False
     a, b = existing.get("usd"), payload.get("usd")
     if isinstance(a, bool) or isinstance(b, bool):
         return a is b
@@ -551,6 +683,14 @@ def append_with_outcome(entry, path=None):
                         f"stays as evidence and is counted as unreadable.")
                 fh.seek(0)
                 before = fh.read()
+                # THE SAME CHARGE UNDER ANOTHER SPELLING OF ITS STATE FILE IS
+                # THE SAME CHARGE. Its entry_id differs (the id is derived from
+                # the spelling), so an id-only scan would append it a second
+                # time; this is what keeps a recovery run under either spelling
+                # idempotent. A same-amount match anywhere wins over a
+                # different-amount one: the money is recorded.
+                memo = {}
+                matches = []
                 for rawline in before.splitlines():
                     if not rawline.strip():
                         continue
@@ -561,15 +701,20 @@ def append_with_outcome(entry, path=None):
                         existing = json.loads(line)
                     except ValueError:
                         continue
-                    if not isinstance(existing, dict) \
-                            or existing.get("entry_id") != eid:
+                    if not isinstance(existing, dict):
                         continue
-                    if _same_charge(existing, payload):
+                    if existing.get("entry_id") != eid \
+                            and not _equivalent_charge(existing, payload, memo):
+                        continue
+                    if _same_charge(existing, payload, memo):
                         return APPEND_DUPLICATE
+                    matches.append(existing)
+                for existing in matches[:1]:
                     JOURNAL_FAULTS["append:conflict"] += 1
                     console.out(
-                        f"  [Spend journal] CONFLICT at {p}: entry_id {eid} "
-                        f"already records a DIFFERENT charge "
+                        f"  [Spend journal] CONFLICT at {p}: entry_id "
+                        f"{existing.get('entry_id')} already records a "
+                        f"DIFFERENT amount for this charge "
                         f"(${existing.get('usd')} for "
                         f"{existing.get('scope')}/{existing.get('unit')}) than "
                         f"the one being appended (${payload.get('usd')} for "
@@ -735,17 +880,248 @@ def confirmed_usd_for_scope(budget, source, scope, unit_prefix=None,
     return usd
 
 
-def _covered_batch_ids(entries, budget):
-    """``{scope: {batch_id, ...}}`` a migration entry already accounts for."""
-    covered = {}
-    for e in entries:
-        if e.get("budget") != budget or e.get("kind") != ENTRY_KIND_MIGRATION:
+COVERAGE_ZERO_AMOUNT = "zero_amount"
+COVERAGE_SINGLE_BATCH = "single_batch"
+COVERAGE_SEVERAL_BATCHES = "several_batches"
+COVERAGE_NO_USABLE_LISTING = "no_usable_listing"
+
+COVERAGE_RULES = (COVERAGE_ZERO_AMOUNT, COVERAGE_SINGLE_BATCH,
+                  COVERAGE_SEVERAL_BATCHES, COVERAGE_NO_USABLE_LISTING)
+"""Which of a migration entry's listed batches its AMOUNT includes. CLOSED.
+
+A migration entry is ``usd`` (the state file's ``spend_usd``, summed at
+collection time over the batches it had COLLECTED) beside ``covers_batch_ids``
+(every batch the state file LISTED, collected or not). Those are two different
+sets, and the entry records only the first one's SUM. So:
+
+``zero_amount``        the amount is 0 -- nothing collected, or a pre-key FLOOR.
+                       NO listed batch is represented: a later collection of
+                       any of them is money the migration never held, and it
+                       counts, once.
+``single_batch``       a positive amount beside exactly ONE listed batch. Only
+                       that batch can have produced it, so it IS represented and
+                       its later entry is not counted again.
+``several_batches``    a positive amount beside two or more listed batches. The
+                       entry cannot say which of them the amount includes -- a
+                       retry batch submitted and never collected is exactly this
+                       shape. COVERAGE IS NOT ESTABLISHED: a later entry for any
+                       of them is NOT counted and marks the budget UNVERIFIED,
+                       which refuses new paid work on it.
+``no_usable_listing``  a positive amount and no readable listing (absent, not a
+                       list, empty, or holding a non-string id). Any later batch
+                       entry for that state file is treated as ``several``.
+
+NOTHING IS GUESSED. The two rules that decide are consequences of how the
+amount was accumulated, not assumptions about which batches were collected;
+the third case is where they stop, and it is reported rather than resolved.
+"""
+
+
+def migration_coverage(entry):
+    """``{"rule", "represented", "ambiguous", "all_ambiguous"}`` for one
+    migration entry whose amount has already been validated. NEVER RAISES."""
+    amount = entry.get("usd") if isinstance(entry, dict) else None
+    if not _valid_amount(amount) or float(amount) <= _AMOUNT_EPSILON:
+        return {"rule": COVERAGE_ZERO_AMOUNT, "represented": frozenset(),
+                "ambiguous": frozenset(), "all_ambiguous": False}
+    ids = entry.get("covers_batch_ids")
+    if not isinstance(ids, list) or not ids \
+            or not all(isinstance(x, str) and x for x in ids):
+        return {"rule": COVERAGE_NO_USABLE_LISTING, "represented": frozenset(),
+                "ambiguous": frozenset(), "all_ambiguous": True}
+    listed = frozenset(ids)
+    if len(listed) == 1:
+        return {"rule": COVERAGE_SINGLE_BATCH, "represented": listed,
+                "ambiguous": frozenset(), "all_ambiguous": False}
+    return {"rule": COVERAGE_SEVERAL_BATCHES, "represented": frozenset(),
+            "ambiguous": listed, "all_ambiguous": False}
+
+
+def _migration_shape(entry):
+    ids = entry.get("covers_batch_ids")
+    listing = (tuple(sorted(set(ids))) if isinstance(ids, list)
+               and all(isinstance(x, str) for x in ids)
+               else ("<unusable listing>", type(ids).__name__))
+    return float(entry["usd"]), listing, bool(entry.get("is_floor"))
+
+
+def _same_shape(a, b):
+    return abs(a[0] - b[0]) <= _AMOUNT_EPSILON and a[1:] == b[1:]
+
+
+def _lines(group):
+    return ", ".join(str(e.get("_lineno")) for e in group)
+
+
+def _analyse_budget(entries, budget, memo=None):
+    """ONE READING OF ONE BUDGET, shared by ``total``, ``recorded_batch_ids``,
+    ``pending_coverage_reasons`` and the recovery. NEVER RAISES.
+
+    Returns a dict:
+
+      ``counted``          ``[(entry, usd, session_key)]`` -- what the cap sums
+      ``unread``           reasons, one per item that is NOT counted and that
+                           the budget's record cannot vouch for
+      ``coverage``         ``{identity: migration_coverage(...) + "entry"}``
+      ``migrated_usd``     ``{identity: the migration's own amount}`` -- what
+                           the migration RECORDS; a represented batch recorded
+                           at a different amount lowers what is COUNTED for
+                           the charge (``counted``), never this
+      ``counted_batches``  ``{(source, identity, unit)}`` actually counted
+      ``batch_units``      ``{(source, identity, unit)}`` present at all
+
+    THE COUNTED TOTAL IS A FLOOR WHEREVER SOMETHING IS UNVERIFIED, and that is
+    chosen rather than incidental: ``spend.unverified_record_refusal`` tells an
+    operator the remainder is "potentially OVERSTATED" because unverified items
+    "may carry spend it does not count". Every rule below keeps that sentence
+    true -- an ambiguous batch is not counted, and of two conflicting amounts
+    for one charge the smaller is -- and an unverified budget refuses new paid
+    work whichever way the number leans.
+    """
+    memo = {} if memo is None else memo
+    out = {"counted": [], "unread": [], "coverage": {}, "migrated_usd": {},
+           "counted_batches": set(), "batch_units": set()}
+    seen = set()
+    migrations, batches = {}, {}
+    counted_at = {}
+    for e in entries or ():
+        if not isinstance(e, dict) or e.get("budget") != budget:
             continue
-        ids = e.get("covers_batch_ids")
-        if isinstance(ids, list):
-            covered.setdefault(e.get("scope"), set()).update(
-                str(x) for x in ids)
-    return covered
+        kind = e.get("kind")
+        if kind not in ENTRY_KINDS:
+            JOURNAL_FAULTS[f"kind:{kind}"] += 1
+            out["unread"].append(f"journal line {e.get('_lineno')}: unknown "
+                                 f"kind {kind!r}")
+            continue
+        eid = e.get("entry_id")
+        if eid in seen:
+            JOURNAL_FAULTS["duplicate_entry_id"] += 1
+            continue
+        seen.add(eid)
+        amount = e.get("usd")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
+            JOURNAL_FAULTS[f"bad_amount:{type(amount).__name__}"] += 1
+            out["unread"].append(f"journal line {e.get('_lineno')}: amount is "
+                                 f"a {type(amount).__name__}")
+            continue
+        if amount != amount or amount < 0:               # NaN and negatives
+            JOURNAL_FAULTS[f"bad_amount:{amount!r}"] += 1
+            out["unread"].append(f"journal line {e.get('_lineno')}: amount "
+                                 f"{amount!r}")
+            continue
+        if kind == ENTRY_KIND_RUN:
+            out["counted"].append((e, float(amount), ("run", e.get("scope"))))
+            continue
+        ident = scope_identity(e.get("scope"), memo)
+        if ident is None:
+            JOURNAL_FAULTS[f"identity:unestablished:{kind}"] += 1
+            out["unread"].append(
+                f"journal line {e.get('_lineno')}: the {kind} entry's state "
+                f"file {e.get('scope')!r} cannot be identified (not an "
+                f"absolute path, or its directory cannot be examined), so it "
+                f"cannot be matched against other spellings of that file; its "
+                f"${float(amount):.4f} is NOT counted")
+            continue
+        if kind == ENTRY_KIND_MIGRATION:
+            migrations.setdefault(ident, []).append(e)
+        else:
+            key = (e.get("source"), ident, str(e.get("unit")))
+            batches.setdefault(key, []).append(e)
+            out["batch_units"].add(key)
+
+    for ident, group in migrations.items():
+        first = group[0]
+        shapes = [_migration_shape(e) for e in group]
+        if all(_same_shape(shapes[0], sh) for sh in shapes[1:]):
+            if len(group) > 1:
+                JOURNAL_FAULTS["duplicate_equivalent_scope"] += len(group) - 1
+            cov = dict(migration_coverage(first))
+            usd = shapes[0][0]
+        else:
+            usd = min(sh[0] for sh in shapes)
+            JOURNAL_FAULTS["equivalent_scope_conflict"] += 1
+            out["unread"].append(
+                f"journal lines {_lines(group)}: {len(group)} migration "
+                f"entries name the same state file "
+                f"{_describe_scope(first.get('scope'))} under different "
+                f"spellings and DISAGREE (amounts "
+                f"{sorted(round(sh[0], 6) for sh in shapes)}, or their batch "
+                f"listings); the smaller amount ${usd:.4f} is counted and no "
+                f"listed batch is treated as represented")
+            cov = {"rule": COVERAGE_NO_USABLE_LISTING,
+                   "represented": frozenset(), "ambiguous": frozenset(),
+                   "all_ambiguous": True}
+        cov["entry"] = first
+        out["coverage"][ident] = cov
+        out["migrated_usd"][ident] = usd
+        counted_at[ident] = len(out["counted"])
+        out["counted"].append((first, usd, ident))
+
+    for key, group in batches.items():
+        source, ident, unit = key
+        first = group[0]
+        amounts = [float(e["usd"]) for e in group]
+        usd = min(amounts)
+        if len(group) > 1:
+            if max(amounts) - usd <= _AMOUNT_EPSILON:
+                JOURNAL_FAULTS["duplicate_equivalent_scope"] += len(group) - 1
+            else:
+                JOURNAL_FAULTS["equivalent_scope_conflict"] += 1
+                out["unread"].append(
+                    f"journal lines {_lines(group)}: batch {unit} is recorded "
+                    f"{len(group)} times for the same state file "
+                    f"{_describe_scope(first.get('scope'))} under different "
+                    f"spellings, with DIFFERENT amounts "
+                    f"{sorted(round(a, 6) for a in amounts)}; the smaller "
+                    f"${usd:.4f} is counted")
+        cov = out["coverage"].get(ident)
+        if cov is not None and unit in cov["represented"]:
+            # ONE CHARGE, TWO RECORDS. Its money is the migration's amount, so
+            # the batch entry is not counted a second time -- and when the two
+            # records DISAGREE about that amount, the rule that governs every
+            # other pair of records for one charge applies: the smaller is
+            # counted and the budget is unverified. This branch used to skip
+            # the entry whatever it held, so such a conflict was invisible to
+            # every reading of the cap.
+            #
+            # RECOVERY_UNIT_TOLERANCE_USD, NOT _AMOUNT_EPSILON: a migration's
+            # amount is a state file's spend_usd, ROUNDED to six decimals, and
+            # a batch entry is the unrounded priced amount. Measured on the
+            # production tree: the probe session's state file records
+            # $0.056607 beside a journal batch entry of $0.05660715 -- an
+            # honest pair 1.5e-7 apart, which a 1e-9 comparison would report
+            # as a conflict and refuse the next paid run on.
+            m_usd = out["migrated_usd"][ident]
+            if abs(usd - m_usd) > RECOVERY_UNIT_TOLERANCE_USD:
+                JOURNAL_FAULTS["coverage:represented_conflict"] += 1
+                i = counted_at[ident]
+                m_entry, m_counted, m_session = out["counted"][i]
+                smaller = min(m_counted, usd)
+                out["counted"][i] = (m_entry, smaller, m_session)
+                out["unread"].append(
+                    f"journal line {first.get('_lineno')}: batch {unit} is "
+                    f"recorded at ${usd:.6f} for state file "
+                    f"{_describe_scope(first.get('scope'))}, whose migration "
+                    f"entry (line {cov['entry'].get('_lineno')}) represents "
+                    f"that batch at ${m_usd:.6f} -- ONE charge, two records, "
+                    f"DIFFERENT amounts; the smaller ${smaller:.6f} is counted")
+            continue
+        if cov is not None and (cov["all_ambiguous"]
+                                or unit in cov["ambiguous"]):
+            m = cov["entry"]
+            JOURNAL_FAULTS["coverage:unestablished"] += 1
+            out["unread"].append(
+                f"journal line {first.get('_lineno')}: batch {unit} "
+                f"(${usd:.4f}) was collected for state file "
+                f"{_describe_scope(first.get('scope'))}, whose migration "
+                f"entry (line {m.get('_lineno')}) records "
+                f"${out['migrated_usd'][ident]:.4f} across its listed batches "
+                f"and cannot say whether that includes this one "
+                f"({cov['rule']}); the batch is NOT counted")
+            continue
+        out["counted"].append((first, usd, ident))
+        out["counted_batches"].add(key)
+    return out
 
 
 def total(budget, path=None, entries=None, unreadable=None):
@@ -754,7 +1130,13 @@ def total(budget, path=None, entries=None, unreadable=None):
     Duplicate ``entry_id``s are summed ONCE, first occurrence winning, and the
     duplicate is counted -- a file that has been hand-edited or concatenated is
     the case that produces them, and both halves of that (do not double-charge,
-    do say it happened) matter.
+    do say it happened) matter. The SAME CHARGE under two spellings of its state
+    file is summed once too, and two spellings that disagree about its amount
+    make the budget unverified -- see ``_analyse_budget``.
+
+    A MIGRATION EXCLUDES A LATER BATCH ENTRY ONLY WHEN ITS AMOUNT PROVABLY
+    INCLUDES THAT BATCH (``migration_coverage``). Where it cannot say, the batch
+    is not counted and the budget is UNVERIFIED -- never a silent skip.
 
     ``unpriced`` counts entries whose amount is a FLOOR -- a pre-journal state
     file that recorded batches but no ``spend_usd``, which is every rater run
@@ -769,43 +1151,15 @@ def total(budget, path=None, entries=None, unreadable=None):
     if entries is None:
         entries, unreadable = read_entries_report(path)
     unread = list(unreadable or [])
-    covered = _covered_batch_ids(entries, budget)
-    seen = set()
+    analysis = _analyse_budget(entries, budget)
+    unread.extend(analysis["unread"])
     usd = 0.0
     rows = unpriced = 0
-    scopes = set()
-    for e in entries:
-        if e.get("budget") != budget:
-            continue
-        kind = e.get("kind")
-        if kind not in ENTRY_KINDS:
-            JOURNAL_FAULTS[f"kind:{kind}"] += 1
-            unread.append(f"journal line {e.get('_lineno')}: unknown kind "
-                          f"{kind!r}")
-            continue
-        eid = e.get("entry_id")
-        if eid in seen:
-            JOURNAL_FAULTS["duplicate_entry_id"] += 1
-            continue
-        seen.add(eid)
-        if kind == ENTRY_KIND_BATCH:
-            unit = str(e.get("unit"))
-            if unit in covered.get(e.get("scope"), ()):  # already migrated
-                continue
-        amount = e.get("usd")
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)):
-            JOURNAL_FAULTS[f"bad_amount:{type(amount).__name__}"] += 1
-            unread.append(f"journal line {e.get('_lineno')}: amount is a "
-                          f"{type(amount).__name__}")
-            continue
-        if amount != amount or amount < 0:               # NaN and negatives
-            JOURNAL_FAULTS[f"bad_amount:{amount!r}"] += 1
-            unread.append(f"journal line {e.get('_lineno')}: amount "
-                          f"{amount!r}")
-            continue
-        usd += float(amount)
+    sessions = set()
+    for e, amount, session in analysis["counted"]:
+        usd += amount
         rows += 1
-        scopes.add(e.get("scope"))
+        sessions.add(session)
         if e.get("is_floor"):
             unpriced += 1
     if not rows and not unread:
@@ -815,44 +1169,82 @@ def total(budget, path=None, entries=None, unreadable=None):
     # anonymous fresh seed would let `rater_spend_before` fall back to a state
     # file as though the journal had simply been empty.
     return spend.LedgerSeed(
-        usd=usd, rows=rows, unpriced=unpriced, runs=len(scopes),
+        usd=usd, rows=rows, unpriced=unpriced, runs=len(sessions),
         source=SEED_SOURCE_FOR_BUDGET[budget], unreadable=len(unread),
         unreadable_reasons=tuple(unread[:spend.UNREADABLE_REASONS_KEPT]))
 
 
 def recorded_batch_ids(budget, source, scope, entries):
-    """The batch ids whose money ``total`` COUNTS for one scope, as a set.
+    """The batch ids whose money ``total`` COUNTS for one state file, as a set.
 
     **WHAT A RESUMED COLLECTION ASKS BEFORE IT CHARGES ANYTHING.** A seed read
-    from this journal already contains every batch entry ``total`` counted, so
+    from this journal already contains every batch ``total`` counted, so
     re-charging one of them to the process ledger counts it twice against the
-    cap. This mirrors ``total``'s rules exactly -- same budget, a readable
-    non-negative amount, NOT covered by a migration entry -- and a batch a
-    migration covers is deliberately NOT in the set: a migration's amount may
-    or may not include a batch it lists (a batch submitted and not yet
-    collected is listed with no money), so the caller charges it and
-    over-counts, which is the safe direction.
+    cap. Two ways a batch's money is in the seed, and both are in the set:
 
-    NEVER RAISES.
+      * a batch entry for this state file -- under ANY spelling of it
+        (``scope_identity``) -- that ``total`` counts;
+      * a batch a migration entry REPRESENTS (``migration_coverage``), whose
+        money is the migration's amount whether or not a batch entry exists.
+
+    A batch whose coverage is NOT established is not in the set: ``total`` did
+    not count it, so the collection charges it, and the budget is already
+    unverified (or is made so by ``pending_coverage_reasons``).
+
+    NEVER RAISES. An unidentifiable ``scope`` matches nothing.
     """
-    covered = _covered_batch_ids(entries, budget).get(scope, set())
-    found = set()
-    for e in entries or ():
-        if not isinstance(e, dict):
-            continue
-        if (e.get("budget") != budget or e.get("source") != source
-                or e.get("kind") != ENTRY_KIND_BATCH
-                or e.get("scope") != scope):
-            continue
-        amount = e.get("usd")
-        if isinstance(amount, bool) or not isinstance(amount, (int, float)) \
-                or amount != amount or amount < 0:
-            continue
-        unit = str(e.get("unit"))
-        if unit in covered:
-            continue
-        found.add(unit)
+    memo = {}
+    ident = scope_identity(scope, memo)
+    if ident is None:
+        return set()
+    analysis = _analyse_budget(entries, budget, memo)
+    found = {unit for (src, i, unit) in analysis["counted_batches"]
+             if src == source and i == ident}
+    cov = analysis["coverage"].get(ident)
+    if cov is not None:
+        found |= set(cov["represented"])
     return found
+
+
+def pending_coverage_reasons(budget, source, scope, entries, batch_ids):
+    """Reasons a collection this session is ABOUT to make cannot be counted
+    exactly once. NEVER RAISES.
+
+    ``total`` marks an ambiguous batch only once its entry exists. A session
+    resuming such a batch would charge it and record it in the same breath, and
+    the budget would stay verified for the rest of that session -- long enough
+    to buy a retry pass on a figure whose coverage nobody established. So a
+    caller about to collect names its batches here first, and each one a
+    migration lists without representing -- and that has no entry yet -- is a
+    reason to mark the budget unverified BEFORE any new paid work.
+    """
+    batch_ids = [str(b) for b in dict.fromkeys(batch_ids or ())]
+    if not batch_ids:
+        return []
+    memo = {}
+    ident = scope_identity(scope, memo)
+    if ident is None:
+        return [f"this session's state file {scope!r} cannot be identified, so "
+                f"whether the journal already holds the batches it is about to "
+                f"collect cannot be established"]
+    analysis = _analyse_budget(entries, budget, memo)
+    cov = analysis["coverage"].get(ident)
+    if cov is None:
+        return []
+    m = cov["entry"]
+    reasons = []
+    for bid in batch_ids:
+        if (source, ident, bid) in analysis["batch_units"]:
+            continue
+        if cov["all_ambiguous"] or bid in cov["ambiguous"]:
+            JOURNAL_FAULTS["coverage:pending"] += 1
+            reasons.append(
+                f"batch {bid}, about to be collected for state file "
+                f"{_describe_scope(scope)}, is listed by that file's migration "
+                f"entry (line {m.get('_lineno')}), which records "
+                f"${analysis['migrated_usd'][ident]:.4f} and cannot say "
+                f"whether that includes it ({cov['rule']})")
+    return reasons
 
 
 SEED_SOURCE_FOR_BUDGET = {
@@ -1774,7 +2166,188 @@ migration entry lists EVERY batch in ``state["batches"]`` as covered, including
 a batch that was submitted and not yet collected when the migration ran, and
 ``total`` then SKIPS that batch's own entry when a later ``--resume`` collects
 it -- so its money never reaches the cap. Owned here because this module reads
-it; ``oncotriage/evaluation/rater.py`` writes it under this name."""
+it; ``oncotriage/evaluation/rater.py`` writes it under this name.
+
+**AND EXCLUSION FROM THE MIGRATION USED TO MEAN EXCLUSION FROM EVERYTHING.**
+The rater writes a batch's amount here and THEN offers it to the journal; if
+that offer never landed and nobody resumed the session, the charge existed
+only in this map. ``recover_state_file_charges`` reads it back into the journal
+under the same charge identity, idempotently."""
+
+
+RECOVERY_UNIT_TOLERANCE_USD = 1e-6
+"""Per recorded amount, how far ``spend_usd`` may exceed what the journal holds
+for its state file before the difference is reported as UNATTRIBUTED. The rater
+rounds ``spend_usd`` to six decimals and keeps ``spend_by_batch`` unrounded, so
+an honest file differs by up to half a micro-dollar per batch; this bound is two
+orders of magnitude below the cheapest batch this project has priced.
+
+**AND IT IS THE BOUND ON "THE SAME AMOUNT" WHEREVER A ROUNDED RECORD MEETS AN
+UNROUNDED ONE FOR ONE CHARGE**: a migration's amount (a rounded ``spend_usd``)
+against the ``spend_by_batch`` value or the journal batch entry for the batch
+that migration represents. ``_AMOUNT_EPSILON`` stays the bound between two
+UNROUNDED records."""
+
+
+def recover_state_file_charges(state_path, state,
+                               budget=spend.SPEND_BUDGET_RATER,
+                               source=spend.SPEND_SOURCE_RATER,
+                               path=None, entries=None, out=None):
+    """Put a JOURNAL-ERA state file's recorded charges into the journal.
+    Idempotent. NEVER RAISES.
+
+    Returns ``{"recovered", "recovered_usd", "already_recorded",
+    "unverified"}``. ``unverified`` is reasons, each a charge this budget's
+    record may be missing; a caller about to spend hands them to
+    ``spend.SPEND_LEDGER.mark_unverified``.
+
+    **EVIDENCE-BACKED, NOT INFERRED.** ``spend_by_batch`` is the amount the
+    rater charged each batch, written by the rater before it offered the same
+    amount to this journal. Each is re-offered through the SAME builder under
+    the SAME charge identity, so:
+
+      * a batch the journal already holds -- under this spelling of the state
+        file or any other -- is answered ``duplicate`` and nothing is written;
+      * a batch it does not hold is written, once, and counted by ``total``;
+      * a batch it holds at a DIFFERENT amount is a ``conflict``: nothing is
+        written, and that is reported, never merged;
+      * a write that cannot be confirmed is reported.
+
+    Running it twice, or under two spellings of one file, writes nothing the
+    second time.
+
+    **A BATCH THE MIGRATION REPRESENTS IS NOT OFFERED.** Its money is already
+    in the journal, as the migration's amount (``migration_coverage``). It is
+    compared instead: equal within ``RECOVERY_UNIT_TOLERANCE_USD`` is
+    ``already_recorded``; different is ONE charge with two amounts, reported
+    unverified, the smaller counted. Offering it used to write a second record
+    of a charge the journal already held and print that it had been RECOVERED.
+
+    **AND ONE CHARGE IS NOT IN ANY BATCH.** ``spend_usd`` above what the journal
+    can account for is spend this map does not attribute to a batch: typically
+    a pre-journal total the migration never recorded because the file had
+    already become journal-era. It cannot be recovered per batch, so it is
+    REPORTED.
+
+    **EACH CHARGE IS COUNTED ONCE IN THAT COMPARISON**, however many records
+    name it. The migration's amount and the map's amount for the batch the
+    migration represents are one charge, so what is explained is the migration
+    (the smaller of the two when they differ) plus every OTHER batch in the
+    map. Subtracting both used to cancel spend nobody could attribute: a
+    migration of $1.00 for batch A, a map repeating A's $1.00 and a
+    ``spend_usd`` of $1.70 explained $2.00 and hid the $0.70.
+    """
+    emit = out or console.out
+    rep = {"recovered": 0, "recovered_usd": 0.0, "already_recorded": 0,
+           "unverified": []}
+    try:
+        if not isinstance(state, dict) or JOURNAL_ERA_STATE_KEY not in state:
+            return rep
+        by_batch = state.get(JOURNAL_ERA_STATE_KEY)
+        if not isinstance(by_batch, dict):
+            JOURNAL_FAULTS["recovery:map_not_an_object"] += 1
+            rep["unverified"].append(
+                f"state file {state_path} records {JOURNAL_ERA_STATE_KEY} as a "
+                f"{type(by_batch).__name__}, so its per-batch charges cannot "
+                f"be read")
+            return rep
+        ident = scope_identity(state_path)
+        if ident is None:
+            JOURNAL_FAULTS["recovery:identity_unestablished"] += 1
+            rep["unverified"].append(
+                f"state file {state_path!r} cannot be identified, so whether "
+                f"the journal holds its recorded charges cannot be established")
+            return rep
+        model = state.get("model")
+        # ONE READING, BEFORE ANY OFFER. The migration's coverage decides which
+        # recorded charge IS the migration's amount, and nothing this function
+        # writes is a migration entry, so its own offers cannot change it.
+        if entries is None:
+            entries = read_entries(path)
+        analysis = _analyse_budget(entries, budget)
+        cov = analysis["coverage"].get(ident)
+        represented = cov["represented"] if cov is not None else frozenset()
+        migrated = analysis["migrated_usd"].get(ident, 0.0)
+        valid = {}
+        for bid in sorted(by_batch, key=str):
+            amount = by_batch[bid]
+            if not isinstance(bid, str) or not bid or not _valid_amount(amount):
+                JOURNAL_FAULTS["recovery:bad_amount"] += 1
+                rep["unverified"].append(
+                    f"state file {state_path} records batch {bid!r} at "
+                    f"{amount!r}, which is not an amount")
+                continue
+            valid[bid] = float(amount)
+        for bid, amount in valid.items():
+            if bid in represented:
+                if abs(amount - migrated) <= RECOVERY_UNIT_TOLERANCE_USD:
+                    rep["already_recorded"] += 1
+                else:
+                    JOURNAL_FAULTS["recovery:represented_conflict"] += 1
+                    rep["unverified"].append(
+                        f"state file {state_path} records batch {bid} at "
+                        f"${amount:.6f} and its migration entry (line "
+                        f"{cov['entry'].get('_lineno')}) represents that batch "
+                        f"at ${migrated:.6f} -- ONE charge, two DIFFERENT "
+                        f"amounts; the smaller ${min(amount, migrated):.6f} "
+                        f"is counted")
+                continue
+            got = record_batch_with_outcome(budget, source, state_path, bid,
+                                            amount, model, path=path)
+            outcome = got.get("outcome")
+            if outcome == BATCH_RECORD_CONFIRMED:
+                rep["recovered"] += 1
+                rep["recovered_usd"] += amount
+                JOURNAL_FAULTS["recovery:recovered"] += 1
+                emit(f"  [Spend journal] RECOVERED ${amount:.6f} for "
+                     f"batch {bid}: state file {state_path} records that "
+                     f"charge and the journal did not. It is recorded now, "
+                     f"once, under that file's charge identity.")
+            elif outcome == BATCH_RECORD_DUPLICATE:
+                rep["already_recorded"] += 1
+            else:
+                JOURNAL_FAULTS[f"recovery:{outcome}"] += 1
+                rep["unverified"].append(
+                    f"state file {state_path} records batch {bid} at "
+                    f"${amount:.6f} and the journal "
+                    + ("holds a DIFFERENT amount for that charge"
+                       if outcome == BATCH_RECORD_CONFLICTED
+                       else "could not confirm recording it")
+                    + f" ({outcome})")
+        spent = state.get("spend_usd")
+        if "spend_usd" in state and not _valid_amount(spent):
+            rep["unverified"].append(
+                f"state file {state_path} records spend_usd {spent!r}, which "
+                f"is not an amount")
+        elif _valid_amount(spent):
+            # A file whose migration coverage is itself unestablished has its
+            # own reason already; its spend_usd cannot be split either way.
+            if cov is None or not (cov["all_ambiguous"] or cov["ambiguous"]):
+                # EACH CHARGE ONCE: the batch the migration represents is the
+                # migration's charge, counted at the smaller of its two
+                # amounts, and every other valid batch in the map beside it.
+                shared = [valid[b] for b in represented if b in valid]
+                explained = ((min(migrated, sum(shared)) if shared
+                              else migrated)
+                             + sum(a for b, a in valid.items()
+                                   if b not in represented))
+                unattributed = float(spent) - explained
+                if unattributed > RECOVERY_UNIT_TOLERANCE_USD * (
+                        len(by_batch) + 1):
+                    JOURNAL_FAULTS["recovery:unattributed_spend"] += 1
+                    rep["unverified"].append(
+                        f"state file {state_path} records spend_usd "
+                        f"${float(spent):.6f}, ${unattributed:.6f} more than "
+                        f"its migration entry and its per-batch charges "
+                        f"account for, each charge counted once; that money "
+                        f"is in no journal entry and cannot be attributed to "
+                        f"a batch")
+    except Exception as exc:                                    # noqa: BLE001
+        JOURNAL_FAULTS[f"recovery:raised:{type(exc).__name__}"] += 1
+        rep["unverified"].append(
+            f"recovery of state file {state_path} failed "
+            f"({type(exc).__name__})")
+    return rep
 
 
 def bootstrap_from_state_files(budget=spend.SPEND_BUDGET_RATER,
@@ -1807,8 +2380,17 @@ def bootstrap_report(budget=spend.SPEND_BUDGET_RATER,
     that file already covers, so a session that later resumes one of those
     batches does not charge it a second time.
 
+    **AND A JOURNAL-ERA FILE IS NOT MIGRATED, IT IS RECOVERED.** Each one is
+    handed to ``recover_state_file_charges``, which offers its recorded
+    per-batch charges to the journal under their own charge identity -- so a
+    batch whose journal write never landed reaches the cap, once, without a
+    resume.
+
     Returns ``{"written", "duplicate", "skipped", "journal_era", "usd",
-    "unreadable"}``. ``unreadable`` names every state file that could not be
+    "recovered", "recovered_usd", "journal_era_identities", "unreadable"}``.
+    ``journal_era_identities`` is the ``scope_identity`` of every journal-era
+    file this call recovered, so a caller about to recover its own state file
+    can tell it has already been done. ``unreadable`` names every state file that could not be
     read, every directory that could not be walked, every recorded spend that
     is present and not a usable amount, and every migration offer the journal
     did not CONFIRM (failed, uncertain or conflicted) -- each of which is spend
@@ -1816,9 +2398,11 @@ def bootstrap_report(budget=spend.SPEND_BUDGET_RATER,
     hands to ``spend.SPEND_LEDGER.mark_unverified``.
     """
     emit = out or console.out
-    written = duplicate = journal_era = 0
-    usd = 0.0
+    written = duplicate = journal_era = recovered = 0
+    usd = recovered_usd = 0.0
     unreadable = []
+    era_files = []
+    era_identities = set()
     for state_path in find_state_files(root, errors=unreadable):
         try:
             with io.open(state_path, "r", encoding="utf-8") as fh:
@@ -1837,6 +2421,7 @@ def bootstrap_report(budget=spend.SPEND_BUDGET_RATER,
             continue
         if JOURNAL_ERA_STATE_KEY in state:
             journal_era += 1
+            era_files.append((state_path, state))
             continue
         amount = state.get("spend_usd")
         batches = state.get("batches")
@@ -1882,13 +2467,32 @@ def bootstrap_report(budget=spend.SPEND_BUDGET_RATER,
                               f"confirmed in the journal ({got})")
     skipped = duplicate + (len([u for u in unreadable
                                 if u.startswith("migration of ")]))
+    # ONE READING, AFTER THE MIGRATIONS: the recovery's unattributed-spend check
+    # asks what the migration entries hold, and its own appends go through the
+    # locked duplicate check rather than through this snapshot.
+    if era_files:
+        snapshot = read_entries(path)
+        for state_path, state in era_files:
+            got = recover_state_file_charges(state_path, state, budget=budget,
+                                             source=source, path=path,
+                                             entries=snapshot, out=emit)
+            recovered += got["recovered"]
+            recovered_usd += got["recovered_usd"]
+            unreadable.extend(got["unverified"])
+            ident = scope_identity(state_path)
+            if ident is not None:
+                era_identities.add(ident)
     emit(f"  [Spend journal] migration: {written} state file(s) recorded, "
          f"{duplicate} already present, {journal_era} journal-era file(s) "
-         f"not migrated, ${usd:.4f} added"
+         f"not migrated, ${usd:.4f} added; {recovered} journal-era batch "
+         f"charge(s) recovered (${recovered_usd:.4f})"
          + (f"; {len(unreadable)} item(s) COULD NOT BE READ OR CONFIRMED."
             if unreadable else "."))
     return {"written": written, "duplicate": duplicate, "skipped": skipped,
-            "journal_era": journal_era, "usd": usd, "unreadable": unreadable}
+            "journal_era": journal_era, "usd": usd, "recovered": recovered,
+            "recovered_usd": recovered_usd,
+            "journal_era_identities": era_identities,
+            "unreadable": unreadable}
 
 
 def _file_mtime_utc(p):

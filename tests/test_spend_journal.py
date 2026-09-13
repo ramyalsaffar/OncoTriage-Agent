@@ -2099,10 +2099,64 @@ J.append({"entry_id": J.entry_id(_RB, _RS, "/S", "migration"),
           "kind": J.ENTRY_KIND_MIGRATION, "budget": _RB, "source": _RS,
           "scope": "/S", "unit": "migration", "usd": 0.1,
           "covers_batch_ids": ["b2"]}, path=_p9r)
-check("9r  recorded_batch_ids is what total COUNTS for one scope: not another "
-      "scope's batch, and not one a migration merely lists",
-      sorted(J.recorded_batch_ids(_RB, _RS, "/S", J.read_entries(_p9r))),
-      ["b1"])
+# ── NON-RAISING DRIVERS FOR EVERY CHECK BELOW ────────────────────────────
+#
+# A defect that makes `total`, `recorded_batch_ids` or `pending_coverage_reasons`
+# RAISE -- each is documented NEVER RAISES -- must be a recorded failure, not an
+# abort that hides every check after it. The revert matrix found exactly that:
+# a plant that broke one unpack took this whole file down with no summary.
+class _NoSeed(object):
+    usd = rows = unreadable = runs = -1
+    unreadable_reasons = ()
+
+    def __init__(self, why):
+        self.why = why
+
+    def __repr__(self):
+        return f"<total raised: {self.why}>"
+
+
+def _tot(path):
+    try:
+        return J.total(_RB, path=path)
+    except BaseException as exc:                                # noqa: BLE001
+        return _NoSeed(f"{type(exc).__name__}: {exc}")
+
+
+def _rbi(scope, path):
+    got = guarded(J.recorded_batch_ids, _RB, _RS, scope, J.read_entries(path))
+    return sorted(got) if isinstance(got, set) else got
+
+
+def _pend(scope, path, ids):
+    return guarded(J.pending_coverage_reasons, _RB, _RS, scope,
+                   J.read_entries(path), ids)
+
+
+# PER-BATCH COVERAGE MOVED THIS PIN, ARGUED RATHER THAN RELAXED. The migration
+# lists ONE batch beside a positive amount, so that amount can only be b2's:
+# b2 IS in the seed (through the migration) and a collection must not charge
+# it again. The old pin read "not one a migration merely lists" and was right
+# about listing; the shipped rule treated this represented batch as merely
+# listed and charged it twice. 9r-ii is the case where listing is NOT
+# representation.
+check("9r  recorded_batch_ids is what total COUNTS for one state file: not "
+      "another scope's batch -- and a batch a single-batch migration "
+      "REPRESENTS is in the set, because its money is the migration's amount",
+      _rbi("/S", _p9r),
+      ["b1", "b2"])
+check("9r-i  ...and total counts b2's money ONCE, through the migration",
+      round(_tot(_p9r).usd, 6), 0.3)
+_p9r2 = fresh()
+J.record_batch(_RB, _RS, "/S2", "c2", 0.1, "j", path=_p9r2)
+J.append({"entry_id": J.entry_id(_RB, _RS, "/S2", "migration"),
+          "kind": J.ENTRY_KIND_MIGRATION, "budget": _RB, "source": _RS,
+          "scope": "/S2", "unit": "migration", "usd": 0.1,
+          "covers_batch_ids": ["c1", "c2"]}, path=_p9r2)
+check("9r-ii a batch a TWO-batch migration merely lists is NOT in the set: "
+      "the amount cannot say whether it includes it",
+      _rbi("/S2", _p9r2),
+      [])
 
 
 # ── 9s-9w  THE MIGRATION'S REPORT ───────────────────────────────────────
@@ -2131,10 +2185,17 @@ try:
     _rep9 = J.bootstrap_report(root=_root9, path=_p9m, out=lambda _m: None)
 finally:
     os.chmod(_locked9, 0o755)
-check("9s  the migration writes the readable pre-journal files and skips the "
-      "journal-era one", (_rep9["written"], _rep9["journal_era"],
-                          any("/era/" in str(e.get("scope"))
-                              for e in J.read_entries(_p9m))), (2, 1, False))
+# THE PIN NARROWED TO WHAT IT IS ABOUT: no MIGRATION entry for the journal-era
+# file. The journal now DOES hold an entry for it -- the recovery of its one
+# recorded batch charge, which the empty journal had never seen -- and that is
+# the P2 repair, checked in section 10.
+check("9s  the migration writes the readable pre-journal files, does not "
+      "MIGRATE the journal-era one, and recovers its one unrecorded batch",
+      (_rep9["written"], _rep9["journal_era"],
+       any("/era/" in str(e.get("scope"))
+           and e.get("kind") == J.ENTRY_KIND_MIGRATION
+           for e in J.read_entries(_p9m)),
+       _rep9["recovered"]), (2, 1, False, 1))
 check("9s-i  ...and NAMES the torn state file, the unusable spend and the "
       "directory it could not walk",
       (any("torn" in u and "could not be read" in u for u in _rep9["unreadable"]),
@@ -2150,10 +2211,92 @@ _state_h = _write_state9(_root9h, "s/rater/rater_state.json",
 _p9h = fresh()
 J.bootstrap_report(root=_root9h, path=_p9h, out=lambda _m: None)
 J.record_batch(_RB, _RS, _state_h, "H2", 0.7, "j", path=_p9h)
-check("9t  THE DEFECT THE MARKER PREVENTS: a migrated file that LISTED a batch "
-      "not yet collected makes total skip that batch's later entry -- its "
-      "$0.70 never reaches the cap (legacy shape, kept as the record)",
-      round(J.total(_RB, path=_p9h).usd, 6), 1.0)
+# ** 9t WAS THE RECORD OF P1 AND IS NOW ITS REPAIR. ** It pinned the total at
+# $1.00: the migration LISTED H1 and H2, `total` skipped every listed batch's
+# later entry, and H2's $0.70 never reached the cap -- with nothing saying so.
+# The migration's ONE amount beside TWO listed batches cannot say whether it
+# includes H2 (a retry batch submitted and never collected is exactly this
+# shape), so coverage is not established. What the repair guarantees is not a
+# guessed number but a REFUSAL: H2 is named, the budget is UNVERIFIED, and no
+# new paid request is issued on it -- while collection stays permitted.
+_s9th = _tot(_p9h)
+check("9t  P1 REPAIRED: H2's later entry is no longer SILENTLY skipped as "
+      "covered -- the budget is UNVERIFIED, naming batch H2 and the ambiguous "
+      "migration, and the counted $1.00 is a floor",
+      (round(_s9th.usd, 6), _s9th.unreadable,
+       any("batch H2" in r and "cannot say" in r and "several_batches" in r
+           for r in _s9th.unreadable_reasons)), (1.0, 1, True))
+_saved9t = (_CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED)
+try:
+    _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = 50.0, True
+    spend.SPEND_LEDGER.reset()
+    if isinstance(_s9th, spend.LedgerSeed):
+        spend.SPEND_LEDGER.seed(_s9th)
+    _gate9t = guarded(spend.require_budget, _RS, "the 9t probe")
+    _txt9t = spend.unverified_record_refusal(_RS) or ""
+    check("9t-i  ...AT THE SURFACE: new paid work on the rater budget is "
+          "REFUSED (SpendRecordUnverified), the refusal names H2, and the "
+          "banner labels the remainder UNVERIFIED",
+          (str(_gate9t).startswith("<RAISED SpendRecordUnverified"),
+           "batch H2" in _txt9t,
+           "UNVERIFIED" in J.describe(_RB, path=_p9h)), (True, True, True))
+finally:
+    _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = _saved9t
+    spend.SPEND_LEDGER.reset()
+check("9t-ii ...and COLLECTION STAYS PERMITTED: re-offering the collected H2 "
+      "is answered as recorded, not refused, and writes no second line",
+      (J.record_batch_with_outcome(_RB, _RS, _state_h, "H2", 0.7, "j",
+                                   path=_p9h)["outcome"],
+       sum(1 for e in J.read_entries(_p9h) if e.get("unit") == "H2")),
+      (J.BATCH_RECORD_DUPLICATE, 1))
+check("9t-iii pending: a session ABOUT to collect H1 -- listed, no entry yet -- "
+      "is told before it collects; a batch the migration never listed is not "
+      "reasons, and H2 (already entered) is left to total",
+      ([bool(r) for r in (
+          _pend(_state_h, _p9h, ["H1"]),
+          _pend(_state_h, _p9h, ["H9"]),
+          _pend(_state_h, _p9h, ["H2"]))]), [True, False, False])
+
+# CLEAN CONTROLS: THE TWO SHAPES WHOSE COVERAGE IS DERIVABLE.
+_root9z = os.path.join(TMP, "runs9z")
+_state_z = _write_state9(_root9z, "s/rater/rater_state.json",
+                         {"batches": [{"id": "Z1"}, {"id": "Z2"}]})
+_p9z = fresh()
+J.bootstrap_report(root=_root9z, path=_p9z, out=lambda _m: None)
+J.record_batch(_RB, _RS, _state_z, "Z2", 0.7, "j", path=_p9z)
+J.record_batch(_RB, _RS, _state_z, "Z2", 0.7, "j", path=_p9z)
+_s9z = _tot(_p9z)
+check("9t-iv ZERO-AMOUNT (a pre-key FLOOR listing two batches): no listed "
+      "batch is represented, so the later Z2 is counted -- EXACTLY ONCE, "
+      "collected twice -- and nothing is unverified",
+      (round(_s9z.usd, 6), _s9z.unreadable,
+       _rbi(_state_z, _p9z)),
+      (0.7, 0, ["Z2"]))
+_root9y = os.path.join(TMP, "runs9y")
+_state_y = _write_state9(_root9y, "s/rater/rater_state.json",
+                         {"spend_usd": 1.0, "batches": [{"id": "Y1"}]})
+_p9y = fresh()
+J.bootstrap_report(root=_root9y, path=_p9y, out=lambda _m: None)
+J.record_batch(_RB, _RS, _state_y, "Y1", 1.0, "j", path=_p9y)
+_s9y = _tot(_p9y)
+check("9t-v SINGLE BATCH: the positive amount can only be Y1's, so its "
+      "re-collection is not counted again, is in the seed, and is verified",
+      (round(_s9y.usd, 6), _s9y.unreadable,
+       _rbi(_state_y, _p9y)),
+      (1.0, 0, ["Y1"]))
+check("9t-vi the rule table is the closed vocabulary, one rule per shape",
+      [J.migration_coverage(e)["rule"] for e in (
+          {"usd": 0.0, "covers_batch_ids": ["a", "b"]},
+          {"usd": 1.0, "covers_batch_ids": ["a"]},
+          {"usd": 1.0, "covers_batch_ids": ["a", "b"]},
+          {"usd": 1.0, "covers_batch_ids": "a"},
+          {"usd": 1.0, "covers_batch_ids": []},
+          {"usd": 1.0})],
+      [J.COVERAGE_ZERO_AMOUNT, J.COVERAGE_SINGLE_BATCH,
+       J.COVERAGE_SEVERAL_BATCHES, J.COVERAGE_NO_USABLE_LISTING,
+       J.COVERAGE_NO_USABLE_LISTING, J.COVERAGE_NO_USABLE_LISTING])
+check("9t-vii ...and that vocabulary is closed and has no duplicate member",
+      (len(set(J.COVERAGE_RULES)), len(J.COVERAGE_RULES)), (4, 4))
 _root9e = os.path.join(TMP, "runs9e")
 _state_e = _write_state9(_root9e, "s/rater/rater_state.json",
                          {"spend_usd": 1.0,
@@ -2165,7 +2308,7 @@ J.record_batch(_RB, _RS, _state_e, "H1", 1.0, "j", path=_p9e)
 J.record_batch(_RB, _RS, _state_e, "H2", 0.7, "j", path=_p9e)
 check("9u  ...and the same session carrying the journal-era marker is not "
       "migrated, so every collected batch counts",
-      round(J.total(_RB, path=_p9e).usd, 6), 1.7)
+      round(_tot(_p9e).usd, 6), 1.7)
 _ro9 = os.path.join(TMP, "ro9")
 os.makedirs(_ro9)
 os.chmod(_ro9, 0o555)
@@ -2181,6 +2324,362 @@ check("9v  a migration the journal did not CONFIRM is on the unreadable list, "
 check("9w  the back-compatible tuple is unchanged in shape and meaning",
       J.bootstrap_from_state_files(root=_root9h, path=_p9h,
                                    out=lambda _m: None), (0, 1, 0.0))
+
+
+print()
+print("=" * 74)
+print("10. JOURNAL-ERA RECOVERY (P2) AND STATE-FILE IDENTITY (P3)")
+print("=" * 74)
+
+
+def _raw_entry(path, kind, scope, unit, usd, **extra):
+    """A HISTORICAL line, written as an earlier writer would have left it --
+    bypassing `append`, whose duplicate check would now refuse it."""
+    payload = {"schema_version": J.SCHEMA_VERSION,
+               "entry_id": J.entry_id(_RB, _RS, scope, unit), "kind": kind,
+               "budget": _RB, "source": _RS, "scope": scope, "unit": unit,
+               "usd": usd}
+    payload.update(extra)
+    with io.open(path, "ab") as fh:
+        fh.write((json.dumps(payload, sort_keys=True) + "\n").encode("utf-8"))
+
+
+def _units(path, unit):
+    return sum(1 for e in J.read_entries(path) if e.get("unit") == unit)
+
+
+_msgs10 = []
+
+# ── 10a-10h  P2: a charge that exists only in a journal-era state file ──
+_root10 = os.path.join(TMP, "runs10")
+_era10 = {"spend_usd": 0.75, "model": "j",
+          J.JOURNAL_ERA_STATE_KEY: {"E1": 0.5, "E2": 0.25},
+          "batches": [{"id": "E1"}, {"id": "E2"}]}
+_st10 = _write_state9(_root10, "era/rater_blind/rater_state_blind.json",
+                      _era10)
+_p10 = fresh()
+J.record_batch(_RB, _RS, _st10, "E1", 0.5, "j", path=_p10)
+check("10a  non-degeneracy: E2's journal write never landed, so before "
+      "recovery the cap reads $0.50 of the $0.75 the state file records",
+      round(_tot(_p10).usd, 6), 0.5)
+_r10 = J.bootstrap_report(root=_root10, path=_p10, out=_msgs10.append)
+_s10 = _tot(_p10)
+check("10b  the migration RECOVERS E2 from the state file, once, and the cap "
+      "reads $0.75, verified",
+      (_r10["recovered"], round(_r10["recovered_usd"], 6), _r10["unreadable"],
+       round(_s10.usd, 6), _s10.unreadable, _units(_p10, "E2")),
+      (1, 0.25, [], 0.75, 0, 1))
+check("10b-i ...and the operator is told what was recovered",
+      any("RECOVERED $0.250000 for batch E2" in m for m in _msgs10), True)
+_r10b = J.bootstrap_report(root=_root10, path=_p10, out=lambda _m: None)
+check("10c  REPEATED RECOVERY CHARGES ONCE: a second run writes nothing",
+      (_r10b["recovered"], round(_tot(_p10).usd, 6),
+       _units(_p10, "E2")), (0, 0.75, 1))
+_link10 = os.path.join(TMP, "runs10-link")
+os.symlink(_root10, _link10)
+_r10c = J.bootstrap_report(root=_link10, path=_p10, out=lambda _m: None)
+check("10d  ...and running it under ANOTHER SPELLING of the root (a symlink) "
+      "writes nothing either -- the duplicate check matches the state FILE",
+      (_r10c["recovered"], _r10c["unreadable"],
+       round(_tot(_p10).usd, 6), _units(_p10, "E2")),
+      (0, [], 0.75, 1))
+
+_p10x = fresh()
+J.record_batch(_RB, _RS, _st10, "E1", 0.5, "j", path=_p10x)
+_raw_entry(_p10x, J.ENTRY_KIND_BATCH,
+           os.path.join(_link10, "era/rater_blind/rater_state_blind.json"),
+           "E2", 0.3)
+_r10x = J.bootstrap_report(root=_root10, path=_p10x, out=lambda _m: None)
+check("10e  a journal holding E2 at a DIFFERENT amount under another spelling "
+      "is a CONFLICT: nothing is written, nothing is merged, and it is "
+      "unverified", (_r10x["recovered"], _units(_p10x, "E2"),
+                     any("batch E2" in u and "DIFFERENT amount" in u
+                         for u in _r10x["unreadable"])), (0, 1, True))
+_ro10 = os.path.join(TMP, "ro10")
+os.makedirs(_ro10)
+_p10r = os.path.join(_ro10, "j.jsonl")
+os.chmod(_ro10, 0o555)
+try:
+    _r10r = J.bootstrap_report(root=_root10, path=_p10r, out=lambda _m: None)
+finally:
+    os.chmod(_ro10, 0o755)
+check("10f  a recovery the journal cannot CONFIRM is unverified, naming the "
+      "batches", sorted(("E1" in u, "E2" in u) for u in _r10r["unreadable"]
+                        if "could not confirm" in u),
+      [(False, True), (True, False)])
+_root10u = os.path.join(TMP, "runs10u")
+_write_state9(_root10u, "era/rater/rater_state.json",
+              dict(_era10, spend_usd=1.75))
+_r10u = J.bootstrap_report(root=_root10u, path=fresh(), out=lambda _m: None)
+check("10g  spend_usd the journal cannot attribute to a batch or a migration "
+      "is REPORTED, never dropped", any("$1.000000 more" in u
+                                        for u in _r10u["unreadable"]), True)
+_root10m = os.path.join(TMP, "runs10m")
+_write_state9(_root10m, "era/rater/rater_state.json",
+              {J.JOURNAL_ERA_STATE_KEY: {"E9": "free"}})
+_write_state9(_root10m, "era2/rater/rater_state.json",
+              {J.JOURNAL_ERA_STATE_KEY: [1]})
+_r10m = J.bootstrap_report(root=_root10m, path=fresh(), out=lambda _m: None)
+check("10h  an unusable per-batch amount and an unusable map are each "
+      "unverified", (any("'E9'" in u and "not an amount" in u
+                         for u in _r10m["unreadable"]),
+                     any("cannot be read" in u for u in _r10m["unreadable"])),
+      (True, True))
+
+# ── 10i-10q  P3: one state file, several spellings ──────────────────────
+_id10 = os.path.join(TMP, "id10")
+os.makedirs(os.path.join(_id10, "out"))
+os.makedirs(os.path.join(_id10, "other"))
+_real10 = os.path.join(_id10, "out", "rater_state_blind.json")
+_idlink10 = os.path.join(TMP, "id10-link")
+os.symlink(_id10, _idlink10)
+_spellings10 = [
+    _real10,
+    os.path.join(_idlink10, "out", "rater_state_blind.json"),
+    _id10 + "/./out/rater_state_blind.json",
+    _id10 + "/other/../out/rater_state_blind.json",
+    _id10.replace(os.sep, os.sep * 2) + "//out//rater_state_blind.json",
+]
+_ids10 = [J.scope_identity(sp) for sp in _spellings10]
+check("10i  every spelling of one state file -- symlink, '.', '..', doubled "
+      "separators -- has ONE identity", (len(set(_ids10)), None in _ids10),
+      (1, False))
+check("10i-i  CLEAN CONTROL: the same basename in ANOTHER directory is another "
+      "identity, and a relative or non-string scope has none",
+      (J.scope_identity(os.path.join(_id10, "other",
+                                     "rater_state_blind.json")) == _ids10[0],
+       J.scope_identity("out/rater_state_blind.json"),
+       J.scope_identity(None)), (False, None, None))
+_gone10 = os.path.join(TMP, "gone10", "x")
+check("10i-ii a directory that does not exist is still one identity across "
+      "'..' spellings", J.scope_identity(_gone10 + "/../x/s.json")
+      == J.scope_identity(_gone10 + "/s.json") is not None, True)
+_case_dir = os.path.join(TMP, "CaseDir10")
+os.makedirs(_case_dir)
+_ci = os.path.isdir(os.path.join(TMP, "casedir10"))
+check("10i-iii a CASE variant is one identity exactly when the filesystem says "
+      "it is one directory (this filesystem: case-"
+      + ("insensitive" if _ci else "sensitive") + ")",
+      J.scope_identity(os.path.join(TMP, "casedir10", "s.json"))
+      == J.scope_identity(os.path.join(_case_dir, "s.json")), _ci)
+
+_p10p = fresh()
+_raw_entry(_p10p, J.ENTRY_KIND_BATCH, _spellings10[0], "B1", 0.4)
+_raw_entry(_p10p, J.ENTRY_KIND_BATCH, _spellings10[1], "B1", 0.4)
+_s10p = _tot(_p10p)
+check("10j  EQUIVALENT HISTORICAL ENTRIES, MATCHING AMOUNTS: two lines (two "
+      "entry_ids) naming one batch under two spellings count ONCE, verified",
+      (round(_s10p.usd, 6), _s10p.rows, _s10p.unreadable, _s10p.runs),
+      (0.4, 1, 0, 1))
+check("10k  ...and either spelling's recorded_batch_ids finds it",
+      [_rbi(sp, _p10p)
+       for sp in _spellings10], [["B1"]] * len(_spellings10))
+_p10q = fresh()
+_raw_entry(_p10q, J.ENTRY_KIND_BATCH, _spellings10[0], "B1", 0.4)
+_raw_entry(_p10q, J.ENTRY_KIND_BATCH, _spellings10[2], "B1", 0.6)
+_s10q = _tot(_p10q)
+check("10l  EQUIVALENT ENTRIES, CONFLICTING AMOUNTS: not silently merged -- "
+      "the smaller is counted and the budget is UNVERIFIED naming both",
+      (round(_s10q.usd, 6), _s10q.unreadable,
+       any("DIFFERENT amounts [0.4, 0.6]" in r
+           for r in _s10q.unreadable_reasons)), (0.4, 1, True))
+_p10n = fresh()
+_raw_entry(_p10n, J.ENTRY_KIND_BATCH, _spellings10[0], "B1", 0.4)
+_raw_entry(_p10n, J.ENTRY_KIND_BATCH,
+           os.path.join(_id10, "other", "rater_state_blind.json"), "B1", 0.4)
+check("10m  CLEAN CONTROL: the same batch id under a genuinely DIFFERENT state "
+      "file is not merged", (round(_tot(_p10n).usd, 6),
+                             _tot(_p10n).unreadable), (0.8, 0))
+check("10n  NEW APPENDS MATCH HISTORY BY FILE: re-offering B1 under a third "
+      "spelling at the same amount is a DUPLICATE and writes no line; at "
+      "another amount it is a CONFLICT and writes none",
+      (J.record_batch_with_outcome(_RB, _RS, _spellings10[3], "B1", 0.4, "j",
+                                   path=_p10p)["outcome"],
+       J.record_batch_with_outcome(_RB, _RS, _spellings10[4], "B1", 0.9, "j",
+                                   path=_p10p)["outcome"], _units(_p10p, "B1")),
+      (J.BATCH_RECORD_DUPLICATE, J.BATCH_RECORD_CONFLICTED, 2))
+_p10c = fresh()
+_raw_entry(_p10c, J.ENTRY_KIND_MIGRATION, _spellings10[1], "migration", 0.3,
+           covers_batch_ids=["M1"])
+_raw_entry(_p10c, J.ENTRY_KIND_BATCH, _spellings10[0], "M1", 0.3)
+check("10o  a migration recorded under one spelling represents a batch "
+      "recorded under another -- no double count",
+      (round(_tot(_p10c).usd, 6),
+       _tot(_p10c).unreadable), (0.3, 0))
+_p10cc = fresh()
+_raw_entry(_p10cc, J.ENTRY_KIND_MIGRATION, _spellings10[1], "migration", 0.3,
+           covers_batch_ids=["M1"])
+_raw_entry(_p10cc, J.ENTRY_KIND_MIGRATION, _spellings10[2], "migration", 0.5,
+           covers_batch_ids=["M1"])
+_s10cc = _tot(_p10cc)
+check("10o-i  two migrations of one file under two spellings that DISAGREE "
+      "count the smaller and are unverified", (round(_s10cc.usd, 6),
+                                               _s10cc.unreadable), (0.3, 1))
+_p10rel = fresh()
+_raw_entry(_p10rel, J.ENTRY_KIND_BATCH, "out/rater_state_blind.json", "R1",
+           2.0)
+_s10rel = _tot(_p10rel)
+check("10p  an entry whose state file cannot be IDENTIFIED (a relative scope) "
+      "is not counted and marks the budget unverified -- never guessed",
+      (round(_s10rel.usd, 6), _s10rel.unreadable,
+       any("cannot be identified" in r for r in _s10rel.unreadable_reasons)),
+      (0.0, 1, True))
+_saved10 = (_CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED)
+try:
+    _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = 50.0, True
+    spend.SPEND_LEDGER.reset()
+    if isinstance(_s10q, spend.LedgerSeed):
+        spend.SPEND_LEDGER.seed(_s10q)
+    check("10q  AT THE SURFACE: the conflicting equivalent entries refuse new "
+          "paid work by name, and the banner labels the remainder",
+          (str(guarded(spend.require_budget, _RS, "10q")).startswith(
+              "<RAISED SpendRecordUnverified"),
+           "DIFFERENT amounts" in (spend.unverified_record_refusal(_RS) or ""),
+           "UNVERIFIED" in J.describe(_RB, path=_p10q)), (True, True, True))
+finally:
+    _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = _saved10
+    spend.SPEND_LEDGER.reset()
+
+
+# ── 10r-10u  EACH CHARGE ONCE IN THE STATE-TOTAL RECONCILIATION ──────────
+#
+# A journal-era state file whose batch A a migration entry REPRESENTS
+# (single_batch). The recovery used to subtract the migration's amount AND
+# spend_by_batch's amount for A from spend_usd -- the same charge twice -- so a
+# residual nobody could attribute was cancelled by the second subtraction.
+
+def _recon10(sub, mig_usd, by_batch, spent, batch_entries=()):
+    st = {"spend_usd": spent, "model": "j",
+          J.JOURNAL_ERA_STATE_KEY: dict(by_batch),
+          "batches": [{"id": b} for b in sorted(set(by_batch) | {"A"})]}
+    sp = _write_state9(os.path.join(TMP, "runs10r", sub),
+                       "era/rater_blind/rater_state_blind.json", st)
+    p = fresh()
+    _raw_entry(p, J.ENTRY_KIND_MIGRATION, sp, "migration", mig_usd,
+               covers_batch_ids=["A"])
+    for unit, usd in batch_entries:
+        _raw_entry(p, J.ENTRY_KIND_BATCH, sp, unit, usd)
+    return sp, st, p
+
+
+def _recover10(sp, st, p):
+    msgs = []
+    got = guarded(J.recover_state_file_charges, sp, st, path=p,
+                  out=msgs.append)
+    if not isinstance(got, dict):
+        got = {"recovered": got, "recovered_usd": got,
+               "already_recorded": got, "unverified": [str(got)]}
+    return got, msgs
+
+
+def _lines10(p):
+    return len(J.read_entries(p))
+
+
+def _refuses10(seed, reasons):
+    """(require_budget refuses, the refusal text) at the operator surface."""
+    saved = (_CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED)
+    try:
+        _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = 50.0, True
+        spend.SPEND_LEDGER.reset()
+        if isinstance(seed, spend.LedgerSeed):
+            spend.SPEND_LEDGER.seed(seed)
+        spend.SPEND_LEDGER.mark_unverified(_RB, list(reasons))
+        raised = str(guarded(spend.require_budget, _RS, "10r"))
+        return (raised.startswith("<RAISED SpendRecordUnverified"),
+                spend.unverified_record_refusal(_RS) or "")
+    finally:
+        _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = saved
+        spend.SPEND_LEDGER.reset()
+
+
+_sp10r, _st10r, _p10rr = _recon10("p1", 1.00, {"A": 1.00}, 1.70)
+check("10r-pre non-degeneracy: before reconciliation the cap reads the "
+      "migration's $1.00, VERIFIED -- the $0.70 is in no journal entry",
+      (round(_tot(_p10rr).usd, 6), _tot(_p10rr).unreadable), (1.0, 0))
+_g10r, _m10r = _recover10(_sp10r, _st10r, _p10rr)
+check("10r  P1: migration $1.00 for A, spend_by_batch repeats A's $1.00, "
+      "spend_usd $1.70 -- the $0.70 residual is UNVERIFIED, named; A is the "
+      "migration's charge (already recorded), not a recovery",
+      (_g10r["recovered"], _g10r["already_recorded"],
+       [("$0.700000 more" in u) for u in _g10r["unverified"]]),
+      (0, 1, [True]))
+check("10r-i  ...no second record of A is written and nothing is announced "
+      "as RECOVERED: the cap still reads $1.00, one line",
+      (_units(_p10rr, "A"), _lines10(_p10rr), round(_tot(_p10rr).usd, 6),
+       any("RECOVERED" in m for m in _m10r)), (0, 1, 1.0, False))
+_g10r2, _ = _recover10(_sp10r, _st10r, _p10rr)
+check("10r-ii REPEATED RECONCILIATION CHARGES ONCE: a second run writes "
+      "nothing, reports the same residual, and the cap is unchanged",
+      (_lines10(_p10rr), round(_tot(_p10rr).usd, 6), _g10r2["unverified"]),
+      (1, 1.0, _g10r["unverified"]))
+_ref10r = _refuses10(_tot(_p10rr), _g10r["unverified"])
+check("10r-iii AT THE SURFACE: new paid work is REFUSED and the refusal names "
+      "the $0.70", (_ref10r[0], "$0.700000 more" in _ref10r[1]), (True, True))
+
+_sp10s, _st10s, _p10s = _recon10("mirror", 1.00, {"A": 0.80}, 0.80)
+_g10s, _ = _recover10(_sp10s, _st10s, _p10s)
+check("10s  MIRROR: the migration says $1.00 and spend_by_batch says $0.80 "
+      "for the SAME batch -- ONE charge, two amounts: unverified naming both, "
+      "the smaller counted, nothing written",
+      ([("DIFFERENT amounts" in u and "$0.800000" in u and "$1.000000" in u)
+        for u in _g10s["unverified"]], _g10s["already_recorded"],
+       _units(_p10s, "A")), ([True], 0, 0))
+check("10s-i ...and it refuses at the surface",
+      _refuses10(_tot(_p10s), _g10s["unverified"])[0], True)
+_sp10s2, _st10s2, _p10s2 = _recon10("mirror-smaller", 1.00, {"A": 0.80}, 1.00)
+_g10s2, _ = _recover10(_sp10s2, _st10s2, _p10s2)
+check("10s-ii COUNT THE SMALLER, proved: spend_usd $1.00 is $0.20 more than "
+      "the smaller $0.80 -- counting the larger would explain it and say "
+      "nothing", sorted(("DIFFERENT" in u, "$0.200000 more" in u)
+                        for u in _g10s2["unverified"]),
+      [(False, True), (True, False)])
+_sp10s3, _st10s3, _p10s3 = _recon10("mirror-rev", 0.80, {"A": 1.00}, 1.00)
+_g10s3, _ = _recover10(_sp10s3, _st10s3, _p10s3)
+check("10s-iii ...symmetric when the MIGRATION is the smaller",
+      sorted(("DIFFERENT" in u, "$0.200000 more" in u)
+             for u in _g10s3["unverified"]), [(False, True), (True, False)])
+
+_sp10t, _st10t, _p10t = _recon10("exact", 1.00, {"A": 1.00, "B": 0.30}, 1.30)
+_g10t, _m10t = _recover10(_sp10t, _st10t, _p10t)
+check("10t  CLEAN CONTROL, EXACT COVERAGE: every charge explained once -- A by "
+      "the migration, B recovered -- no reason, the cap reads $1.30",
+      (_g10t["unverified"], _g10t["already_recorded"], _g10t["recovered"],
+       round(_g10t["recovered_usd"], 6), round(_tot(_p10t).usd, 6),
+       _tot(_p10t).unreadable), ([], 1, 1, 0.3, 1.3, 0))
+check("10t-i ...and it does NOT refuse at the surface",
+      _refuses10(_tot(_p10t), _g10t["unverified"])[0], False)
+_g10t2, _ = _recover10(_sp10t, _st10t, _p10t)
+check("10t-ii ...repeated: nothing written, still clean",
+      (_lines10(_p10t), _g10t2["unverified"], round(_tot(_p10t).usd, 6)),
+      (2, [], 1.3))
+_sp10tr, _st10tr, _p10tr = _recon10("rounding", 0.056607,
+                                    {"A": 0.05660715}, 0.056607)
+_g10tr, _ = _recover10(_sp10tr, _st10tr, _p10tr)
+check("10t-iii ROUNDING CONTROL: the production shape (rounded $0.056607 "
+      "against an unrounded $0.05660715 for one batch) is ONE amount, not a "
+      "conflict", (_g10tr["unverified"], _g10tr["already_recorded"]), ([], 1))
+
+_sp10u, _, _p10u = _recon10("total", 1.00, {}, 1.00,
+                            batch_entries=[("A", 0.80)])
+_s10u = _tot(_p10u)
+check("10u  THE CAP'S OWN READING: a journal batch entry for the batch a "
+      "migration represents, at a DIFFERENT amount, is one charge -- the "
+      "smaller is counted and the budget is UNVERIFIED (it used to be skipped "
+      "silently)", (round(_s10u.usd, 6), _s10u.unreadable,
+                    any("DIFFERENT amounts; the smaller $0.800000" in r
+                        for r in _s10u.unreadable_reasons)), (0.8, 1, True))
+_s10u2 = _tot(_recon10("total-rev", 1.00, {}, 1.00,
+                       batch_entries=[("A", 1.20)])[2])
+check("10u-i ...symmetric: a LARGER batch entry leaves the migration's $1.00 "
+      "counted, still unverified", (round(_s10u2.usd, 6), _s10u2.unreadable),
+      (1.0, 1))
+_s10u3 = _tot(_recon10("total-round", 1.00, {}, 1.00,
+                       batch_entries=[("A", 1.0000004)])[2])
+check("10u-ii CLEAN CONTROL: within rounding it is ONE amount -- $1.00 counted "
+      "once, verified", (round(_s10u3.usd, 6), _s10u3.unreadable), (1.0, 0))
+check("10u-iii AT THE SURFACE: the conflicting reading refuses new paid work",
+      _refuses10(_s10u, [])[0], True)
 
 
 print()

@@ -3164,11 +3164,15 @@ def collected_batch_spend(state, batch_id, usd, seed_source, seed_batch_ids,
     otherwise, and 0.0 when neither exists -- which is what the collection
     recorded before this function did.
 
-    **THE ASYMMETRY IS DELIBERATE.** A batch a migration entry merely LISTS is
-    not treated as in the seed (see ``spend_journal.recorded_batch_ids``), and a
+    **WHAT IS "IN THE SEED" IS ``spend_journal.recorded_batch_ids``' ANSWER.**
+    That includes a batch a migration entry REPRESENTS (its money is the
+    migration's amount) but not one a migration merely LISTS without
+    representing: that batch is charged here, and the budget is made unverified
+    before any new paid work by ``spend_journal.pending_coverage_reasons``, so
+    a figure whose coverage nobody established never gates a submission. A
     legacy state file with no ``spend_by_batch`` cannot say which batches its
-    total includes -- both are charged, which OVER-counts. Under-counting is
-    the direction a cap must not fail in.
+    total includes either. Charging in those cases can OVER-count the process
+    ledger; under-counting is the direction a cap must not fail in.
     """
     recorded = state.get(STATE_SPEND_BY_BATCH_KEY) if isinstance(state, dict) \
         else None
@@ -8506,6 +8510,21 @@ def main(argv=None):
     spend.SPEND_LEDGER.reset()
     spend.SPEND_STOP.reset()
     _migration = spend_journal.bootstrap_report()
+    # ── THIS SESSION'S OWN STATE FILE IS RECOVERED TOO ────────────────────
+    #
+    # The migration walks the evaluation-runs root, and `--output-dir` may be
+    # anywhere. A journal-era state file this session is about to reuse can
+    # hold a batch charge whose journal write never landed; without this, a
+    # `--submit` into that directory would be gated against a cumulative figure
+    # missing it. Skipped when the walk already recovered the same file under
+    # any spelling -- it is idempotent either way, and the skip only keeps its
+    # reasons from being counted twice.
+    _own_recovery = {"unverified": []}
+    if isinstance(state, dict) and STATE_SPEND_BY_BATCH_KEY in state \
+            and spend_journal.scope_identity(state_path) \
+            not in _migration.get("journal_era_identities", ()):
+        _own_recovery = spend_journal.recover_state_file_charges(
+            state_path, state)
     # ONE READING OF THE JOURNAL serves the seed AND the set of batches that
     # seed already counts, so the two cannot describe different files.
     _reading = spend_journal.read_entries_report()
@@ -8514,6 +8533,17 @@ def main(argv=None):
     # item is spend this budget's record may be missing.
     spend.SPEND_LEDGER.mark_unverified(spend.SPEND_BUDGET_RATER,
                                        _migration["unreadable"])
+    spend.SPEND_LEDGER.mark_unverified(spend.SPEND_BUDGET_RATER,
+                                       _own_recovery["unverified"])
+    # A BATCH THIS SESSION IS ABOUT TO COLLECT, whose migration entry lists it
+    # without being able to say whether its amount includes it, cannot be
+    # counted exactly once -- so the budget is marked BEFORE anything is
+    # collected or bought, not after the collection records it.
+    spend.SPEND_LEDGER.mark_unverified(
+        spend.SPEND_BUDGET_RATER,
+        spend_journal.pending_coverage_reasons(
+            spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER, state_path,
+            _reading[0], resume_ids))
     seed_source = spend.SPEND_LEDGER.seeded.source
     seed_batch_ids = spend_journal.recorded_batch_ids(
         spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER, state_path,

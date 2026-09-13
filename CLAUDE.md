@@ -15500,7 +15500,7 @@ the reviewer's exact shape.
 # keys, NO SPEND -- no provider client of any kind is built and no request is
 # issued. NOT in the collision matrix; every journal is a temp file and section
 # 8a hashes the PRODUCTION journal before and after. Bucket A.
-python tests/test_spend_journal.py                                  # 264 (MEASURED 2026-09-13, was 233; the SB repair pass made 7g build its own environment state -- it failed whenever the invoking shell exported ONCOTRIAGE_SPEND_JOURNAL -- and added section 9 over unreadable records, the journal-era migration skip and the unverified-record gate. this file had NO CLAUDE.md entry at all until this pass, which is why no count was ever stale -- it was never written down. 86 before the three passes; the confirmed-write repair added sections 7c-2, 7d-i and 7d-j and the boundary repair added 7c-3. MEASURED 2026-09-10)
+python tests/test_spend_journal.py                                  # 312 (MEASURED 2026-09-13, was 295; the reconciliation arithmetic repair added 10r-10u -- each charge counted once in the state-total reconciliation, the migration-vs-map and migration-vs-batch-entry conflicts, the rounding controls, and the refusal at the surface. Before that 295, was 264; the spend-reconciliation repair rewrote 9t from the record of P1 (a migration's LISTED batch skipped as covered) into its repair, moved 9r and 9s with argued pins, and added section 10 over journal-era recovery and state-file identity. Before that 264, was 233; the SB repair pass made 7g build its own environment state -- it failed whenever the invoking shell exported ONCOTRIAGE_SPEND_JOURNAL -- and added section 9 over unreadable records, the journal-era migration skip and the unverified-record gate. this file had NO CLAUDE.md entry at all until this pass, which is why no count was ever stale -- it was never written down. 86 before the three passes; the confirmed-write repair added sections 7c-2, 7d-i and 7d-j and the boundary repair added 7c-3. MEASURED 2026-09-10)
 
 # The money-path safety bundle (the SB pass). Same shape, same directory. No
 # network, no keys, NO SPEND, no model load, no live Qdrant, no corpus, no
@@ -15509,7 +15509,7 @@ python tests/test_spend_journal.py                                  # 264 (MEASU
 # ONCOTRIAGE_SPEND_JOURNAL points inside it and the PRODUCTION journal is
 # sha256-compared at the end. Neither is in the collision matrix and neither
 # execs anything. Bucket A.
-python tests/test_rater_batch_spend_accounting.py                   # 106 (MEASURED 2026-09-13, was 60; the SB repair pass added sections 7-10 -- a failed batch affects only its own requests, an unreadable record refuses new spend at the surface, re-collection charges nothing twice, a budget stop writes what was collected marked incomplete): the rater's per-batch journal outcome, the retry-pass refusal, the per-rating output ceiling, and the malformed-batches refusal -- driving the REAL rater main() six times against a stand-in Batch-API client
+python tests/test_rater_batch_spend_accounting.py                   # 124 (MEASURED 2026-09-13, was 118; the reconciliation arithmetic repair corrected 11c -- its clean control recorded batch-2 at $0.01 against a migration whose amount is the session's whole spend_usd, one charge with two amounts, which the repair refuses and 11c-i now asserts -- and added 11i-11k through the REAL main(). Before that 118, was 106; the spend-reconciliation repair moved 9j -- seeding-time recovery puts the charge in the seed before collection -- and added section 11, the P1 refusal, the P2 recovery and the P3 symlinked-spelling resume driven through the REAL main(). Before that 106, was 60; the SB repair pass added sections 7-10 -- a failed batch affects only its own requests, an unreadable record refuses new spend at the surface, re-collection charges nothing twice, a budget stop writes what was collected marked incomplete): the rater's per-batch journal outcome, the retry-pass refusal, the per-rating output ceiling, and the malformed-batches refusal -- driving the REAL rater main() six times against a stand-in Batch-API client
 python tests/test_spend_checkpoint_backstop.py                      #  54 (MEASURED 2026-09-13): the checkpointer's wall-clock backstop, through the REAL ragas_harness.score_all with every pair hanging and with the event loop blocked
 
 # The hard-kill journaling pass. Same shape, same directory. No network, no
@@ -16500,6 +16500,65 @@ that matter most are the remaining-budget label above, the budget-stop exit
 that still returns before `ratings.json` is written, and the resume path that
 re-charges the process ledger and the state file's `spend_usd` for a batch the
 journal already holds.
+
+### Each charge is counted once in the state-total reconciliation (the reconciliation arithmetic repair)
+
+**`recover_state_file_charges` SUBTRACTED ONE CHARGE TWICE.** Its residual was
+`spend_usd - migrated_usd - sum(spend_by_batch)`. A migration listing ONE batch
+beside a positive amount REPRESENTS that batch (`migration_coverage`), so when
+`spend_by_batch` names the same batch the two terms are one charge, and the
+second subtraction cancelled spend nobody could attribute. DRIVEN before the
+edit: migration $1.00 for A, map A $1.00, `spend_usd` $1.70 returned
+`unverified: []` and the cap read $1.00 -- the $0.70 was hidden, and the
+function wrote a second record of A and printed "RECOVERED $1.000000 ... the
+journal did not", which was false.
+
+**THE RULE NOW, AND WHERE IT LIVES.** A batch the migration represents is not
+offered to the journal; its map amount is COMPARED with the migration's.
+Equal within `RECOVERY_UNIT_TOLERANCE_USD` is `already_recorded`; different is
+ONE charge with two amounts -- unverified, naming both, the smaller counted.
+The residual explains the migration (the smaller amount when they differ) plus
+every OTHER batch in the map, and the existing tolerance decides it.
+
+**AND THE CAP'S OWN READING HAD THE SAME HOLE ONE LAYER DOWN.** `_analyse_budget`
+skipped a journal batch entry for a represented batch whatever amount it held,
+so a conflict there was invisible to every reading -- and visible to the
+recovery only while the state file was discoverable. It now applies the rule
+every other pair of records for one charge already obeys: the smaller is
+counted, the budget is unverified. This is wider than the brief asked, and it
+is what makes the conflict durable rather than dependent on the state file.
+
+**THE TOLERANCE IS `RECOVERY_UNIT_TOLERANCE_USD` (1e-6), NOT `_AMOUNT_EPSILON`
+(1e-9), AND PRODUCTION DECIDED IT.** A migration amount is a rounded
+`spend_usd`; a map value and a batch entry are unrounded. The probe session's
+state file records $0.056607 beside a journal entry of $0.05660715 -- 1.5e-7
+apart. At 1e-9 the next bootstrap would migrate that file and refuse every
+later paid run on a rounding difference. Measured: the real `bootstrap_report`
+over the production root, writing only into a temp copy of the journal, reads
+**$7.339006, verified, before and after the repair**.
+
+**`11c`'S CLEAN CONTROL WAS A CONFLICT.** It recorded batch-2 at $0.01 against
+a migration whose amount is the session's whole `spend_usd`, and passed only
+because of the skip above. It records the migration's own amount now, and the
+$0.01 version is `11c-i`, a refusal at the surface.
+
+**P2, READ-ONLY.** The walk root is `paths.testing_evaluation_path`; the only
+19 state files under the project root are all under it (all pre-journal, none
+with `spend_by_batch`, no duplicate batch ids, no identical copies), and every
+journal scope resolves inside it. Outside the project root there are only test
+temp trees and a prior session's journal copy -- copies, not evidence. **THE GAP
+IS STRUCTURAL:** `--output-dir` may be anywhere, and a journal-era state file
+outside the root is recovered only when a later session reuses that exact
+directory. A session whose FIRST journal write fails, outside the root, and is
+never resumed leaves a charge no walk finds. Proposed, not built: a
+registration line written to the journal at session start, before the first
+billed call, naming the state file -- so recovery walks root plus registered
+files, portably.
+
+```bash
+# No new file: tests/test_spend_journal.py 10r-10u and
+# tests/test_rater_batch_spend_accounting.py 11c, 11c-i, 11i-11k.
+```
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

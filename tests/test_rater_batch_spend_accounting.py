@@ -1068,11 +1068,11 @@ os.chmod(_dir_9b, 0o755)
 # not from this state file's own total.
 J.record_batch(_B, _S, "/elsewhere/state.json", "x-batch", 2.0, "judge",
                path=_j9b)
-run_main(_stub_9b, ["--blind", "--run-dir", _RUN, "--output-dir", _out_9b,
-                    "--resume", "batch-1", "--no-retry"], _j9b)
+_rc_9bb, _text_9b = run_main(_stub_9b, ["--blind", "--run-dir", _RUN,
+                                        "--output-dir", _out_9b, "--resume",
+                                        "batch-1", "--no-retry"], _j9b)
 _man_9b = read_json(os.path.join(_out_9b, "rater_manifest.json"))
-check("9h  the resume CHARGES the ledger for money the journal seed lacked, "
-      "exactly once",
+check("9h  the money the journal lacked reaches the ledger exactly once",
       round(spend.active_spend(spend.SPEND_SOURCE_RATER), 9),
       # GUARDED: a session the plant broke leaves no spend to add to, and
       # arithmetic on the named absence would abort the file here.
@@ -1083,10 +1083,19 @@ check("9i  ...does not add it to spend_usd a second time, and records it in "
       (at(state_of(_out_9b), R.STATE_SPEND_KEY),
        sorted(e["unit"] for e in journal_lines(_j9b))),
       (_spent_9b, ["batch-1", "x-batch"]))
-check("9j  ...with that disposition named in the manifest",
-      [d.get("disposition") for d in
-       as_list(at(_man_9b, "cost", "batch_spend_dispositions"))],
-      [R.BATCH_SPEND_IN_STATE_NOT_SEED])
+# 9j MOVED, AND THE MOVE IS THE P2 REPAIR REACHING THIS SCENARIO. The session's
+# OWN journal-era state file is recovered at seeding time, BEFORE anything is
+# collected or bought -- so batch-1's charge is in the journal and in the seed
+# by the time the collection asks, and the disposition is `already_in_seed`
+# rather than `in_state_not_in_seed`. The amount the ledger ends at (9h) and
+# the journal's one line (9i) are unchanged: the same money, recorded earlier.
+check("9j  ...recovered from this session's own state file before collection, "
+      "so the manifest names it as already in the seed, and the operator is "
+      "told what was recovered",
+      ([d.get("disposition") for d in
+        as_list(at(_man_9b, "cost", "batch_spend_dispositions"))],
+       "RECOVERED" in _text_9b and "batch-1" in _text_9b),
+      ([R.BATCH_SPEND_IN_SEED], True))
 
 
 section("10. P5 -- A BUDGET STOP WRITES WHAT WAS COLLECTED, MARKED INCOMPLETE")
@@ -1167,6 +1176,276 @@ check("10i  a write that fails mid-serialisation leaves the previous file "
       "byte-identical (atomic replacement)",
       (str(_raised_wj).startswith("<RAISED TypeError"),
        open(_wj, "rb").read() == _before_wj), (True, True))
+
+
+section("11. SPEND RECONCILIATION REPAIR, AT THE OPERATOR SURFACE (P1-P3)")
+
+_STATE_11 = R.state_filename(R.MODE_BLIND)
+
+
+def _rewrite_state(out_dir, drop_era=True, keep_batches=None):
+    st = state_of(out_dir)
+    if not isinstance(st, dict):
+        return {}
+    if drop_era:
+        st.pop(R.STATE_SPEND_BY_BATCH_KEY, None)
+    if keep_batches is not None:
+        st["batches"] = [b for b in st.get("batches") or []
+                         if isinstance(b, dict) and b.get("id") in keep_batches]
+    # NEVER RAISES: a session the plant broke leaves no state file to rewrite,
+    # and a raise here would abort every check below it -- the named absence
+    # is what the non-degeneracy check then fails on.
+    try:
+        with io.open(os.path.join(out_dir, _STATE_11), "w",
+                     encoding="utf-8") as fh:
+            json.dump(st, fh)
+    except OSError as exc:
+        return {"<unwritable>": type(exc).__name__}
+    return st
+
+
+def _units_for(path, scope_dir, unit):
+    return sum(1 for e in journal_lines(path)
+               if e.get("unit") == unit
+               and str(e.get("scope", "")).startswith(scope_dir))
+
+
+# ── 11a-11c  P1: a LEGACY migration that lists batches it cannot vouch for ──
+_out_11 = os.path.join(_STATE_ROOT, "legacy11", "rater_blind")
+# THE PARENT, NOT THE DIRECTORY: `main()` refuses an --output-dir whose parent
+# is missing, before any spend, and creates the directory itself.
+os.makedirs(os.path.dirname(_out_11))
+_stub_11 = _BatchStub()
+_rc_11s, _text_11s = run_main(_stub_11, ["--blind", "--run-dir", _RUN,
+                                         "--output-dir", _out_11, "--submit"],
+                              fresh())
+check("11-setup the session that writes the legacy file ran (its exit and "
+      "the tail of its console, shown on failure)",
+      (_rc_11s in (0, 3), os.path.isfile(os.path.join(_out_11,
+                                                      R.state_filename(
+                                                          R.MODE_BLIND)))),
+      (True, True))
+if not os.path.isfile(os.path.join(_out_11, R.state_filename(R.MODE_BLIND))):
+    print("  setup console tail:\n" + _text_11s[-3000:])
+_st_11 = _rewrite_state(_out_11)
+_sp_11 = os.path.join(_out_11, _STATE_11)
+check("11-pre non-degeneracy: a PRE-JOURNAL state file listing two batches "
+      "beside one positive spend_usd, under the migration root",
+      (sorted(b.get("id") for b in as_list(at(_st_11, "batches"))),
+       isinstance(at(_st_11, R.STATE_SPEND_KEY), float)
+       and _st_11[R.STATE_SPEND_KEY] > 0,
+       R.STATE_SPEND_BY_BATCH_KEY in _st_11), (["batch-1", "batch-2"], True,
+                                               False))
+_j11 = fresh()
+J.record_batch(_B, _S, _sp_11, "batch-2", 0.01, "judge", path=_j11)
+_stub_11s = _BatchStub()
+_rc_11a, _text_11a = run_main(_stub_11s, ["--blind", "--run-dir", _RUN,
+                                          "--output-dir",
+                                          os.path.join(TMP, "out_11a"),
+                                          "--submit"], _j11)
+check("11a  P1: a later entry for batch-2, which that migration lists and "
+      "cannot say it includes, REFUSES --submit by name before anything is "
+      "uploaded -- not a silent skip",
+      (_rc_11a, _stub_11s.uploads, spend.SPEND_RECORD_UNVERIFIED in _text_11a,
+       "batch batch-2" in _text_11a and "cannot say" in _text_11a),
+      (1, {}, True, True))
+_j11b = fresh()
+_rc_11b, _text_11b = run_main(_stub_11, ["--blind", "--run-dir", _RUN,
+                                         "--output-dir", _out_11, "--resume",
+                                         "batch-1"], _j11b)
+check("11b  P1 PENDING: resuming batch-1 -- listed, no entry yet -- still "
+      "COLLECTS it, and the retry pass is REFUSED naming batch-1 as about to "
+      "be collected; no new batch is bought",
+      (sum(1 for r in rows_by_cid(_out_11).values() if r.get("rated")) >= 1,
+       "REFUSED NEW PAID SUBMISSION" in _text_11b,
+       "batch batch-1, about to be collected" in _text_11b,
+       sorted(_stub_11.input_for)),
+      (True, True, True, ["batch-1", "batch-2"]))
+_st_11c = _rewrite_state(_out_11, keep_batches=("batch-2",))
+# THE CLEAN CONTROL RECORDS BATCH-2 AT THE MIGRATION'S OWN AMOUNT. A migration
+# listing ONE batch beside a positive spend_usd is that batch's charge, so a
+# journal entry for it at any other amount is one charge with two amounts --
+# which is refused (11c-i). The first version of this control recorded $0.01
+# against the whole session's spend_usd and passed only because a represented
+# batch entry used to be skipped whatever it held.
+_amt_11c = (float(_st_11c.get(R.STATE_SPEND_KEY) or 0.0)
+            if isinstance(_st_11c, dict) else 0.0)
+check("11c-pre non-degeneracy: the migration amount batch-2 is recorded at is "
+      "positive and is not the $0.01 of 11c-i", (_amt_11c > 0,
+                                                 _amt_11c != 0.01),
+      (True, True))
+_j11c = fresh()
+J.record_batch(_B, _S, _sp_11, "batch-2", _amt_11c, "judge", path=_j11c)
+_stub_11c = _BatchStub()
+_rc_11c, _text_11c = run_main(_stub_11c, ["--blind", "--run-dir", _RUN,
+                                          "--output-dir",
+                                          os.path.join(TMP, "out_11c"),
+                                          "--submit", "--no-retry"], _j11c)
+check("11c  CLEAN CONTROL: the same file listing ONE batch provably represents "
+      "it -- the session is not refused and submits",
+      (sorted(_stub_11c.input_for), "cannot say" in _text_11c),
+      (["batch-1"], False))
+_j11ci = fresh()
+J.record_batch(_B, _S, _sp_11, "batch-2", 0.01, "judge", path=_j11ci)
+_stub_11ci = _BatchStub()
+_rc_11ci, _text_11ci = run_main(_stub_11ci, ["--blind", "--run-dir", _RUN,
+                                            "--output-dir",
+                                            os.path.join(TMP, "out_11ci"),
+                                            "--submit", "--no-retry"], _j11ci)
+check("11c-i ...but the same batch recorded at a DIFFERENT amount from the "
+      "migration that represents it is ONE charge with two amounts: --submit "
+      "is REFUSED naming it and nothing is uploaded",
+      (_rc_11ci, _stub_11ci.uploads, spend.SPEND_RECORD_UNVERIFIED in _text_11ci,
+       "DIFFERENT amounts" in _text_11ci), (1, {}, True, True))
+shutil.rmtree(os.path.join(_STATE_ROOT, "legacy11"))
+
+# ── 11d-11f  P2: a journal-era charge nobody resumed ─────────────────────
+_out_11d = os.path.join(_STATE_ROOT, "era11", "rater_blind")
+os.makedirs(os.path.dirname(_out_11d))
+_dir_11d, _j11d_ro = readable_unwritable("readonly_11d")
+_stub_11d = _BatchStub()
+run_main(_stub_11d, ["--blind", "--run-dir", _RUN, "--output-dir", _out_11d,
+                     "--submit", "--no-retry"], _j11d_ro)
+_by_11d = at(state_of(_out_11d), R.STATE_SPEND_BY_BATCH_KEY)
+check("11d-pre non-degeneracy: the charge is in the journal-era state file "
+      "and NOT in the journal",
+      (sorted(_by_11d) if isinstance(_by_11d, dict) else _by_11d,
+       journal_lines(_j11d_ro)), (["batch-1"], []))
+_j11d = fresh()
+_stub_11e = _BatchStub()
+_rc_11d, _text_11d = run_main(_stub_11e, ["--blind", "--run-dir", _RUN,
+                                          "--output-dir",
+                                          os.path.join(TMP, "out_11d"),
+                                          "--submit", "--no-retry"], _j11d)
+check("11d  P2: the NEXT session anywhere RECOVERS the charge before anything "
+      "is bought -- printed, recorded once under its state file -- and is not "
+      "refused on it",
+      ("RECOVERED" in _text_11d, _units_for(_j11d, _out_11d, "batch-1"),
+       spend.SPEND_RECORD_UNVERIFIED in _text_11d,
+       sorted(_stub_11e.input_for)), (True, 1, False, ["batch-1"]))
+check("11d-i ...and the ledger ends at the journal total: the recovered money "
+      "counted once",
+      round(spend.active_spend(spend.SPEND_SOURCE_RATER), 9),
+      journal_total(_j11d))
+_stub_11f = _BatchStub()
+run_main(_stub_11f, ["--blind", "--run-dir", _RUN, "--output-dir",
+                     os.path.join(TMP, "out_11f"), "--submit", "--no-retry"],
+         _j11d)
+check("11e  REPEATED RECOVERY CHARGES ONCE: a second session writes no second "
+      "line for that charge", _units_for(_j11d, _out_11d, "batch-1"), 1)
+_link_root = os.path.join(TMP, "state_root_link")
+os.symlink(_STATE_ROOT, _link_root)
+_j11g = fresh()
+J.record_batch(_B, _S, os.path.join(_link_root, "era11", "rater_blind",
+                                    _STATE_11), "batch-1",
+               float(_by_11d["batch-1"]) + 1.0 if isinstance(_by_11d, dict)
+               else 1.0, "judge", path=_j11g)
+_stub_11g = _BatchStub()
+_rc_11g, _text_11g = run_main(_stub_11g, ["--blind", "--run-dir", _RUN,
+                                          "--output-dir",
+                                          os.path.join(TMP, "out_11g"),
+                                          "--submit"], _j11g)
+check("11f  a journal holding that charge at a DIFFERENT amount, under another "
+      "spelling of the state file, is not merged: --submit is REFUSED naming "
+      "the conflict and nothing is uploaded",
+      (_rc_11g, _stub_11g.uploads, "DIFFERENT amount" in _text_11g),
+      (1, {}, True))
+shutil.rmtree(os.path.join(_STATE_ROOT, "era11"))
+
+# ── 11h  P3: one output directory, two spellings ─────────────────────────
+_real_11h = os.path.join(TMP, "real11h", "out")
+os.makedirs(os.path.dirname(_real_11h))
+_link_11h = os.path.join(TMP, "link11h")
+os.symlink(os.path.dirname(_real_11h), _link_11h)
+_j11h = fresh()
+_stub_11h = _BatchStub()
+run_main(_stub_11h, ["--blind", "--run-dir", _RUN, "--output-dir", _real_11h,
+                     "--submit"], _j11h)
+_lines_11h = len(journal_lines(_j11h))
+_spelled_11h = os.path.join(_link_11h, "out")
+run_main(_stub_11h, ["--blind", "--run-dir", _RUN, "--output-dir",
+                     _spelled_11h, "--resume", "batch-1,batch-2",
+                     "--no-retry"], _j11h)
+_man_11h = read_json(os.path.join(_real_11h, "rater_manifest.json"))
+check("11h-pre non-degeneracy: two batches recorded, and the resume's spelling "
+      "is a different STRING from the one they were recorded under",
+      (_lines_11h, os.path.abspath(_spelled_11h) != _real_11h), (2, True))
+check("11h  P3: resuming under a SYMLINKED spelling charges nothing twice -- "
+      "the ledger reads the journal total, no line is added, and both batches "
+      "are found already in the seed",
+      (round(spend.active_spend(spend.SPEND_SOURCE_RATER), 9)
+       == journal_total(_j11h), len(journal_lines(_j11h)),
+       [d.get("disposition") for d in
+        as_list(at(_man_11h, "cost", "batch_spend_dispositions"))]),
+      (True, 2, [R.BATCH_SPEND_IN_SEED] * 2))
+
+
+# ── 11i-11k  EACH CHARGE ONCE: the state-total reconciliation, via main() ──
+#
+# A journal-era state file under the migration root whose batch-A a migration
+# entry REPRESENTS, and whose spend_by_batch repeats batch-A. Built one at a
+# time and removed after its session: the migration walk recovers EVERY state
+# file under the root, so a refusing fixture left in place would refuse the
+# clean control for a reason that has nothing to do with it.
+def _recon_11(sub, spent, amount_a):
+    out = os.path.join(_STATE_ROOT, "recon11", sub, "rater_blind")
+    os.makedirs(out)
+    sp = os.path.join(out, _STATE_11)
+    with io.open(sp, "w", encoding="utf-8") as fh:
+        json.dump({"model": "judge", R.STATE_SPEND_KEY: spent,
+                   R.STATE_SPEND_BY_BATCH_KEY: {"batch-A": amount_a},
+                   "batches": [{"id": "batch-A"}]}, fh)
+    j = fresh()
+    J.append_with_outcome({
+        "entry_id": J.entry_id(_B, _S, sp, "migration"),
+        "kind": J.ENTRY_KIND_MIGRATION, "budget": _B, "source": _S,
+        "scope": sp, "unit": "migration", "usd": 1.0, "judge_model": "judge",
+        "state_file": sp, "covers_batch_ids": ["batch-A"], "is_floor": False},
+        path=j)
+    return out, j
+
+
+def _recon_run_11(tag, j):
+    stub = _BatchStub()
+    rc, text = run_main(stub, ["--blind", "--run-dir", _RUN, "--output-dir",
+                               os.path.join(TMP, "out_" + tag), "--submit",
+                               "--no-retry"], j)
+    return rc, text, stub
+
+
+_o11i, _j11i = _recon_11("p1", 1.70, 1.00)
+_rc_11i, _text_11i, _stub_11i = _recon_run_11("11i", _j11i)
+check("11i  P1 AT THE SURFACE: migration $1.00 for batch-A, spend_by_batch "
+      "repeats it, spend_usd $1.70 -- --submit is REFUSED naming the $0.70 "
+      "and nothing is uploaded; batch-A gets no second record",
+      (_rc_11i, _stub_11i.uploads, spend.SPEND_RECORD_UNVERIFIED in _text_11i,
+       "$0.700000 more" in _text_11i, _units_for(_j11i, _o11i, "batch-A")),
+      (1, {}, True, True, 0))
+shutil.rmtree(os.path.join(_STATE_ROOT, "recon11"))
+_o11j, _j11j = _recon_11("mirror", 0.80, 0.80)
+_rc_11j, _text_11j, _stub_11j = _recon_run_11("11j", _j11j)
+check("11j  MIRROR AT THE SURFACE: the migration says $1.00 and spend_by_batch "
+      "says $0.80 for batch-A -- REFUSED naming the two amounts",
+      (_rc_11j, _stub_11j.uploads, "DIFFERENT amounts" in _text_11j,
+       "$0.800000" in _text_11j), (1, {}, True, True))
+shutil.rmtree(os.path.join(_STATE_ROOT, "recon11"))
+_o11k, _j11k = _recon_11("exact", 1.00, 1.00)
+_rc_11k, _text_11k, _stub_11k = _recon_run_11("11k", _j11k)
+check("11k  CLEAN CONTROL: every charge explained once -- the session is not "
+      "refused, submits, and announces no recovery of batch-A",
+      (sorted(_stub_11k.input_for), spend.SPEND_RECORD_UNVERIFIED in _text_11k,
+       "more than its migration" in _text_11k,
+       "for batch batch-A" in _text_11k), (["batch-1"], False, False, False))
+_lines_11k = len(journal_lines(_j11k))
+_rc_11k2, _text_11k2, _stub_11k2 = _recon_run_11("11k2", _j11k)
+check("11k-i REPEATED RECONCILIATION CHARGES ONCE: a second session over the "
+      "same state file writes nothing for batch-A, adds only its own new "
+      "batch, and the ledger ends at the journal total",
+      (_units_for(_j11k, _o11k, "batch-A"), len(journal_lines(_j11k))
+       - _lines_11k, sorted(_stub_11k2.input_for),
+       round(spend.active_spend(spend.SPEND_SOURCE_RATER), 9)
+       == journal_total(_j11k)), (0, 1, ["batch-1"], True))
+shutil.rmtree(os.path.join(_STATE_ROOT, "recon11"))
 
 
 section("5. ISOLATION AND RESTORES")
