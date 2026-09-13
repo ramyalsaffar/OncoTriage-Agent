@@ -2461,7 +2461,11 @@ or run one process."""
 PROVIDER_TOKENS_PER_MINUTE = {
     MATCHING_PROVIDER_OPENAI: None,
     MATCHING_PROVIDER_BEDROCK: None,
-    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: None,
+    # OPERATOR-SUPPLIED CONSOLE VALUE, PROVISIONAL -- NOT PROVIDER-CONFIRMED.
+    # The operator's quota record for this arm is 10 requests/minute and
+    # 6,000,000 tokens/minute; the request half is the RPM row above. See the
+    # docstring below for what has NOT been verified before live use.
+    MATCHING_PROVIDER_BEDROCK_ANTHROPIC: 6_000_000,
     PROVIDER_QUOTA_SCOPE_OPENAI_BATCH: QUOTA_NOT_APPLICABLE,
     # `None` AND NOT `QUOTA_NOT_APPLICABLE`, AND THE DIFFERENCE FROM THE BATCH
     # ROW ABOVE IS THE WHOLE POINT OF THAT SENTINEL. The batch row is argued
@@ -2489,17 +2493,33 @@ tokens-per-minute figure for an operator to fetch, and a `None` here would
 block every batch submission forever waiting on a console value that does not
 exist. What DOES bound that work is the batch caps and the spend gate.
 
-None FOR EVERY ARM, AND THAT IS AN UNRESOLVED PREMISE STATED RATHER THAN A
-NUMBER GUESSED. The account's tokens-per-minute quota is not recorded anywhere
-in this repository, and the smoke run's throttle text ("Too many requests")
-names the REQUEST quota. When it is read off the Service Quotas console, set it
-here and the pacer enforces it by RESERVATION: each attempt reserves its
-estimated input plus its `max_tokens` at dispatch -- the way Bedrock burns
-token quota -- and the reservation is adjusted to actual usage on completion.
+6,000,000 FOR THE SHIPPED ARM, PROVISIONAL AND OPERATOR-CONFIGURED -- NOT
+PROVIDER-CONFIRMED. It is the operator-supplied console value from the same
+quota record as the RPM row's 10 (10 requests/minute, 6M tokens/minute for
+Claude Sonnet 4.6 on this account and Region). IT HAS NOT BEEN READ BACK FROM
+THE PROVIDER, for the RPM row's reason: `provider_quotas.lookup_applied_quotas()`
+is the read that would confirm it, and a bearer token cannot sign a Service
+Quotas call. Replace it with the read-back value and drop the word provisional.
+The pacer enforces it by RESERVATION: each attempt reserves its estimated input
+plus its `max_tokens` at dispatch -- the way Bedrock burns token quota -- and
+the reservation is adjusted to actual usage on completion. At the RPM row's 10
+the request quota binds first: ten full-ceiling calls reserve ten times
+(`MATCHING_MAX_TOKENS` output plus the input estimate), far inside 6M, so this
+row changes pacing only if the request quota is raised or the burndown question
+below turns out badly. What it DOES change today is that a Stage 5 inference
+reservation on this arm no longer refuses as `QuotaUnknown` for the token
+family.
 
-BEFORE ENABLING, CONFIRM ONE THING THIS PROJECT HAS NOT VERIFIED: whether AWS
-applies an output-token burndown multiplier for this model. If it does, the
-reservation rule under-reserves by that factor and must carry it.
+None FOR EVERY OTHER INFERENCE ARM, AND THAT IS AN UNRESOLVED PREMISE STATED
+RATHER THAN A NUMBER GUESSED. No tokens-per-minute quota for them is recorded
+anywhere in this repository, and the smoke run's throttle text ("Too many
+requests") names the REQUEST quota.
+
+BEFORE LIVE USE, CONFIRM ONE THING THIS PROJECT HAS NOT VERIFIED -- AND SETTING
+THE SHIPPED ARM'S ROW ABOVE DID NOT VERIFY IT: whether AWS applies an
+output-token burndown multiplier for this model. If it does, the reservation
+rule under-reserves by that factor and must carry it, and a configured 6M is
+then a larger real allowance than the pacer believes it is spending.
 
 A reservation LARGER than the whole window is refused by name
 (`provider_resilience.ReservationExceedsQuota`) rather than waited on forever.

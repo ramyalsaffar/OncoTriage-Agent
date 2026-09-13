@@ -425,9 +425,17 @@ check("...and every other scope's requests/minute is UNKNOWN, which REFUSES "
        # quota row, which is the one way a path can end up dispatching unpaced.
        config.PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE: pr.QUOTA_STATE_UNKNOWN,
        config.PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING: pr.QUOTA_STATE_UNKNOWN})
-check("no token quota is configured for any arm that is metered on that axis",
+check("the shipped arm's tokens/minute is the PROVISIONAL operator-supplied "
+      "console value 6,000,000 (10 RPM / 6M TPM record; not provider-confirmed)",
+      config.PROVIDER_TOKENS_PER_MINUTE[_BEDROCK], 6_000_000)
+# THIS MAP WAS "no token quota is configured for any arm" UNTIL THE OPERATOR
+# SUPPLIED THE SHIPPED ARM'S CONSOLE VALUE. It stays EXACT for the reason the
+# requests map above gives, so every other metered scope is still pinned
+# UNKNOWN and still refuses.
+check("the shipped arm's token quota is CONFIGURED; every other scope metered "
+      "on that axis is still UNKNOWN",
       {s: pr.quota_state(s, "tokens") for s in config.PROVIDER_QUOTA_SCOPES},
-      {_BEDROCK: pr.QUOTA_STATE_UNKNOWN,
+      {_BEDROCK: pr.QUOTA_STATE_CONFIGURED,
        _OPENAI: pr.QUOTA_STATE_UNKNOWN,
        config.MATCHING_PROVIDER_BEDROCK: pr.QUOTA_STATE_UNKNOWN,
        # ARGUED, NOT CONVENIENT: the four Batch calls consume no model tokens.
@@ -2108,9 +2116,18 @@ _i8, _t8, _w8, _n8 = pr.effective_limits(_BEDROCK)
 check("the announcement states the per-window count and spacing, derived",
       (f"at most {_n8} starts per {_w8:g}s" in _ann,
        f"spaced {_i8:.2f}s apart" in _ann), (True, True))
-check("...that tokens/min is UNKNOWN and that dispatch will be REFUSED for it, "
-      "rather than the retired 'not enforced' which read like a decision",
-      ("tokens/min UNKNOWN" in _ann and "DISPATCH WILL BE REFUSED" in _ann),
+# THE SHIPPED ARM'S TOKEN ROW IS CONFIGURED NOW, so its announcement states the
+# quota and the reservation rule; the UNKNOWN-refuses wording is pinned below
+# on a scope that is still UNKNOWN, which is where it can still be printed.
+check("...that the shipped arm's tokens/min quota is announced WITH the "
+      "reservation rule, now that the row is configured",
+      (f"tokens: quota {config.PROVIDER_TOKENS_PER_MINUTE[_BEDROCK]}/min" in _ann
+       and "reserves its estimated input plus its max_tokens" in _ann), True)
+check("...and a scope whose tokens/min is still UNKNOWN announces that DISPATCH "
+      "WILL BE REFUSED, rather than the retired 'not enforced' which read like "
+      "a decision",
+      ("tokens/min UNKNOWN" in pr.describe_pacing(scope=_OPENAI)
+       and "DISPATCH WILL BE REFUSED" in pr.describe_pacing(scope=_OPENAI)),
       True)
 check("...the PROCESS-LOCAL rule for simultaneous processes",
       "PROCESS-LOCAL" in _ann and "half these limits" in _ann, True)

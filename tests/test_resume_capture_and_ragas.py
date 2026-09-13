@@ -1939,6 +1939,39 @@ check("9g  ...and the operator is told why it was kept",
       txt[-500:])
 shutil.rmtree(EMPTY_RUN, ignore_errors=True)
 
+# --- 9i  an unreadable spend record refuses the run before anything is judged -
+#
+# The campaign budget's record is this drive's redirected journal. One torn
+# line is appended, the run is driven, and the file is put back byte for byte
+# in a `finally` so every check below reads the journal it would have read.
+_journal_9i = os.path.join(DRIVE_JOURNAL_DIR, "spend_journal.jsonl")
+_bytes_9i = (io.open(_journal_9i, "rb").read()
+             if os.path.isfile(_journal_9i) else None)
+with io.open(_journal_9i, "ab") as _fh:
+    _fh.write(b"{a torn journal line\n")
+try:
+    shutil.rmtree(DRIVE_OUT, ignore_errors=True)
+    code, txt = drive_ragas_main([], DRIVE_RUN)
+    _scored_9i = _TOTAL_SCORED["n"]
+finally:
+    if _bytes_9i is None:
+        os.remove(_journal_9i)
+    else:
+        with io.open(_journal_9i, "wb") as _fh:
+            _fh.write(_bytes_9i)
+check("9i  a campaign record with an unreadable line REFUSES the ragas run by "
+      "name, before a single pair is judged",
+      code == 1 and _scored_9i == 0
+      and "REFUSED (spend_record_unverified)" in txt,
+      (code, _scored_9i, txt[-700:]))
+check("9i  ...telling the operator the remainder is UNVERIFIED and potentially "
+      "OVERSTATED", "potentially OVERSTATED" in txt, txt[-700:])
+shutil.rmtree(DRIVE_OUT, ignore_errors=True)
+code, txt = drive_ragas_main([], DRIVE_RUN)
+check("9i  CLEAN CONTROL: the same run with the line removed judges every pair",
+      code == 0 and _TOTAL_SCORED["n"] == TOTAL_PAIRS,
+      (code, _TOTAL_SCORED["n"]))
+
 # --- 9h  the PRODUCTION spend journal was not written -----------------------
 #
 # `ragas_harness.main()` records this invocation's spend to the cross-process

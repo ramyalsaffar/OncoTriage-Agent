@@ -2404,6 +2404,29 @@ BUCKETS = {
         "PRODUCTION journal is sha256-compared at the end, and the two "
         "repository files it reads are written by neither of the suite's two "
         "writers. It EXECS NOTHING and loads no module by location."),
+    "test_rater_batch_spend_accounting.py": (
+        _A, None,
+        "the rater's per-batch spend record and the per-rating output "
+        "ceiling. No network, no keys, NO SPEND: the Batch-API client is a "
+        "stand-in that renders output from the bytes uploaded to it, and "
+        "require_client, model_is_visible, poll_batch and _paced_management "
+        "are rebound for the drive and restored by identity. It DRIVES THE "
+        "REAL rater main() four times. Every journal, state file, run "
+        "directory and output directory is inside a tempfile.mkdtemp it "
+        "removes; ONCOTRIAGE_SPEND_JOURNAL and "
+        "paths._RESOLVED['testing_evaluation_path'] point inside it, and the "
+        "PRODUCTION journal is sha256-compared at the end. NOT in the "
+        "collision matrix. It EXECS NOTHING and loads no module by location."),
+    "test_spend_checkpoint_backstop.py": (
+        _A, None,
+        "the spend checkpointer's wall-clock backstop thread. No network, no "
+        "keys, NO SPEND: every metric is a stub charging a local counter, "
+        "driven through the REAL ragas_harness.score_all. Uses real threads "
+        "and short real waits (bounded polls, never fixed sleeps for a "
+        "positive). Every journal is inside a tempfile.mkdtemp it removes; "
+        "ONCOTRIAGE_SPEND_JOURNAL points inside it and the PRODUCTION journal "
+        "is sha256-compared at the end. NOT in the collision matrix. It EXECS "
+        "NOTHING and loads no module by location."),
     "test_rater_multi_run_selection.py": (
         _A, None,
         "ran green in 0.8s, 44 checks, against ONLY the provisioned CI "

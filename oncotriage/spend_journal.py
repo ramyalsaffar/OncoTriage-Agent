@@ -241,6 +241,28 @@ def decode_journal_line(raw):
 def read_entries(path=None):
     """Every well-formed entry, in file order. NEVER RAISES.
 
+    ``read_entries_report(path)[0]``. A caller that computes a BUDGET from the
+    result must use ``read_entries_report`` instead, because this form throws
+    away the one fact that decides whether that budget can be trusted: what
+    was skipped.
+    """
+    return read_entries_report(path)[0]
+
+
+def read_entries_report(path=None):
+    """``(entries, unreadable)``: every well-formed entry, and what was not.
+
+    ``unreadable`` is a list of short reason strings, one per item that could
+    not be read -- an undecodable, unparseable or unknown-schema LINE, an
+    unresolvable path, a file that exists and could not be opened. An ABSENT
+    file is not in it: nothing has been recorded yet, which is a reading and
+    not a failure to read. A LINE-level item cannot be attributed to a budget
+    (its budget field is exactly what could not be read), so a caller must
+    treat it as bearing on every budget.
+
+    NEVER RAISES. Every item is also counted into ``JOURNAL_FAULTS`` exactly as
+    before this report existed; the list adds names, it does not move counts.
+
     An absent file is an empty list, which is the correct reading: nothing has
     been recorded yet. A line that cannot be DECODED, that will not parse, or
     that carries a schema version this build does not know, is COUNTED into
@@ -257,44 +279,61 @@ def read_entries(path=None):
     a skipped entry is money the next session will not be charged for, so every
     skip is a counted degradation that reaches the run-end report.
     """
+    unreadable = []
     p = resolved_journal_path(path)
     if p is None:
-        return []
+        # COUNTED by `resolved_journal_path`. Named here because "no journal"
+        # and "a journal nobody could locate" are the same empty list, and only
+        # one of them is a record that may hold money.
+        unreadable.append(f"the journal path could not be resolved (set "
+                          f"{settings.ENV_SPEND_JOURNAL} to the journal file, "
+                          f"or restore the evaluation-runs directory)")
+        return [], unreadable
     try:
         with io.open(p, "rb") as fh:
             raw = fh.read()
     except FileNotFoundError:
-        return []
+        return [], unreadable
     except OSError as exc:
         JOURNAL_FAULTS[f"read:{type(exc).__name__}"] += 1
         console.out(f"  [Spend journal] could not read {p}: "
                     f"{type(exc).__name__}: {exc}")
-        return []
+        unreadable.append(f"journal file {p} could not be opened "
+                          f"({type(exc).__name__})")
+        return [], unreadable
     out = []
     for lineno, rawline in enumerate(raw.splitlines(), 1):
         if not rawline.strip():
             continue
         line = decode_journal_line(rawline)
         if line is None:
+            unreadable.append(f"journal line {lineno}: not UTF-8")
             continue
         try:
             entry = json.loads(line)
         except ValueError:
             JOURNAL_FAULTS["parse:not_json"] += 1
+            unreadable.append(f"journal line {lineno}: not JSON")
             continue
         if not isinstance(entry, dict):
             JOURNAL_FAULTS[f"parse:{type(entry).__name__}"] += 1
+            unreadable.append(f"journal line {lineno}: a JSON "
+                              f"{type(entry).__name__}, not an entry")
             continue
         version = entry.get("schema_version")
         if not isinstance(version, int) or isinstance(version, bool):
             JOURNAL_FAULTS["schema:absent"] += 1
+            unreadable.append(f"journal line {lineno}: no schema_version")
             continue
         if version > SCHEMA_VERSION:
             JOURNAL_FAULTS[f"schema:from_the_future:{version}"] += 1
+            unreadable.append(f"journal line {lineno}: schema_version "
+                              f"{version} is newer than this build's "
+                              f"{SCHEMA_VERSION}")
             continue
         entry["_lineno"] = lineno
         out.append(entry)
-    return out
+    return out, unreadable
 
 
 APPEND_WROTE = "wrote"
@@ -709,7 +748,7 @@ def _covered_batch_ids(entries, budget):
     return covered
 
 
-def total(budget, path=None, entries=None):
+def total(budget, path=None, entries=None, unreadable=None):
     """``spend.LedgerSeed`` for ``budget``: everything ever recorded for it.
 
     Duplicate ``entry_id``s are summed ONCE, first occurrence winning, and the
@@ -723,7 +762,13 @@ def total(budget, path=None, entries=None):
     ``spend.describe_seed`` print "A FLOOR, NOT A TOTAL", which is the honest
     thing to say about a cap enforced against it.
     """
-    entries = read_entries(path) if entries is None else entries
+    # WHAT COULD NOT BE READ TRAVELS WITH THE TOTAL. A caller handing in
+    # `entries` it read itself hands in `unreadable` with them, or asserts by
+    # omission that there was nothing -- which is why the default reading goes
+    # through the reporting reader rather than the plain one.
+    if entries is None:
+        entries, unreadable = read_entries_report(path)
+    unread = list(unreadable or [])
     covered = _covered_batch_ids(entries, budget)
     seen = set()
     usd = 0.0
@@ -735,6 +780,8 @@ def total(budget, path=None, entries=None):
         kind = e.get("kind")
         if kind not in ENTRY_KINDS:
             JOURNAL_FAULTS[f"kind:{kind}"] += 1
+            unread.append(f"journal line {e.get('_lineno')}: unknown kind "
+                          f"{kind!r}")
             continue
         eid = e.get("entry_id")
         if eid in seen:
@@ -748,20 +795,64 @@ def total(budget, path=None, entries=None):
         amount = e.get("usd")
         if isinstance(amount, bool) or not isinstance(amount, (int, float)):
             JOURNAL_FAULTS[f"bad_amount:{type(amount).__name__}"] += 1
+            unread.append(f"journal line {e.get('_lineno')}: amount is a "
+                          f"{type(amount).__name__}")
             continue
         if amount != amount or amount < 0:               # NaN and negatives
             JOURNAL_FAULTS[f"bad_amount:{amount!r}"] += 1
+            unread.append(f"journal line {e.get('_lineno')}: amount "
+                          f"{amount!r}")
             continue
         usd += float(amount)
         rows += 1
         scopes.add(e.get("scope"))
         if e.get("is_floor"):
             unpriced += 1
-    if not rows:
+    if not rows and not unread:
         return spend.LedgerSeed()
+    # A READING WITH NO READABLE ROW AND AN UNREADABLE ONE IS STILL A READING
+    # OF THIS BUDGET'S JOURNAL, and it is attributed to it: returning the
+    # anonymous fresh seed would let `rater_spend_before` fall back to a state
+    # file as though the journal had simply been empty.
     return spend.LedgerSeed(
         usd=usd, rows=rows, unpriced=unpriced, runs=len(scopes),
-        source=SEED_SOURCE_FOR_BUDGET[budget])
+        source=SEED_SOURCE_FOR_BUDGET[budget], unreadable=len(unread),
+        unreadable_reasons=tuple(unread[:spend.UNREADABLE_REASONS_KEPT]))
+
+
+def recorded_batch_ids(budget, source, scope, entries):
+    """The batch ids whose money ``total`` COUNTS for one scope, as a set.
+
+    **WHAT A RESUMED COLLECTION ASKS BEFORE IT CHARGES ANYTHING.** A seed read
+    from this journal already contains every batch entry ``total`` counted, so
+    re-charging one of them to the process ledger counts it twice against the
+    cap. This mirrors ``total``'s rules exactly -- same budget, a readable
+    non-negative amount, NOT covered by a migration entry -- and a batch a
+    migration covers is deliberately NOT in the set: a migration's amount may
+    or may not include a batch it lists (a batch submitted and not yet
+    collected is listed with no money), so the caller charges it and
+    over-counts, which is the safe direction.
+
+    NEVER RAISES.
+    """
+    covered = _covered_batch_ids(entries, budget).get(scope, set())
+    found = set()
+    for e in entries or ():
+        if not isinstance(e, dict):
+            continue
+        if (e.get("budget") != budget or e.get("source") != source
+                or e.get("kind") != ENTRY_KIND_BATCH
+                or e.get("scope") != scope):
+            continue
+        amount = e.get("usd")
+        if isinstance(amount, bool) or not isinstance(amount, (int, float)) \
+                or amount != amount or amount < 0:
+            continue
+        unit = str(e.get("unit"))
+        if unit in covered:
+            continue
+        found.add(unit)
+    return found
 
 
 SEED_SOURCE_FOR_BUDGET = {
@@ -785,13 +876,158 @@ if set(SEED_SOURCE_FOR_BUDGET) != set(spend.SPEND_BUDGETS):
 
 def record_batch(budget, source, scope, batch_id, usd, judge_model,
                  path=None):
-    """Record one collected batch. Idempotent on ``(scope, batch_id)``."""
-    return append({
+    """Record one collected batch. Idempotent on ``(scope, batch_id)``.
+
+    **A BOOL, AND THEREFORE NOT WHAT A MONEY PATH MAY CONSUME.** ``True`` is
+    ``wrote``; ``False`` is duplicate, conflict, failed and uncertain at once,
+    and two of those mean the money IS recorded while two mean it is NOT. It is
+    kept for back-compatibility and has no production caller:
+    ``oncotriage/evaluation/rater.py`` records batches through
+    ``record_batch_with_outcome``, which keeps the distinction and retries the
+    two unconfirmed outcomes.
+    """
+    return append(_batch_entry(budget, source, scope, batch_id, usd,
+                               judge_model), path=path)
+
+
+def _batch_entry(budget, source, scope, batch_id, usd, judge_model):
+    """The one entry shape for a collected batch, shared by both writers.
+
+    ONE BUILDER, because the duplicate check that makes a retry safe compares
+    the charge identity AND the amount -- two builders that drifted by one field
+    would turn every retry of a landed write into a conflict.
+    """
+    return {
         "entry_id": entry_id(budget, source, scope, batch_id),
         "kind": ENTRY_KIND_BATCH, "budget": budget, "source": source,
         "scope": scope, "unit": str(batch_id), "usd": float(usd),
         "judge_model": judge_model,
-    }, path=path)
+    }
+
+
+BATCH_RECORD_CONFIRMED = "confirmed"
+BATCH_RECORD_DUPLICATE = "duplicate"
+BATCH_RECORD_CONFLICTED = "conflicted"
+BATCH_RECORD_UNCONFIRMED = "unconfirmed"
+
+BATCH_RECORD_OUTCOMES = (BATCH_RECORD_CONFIRMED, BATCH_RECORD_DUPLICATE,
+                         BATCH_RECORD_CONFLICTED, BATCH_RECORD_UNCONFIRMED)
+"""What recording one collected batch finally did, after its bounded retries.
+CLOSED.
+
+``confirmed``    this call's append WROTE the line and it read back as this
+                 charge.
+``duplicate``    an entry with this id, this charge identity AND this amount was
+                 already in the file -- an earlier attempt or an earlier session
+                 (``--resume`` re-collects a collected batch on purpose). The
+                 money IS recorded.
+``conflicted``   an entry with this id records a DIFFERENT charge. This batch's
+                 money is NOT recorded by it and retrying cannot change that, so
+                 it is never retried.
+``unconfirmed``  every attempt ended ``failed`` or ``uncertain``. The money MAY
+                 be on disk (an uncertain write) or may not; a caller must treat
+                 it as NOT recorded and may offer it again under the same id,
+                 which the duplicate check resolves safely.
+
+The first two are ``BATCH_RECORD_SETTLED``; the last two are unresolved
+accounting, and the rater refuses new paid submissions while any exists.
+"""
+
+BATCH_RECORD_SETTLED = (BATCH_RECORD_CONFIRMED, BATCH_RECORD_DUPLICATE)
+"""The outcomes under which the batch's money IS in the journal."""
+
+BATCH_RECORD_MAX_ATTEMPTS = 3
+"""Append attempts per offer of one batch. Bounded, and deliberately small.
+
+A transient failure -- a lock held across a slow filesystem, an ``EINTR`` -- is
+what a retry can fix, and it fixes it on the second attempt or not at all. A
+persistent one (a read-only directory, a full disk) cannot be fixed by retrying
+in a loop, and a loop that retried until it worked would hold a collected
+batch's results hostage to the journal. UNCALIBRATED: nobody has measured a
+transient journal failure in this project, which is also why the attempts are
+reported per batch rather than summarised away."""
+
+BATCH_RECORD_RETRY_SECONDS = 0.05
+"""Base pause between attempts; doubled each time (0.05 s, then 0.1 s).
+Sub-second on purpose: it runs on the collection path, after money is spent."""
+
+_APPEND_TO_BATCH_OUTCOME = {
+    APPEND_WROTE: BATCH_RECORD_CONFIRMED,
+    APPEND_DUPLICATE: BATCH_RECORD_DUPLICATE,
+    APPEND_CONFLICT: BATCH_RECORD_CONFLICTED,
+    APPEND_FAILED: BATCH_RECORD_UNCONFIRMED,
+    APPEND_UNCERTAIN: BATCH_RECORD_UNCONFIRMED,
+}
+
+# TOTAL OVER THE WRITER'S VOCABULARY, guarded at import rather than by an
+# `assert` (`python -O` deletes those). An append outcome with no mapping would
+# fall to `.get`'s default below, and the default is UNCONFIRMED -- safe, but a
+# new outcome that meant "recorded" would then refuse every retry pass.
+if set(_APPEND_TO_BATCH_OUTCOME) != set(APPEND_OUTCOMES) \
+        or set(_APPEND_TO_BATCH_OUTCOME.values()) != set(BATCH_RECORD_OUTCOMES):
+    raise RuntimeError(
+        f"spend_journal._APPEND_TO_BATCH_OUTCOME must map every "
+        f"APPEND_OUTCOMES member onto BATCH_RECORD_OUTCOMES: "
+        f"{_APPEND_TO_BATCH_OUTCOME!r}")
+
+
+def record_batch_with_outcome(budget, source, scope, batch_id, usd,
+                              judge_model, path=None, max_attempts=None,
+                              sleep=None):
+    """Record one collected batch and say WHAT HAPPENED. NEVER RAISES.
+
+    Returns ``{"outcome", "attempts", "append_outcomes"}`` where ``outcome`` is
+    a ``BATCH_RECORD_OUTCOMES`` member and ``append_outcomes`` is every
+    ``append_with_outcome`` answer in order -- the evidence, not a summary of it.
+
+    IDEMPOTENT ON ``(scope, batch_id)`` exactly as ``record_batch`` is: the
+    entry is built ONCE and every attempt offers the SAME id and the SAME
+    amount, so an attempt that follows an ``uncertain`` write that did land is
+    answered ``duplicate`` rather than recording the money twice.
+
+    RETRIES ONLY THE TWO UNCONFIRMED WRITER OUTCOMES, at most ``max_attempts``
+    times in all. ``conflict`` is returned at once: a collision is a fact about
+    the file, not a transient.
+    """
+    allowed = BATCH_RECORD_MAX_ATTEMPTS if max_attempts is None else max_attempts
+    if isinstance(allowed, bool) or not isinstance(allowed, int) or allowed < 1:
+        JOURNAL_FAULTS[f"batch:bad_max_attempts:{allowed!r}"] += 1
+        allowed = 1
+    pause = time.sleep if sleep is None else sleep
+    seen = []
+    try:
+        entry = _batch_entry(budget, source, scope, batch_id, usd, judge_model)
+    except Exception as exc:                                    # noqa: BLE001
+        # `float(usd)` on a non-number. Nothing was offered, so nothing can be
+        # on disk -- unconfirmed, counted, and the amount is the caller's to
+        # report because this function never learned it.
+        JOURNAL_FAULTS[f"batch:unbuildable:{type(exc).__name__}"] += 1
+        return {"outcome": BATCH_RECORD_UNCONFIRMED, "attempts": 0,
+                "append_outcomes": seen}
+    outcome = BATCH_RECORD_UNCONFIRMED
+    for n in range(allowed):
+        try:
+            got = append_with_outcome(entry, path=path)
+        except Exception as exc:                                # noqa: BLE001
+            # DOCUMENTED NEVER RAISES, GUARDED ANYWAY: a raise escaping here
+            # would take a collected batch's results with it. It is read as
+            # UNCERTAIN, not failed, because nothing says where it raised.
+            JOURNAL_FAULTS[f"batch:append_raised:{type(exc).__name__}"] += 1
+            got = APPEND_UNCERTAIN
+        seen.append(got)
+        outcome = _APPEND_TO_BATCH_OUTCOME.get(got, BATCH_RECORD_UNCONFIRMED)
+        if outcome != BATCH_RECORD_UNCONFIRMED:
+            break
+        if n + 1 < allowed:
+            try:
+                pause(BATCH_RECORD_RETRY_SECONDS * (2 ** n))
+            except Exception:                                   # noqa: BLE001
+                JOURNAL_FAULTS["batch:retry_pause_raised"] += 1
+    if outcome == BATCH_RECORD_UNCONFIRMED:
+        JOURNAL_FAULTS["batch:unconfirmed"] += 1
+    elif outcome == BATCH_RECORD_CONFLICTED:
+        JOURNAL_FAULTS["batch:conflicted"] += 1
+    return {"outcome": outcome, "attempts": len(seen), "append_outcomes": seen}
 
 
 def record_run(budget, source, scope, unit, usd, judge_model, path=None):
@@ -834,14 +1070,38 @@ number because nothing has measured what a kill actually costs in practice.
 """
 
 RUN_CHECKPOINT_SECONDS = 60.0
-"""How long a run may go without checkpointing, whatever it has spent.
+"""How long a run may go without offering its spend, whatever it has spent.
 
 The backstop, not the bound. A run that is judging slowly and cheaply would
 otherwise sit under ``RUN_CHECKPOINT_USD`` for its whole length and record
 nothing until the end, which is the state this whole mechanism removes. It
 cannot make the money bound worse -- an extra checkpoint only ever records
 MORE of what has been spent.
+
+**IT IS A WALL-CLOCK BOUND ONLY WHERE A CALLER STARTS THE BACKSTOP.**
+``checkpoint`` evaluates this threshold when it is CALLED, and its caller calls
+it on pair completion -- so on its own a run whose pairs all hang never reaches
+it. ``RunSpendCheckpointer.start_backstop`` runs a thread that asks the
+checkpointer every ``min_seconds / BACKSTOP_TICKS_PER_THRESHOLD`` whether this
+threshold has passed, with or without a completion. **WHAT IT BOUNDS IS
+UNRECORDED TIME, NOT STORAGE FAILURE**: a delta is OFFERED on schedule, and a
+journal that refuses the write keeps it pending exactly as before.
 """
+
+BACKSTOP_TICKS_PER_THRESHOLD = 4
+"""How many times per ``min_seconds`` the backstop thread asks. At the default
+60 s that is every 15 s, so spend that has been unoffered for ``min_seconds``
+is offered within one further tick. Four rather than one: a single tick per
+threshold makes the worst case twice the threshold."""
+
+BACKSTOP_MIN_INTERVAL_SECONDS = 0.01
+"""A floor under the tick, so a tiny or zero ``min_seconds`` cannot turn the
+backstop into a busy loop holding the checkpointer's lock."""
+
+BACKSTOP_JOIN_SECONDS = 10.0
+"""How long ``finalize`` waits for the backstop thread to exit. Bounded because
+the thread may be inside an append blocked on another process's ``flock``; the
+thread is a daemon, so a timeout is reported and never hangs the interpreter."""
 
 
 class _PendingDelta(object):
@@ -992,7 +1252,28 @@ class RunSpendCheckpointer(object):
     **WHAT IT DOES PROMISE**, which is smaller and true: every completed pair's
     spend is offered to the journal at the first completion after the running
     delta reaches ``RUN_CHECKPOINT_USD``, and once offered it is retried until
-    confirmed or until finalization reports it. What a kill loses is the spend
+    confirmed or until finalization reports it.
+
+    ═══ THE BACKSTOP: A TIMER BESIDE ``checkpoint``, NOT INSIDE IT ═══
+
+    ``start_backstop(measure)`` starts a daemon thread that, every
+    ``min_seconds / BACKSTOP_TICKS_PER_THRESHOLD``, reads ``measure()`` and runs
+    the SAME threshold decision ``checkpoint`` runs, under the SAME lock. So a
+    run whose scoring loop is stalled -- every pair hanging, or the event loop
+    itself blocked -- still OFFERS its spend once ``min_seconds`` have passed
+    since the last journal attempt, and still retries its pending deltas.
+    ``measure`` is the ledger's running total, which is charged per RESPONSE, so
+    the backstop also offers the in-flight charges that no completion has
+    reached.
+
+    **WHAT IT BOUNDS IS UNRECORDED TIME, NOT STORAGE FAILURE.** A backstop
+    offer that the journal refuses is exactly as pending as a completion's, and
+    a hard kill still loses whatever was charged since the last CONFIRMED
+    write. It changes nothing about double counting: the tick and a
+    completion's ``checkpoint`` serialise on one lock, both measure against
+    ``_issued_usd``, and a delta is frozen once cut. ``finalize`` signals the
+    thread before it takes the lock and joins it after, so no tick can cut a
+    delta after the terminal one. What a kill loses is the spend
     that was never offered -- the sub-threshold remainder plus the in-flight
     charges -- and ``tests/test_spend_hard_kill_journaling.py`` section 6
     MEASURES that at the configured worker count rather than bounding it by
@@ -1047,6 +1328,15 @@ class RunSpendCheckpointer(object):
         self.finalized = False
         self.verified_usd = None      # set by finalize, READ BACK from disk
         self.residual_usd = None      # measured - verified_usd, at finalize
+        # ── THE BACKSTOP ──
+        # Plain attributes, not properties: `start_backstop` sets them under the
+        # lock and `finalize` reads the event without it (setting an Event is
+        # thread-safe and must not wait behind a tick that holds the lock).
+        self._backstop = None
+        self._backstop_stop = None
+        self.backstop_interval = None
+        self.backstop_ticks = 0       # ticks that ran the threshold decision
+        self.backstop_stopped = None  # True once finalize joined the thread
 
     @property
     def recorded(self):
@@ -1199,23 +1489,141 @@ class RunSpendCheckpointer(object):
             if self.finalized:
                 JOURNAL_FAULTS["checkpoint:after_finalize"] += 1
                 return False
-            delta = self._delta(measured)
-            if delta is None:               # counted in `_delta`
+            return self._checkpoint_locked(measured)
+
+    def _checkpoint_locked(self, measured):
+        """The threshold decision and the writes. CALLER HOLDS ``_lock``.
+
+        ONE BODY FOR BOTH CALLERS -- a completion's ``checkpoint`` and the
+        backstop's tick -- so the two cannot disagree about when a delta is due
+        or how it is cut. A second copy of this decision in the thread is the
+        shape that would double count.
+        """
+        delta = self._delta(measured)
+        if delta is None:               # counted in `_delta`
+            return False
+        due = (bool(self._pending)
+               or (delta > 0 and delta >= self.min_usd)
+               or (delta > 0
+                   and (self._clock() - self._last) >= self.min_seconds))
+        if not due:
+            return False
+        confirmed = self._flush_pending()
+        if delta > 0:
+            item = self._cut(delta)
+            if item.last_outcome in (APPEND_WROTE, APPEND_DUPLICATE):
+                confirmed += 1
+        return confirmed > 0
+
+    def start_backstop(self, measure, interval=None):
+        """Offer spend on a wall clock, whether or not anything completes.
+
+        ``measure`` is a zero-argument callable returning the ledger's running
+        total -- ``lambda: spend.SPEND_LEDGER.measured`` in the ragas harness.
+        Returns True when a thread was started. NEVER RAISES.
+
+        Refused and counted after ``finalize`` (a tick could otherwise cut a
+        delta after the terminal one) and when already started (two threads
+        would be two ticks per interval over one lock, harmless but a sign the
+        caller wired it twice).
+        """
+        with self._lock:
+            if self.finalized:
+                JOURNAL_FAULTS["backstop:start_after_finalize"] += 1
                 return False
-            due = (bool(self._pending)
-                   or (delta > 0 and delta >= self.min_usd)
-                   or (delta > 0
-                       and (self._clock() - self._last) >= self.min_seconds))
-            if not due:
+            if self._backstop is not None:
+                JOURNAL_FAULTS["backstop:already_started"] += 1
                 return False
-            confirmed = self._flush_pending()
-            if delta > 0:
-                item = self._cut(delta)
-                if item.last_outcome in (APPEND_WROTE, APPEND_DUPLICATE):
-                    confirmed += 1
-            return confirmed > 0
+            if interval is None:
+                interval = self.min_seconds / BACKSTOP_TICKS_PER_THRESHOLD
+            if isinstance(interval, bool) \
+                    or not isinstance(interval, (int, float)) \
+                    or interval != interval:
+                JOURNAL_FAULTS[f"backstop:bad_interval:"
+                               f"{type(interval).__name__}"] += 1
+                interval = BACKSTOP_MIN_INTERVAL_SECONDS
+            interval = max(float(interval), BACKSTOP_MIN_INTERVAL_SECONDS)
+            stop = threading.Event()
+            thread = threading.Thread(
+                target=self._backstop_loop, args=(measure, interval, stop),
+                name=f"spend-journal-backstop:{self.prefix}", daemon=True)
+            try:
+                # STARTED INSIDE THE LOCK. Outside it, a `finalize` landing
+                # between the assignment and `start()` would join a thread that
+                # was never started, which raises.
+                thread.start()
+            except Exception as exc:                            # noqa: BLE001
+                JOURNAL_FAULTS[f"backstop:start_failed:"
+                               f"{type(exc).__name__}"] += 1
+                return False
+            self._backstop_stop = stop
+            self._backstop = thread
+            self.backstop_interval = interval
+            return True
+
+    def _backstop_loop(self, measure, interval, stop):
+        """The thread body. Every fault is counted; nothing escapes."""
+        while not stop.wait(interval):
+            try:
+                value = measure()
+            except Exception as exc:                            # noqa: BLE001
+                JOURNAL_FAULTS[f"backstop:measure:{type(exc).__name__}"] += 1
+                continue
+            try:
+                with self._lock:
+                    # A TICK THAT LOST THE RACE TO `finalize` IS NOT A FAULT.
+                    # It is shutdown working, so it returns silently rather
+                    # than counting `checkpoint:after_finalize` the way a late
+                    # completion does.
+                    if self.finalized or stop.is_set():
+                        return
+                    self.backstop_ticks += 1
+                    self._checkpoint_locked(value)
+            except Exception as exc:                            # noqa: BLE001
+                JOURNAL_FAULTS[f"backstop:tick:{type(exc).__name__}"] += 1
+
+    def _stop_backstop(self):
+        """Signal the thread and join it, OUTSIDE the lock. NEVER RAISES."""
+        stop, thread = self._backstop_stop, self._backstop
+        if stop is None or thread is None:
+            return None
+        stop.set()
+        if thread is threading.current_thread():
+            return True
+        try:
+            thread.join(BACKSTOP_JOIN_SECONDS)
+        except Exception as exc:                                # noqa: BLE001
+            JOURNAL_FAULTS[f"backstop:join:{type(exc).__name__}"] += 1
+            return False
+        if thread.is_alive():
+            JOURNAL_FAULTS["backstop:join_timeout"] += 1
+            console.out(
+                f"  [Spend journal] the backstop thread for units "
+                f"{self.prefix}#* did not exit within {BACKSTOP_JOIN_SECONDS}s "
+                f"(it is most likely inside an append waiting on the journal "
+                f"lock). It is a daemon and cannot hold the process open, and "
+                f"it cannot cut a delta after finalization.")
+            return False
+        return True
 
     def finalize(self, measured):
+        """Flush, verify against the file, and stop the backstop. NEVER RAISES.
+
+        THE ORDER IS THE SHUTDOWN GUARANTEE. The backstop's stop event is set
+        BEFORE the lock is taken, so a tick waiting on the lock sees it and
+        returns; the body below runs under the lock; the thread is JOINED after
+        the lock is released, because joining while holding it would deadlock
+        against a tick blocked on it. See ``_finalize_body`` for the rest.
+        """
+        stop = self._backstop_stop
+        if stop is not None:
+            stop.set()
+        try:
+            return self._finalize_body(measured)
+        finally:
+            self.backstop_stopped = self._stop_backstop()
+
+    def _finalize_body(self, measured):
         """Flush everything, then VERIFY against the file. NEVER RAISES.
 
         Idempotent: a second call does nothing, because a caller with a
@@ -1319,30 +1727,74 @@ being trusted.
 """
 
 
-def find_state_files(root=None):
+def find_state_files(root=None, errors=None):
     """Every rater state file under ``root``, sorted. Reads nothing else.
 
     NEVER RAISES, for ``resolved_journal_path``'s reason: the default root is
     the same lazy glob, and a machine with no sibling tree has no state files
     rather than a broken migration.
+
+    ``errors``, when a list, receives one reason per directory that could NOT
+    be walked and for an unresolvable root. ``os.walk`` skips an unreadable
+    directory silently by default, and a skipped directory is state files --
+    and therefore spend -- this migration never saw.
     """
     if root is None:
         try:
             root = paths.testing_evaluation_path
         except Exception as exc:                                # noqa: BLE001
             JOURNAL_FAULTS[f"unresolvable_root:{type(exc).__name__}"] += 1
+            if errors is not None:
+                errors.append(f"the state-file root could not be resolved "
+                              f"({type(exc).__name__})")
             return []
+
+    def _walk_error(exc):
+        JOURNAL_FAULTS[f"migrate:walk:{type(exc).__name__}"] += 1
+        if errors is not None:
+            errors.append(f"directory {getattr(exc, 'filename', '?')} could "
+                          f"not be walked ({type(exc).__name__})")
+
     found = []
-    for dirpath, _dirnames, filenames in os.walk(root):
+    for dirpath, _dirnames, filenames in os.walk(root, onerror=_walk_error):
         for name in filenames:
             if name in STATE_BASENAMES:
                 found.append(os.path.join(dirpath, name))
     return sorted(found)
 
 
+JOURNAL_ERA_STATE_KEY = "spend_by_batch"
+"""A state-file key that only a journal-era rater writes: ``{batch id: usd}``.
+
+**ITS PRESENCE IS WHAT KEEPS A STATE FILE OUT OF THE MIGRATION.** The migration
+exists for PRE-journal artifacts, whose spend is in no batch entry. A
+journal-era session offers every collected batch to this journal itself, and
+migrating its state file too was a defect rather than a redundancy: the
+migration entry lists EVERY batch in ``state["batches"]`` as covered, including
+a batch that was submitted and not yet collected when the migration ran, and
+``total`` then SKIPS that batch's own entry when a later ``--resume`` collects
+it -- so its money never reaches the cap. Owned here because this module reads
+it; ``oncotriage/evaluation/rater.py`` writes it under this name."""
+
+
 def bootstrap_from_state_files(budget=spend.SPEND_BUDGET_RATER,
                                source=spend.SPEND_SOURCE_RATER,
                                root=None, path=None, out=None):
+    """Seed the journal from the state files on disk. Idempotent. NEVER RAISES.
+
+    ``bootstrap_report``'s counts as ``(appended, skipped, usd)``, kept for
+    back-compatibility. ``skipped`` is every offer that did not write -- a
+    duplicate AND a write that failed -- so a caller that has to tell those
+    apart, which is every caller that goes on to spend, uses the report.
+    """
+    rep = bootstrap_report(budget=budget, source=source, root=root, path=path,
+                           out=out)
+    return rep["written"], rep["skipped"], rep["usd"]
+
+
+def bootstrap_report(budget=spend.SPEND_BUDGET_RATER,
+                     source=spend.SPEND_SOURCE_RATER,
+                     root=None, path=None, out=None):
     """Seed the journal from the state files on disk. Idempotent. NEVER RAISES.
 
     **SUMMED FROM THE ARTIFACTS, NEVER FROM PROSE.** Every amount here is read
@@ -1355,12 +1807,19 @@ def bootstrap_from_state_files(budget=spend.SPEND_BUDGET_RATER,
     that file already covers, so a session that later resumes one of those
     batches does not charge it a second time.
 
-    Returns ``(appended, skipped, usd)``.
+    Returns ``{"written", "duplicate", "skipped", "journal_era", "usd",
+    "unreadable"}``. ``unreadable`` names every state file that could not be
+    read, every directory that could not be walked, every recorded spend that
+    is present and not a usable amount, and every migration offer the journal
+    did not CONFIRM (failed, uncertain or conflicted) -- each of which is spend
+    this budget's record may be missing. It is what a caller about to spend
+    hands to ``spend.SPEND_LEDGER.mark_unverified``.
     """
     emit = out or console.out
-    written = skipped = 0
+    written = duplicate = journal_era = 0
     usd = 0.0
-    for state_path in find_state_files(root):
+    unreadable = []
+    for state_path in find_state_files(root, errors=unreadable):
         try:
             with io.open(state_path, "r", encoding="utf-8") as fh:
                 state = json.load(fh)
@@ -1368,9 +1827,16 @@ def bootstrap_from_state_files(budget=spend.SPEND_BUDGET_RATER,
             JOURNAL_FAULTS[f"migrate:{type(exc).__name__}"] += 1
             emit(f"  [Spend journal] could not read {state_path}: "
                  f"{type(exc).__name__}")
+            unreadable.append(f"state file {state_path} could not be read "
+                              f"({type(exc).__name__})")
             continue
         if not isinstance(state, dict):
             JOURNAL_FAULTS["migrate:not_an_object"] += 1
+            unreadable.append(f"state file {state_path} is a JSON "
+                              f"{type(state).__name__}, not an object")
+            continue
+        if JOURNAL_ERA_STATE_KEY in state:
+            journal_era += 1
             continue
         amount = state.get("spend_usd")
         batches = state.get("batches")
@@ -1379,13 +1845,20 @@ def bootstrap_from_state_files(budget=spend.SPEND_BUDGET_RATER,
             if isinstance(batches, list) else []
         if isinstance(amount, bool) or not isinstance(amount, (int, float)) \
                 or amount != amount or amount < 0:
+            if "spend_usd" in state:
+                # PRESENT AND UNUSABLE is not ABSENT. Absent is a pre-key run
+                # and is the floor below; present-and-garbage is a number that
+                # was recorded and cannot be read.
+                JOURNAL_FAULTS["migrate:bad_spend_usd"] += 1
+                unreadable.append(f"state file {state_path} records spend_usd "
+                                  f"{amount!r}, which is not an amount")
             amount = 0.0
         # A FLOOR when the file records batches and no money. Those are runs
         # from before `STATE_SPEND_KEY` existed: they DID spend, the artifact
         # cannot say how much, and recording 0 without saying it is a floor
         # would present an unknown as a measurement.
         is_floor = bool(batch_ids) and not amount
-        ok = append({
+        got = append_with_outcome({
             "entry_id": entry_id(budget, source, state_path, "migration"),
             "kind": ENTRY_KIND_MIGRATION, "budget": budget, "source": source,
             "scope": state_path, "unit": "migration",
@@ -1395,14 +1868,27 @@ def bootstrap_from_state_files(budget=spend.SPEND_BUDGET_RATER,
             "covers_batch_ids": batch_ids,
             "is_floor": is_floor,
         }, path=path)
-        if ok:
+        if got == APPEND_WROTE:
             written += 1
             usd += float(amount)
+        elif got == APPEND_DUPLICATE:
+            duplicate += 1
         else:
-            skipped += 1
+            # NOT "already present", which is what this branch used to report
+            # for every non-write: a FAILED or UNCERTAIN write is money that may
+            # not be recorded, and a CONFLICT is an entry under this file's id
+            # that records a different charge.
+            unreadable.append(f"migration of state file {state_path} was not "
+                              f"confirmed in the journal ({got})")
+    skipped = duplicate + (len([u for u in unreadable
+                                if u.startswith("migration of ")]))
     emit(f"  [Spend journal] migration: {written} state file(s) recorded, "
-         f"{skipped} already present, ${usd:.4f} added.")
-    return written, skipped, usd
+         f"{duplicate} already present, {journal_era} journal-era file(s) "
+         f"not migrated, ${usd:.4f} added"
+         + (f"; {len(unreadable)} item(s) COULD NOT BE READ OR CONFIRMED."
+            if unreadable else "."))
+    return {"written": written, "duplicate": duplicate, "skipped": skipped,
+            "journal_era": journal_era, "usd": usd, "unreadable": unreadable}
 
 
 def _file_mtime_utc(p):
@@ -1418,9 +1904,16 @@ def describe(budget, path=None):
     seed = total(budget, path=path)
     cap = spend.budget_cap(budget)
     where = resolved_journal_path(path) or "<unresolvable>"
+    # THE LEDGER'S COUNT WHEN IT HAS ONE, because it holds what the seed read
+    # AND what the migration could not; a standalone call has only the seed.
+    n_unread = spend.SPEND_LEDGER.unverified(budget)[0] or seed.unreadable
+    unverified = (f" -- UNVERIFIED, potentially OVERSTATED: {n_unread} "
+                  f"item(s) on this budget's record could not be read"
+                  if n_unread else "")
     if cap is None:
         return (f"[Spend journal] {budget}: ${seed.usd:.4f} recorded across "
-                f"{seed.runs} session(s); NO CAP is in force. {where}")
+                f"{seed.runs} session(s); NO CAP is in force{unverified}. "
+                f"{where}")
     return (f"[Spend journal] {budget}: ${seed.usd:.4f} recorded across "
             f"{seed.runs} session(s), ${max(cap - seed.usd, 0.0):.4f} of "
-            f"${cap:.2f} remaining. {where}")
+            f"${cap:.2f} remaining{unverified}. {where}")

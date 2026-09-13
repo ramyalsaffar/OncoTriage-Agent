@@ -3088,39 +3088,578 @@ def charge_batch_to_ledger(model, usage_totals):
     has been collected, and a pricing defect that discarded the collection
     would throw away results already paid for.
     """
+    usd = price_batch_usage(model, usage_totals)
+    if usd is None:
+        return 0.0
+    return spend.SPEND_LEDGER.charge_usd(usd, spend.SPEND_SOURCE_RATER)
+
+
+def price_batch_usage(model, usage_totals):
+    """One collected batch's measured cost, or None when it could not be priced.
+
+    ``charge_batch_to_ledger``'s pricing half, split out so a collection can
+    decide WHETHER to charge (see ``collected_batch_spend``) before it does.
+    NEVER RAISES; a pricing fault is counted and printed exactly as before.
+    """
     try:
-        usd = price_usage(model, usage_totals)
+        return price_usage(model, usage_totals)
     except Exception as exc:                                    # noqa: BLE001
         spend.SPEND_LEDGER_FAULTS[
             f"rater_unpriced:{type(exc).__name__}"] += 1
         console.out(f"  [Spend] could not price this batch "
                     f"({type(exc).__name__}: {exc}); the campaign total is "
                     f"LOWER than the truth by whatever it cost")
-        return 0.0
-    return spend.SPEND_LEDGER.charge_usd(usd, spend.SPEND_SOURCE_RATER)
+        return None
 
 
-def record_batch_spend(state_path, batch_id, usd, model, journal=None):
+# ── RE-COLLECTION IS IDEMPOTENT ACROSS ALL THREE RECORDS ──────────────────
+#
+# A collected batch's money lives in three places: this process's ledger (what
+# the cap is compared against NOW), the state file's `spend_usd` (the fallback
+# seed, and what the migration once read), and the cross-process journal
+# (every later session's seed). The journal was already idempotent on
+# (state file, batch id). The other two were not: `--resume` seeded the ledger
+# from a journal that ALREADY held the batch and then charged it again, so the
+# retry pass on a resume was gated against a figure inflated by exactly the
+# batches it re-collected, and `spend_usd` grew by them too.
+
+STATE_SPEND_BY_BATCH_KEY = spend_journal.JOURNAL_ERA_STATE_KEY
+"""``{batch id: usd}`` in the state file: which batches this session's
+``spend_usd`` already includes, and at what amount. Its presence also marks the
+file journal-era, which keeps it out of the pre-journal migration -- see
+``spend_journal.JOURNAL_ERA_STATE_KEY`` for why that matters."""
+
+BATCH_SPEND_FIRST = "first_collection"
+BATCH_SPEND_IN_SEED = "already_in_seed"
+BATCH_SPEND_IN_STATE_NOT_SEED = "in_state_not_in_seed"
+BATCH_SPEND_REPEAT = "repeat_in_session"
+
+BATCH_SPEND_DISPOSITIONS = (BATCH_SPEND_FIRST, BATCH_SPEND_IN_SEED,
+                            BATCH_SPEND_IN_STATE_NOT_SEED, BATCH_SPEND_REPEAT)
+"""What a collection did with one batch's money. CLOSED.
+
+``first_collection``      nowhere yet: charge the ledger, add to ``spend_usd``.
+``already_in_seed``       the installed seed already counts it (a journal batch
+                          entry for this state file, or this state file's own
+                          ``spend_by_batch`` when the seed came from it): charge
+                          nothing, add nothing.
+``in_state_not_in_seed``  ``spend_usd`` has it but the seed does not -- the
+                          journal write of an earlier session did not land:
+                          charge the ledger, do not add to ``spend_usd`` again.
+``repeat_in_session``     this session already accounted for it.
+
+Every disposition still OFFERS the batch to the journal at the recorded amount,
+which the journal answers as a duplicate or, for the third, confirms at last.
+"""
+
+
+def collected_batch_spend(state, batch_id, usd, seed_source, seed_batch_ids,
+                          accounted_this_session):
+    """Decide where one collected batch's money must still go. NEVER RAISES.
+
+    Returns ``{"disposition", "usd", "charge_ledger", "add_to_state",
+    "prior_usd"}``. ``usd`` is the amount every record uses: the amount the
+    state file already recorded for this batch when it has one (so the
+    journal's duplicate check sees the same charge), the freshly priced one
+    otherwise, and 0.0 when neither exists -- which is what the collection
+    recorded before this function did.
+
+    **THE ASYMMETRY IS DELIBERATE.** A batch a migration entry merely LISTS is
+    not treated as in the seed (see ``spend_journal.recorded_batch_ids``), and a
+    legacy state file with no ``spend_by_batch`` cannot say which batches its
+    total includes -- both are charged, which OVER-counts. Under-counting is
+    the direction a cap must not fail in.
+    """
+    recorded = state.get(STATE_SPEND_BY_BATCH_KEY) if isinstance(state, dict) \
+        else None
+    prior = recorded.get(batch_id) if isinstance(recorded, dict) else None
+    if isinstance(prior, bool) or not isinstance(prior, (int, float)) \
+            or prior != prior or prior < 0:
+        prior = None
+    ids = seed_batch_ids or ()
+    in_state = prior is not None or batch_id in ids
+    in_seed = ((seed_source == spend.SEED_SOURCE_JOURNAL_RATER
+                and batch_id in ids)
+               or (seed_source == spend.SEED_SOURCE_RATER_STATE
+                   and prior is not None))
+    amount = (float(prior) if prior is not None
+              else float(usd) if isinstance(usd, (int, float))
+              and not isinstance(usd, bool) else 0.0)
+    if batch_id in (accounted_this_session or ()):
+        disposition = BATCH_SPEND_REPEAT
+    elif in_seed:
+        disposition = BATCH_SPEND_IN_SEED
+    elif in_state:
+        disposition = BATCH_SPEND_IN_STATE_NOT_SEED
+    else:
+        disposition = BATCH_SPEND_FIRST
+    return {"disposition": disposition, "usd": amount,
+            "charge_ledger": disposition in (BATCH_SPEND_FIRST,
+                                             BATCH_SPEND_IN_STATE_NOT_SEED),
+            "add_to_state": disposition == BATCH_SPEND_FIRST,
+            "prior_usd": prior}
+
+
+# ── ONE ATTEMPT, ONE RESULT, ONE CEILING ──────────────────────────────────
+#
+# A decision may be answered by more than one batch: its primary, a retry, a
+# resumed copy of either. Merging them by overwriting on custom_id was the
+# defect -- a later FAILED batch marked every decision in the index unrated
+# (see `collect_results`) and restamped each one's ceiling from its own body,
+# on top of ratings earlier batches had produced. Each batch's outcome for a
+# decision is now an ATTEMPT, kept in order; the row's result and its ceiling
+# are the SAME attempt's.
+
+ATTEMPT_RATED = "rated"
+ATTEMPT_UNRATED = "unrated"
+
+
+def _attempt_record(batch_id, tag, outcome, record):
+    return {"batch_id": batch_id, "tag": tag, "outcome": outcome,
+            "reason": (record.get("reason") if outcome == ATTEMPT_UNRATED
+                       else None),
+            CEILING_FIELD: record.get(CEILING_FIELD),
+            CEILING_SOURCE_FIELD: record.get(CEILING_SOURCE_FIELD,
+                                             CEILING_ABSENT_NOT_RECORDED)}
+
+
+def merge_batch_results(rated, unrated, attempts, got, batch_id, tag,
+                        retried=None):
+    """Fold one batch's outcomes into the session. Returns attempts NOT adopted.
+
+    * a RATED outcome is adopted unless the decision is already rated -- an
+      earlier successful result is never replaced, and the later one is kept
+      in ``attempts`` only;
+    * an UNRATED outcome never overwrites a rated decision; for a decision not
+      yet rated it becomes the current outcome, and every earlier unsuccessful
+      attempt stays in ``attempts``;
+    * ``retried``, when given, gains every decision THIS batch answered.
+
+    The adopted record carries its own ceiling (``collect_results`` stamped it
+    from this batch's submitted body), so a row's result and its ceiling can
+    only come from one attempt.
+    """
+    not_adopted = 0
+    for cid, rating in (got.get("rated") or {}).items():
+        attempts.setdefault(cid, []).append(
+            _attempt_record(batch_id, tag, ATTEMPT_RATED, rating))
+        if retried is not None:
+            retried.add(cid)
+        if cid in rated:
+            not_adopted += 1
+            continue
+        rated[cid] = rating
+        unrated.pop(cid, None)
+    for cid, record in (got.get("unrated") or {}).items():
+        attempts.setdefault(cid, []).append(
+            _attempt_record(batch_id, tag, ATTEMPT_UNRATED, record))
+        if retried is not None:
+            retried.add(cid)
+        if cid in rated:
+            not_adopted += 1
+            continue
+        unrated[cid] = record
+    return not_adopted
+
+
+SESSION_COMPLETE = "complete"
+SESSION_STOPPED_ON_BUDGET = "stopped_on_budget"
+SESSION_STATUSES = (SESSION_COMPLETE, SESSION_STOPPED_ON_BUDGET)
+"""What the written artifacts describe. CLOSED. ``stopped_on_budget`` files hold
+only what was collected before a spend limit stopped the session."""
+
+
+def session_status_block(budget_stop, uncollected_batch_ids):
+    """The status keys every written artifact carries. NEVER RAISES."""
+    if budget_stop is None:
+        return {"session_status": SESSION_COMPLETE, "incomplete": False,
+                "stop": None}
+    return {"session_status": SESSION_STOPPED_ON_BUDGET, "incomplete": True,
+            "stop": {"reason": "spend_limit_reached",
+                     "limit": getattr(budget_stop, "limit", None),
+                     "source": getattr(budget_stop, "source", None),
+                     "message": str(budget_stop),
+                     "uncollected_batch_ids": list(uncollected_batch_ids),
+                     "remedy": ("raise the cap and run --resume <batch ids> "
+                                "to collect or retry what this session did "
+                                "not")}}
+
+
+def record_batch_spend(state_path, batch_id, usd, model, journal=None,
+                       max_attempts=None, sleep=None):
     """Persist one collected batch's cost to the CROSS-PROCESS journal.
 
-    Called at both collection sites, immediately after
-    ``charge_batch_to_ledger`` and ``write_state``, so the three records of one
-    batch -- this process's ledger, this session's state file and every future
-    session's cap -- are written together or not at all.
+    Called at both collection sites (through ``BatchSpendAccounting.record``),
+    immediately after ``charge_batch_to_ledger`` and ``write_state``.
 
     IDEMPOTENT ON ``(state file, batch id)``, which is what makes ``--resume``
     safe: re-collecting a batch that was already collected recomputes the same
     ``entry_id`` and appends nothing. Without that the resume gesture would
     charge the campaign twice for money spent once.
 
+    **RETURNS THE WRITER'S OUTCOME, AND THAT IS THE REPAIR.** It used to return
+    ``spend_journal.record_batch``'s bool, and both call sites threw even that
+    away -- so a batch whose journal write FAILED and a batch recorded twice
+    over looked identical, nothing retried the first, and a session could go on
+    to submit a retry batch while every later session's cumulative cap was
+    missing this one's money. It now returns
+    ``spend_journal.record_batch_with_outcome``'s dict, whose ``outcome`` is a
+    ``spend_journal.BATCH_RECORD_OUTCOMES`` member, after that function's
+    bounded retries of the two unconfirmed writer outcomes.
+
     NEVER RAISES, on ``charge_batch_to_ledger``'s footing: it runs after a
     batch has been collected, and a record that could not be written must not
-    discard results already paid for. The failure is counted into
-    ``spend_journal.JOURNAL_FAULTS`` and reaches the run-end degradation block.
+    discard results already paid for. A raise is read as ``unconfirmed`` and
+    counted into ``spend_journal.JOURNAL_FAULTS``.
     """
-    return spend_journal.record_batch(
-        spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER,
-        state_path, batch_id, usd, model, path=journal)
+    try:
+        return spend_journal.record_batch_with_outcome(
+            spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER,
+            state_path, batch_id, usd, model, path=journal,
+            max_attempts=max_attempts, sleep=sleep)
+    except Exception as exc:                                    # noqa: BLE001
+        spend_journal.JOURNAL_FAULTS[
+            f"batch:record_raised:{type(exc).__name__}"] += 1
+        return {"outcome": spend_journal.BATCH_RECORD_UNCONFIRMED,
+                "attempts": 0, "append_outcomes": []}
+
+
+SPEND_ACCOUNTING_UNRESOLVED = "spend_accounting_unresolved"
+"""The refusal code for a paid submission declined because a collected batch's
+spend could not be confirmed in the journal. One spelling, read by the gate in
+``submit_batches``, by ``main()``'s retry-pass refusal and by the manifest."""
+
+
+class SpendAccountingUnresolved(RuntimeError):
+    """A paid batch was NOT submitted because this session's spend record is
+    unresolved.
+
+    NOT a ``RaterRefusal`` and NOT a ``spend.SpendLimitReached``, and the
+    difference is what ``main()`` does next. A refusal says the configuration is
+    wrong and the session ends; a budget stop says the money is gone and the
+    session ends. This says the money IS known to this process and is NOT known
+    to the cross-process record every later session's cap reads -- so nothing
+    NEW is bought, and everything already submitted is still collected and
+    written. Ending the session here would discard paid-for results over a
+    bookkeeping fault, which is the one outcome the brief rules out.
+    """
+
+    def __init__(self, message, code=SPEND_ACCOUNTING_UNRESOLVED):
+        super().__init__(message)
+        self.code = code
+
+
+def _usd_text(value):
+    """``$0.123456`` for a number, the repr otherwise. Never raises."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return f"${float(value):.6f}"
+    return repr(value)
+
+
+class BatchSpendAccounting(object):
+    """One session's per-batch journal outcomes, and the gate they drive.
+
+    ONE INSTANCE PER ``main()``, created before the first batch is submitted or
+    collected. Every collected batch goes through ``record``; ``reconcile``
+    offers every UNCONFIRMED batch again (bounded, same id, same amount);
+    ``refusal_reason`` is what ``submit_batches`` and the retry pass ask before
+    buying anything new; ``report_lines`` and ``manifest_block`` are the two
+    surfaces an operator and a reader meet.
+
+    **CONFLICTED IS NEVER RETRIED AND NEVER CLEARS ITSELF.** An entry with this
+    batch's id already records a DIFFERENT charge, so retrying writes nothing
+    and inventing a new id would record the money beside a charge nobody has
+    explained. It stays unresolved for the life of the session, and the
+    refusal names it.
+    """
+
+    def __init__(self, state_path, model, journal=None, max_attempts=None,
+                 sleep=None):
+        self.state_path = state_path
+        self.model = model
+        self.journal = journal
+        self.max_attempts = max_attempts
+        self.sleep = sleep
+        self.records = OrderedDict()
+
+    def _offer(self, batch_id, usd):
+        return record_batch_spend(self.state_path, batch_id, usd, self.model,
+                                  journal=self.journal,
+                                  max_attempts=self.max_attempts,
+                                  sleep=self.sleep)
+
+    def record(self, batch_id, usd):
+        """Offer one collected batch. Returns its outcome. NEVER RAISES."""
+        got = self._offer(batch_id, usd)
+        prior = self.records.get(batch_id)
+        rec = {"batch_id": batch_id, "usd": usd,
+               "outcome": got.get("outcome", spend_journal.BATCH_RECORD_UNCONFIRMED),
+               "attempts": int(got.get("attempts") or 0)
+               + (prior["attempts"] if prior else 0),
+               "append_outcomes": (list(prior["append_outcomes"]) if prior
+                                   else []) + list(got.get("append_outcomes")
+                                                   or []),
+               "reconciled": False}
+        self.records[batch_id] = rec
+        self._announce(rec)
+        return rec["outcome"]
+
+    def _announce(self, rec):
+        if rec["outcome"] == spend_journal.BATCH_RECORD_UNCONFIRMED:
+            console.out(
+                f"  [Spend journal] batch {rec['batch_id']}: "
+                f"{_usd_text(rec['usd'])} is NOT CONFIRMED in the journal after "
+                f"{rec['attempts']} attempt(s) "
+                f"({', '.join(rec['append_outcomes']) or 'no attempt'}). It is "
+                f"offered again before any new paid submission and at "
+                f"finalization; until it confirms, no new batch is bought.")
+        elif rec["outcome"] == spend_journal.BATCH_RECORD_CONFLICTED:
+            console.out(
+                f"  [Spend journal] batch {rec['batch_id']}: the journal already "
+                f"records a DIFFERENT charge under this batch's entry id, so "
+                f"{_usd_text(rec['usd'])} is NOT recorded and cannot be by "
+                f"retrying. No new batch is bought this session.")
+
+    def reconcile(self):
+        """Offer every UNCONFIRMED batch once more. Returns how many settled.
+
+        Bounded by ``spend_journal.BATCH_RECORD_MAX_ATTEMPTS`` per call, and
+        called at a small fixed number of points (before a retry pass, at
+        finalization, on the early exits), so the whole session's retries are
+        bounded too.
+        """
+        settled = 0
+        for rec in list(self.records.values()):
+            if rec["outcome"] != spend_journal.BATCH_RECORD_UNCONFIRMED:
+                continue
+            got = self._offer(rec["batch_id"], rec["usd"])
+            rec["attempts"] += int(got.get("attempts") or 0)
+            rec["append_outcomes"].extend(got.get("append_outcomes") or [])
+            rec["outcome"] = got.get("outcome",
+                                     spend_journal.BATCH_RECORD_UNCONFIRMED)
+            rec["reconciled"] = True
+            if rec["outcome"] in spend_journal.BATCH_RECORD_SETTLED:
+                settled += 1
+            else:
+                self._announce(rec)
+        return settled
+
+    def unresolved(self):
+        return [r for r in self.records.values()
+                if r["outcome"] not in spend_journal.BATCH_RECORD_SETTLED]
+
+    def unresolved_usd(self):
+        return round(sum(float(r["usd"]) for r in self.unresolved()
+                         if isinstance(r["usd"], (int, float))
+                         and not isinstance(r["usd"], bool)), 6)
+
+    def counts(self):
+        out = OrderedDict((o, 0) for o in spend_journal.BATCH_RECORD_OUTCOMES)
+        for r in self.records.values():
+            out[r["outcome"]] = out.get(r["outcome"], 0) + 1
+        return out
+
+    def refusal_reason(self):
+        """None when every collected batch is settled; the refusal otherwise."""
+        bad = self.unresolved()
+        if not bad:
+            return None
+        where = spend_journal.resolved_journal_path(self.journal) \
+            or "<unresolvable journal path>"
+        which = ", ".join(f"{r['batch_id']}={r['outcome']}" for r in bad)
+        return (
+            f"{SPEND_ACCOUNTING_UNRESOLVED}: {len(bad)} collected batch(es) "
+            f"carrying {_usd_text(self.unresolved_usd())} could not be "
+            f"confirmed in the cross-process spend journal at {where} "
+            f"({which}). That money is in this process's ledger and in "
+            f"{self.state_path}, but the journal is what every LATER session's "
+            f"cumulative cap reads -- so the remaining budget is unreliable and "
+            f"NO NEW PAID BATCH IS SUBMITTED. Everything already submitted is "
+            f"still collected and written. To recover: make the journal "
+            f"writable and re-run with --resume <batch ids>; re-collecting "
+            f"re-offers the same charge under the same entry id, which the "
+            f"journal answers as a duplicate if an earlier write did land. A "
+            f"`conflicted` batch needs its entry id inspected in the journal "
+            f"by hand -- retrying cannot resolve a collision.")
+
+    def report_lines(self):
+        c = self.counts()
+        lines = ["  SPEND JOURNAL (this session's collected batches)",
+                 "    " + "   ".join(f"{k} {v}" for k, v in c.items())]
+        bad = self.unresolved()
+        if not self.records:
+            lines.append("    no batch was collected, so nothing was offered "
+                         "to the journal")
+        elif bad:
+            lines.append(
+                f"    *** {_usd_text(self.unresolved_usd())} OF THIS SESSION'S "
+                f"SPEND IS NOT CONFIRMED IN THE JOURNAL: "
+                + ", ".join(f"{r['batch_id']}={r['outcome']} after "
+                            f"{r['attempts']} attempt(s)" for r in bad)
+                + ". The next session's cumulative cap will not see it. ***")
+        else:
+            lines.append("    every collected batch is confirmed in the "
+                         "journal")
+        return lines
+
+    def manifest_block(self):
+        return {
+            "outcomes": dict(self.counts()),
+            "unresolved_usd": self.unresolved_usd(),
+            "unresolved_batch_ids": [r["batch_id"] for r in self.unresolved()],
+            "batches": [dict(r, append_outcomes=list(r["append_outcomes"]))
+                        for r in self.records.values()],
+            "max_attempts_per_offer": (self.max_attempts
+                                       or spend_journal.BATCH_RECORD_MAX_ATTEMPTS),
+            "journal": spend_journal.resolved_journal_path(self.journal),
+            "basis": ("per batch, the cross-process journal writer's own "
+                      "outcome after bounded retries; `confirmed` and "
+                      "`duplicate` mean the money is in the journal, "
+                      "`conflicted` and `unconfirmed` mean it is not"),
+        }
+
+
+def _print_accounting(accounting):
+    """Reconcile once more and print the block. Used on every exit that has
+    collected anything. NEVER RAISES."""
+    if accounting is None:
+        return
+    try:
+        accounting.reconcile()
+        for _line in accounting.report_lines():
+            console.out(_line)
+    except Exception as exc:                                    # noqa: BLE001
+        spend_journal.JOURNAL_FAULTS[
+            f"batch:report_raised:{type(exc).__name__}"] += 1
+
+
+# ── THE OUTPUT CEILING EACH RATING WAS PRODUCED UNDER ────────────────────
+#
+# READ FROM THE SUBMITTED REQUEST BODY, NEVER INFERRED. The retry pass doubles
+# the ceiling for a truncated request, a resumed session collects batches this
+# process never built, and "retry therefore doubled" is exactly the inference
+# that is wrong for a retry batch carrying an UNtruncated request (its ceiling
+# is the original) and for any future change to the retry rule. So the value on
+# a rating is the `max_completion_tokens` in the JSONL line that was uploaded
+# for that custom_id -- from the bytes this process uploaded when it submitted
+# the batch, or from the provider's copy of the input file when it did not.
+
+CEILING_FIELD = "max_completion_tokens"
+"""The per-rating field, spelled as the request body spells it."""
+
+CEILING_SOURCE_FIELD = "max_completion_tokens_source"
+"""Where the value came from, or why there is none. A ``CEILING_SOURCES`` member."""
+
+CEILING_SOURCE_SUBMITTED_PAYLOAD = "submitted_payload"
+CEILING_SOURCE_PROVIDER_INPUT_FILE = "provider_input_file"
+CEILING_ABSENT_INPUT_FILE_UNREADABLE = "absent:input_file_unreadable"
+CEILING_ABSENT_NOT_IN_BODY = "absent:not_in_submitted_body"
+CEILING_ABSENT_MALFORMED = "absent:malformed_in_submitted_body"
+CEILING_ABSENT_NO_BATCH_RESULT = "absent:no_batch_result"
+CEILING_ABSENT_NOT_RECORDED = "absent:not_recorded_by_collector"
+
+CEILING_SOURCES_PRESENT = (CEILING_SOURCE_SUBMITTED_PAYLOAD,
+                           CEILING_SOURCE_PROVIDER_INPUT_FILE)
+CEILING_SOURCES = CEILING_SOURCES_PRESENT + (
+    CEILING_ABSENT_INPUT_FILE_UNREADABLE, CEILING_ABSENT_NOT_IN_BODY,
+    CEILING_ABSENT_MALFORMED, CEILING_ABSENT_NO_BATCH_RESULT,
+    CEILING_ABSENT_NOT_RECORDED)
+"""CLOSED. The first two carry an integer ceiling; every ``absent:*`` member
+carries ``None`` and names why, because "the body said nothing" and "the body
+could not be read" send a reader to different places.
+
+``submitted_payload``            the bytes this process uploaded for the batch.
+``provider_input_file``          the provider's copy of the input file, read back
+                                 for a batch this process did not submit.
+``absent:input_file_unreadable`` the input file could not be retrieved or
+                                 decoded (or the batch object named none).
+``absent:not_in_submitted_body`` the file was read and has no line for this
+                                 custom_id -- the rating came from somewhere else.
+``absent:malformed_in_submitted_body`` the line is there and carries no positive
+                                 integer ceiling, or the custom_id appears twice.
+``absent:no_batch_result``       no batch returned anything for this request.
+``absent:not_recorded_by_collector`` a rating that reached the row builder
+                                 without going through ``collect_results``.
+"""
+
+
+def submitted_ceilings_from_jsonl(text, source):
+    """``{"source", "by_custom_id": {cid: int or None}, "unparseable_lines"}``.
+
+    ``text`` is a batch input file (str or bytes). Returns None when it cannot
+    be decoded. NEVER RAISES. A value of None marks a line that is present and
+    carries no usable ceiling; a custom_id seen twice is marked None too,
+    because two lines for one id cannot say which one answered.
+    """
+    if isinstance(text, (bytes, bytearray)):
+        try:
+            text = bytes(text).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    if not isinstance(text, str):
+        return None
+    by_cid, bad = {}, 0
+    for raw in text.splitlines():
+        if not raw.strip():
+            continue
+        try:
+            line = json.loads(raw)
+        except ValueError:
+            bad += 1
+            continue
+        if not isinstance(line, dict) or not isinstance(line.get("custom_id"),
+                                                        str):
+            bad += 1
+            continue
+        cid = line["custom_id"]
+        body = line.get("body")
+        value = body.get(CEILING_FIELD) if isinstance(body, dict) else None
+        usable = (isinstance(value, int) and not isinstance(value, bool)
+                  and value >= 1)
+        if cid in by_cid:
+            by_cid[cid] = None
+            bad += 1
+            continue
+        by_cid[cid] = value if usable else None
+    return {"source": source, "by_custom_id": by_cid, "unparseable_lines": bad}
+
+
+def ceiling_for(ceilings, custom_id):
+    """``(value, source)`` for one custom_id. NEVER RAISES; never infers."""
+    if not isinstance(ceilings, dict):
+        return None, CEILING_ABSENT_INPUT_FILE_UNREADABLE
+    by_cid = ceilings.get("by_custom_id")
+    if not isinstance(by_cid, dict) or custom_id not in by_cid:
+        return None, CEILING_ABSENT_NOT_IN_BODY
+    value = by_cid[custom_id]
+    if value is None:
+        return None, CEILING_ABSENT_MALFORMED
+    if ceilings.get("source") not in CEILING_SOURCES_PRESENT:
+        return None, CEILING_ABSENT_NOT_RECORDED
+    return value, ceilings["source"]
+
+
+def read_submitted_ceilings(client, batch):
+    """The provider's copy of a batch's input file, parsed. NEVER RAISES.
+
+    Returns ``(ceilings or None, fault or None)``. One ``files.content``
+    download through the existing paced reader -- free, a management call --
+    and only for a batch this process did not submit.
+    """
+    file_id = getattr(batch, "input_file_id", None)
+    if not file_id:
+        return None, "the retrieved batch names no input_file_id"
+    try:
+        text = _read_file_text(client, file_id)
+    except Exception as exc:                                    # noqa: BLE001
+        log.warning("rater.ceiling_input_file_unreadable",
+                    error_type=type(exc).__name__)
+        return None, f"{type(exc).__name__}: {str(exc)[:160]}"
+    ceilings = submitted_ceilings_from_jsonl(
+        text, CEILING_SOURCE_PROVIDER_INPUT_FILE)
+    if ceilings is None:
+        return None, "the input file could not be decoded"
+    return ceilings, None
 
 
 STATE_SPEND_KEY = "spend_usd"
@@ -3155,7 +3694,7 @@ added to the rater budget and to no other.
 """
 
 
-def rater_spend_before(state, journal=None):
+def rater_spend_before(state, journal=None, journal_reading=None):
     """What the JUDGE has already spent, cumulatively, as a ``LedgerSeed``.
 
     **THIS USED TO BE ONE SESSION'S OWN STATE FILE AND THAT WAS THE DEFECT.**
@@ -3185,21 +3724,46 @@ def rater_spend_before(state, journal=None):
     judge refusing to start because its own history could not be read would be
     a brake stopping a run it has nothing to say about.
     """
-    cumulative = spend_journal.total(spend.SPEND_BUDGET_RATER, path=journal)
+    if journal_reading is not None:
+        _entries, _unread = journal_reading
+        cumulative = spend_journal.total(spend.SPEND_BUDGET_RATER,
+                                         entries=_entries, unreadable=_unread)
+    else:
+        cumulative = spend_journal.total(spend.SPEND_BUDGET_RATER,
+                                         path=journal)
     if cumulative.rows:
         return cumulative
+    # ── THE FALLBACK KEEPS WHAT THE JOURNAL COULD NOT READ ────────────────
+    #
+    # A journal with no readable row and an unreadable one is NOT an empty
+    # journal: falling back to the state file there used to present one
+    # session's own total as the whole cumulative history, with nothing saying
+    # the history was unreadable. The reasons are carried onto whatever seed is
+    # returned, so the budget stays marked UNVERIFIED.
+    unread = list(cumulative.unreadable_reasons)
+    n_unread = cumulative.unreadable
     if not isinstance(state, dict):
-        return spend.LedgerSeed()
+        return cumulative if n_unread else spend.LedgerSeed()
     usd = state.get(STATE_SPEND_KEY)
-    if isinstance(usd, bool) or not isinstance(usd, (int, float)):
-        return spend.LedgerSeed()
-    if usd != usd or usd < 0:            # NaN and negatives, explicitly.
-        return spend.LedgerSeed()
+    if isinstance(usd, bool) or not isinstance(usd, (int, float)) \
+            or usd != usd or usd < 0:     # NaN and negatives, explicitly.
+        if STATE_SPEND_KEY in state:
+            # PRESENT AND UNUSABLE: a spend this session recorded and nobody
+            # can read, which is not the same as a session that spent nothing.
+            unread.append(f"this session's state file records "
+                          f"{STATE_SPEND_KEY}={usd!r}, which is not an amount")
+            return spend.LedgerSeed(
+                source=spend.SEED_SOURCE_RATER_STATE,
+                unreadable=n_unread + 1,
+                unreadable_reasons=tuple(
+                    unread[:spend.UNREADABLE_REASONS_KEPT]))
+        return cumulative if n_unread else spend.LedgerSeed()
     batches = state.get("batches")
     return spend.LedgerSeed(
         usd=float(usd), rows=0, unpriced=0,
         runs=len(batches) if isinstance(batches, list) else 0,
-        source=spend.SEED_SOURCE_RATER_STATE)
+        source=spend.SEED_SOURCE_RATER_STATE, unreadable=n_unread,
+        unreadable_reasons=tuple(unread))
 
 
 def estimate_tokens(index, run, chars_per_token, max_tokens,
@@ -4356,7 +4920,8 @@ def reconcile_uncertain_submission(client, identity, *, limit=50):
     return RECONCILE_ABSENT, None
 
 
-def submit_batches(client, chunks, state, state_path, tag, out_dir=None):
+def submit_batches(client, chunks, state, state_path, tag, out_dir=None,
+                   accounting=None, ceilings=None):
     """Upload one JSONL file per chunk, create one batch each, record the ids.
 
     **TWO API CALLS PER CHUNK WHERE ANTHROPIC TOOK ONE.** The requests go up as
@@ -4392,6 +4957,19 @@ def submit_batches(client, chunks, state, state_path, tag, out_dir=None):
         # already created are written to the state file before this point on
         # every iteration, so a stop here loses nothing: `--resume` collects
         # them.
+        # ── THE ACCOUNTING GATE, ABOVE THE BUDGET GATE ────────────────────
+        #
+        # A collected batch whose spend the journal could not confirm makes
+        # every later session's remaining budget unreliable, so nothing NEW is
+        # bought while one exists. Above `require_budget` because an unreliable
+        # record is the more basic fault: a budget figure computed from it is
+        # what is in question. `main()` catches this one and keeps collecting.
+        if accounting is not None:
+            _unresolved = accounting.refusal_reason()
+            if _unresolved is not None:
+                raise SpendAccountingUnresolved(
+                    f"the rater's {tag} batch {i + 1}/{len(chunks)} was NOT "
+                    f"submitted. {_unresolved}")
         spend.require_budget(spend.SPEND_SOURCE_RATER,
                              f"the rater's {tag} batch {i + 1}/{len(chunks)}")
         payload = batch_jsonl(chunk).encode("utf-8")
@@ -4532,6 +5110,11 @@ def submit_batches(client, chunks, state, state_path, tag, out_dir=None):
             # all.
             _input_file_id = upload.id
         ids.append(batch.id)
+        if ceilings is not None:
+            # THE BYTES THAT WERE UPLOADED, parsed back -- including on the
+            # ADOPTED path, whose input file was verified identical to them.
+            ceilings[batch.id] = submitted_ceilings_from_jsonl(
+                payload, CEILING_SOURCE_SUBMITTED_PAYLOAD)
         state.setdefault("batches", []).append(
             {"id": batch.id, "tag": tag, "chunk": i, "requests": len(chunk),
              "input_file_id": _input_file_id})
@@ -4633,7 +5216,8 @@ def parse_batch_output(text):
     return rows, faults
 
 
-def collect_results(client, batch_id, index, model, out_dir=None):
+def collect_results(client, batch_id, index, model, out_dir=None,
+                    submitted_ceilings=None):
     """Join one batch's results back onto decisions, bucketing every outcome.
 
     Joined on custom_id, never on position: the API states result order is not
@@ -4663,21 +5247,59 @@ def collect_results(client, batch_id, index, model, out_dir=None):
         if error_text is not None:
             persist_raw_replies(out_dir, batch_id, error_text, "error")
 
+    # THE CEILING EACH OUTCOME WAS PRODUCED UNDER, from the submitted body. The
+    # caller hands over the parsed bytes it uploaded when it submitted this
+    # batch; otherwise (a resumed batch) the provider's input file is read.
+    if submitted_ceilings is not None:
+        ceilings, ceiling_fault = submitted_ceilings, None
+    else:
+        ceilings, ceiling_fault = read_submitted_ceilings(client, batch)
+
+    def _with_ceilings(result):
+        for bucket in (result["rated"], result["unrated"]):
+            for cid, record in bucket.items():
+                value, source = ceiling_for(ceilings, cid)
+                record[CEILING_FIELD] = value
+                record[CEILING_SOURCE_FIELD] = source
+        # AN UNRATED OUTCOME NAMES ITS BATCH TOO, as a rating always did, so a
+        # row's reason can be traced to the attempt that produced it.
+        for record in result["unrated"].values():
+            record.setdefault("batch_id", batch_id)
+        result["ceiling_source"] = (ceilings.get("source")
+                                    if isinstance(ceilings, dict) else None)
+        result["ceiling_fault"] = ceiling_fault
+        return result
+
     if output_text is None and status != "completed":
         # No output file at all. Every request in this batch is unrated for one
         # named reason rather than for `no_result`, which would say the join
         # found nothing when in fact the batch never ran.
         reason = {"failed": "batch_failed", "expired": "expired",
                   "cancelled": "canceled"}.get(status, "api_error")
-        for cid in index.by_custom_id:
+        # ── ONLY THIS BATCH'S OWN REQUESTS ────────────────────────────────
+        #
+        # This loop used to walk `index.by_custom_id` -- EVERY decision in the
+        # session -- so one failed batch marked decisions it never carried
+        # unrated, and the caller then overwrote results and ceilings other
+        # batches had produced. The batch's membership is its submitted body:
+        # the uploaded bytes, or the provider's copy of the input file. When
+        # that cannot be read the membership is UNKNOWN and nothing is marked;
+        # the caller reports those decisions as unanswered and names the batch.
+        by_cid = (ceilings.get("by_custom_id")
+                  if isinstance(ceilings, dict) else None)
+        membership = (set(by_cid) & set(index.by_custom_id)
+                      if isinstance(by_cid, dict) else None)
+        for cid in sorted(membership or ()):
             unrated[cid] = {"reason": reason if reason in UNRATED_REASONS
                             else "api_error",
                             "detail": f"batch status={status}"}
-        return {"rated": rated, "unrated": unrated, "usage": usage,
-                "usage_by_cid": usage_by_cid,
-                "missing": set(index.by_custom_id),
-                "stop_reasons": {}, "batch_status": status,
-                "answering_models": {}, "output_faults": []}
+        return _with_ceilings({
+            "rated": rated, "unrated": unrated, "usage": usage,
+            "usage_by_cid": usage_by_cid,
+            "missing": set(membership or ()),
+            "membership_unknown": membership is None,
+            "stop_reasons": {}, "batch_status": status,
+            "answering_models": {}, "output_faults": []})
 
     rows, faults = parse_batch_output(output_text or "")
     for row in rows + parse_batch_output(error_text or "")[0]:
@@ -4768,11 +5390,12 @@ def collect_results(client, batch_id, index, model, out_dir=None):
         rated[cid] = rating
 
     missing = set(index.by_custom_id) - seen
-    return {"rated": rated, "unrated": unrated, "usage": usage,
-            "usage_by_cid": usage_by_cid, "missing": missing,
-            "stop_reasons": dict(stop_reasons), "batch_status": status,
-            "answering_models": dict(answering_models),
-            "output_faults": faults}
+    return _with_ceilings({
+        "rated": rated, "unrated": unrated, "usage": usage,
+        "usage_by_cid": usage_by_cid, "missing": missing,
+        "stop_reasons": dict(stop_reasons), "batch_status": status,
+        "answering_models": dict(answering_models),
+        "output_faults": faults})
 
 
 #------------------------------------------------------------------------------
@@ -5677,6 +6300,46 @@ def require_state_max_tokens(state, max_tokens, state_path):
         code="state_max_tokens_mismatch")
 
 
+STATE_BATCHES_MALFORMED = "state_batches_malformed"
+"""Refusal code: a state file that DECODES but whose ``batches`` list is not a
+list of objects each carrying a non-empty string ``id``."""
+
+
+def state_batches_problem(state):
+    """None when ``state["batches"]`` is absent or well-formed; a description
+    otherwise. NEVER RAISES.
+
+    **FOUND BY THE PRE-SPEND READER SWEEP, NOT BY A REPORT.** ``read_state``
+    refuses a payload that is not a mapping, and four readers of the batch list
+    already skip a non-object entry -- but ``refuse_batch_from_other_mode``,
+    the resume path's ``known = {b["id"] ...}`` and the manifest's
+    ``[b["id"] ...]`` did not. A state file carrying ``"batches": [7, ...]``
+    therefore escaped ``main()`` as an ``AttributeError`` traceback from the
+    first, before any network call, and ``main()``'s guard block catches only
+    ``RaterRefusal``. Measured with a torn file, not reasoned about.
+
+    IT IS A NAMED REFUSAL AND NOT A SILENT ``None`` FROM ``read_state``, and
+    the difference is money. ``read_state`` answering None makes ``state`` an
+    empty dict, and on a first ``--submit`` that empty dict is written back over
+    the file -- erasing the one record of which paid batches exist.
+    """
+    if not isinstance(state, dict):
+        return None
+    batches = state.get("batches")
+    if batches is None:
+        return None
+    if not isinstance(batches, list):
+        return f"`batches` is a {type(batches).__name__}, not a list"
+    bad = [i for i, b in enumerate(batches)
+           if not (isinstance(b, dict) and isinstance(b.get("id"), str)
+                   and b.get("id"))]
+    if bad:
+        return (f"`batches` entries at positions {bad[:10]}"
+                f"{' ...' if len(bad) > 10 else ''} are not objects carrying "
+                f"a non-empty string `id`")
+    return None
+
+
 def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
     """Refuse to resume a batch that the OTHER mode's state file claims.
 
@@ -5712,6 +6375,18 @@ def refuse_batch_from_other_mode(batch_ids, mode, out_dir, run_dir):
         state = read_state(path)
         if not state:
             continue
+        # A MALFORMED LIST IS NOT "NO EVIDENCE": the file decodes, and one of the
+        # entries this module cannot read may be the batch being resumed. It is
+        # refused by name rather than reached by `b.get` on a non-object.
+        _problem = state_batches_problem(state)
+        if _problem is not None:
+            raise RaterRefusal(
+                f"the {other!r} run's state file at {path!r} decodes but its "
+                f"batch list is malformed: {_problem} "
+                f"({STATE_BATCHES_MALFORMED}). It may or may not claim "
+                f"{sorted(wanted)!r}, so this resume cannot be checked against "
+                f"it. Nothing has been sent. Repair or move that file.",
+                code=STATE_BATCHES_MALFORMED)
         claimed = {b.get("id") for b in state.get("batches") or []}
         overlap = sorted(wanted & claimed)
         if overlap:
@@ -6598,7 +7273,7 @@ def print_summary(summary, top_n=30):
 #------------------------------------------------------------------------------
 
 
-def build_rating_rows(index, rated, unrated, retried):
+def build_rating_rows(index, rated, unrated, retried, attempts=None):
     """One row per REQUEST, rated or not, in run order.
 
     One row per request rather than per decision, because in blind mode a
@@ -6677,14 +7352,31 @@ def build_rating_rows(index, rated, unrated, retried):
             row["response_was_extracted"] = rating["extracted"]
             row["rated_by"] = rating["rated_by"]
             row["batch_id"] = rating["batch_id"]
+        # THE CEILING THAT PRODUCED THIS ROW, read by `collect_results` from the
+        # submitted body of the request that answered -- the retry's body for a
+        # retried row, the primary's otherwise. Never derived from `retry`.
+        _ceiling_src = rating if rating is not None else unrated.get(cid, {})
+        row[CEILING_FIELD] = _ceiling_src.get(CEILING_FIELD)
+        row[CEILING_SOURCE_FIELD] = _ceiling_src.get(
+            CEILING_SOURCE_FIELD, CEILING_ABSENT_NOT_RECORDED)
+        if attempts is not None:
+            # EVERY ATTEMPT, IN ORDER, including the ones not adopted -- an
+            # unsuccessful retry is recorded here and never over the result.
+            row["attempts"] = [dict(a) for a in attempts.get(cid, ())]
         rows.append(row)
     return rows
 
 
 def write_json(path, payload):
+    """Write ``payload`` by ATOMIC REPLACEMENT: a temp file, flushed and
+    fsynced, then ``os.replace``. A reader sees the old file or the new one,
+    never half of one -- which matters most on a budget-stop exit, where these
+    files are written on the way out."""
     tmp = path + ".tmp"
     with io.open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, sort_keys=False, ensure_ascii=False)
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
 
 
@@ -7639,7 +8331,10 @@ def main(argv=None):
     # PARSED HERE RATHER THAN AT THE FORK BELOW, so the guard that consults the
     # other mode's state can run with the rest of them. On a submit this is
     # empty and every guard that reads it is a no-op.
-    resume_ids = ([b.strip() for b in args.resume.split(",") if b.strip()]
+    # DE-DUPLICATED, ORDER KEPT: `--resume b1,b1` would otherwise collect and
+    # account for one batch twice in one session.
+    resume_ids = (list(dict.fromkeys(b.strip() for b in args.resume.split(",")
+                                     if b.strip()))
                   if args.resume else [])
     try:
         # FIRST, AND IT GATES THE OTHER FOUR. A resume with no state file makes
@@ -7647,6 +8342,19 @@ def main(argv=None):
         # state" is indistinguishable from "first submit" to each of them
         # individually. Only this one knows which of the two it is.
         require_state_for_resume(state, args.resume, state_path)
+        # THE BATCH LIST'S SHAPE, BEFORE ANYTHING READS IT. Local, like every
+        # guard here; see `state_batches_problem` for why this is a refusal
+        # rather than a `read_state` -> None.
+        _batches_problem = state_batches_problem(state)
+        if _batches_problem is not None:
+            raise RaterRefusal(
+                f"the state file at {state_path!r} decodes but its batch list "
+                f"is malformed: {_batches_problem} "
+                f"({STATE_BATCHES_MALFORMED}). It is the record of which PAID "
+                f"batches this directory holds, so it is neither resumed from "
+                f"nor overwritten. Nothing has been sent. Repair it, or move it "
+                f"aside and use a new --output-dir.",
+                code=STATE_BATCHES_MALFORMED)
         require_state_mode(state, index.mode, state_path)
         require_state_subset(state, index, state_path)
         # ── WHICH INSTRUMENT PRODUCED THE ANSWERS BEING JOINED ────────
@@ -7785,11 +8493,50 @@ def main(argv=None):
     # of the evaluation-runs tree and one small JSON per state file) and it
     # has to be here rather than in a separate command, because the invocation
     # that would forget to run it is the one whose cap then reads zero.
-    spend_journal.bootstrap_from_state_files()
-    spend.SPEND_LEDGER.seed(rater_spend_before(state))
+    # ── ONE SESSION, ONE LEDGER ───────────────────────────────────────────
+    #
+    # RESET BEFORE SEEDING, as `ragas_harness.main()` already does. The ledger
+    # is process-global and the seed below is the CUMULATIVE journal reading,
+    # which already holds every batch an earlier `main()` in this interpreter
+    # collected -- so without the reset those batches were counted twice (once
+    # in the seed, once in the carried-over charges), and an unverified mark
+    # from an earlier session refused a later one whose record read cleanly.
+    # Measured: two `main()` calls in one process, the second inheriting the
+    # first's marks, refused a submission against a clean journal.
+    spend.SPEND_LEDGER.reset()
+    spend.SPEND_STOP.reset()
+    _migration = spend_journal.bootstrap_report()
+    # ONE READING OF THE JOURNAL serves the seed AND the set of batches that
+    # seed already counts, so the two cannot describe different files.
+    _reading = spend_journal.read_entries_report()
+    spend.SPEND_LEDGER.seed(rater_spend_before(state, journal_reading=_reading))
+    # WHAT THE MIGRATION COULD NOT READ OR CONFIRM marks the budget too: each
+    # item is spend this budget's record may be missing.
+    spend.SPEND_LEDGER.mark_unverified(spend.SPEND_BUDGET_RATER,
+                                       _migration["unreadable"])
+    seed_source = spend.SPEND_LEDGER.seeded.source
+    seed_batch_ids = spend_journal.recorded_batch_ids(
+        spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER, state_path,
+        _reading[0])
     console.out(spend.describe_rater_cap())
     console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
     console.out(spend_journal.describe(spend.SPEND_BUDGET_RATER))
+    # ── AN UNVERIFIED RECORD IS SAID BEFORE ANYTHING ELSE IS ─────────────
+    #
+    # Printed on --submit AND --resume: a resume may still collect (that buys
+    # nothing), and its operator is owed the same statement, because the retry
+    # pass it would otherwise run is refused on it.
+    _unread_n, _unread_reasons = spend.SPEND_LEDGER.unverified(
+        spend.SPEND_BUDGET_RATER)
+    record_refusal = spend.unverified_record_refusal(spend.SPEND_SOURCE_RATER)
+    if _unread_n:
+        console.out("")
+        console.out(f"  *** THE RATER BUDGET'S SPEND RECORD IS UNVERIFIED: "
+                    f"{_unread_n} item(s) could not be read. ***")
+        console.out(f"  {record_refusal}" if record_refusal is not None
+                    else "  (no rater cap is being enforced, so nothing is "
+                         "refused on it; the figures above are still "
+                         "unverified)")
 
     state.update({"run_dir": run.run_dir, "run_dirs": list(run.run_dirs),
                   # UNDER THE MODULE'S OWN KEY CONSTANT, so the writer and
@@ -7822,6 +8569,17 @@ def main(argv=None):
                   # `require_state_max_tokens` has just proved equal, so it is
                   # a no-op there rather than a silent adoption.
                   STATE_MAX_TOKENS_KEY: args.max_tokens,
+                  # THE JOURNAL-ERA MARKER, AND THE PER-BATCH SPEND IT NAMES.
+                  # Applied before the first `write_state`, so no state file
+                  # this version writes can be mistaken for a pre-journal one
+                  # by the migration -- including one whose batches were
+                  # submitted and not yet collected, which is the case the
+                  # migration used to under-record. A malformed value is
+                  # replaced: this module is its only writer.
+                  STATE_SPEND_BY_BATCH_KEY: (
+                      dict(state.get(STATE_SPEND_BY_BATCH_KEY))
+                      if isinstance(state.get(STATE_SPEND_BY_BATCH_KEY), dict)
+                      else {}),
                   RUBRIC_SHA_KEY:
                       index.rubric_meta[RUBRIC_SHA_KEY]})
 
@@ -7830,8 +8588,70 @@ def main(argv=None):
     # None on a --resume, where nothing is submitted and so nothing is
     # reserved. An empty dict would read as "reserved, and it came to nothing".
     reservation = None
+    # THE PER-BATCH JOURNAL OUTCOMES, AND THE GATE THEY DRIVE. Created before
+    # the first submission so the gate inside `submit_batches` is the same
+    # object every collection records into.
+    accounting = BatchSpendAccounting(state_path, args.model)
+    # {batch id: the ceilings parsed out of the bytes THIS process uploaded}.
+    # Empty on a --resume, which is what makes `collect_results` read the
+    # provider's input file instead of guessing.
+    session_ceilings = {}
+    ceiling_faults = {}
+    retry_refusal = None
+    # ── WHAT HAS BEEN COLLECTED, INITIALISED OUTSIDE THE `try` ────────────
+    #
+    # So a budget stop can still write it. These used to be bound inside the
+    # try, after the primary submission, and the budget-stop handler returned
+    # before anything was persisted -- collected primary results reached disk
+    # only through a later --resume.
+    rated, unrated = {}, {}
+    usage = _usage_totals()
+    usage_by_cid = {}
+    stop_reasons = Counter()
+    answering_models = Counter()
+    retried = set()
+    retry_ids = []
+    attempts = {}
+    collected_batch_ids = []
+    membership_unknown = []
+    batch_spend = []
+    accounted_batches = set()
+    budget_stop = None
+
+    def _account_collected_batch(bid, got):
+        # THE THREE RECORDS, IN ONE PLACE FOR BOTH LOOPS. Charged per batch and
+        # persisted per batch -- the retry pass below asks the gate, so the
+        # primary batches' money must be in the ledger first -- but only where
+        # it is not already: see `collected_batch_spend`.
+        _priced = price_batch_usage(args.model, got["usage"])
+        _disp = collected_batch_spend(state, bid, _priced, seed_source,
+                                      seed_batch_ids, accounted_batches)
+        if _disp["charge_ledger"]:
+            spend.SPEND_LEDGER.charge_usd(_disp["usd"],
+                                          spend.SPEND_SOURCE_RATER)
+        if _disp["add_to_state"]:
+            state[STATE_SPEND_KEY] = round(
+                float(state.get(STATE_SPEND_KEY) or 0.0) + _disp["usd"], 6)
+        _map = state.get(STATE_SPEND_BY_BATCH_KEY)
+        if not isinstance(_map, dict):
+            _map = state[STATE_SPEND_BY_BATCH_KEY] = {}
+        # UNROUNDED, deliberately: every earlier writer offered the journal the
+        # unrounded priced amount, and the journal's duplicate check compares
+        # amounts to 1e-9 -- a rounded re-offer of a batch it already holds
+        # would read as a CONFLICT and refuse the retry pass for nothing.
+        _map.setdefault(bid, _disp["usd"])
+        write_state(state_path, state)
+        accounted_batches.add(bid)
+        accounting.record(bid, _disp["usd"])
+        batch_spend.append({"batch_id": bid, **_disp})
+
     try:
         if args.submit:
+            # REFUSED FIRST, BEFORE THE PLAN'S BUDGET LINES: those quote a
+            # remainder that is exactly what is in doubt.
+            if record_refusal is not None:
+                raise RaterRefusal(f"NOTHING WAS SUBMITTED. {record_refusal}",
+                                   code=spend.SPEND_RECORD_UNVERIFIED)
             plan = _report_plan(run, index, out_dir, args,
                                 independence=independence)
             console.out("")
@@ -7933,7 +8753,9 @@ def main(argv=None):
             console.out(f"  {state_path} -- an interrupted session resumes "
                         f"with --resume <id>.")
             batch_ids = submit_batches(client, chunks, state, state_path,
-                                       "primary", out_dir=out_dir)
+                                       "primary", out_dir=out_dir,
+                                       accounting=accounting,
+                                       ceilings=session_ceilings)
         else:
             # PARSED ABOVE, WITH THE GUARDS. `refuse_batch_from_other_mode`
             # used to be called here, which is after the visibility check and
@@ -7950,45 +8772,64 @@ def main(argv=None):
                                              "chunk": None, "requests": None})
             write_state(state_path, state)
 
-        rated, unrated = {}, {}
-        usage = _usage_totals()
-        usage_by_cid = {}
-        stop_reasons = Counter()
-        answering_models = Counter()
+        # THE TAG EACH BATCH WAS SUBMITTED UNDER, for its attempts' provenance.
+        _batch_tags = {b.get("id"): b.get("tag")
+                       for b in state.get("batches") or []
+                       if isinstance(b, dict)}
         for bid in batch_ids:
             poll_batch(client, bid, args.poll_seconds, args.poll_timeout)
             got = collect_results(client, bid, index, args.model,
-                                  out_dir=out_dir)
-            rated.update(got["rated"])
-            for cid, u in got["unrated"].items():
-                unrated[cid] = u
+                                  out_dir=out_dir,
+                                  submitted_ceilings=session_ceilings.get(bid))
+            if got.get("ceiling_fault"):
+                ceiling_faults[bid] = got["ceiling_fault"]
+            if got.get("membership_unknown"):
+                membership_unknown.append(bid)
+            merge_batch_results(rated, unrated, attempts, got, bid,
+                                _batch_tags.get(bid) or "primary")
             for k, v in got["usage"].items():
                 usage[k] += v
             usage_by_cid.update(got["usage_by_cid"])
             stop_reasons.update(got["stop_reasons"])
             answering_models.update(got.get("answering_models") or {})
-            # CHARGED PER BATCH, NOT ONCE AT THE END. The retry pass below
-            # submits through the same gate, so the primary batches' measured
-            # cost has to be in the ledger before it asks -- otherwise a
-            # session that spent its whole budget on the primary batches would
-            # be allowed to submit a retry batch on a ledger reading zero.
-            # Persisted with it, so an interrupted session resumes knowing it.
-            _spent = charge_batch_to_ledger(args.model, got["usage"])
-            state[STATE_SPEND_KEY] = round(
-                float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
-            write_state(state_path, state)
-            record_batch_spend(state_path, bid, _spent, args.model)
+            collected_batch_ids.append(bid)
+            _account_collected_batch(bid, got)
 
+        _unanswered_detail = "no result returned for this custom_id"
+        if membership_unknown:
+            _unanswered_detail += (
+                f"; batch(es) {', '.join(membership_unknown)} produced no "
+                f"output and their submitted bodies could not be read, so "
+                f"whether they carried this request is unknown")
         for cid in set(index.by_custom_id) - set(rated) - set(unrated):
             unrated[cid] = {"reason": "no_result",
-                            "detail": "no result returned for this custom_id"}
+                            "detail": _unanswered_detail,
+                            CEILING_FIELD: None,
+                            CEILING_SOURCE_FIELD: CEILING_ABSENT_NO_BATCH_RESULT}
 
         # ---- one retry pass --------------------------------------------
-        retried = set()
-        retry_ids = []
         retryable = sorted(cid for cid, u in unrated.items()
                            if u["reason"] in RETRYABLE_REASONS)
         if retryable and not args.no_retry:
+            # ── NOTHING NEW IS BOUGHT ON AN UNRESOLVED RECORD ─────────────
+            #
+            # Offered once more first: a transient journal fault during the
+            # primary collection should not cost the retry pass. If a batch is
+            # still unconfirmed or conflicted -- or the budget's own record
+            # could not be read -- the retry pass is REFUSED by name and the
+            # session carries on to write every rating it has.
+            accounting.reconcile()
+            retry_refusal = (accounting.refusal_reason()
+                             or spend.unverified_record_refusal(
+                                 spend.SPEND_SOURCE_RATER))
+            if retry_refusal is not None:
+                console.out("")
+                console.out(f"  REFUSED NEW PAID SUBMISSION: {len(retryable)} "
+                            f"retryable decision(s) are left unrated. "
+                            f"{retry_refusal}")
+                log.error("rater.refused", stage="retry",
+                          reason=retry_refusal.split(":", 1)[0])
+        if retryable and not args.no_retry and retry_refusal is None:
             console.out("")
             console.out(f"  {len(retryable)} decision(s) failed for a "
                         f"retryable reason; submitting ONE retry batch.")
@@ -8004,31 +8845,40 @@ def main(argv=None):
                     req["params"]["max_completion_tokens"] = \
                         args.max_tokens * 2
                 retry_requests.append(req)
-            retry_ids = submit_batches(
-                client, chunk_requests(retry_requests), state, state_path,
-                "retry", out_dir=out_dir)
+            try:
+                retry_ids = submit_batches(
+                    client, chunk_requests(retry_requests), state, state_path,
+                    "retry", out_dir=out_dir, accounting=accounting,
+                    ceilings=session_ceilings)
+            except (SpendAccountingUnresolved,
+                    spend.SpendRecordUnverified) as exc:
+                # UNREACHABLE THROUGH THE CHECK ABOVE, AND KEPT AS THE
+                # STRUCTURAL GATE: a future call site that skips that check
+                # still cannot buy a batch, and still does not end the session.
+                retry_refusal = str(exc)
+                retry_ids = []
+                console.out(f"  REFUSED NEW PAID SUBMISSION: {exc}")
+                log.error("rater.refused", stage="retry", reason=exc.code)
             for bid in retry_ids:
                 poll_batch(client, bid, args.poll_seconds, args.poll_timeout)
                 got = collect_results(client, bid, index, args.model,
-                                      out_dir=out_dir)
-                for cid, rating in got["rated"].items():
-                    rated[cid] = rating
-                    unrated.pop(cid, None)
-                    retried.add(cid)
-                for cid, u in got["unrated"].items():
-                    unrated[cid] = u
-                    retried.add(cid)
+                                      out_dir=out_dir,
+                                      submitted_ceilings=session_ceilings.get(
+                                          bid))
+                if got.get("ceiling_fault"):
+                    ceiling_faults[bid] = got["ceiling_fault"]
+                if got.get("membership_unknown"):
+                    membership_unknown.append(bid)
+                merge_batch_results(rated, unrated, attempts, got, bid,
+                                    "retry", retried=retried)
                 for k, v in got["usage"].items():
                     usage[k] += v
                 usage_by_cid.update(got["usage_by_cid"])
                 stop_reasons.update(got["stop_reasons"])
                 answering_models.update(got.get("answering_models") or {})
-                _spent = charge_batch_to_ledger(args.model, got["usage"])
-                state[STATE_SPEND_KEY] = round(
-                    float(state.get(STATE_SPEND_KEY) or 0.0) + _spent, 6)
-                write_state(state_path, state)
-                record_batch_spend(state_path, bid, _spent, args.model)
-        elif retryable:
+                collected_batch_ids.append(bid)
+                _account_collected_batch(bid, got)
+        elif retryable and retry_refusal is None:
             console.out(f"  {len(retryable)} retryable failure(s) left "
                         f"unrated (--no-retry).")
 
@@ -8058,10 +8908,34 @@ def main(argv=None):
             console.out(f"  {_line}")
         log.warning("rater.stopped_on_budget", stage="submit",
                     reason=exc.limit)
-        return 3
+        # ── WHAT WAS COLLECTED IS WRITTEN BEFORE THE EXIT ─────────────────
+        #
+        # The exit code is still 3 and nothing new is submitted from here.
+        # When nothing has been collected there is nothing to write, and the
+        # state file already names every batch. Otherwise the session FALLS
+        # THROUGH to the persist block below, which writes ratings.json, the
+        # manifest and summary.json by atomic replacement, each marked
+        # `stopped_on_budget` and incomplete, and then returns 3.
+        if not collected_batch_ids:
+            _print_accounting(accounting)
+            console.out("  Nothing had been collected in this session, so no "
+                        "ratings file was written.")
+            return 3
+        budget_stop = exc
+        console.out(f"  Writing what {len(collected_batch_ids)} collected "
+                    f"batch(es) produced -- MARKED INCOMPLETE -- before "
+                    f"exiting.")
+    except spend.SpendRecordUnverified as exc:
+        # STRUCTURAL: `main()` refuses an unverified record before submitting,
+        # so this is reachable only through a call site that skipped that.
+        console.out(f"REFUSED: {exc}")
+        log.error("rater.refused", stage="submit", reason=exc.code)
+        _print_accounting(accounting)
+        return 1
     except RaterRefusal as exc:
         console.out(f"REFUSED: {exc}")
         log.error("rater.refused", stage="submit", reason=exc.code)
+        _print_accounting(accounting)
         return 1
 
     # ---- persist -------------------------------------------------------
@@ -8069,7 +8943,25 @@ def main(argv=None):
     measured = measured_cache_report(usage_by_cid, index)
     projection = project_full_run(measured, run, args.model,
                                   len(run.decisions))
-    rows = build_rating_rows(index, rated, unrated, retried)
+    rows = build_rating_rows(index, rated, unrated, retried,
+                             attempts=attempts)
+    _collected = set(collected_batch_ids)
+    session = session_status_block(
+        budget_stop, [b.get("id") for b in state.get("batches") or []
+                      if isinstance(b, dict) and b.get("id") not in _collected])
+    attempts_not_adopted = sum(
+        1 for cid, recs in attempts.items() for a in recs
+        if (a["outcome"] == ATTEMPT_UNRATED and cid in rated)
+        or (a["outcome"] == ATTEMPT_RATED
+            and rated.get(cid, {}).get("batch_id") != a["batch_id"]))
+    # ONE MORE OFFER BEFORE THE RECORD IS WRITTEN, so the manifest describes the
+    # journal as it stands when the session ends rather than as it stood at the
+    # batch's collection.
+    accounting.reconcile()
+    ceiling_by_rating = Counter(
+        "absent" if r.get(CEILING_FIELD) is None else str(r[CEILING_FIELD])
+        for r in rows)
+    ceiling_sources = Counter(r.get(CEILING_SOURCE_FIELD) for r in rows)
     summary = summarize(index, rated, unrated, run)
     fenced = sum(1 for r in rows if r.get("response_was_fenced"))
     extracted = sum(1 for r in rows if r.get("response_was_extracted"))
@@ -8077,6 +8969,12 @@ def main(argv=None):
 
     manifest = {
         "schema_version": 1,
+        # WHETHER THIS FILE DESCRIBES A WHOLE SESSION. Always written, so
+        # "complete" is a statement rather than an absence; a budget stop writes
+        # what it had collected and says so here, in ratings.json and in
+        # summary.json alike.
+        **session,
+        "session_status_vocabulary": list(SESSION_STATUSES),
         # THE REQUEST SHAPE, AT TOP LEVEL AND UNDER THE SAME NAME IN ALL THREE
         # WRITTEN ARTIFACTS. `schema_version` above is this FILE's shape and is
         # a different fact: a manifest whose schema did not move can perfectly
@@ -8160,16 +9058,38 @@ def main(argv=None):
             "custom_id_form": index.form,
             "limit": args.limit or None,
             "include_keys_file": (index.include_keys_meta or {}).get("path"),
+            # PER RATING, AND READ RATHER THAN ASSUMED. `max_completion_tokens`
+            # above is the session's primary ceiling; these count what each row
+            # in ratings.json was actually produced under.
+            "max_completion_tokens_by_rating": dict(sorted(
+                ceiling_by_rating.items())),
+            "max_completion_tokens_sources": dict(sorted(
+                ceiling_sources.items())),
+            "max_completion_tokens_faults_by_batch": dict(ceiling_faults),
+            "max_completion_tokens_basis": (
+                "per rating, the max_completion_tokens in the submitted body "
+                "of the request that produced it: the uploaded bytes for a "
+                "batch this session submitted, the provider's input file for "
+                "one it did not. Never inferred from the retry flag."),
         },
         "batch_ids": [b["id"] for b in state.get("batches", [])],
         "primary_batch_ids": batch_ids,
         "retry_batch_ids": retry_ids,
+        # None when the retry pass ran, was not needed, or was switched off;
+        # the refusal text when it was declined on an unresolved spend record.
+        "retry_pass_refused": retry_refusal,
+        "collected_batch_ids": list(collected_batch_ids),
         "counts": {
             "requests": len(index.requests),
             "decisions_in_run": len(run.decisions),
             "rated": len(rated),
             "unrated": len(unrated),
             "retried": len(retried),
+            # ATTEMPTS THAT PRODUCED AN OUTCOME AND WERE NOT ADOPTED: an
+            # unsuccessful attempt on a decision another attempt rated, or a
+            # second rating of an already-rated decision. Each is still in its
+            # row's `attempts`.
+            "attempts_not_adopted": attempts_not_adopted,
             "responses_with_markdown_fences": fenced,
             "responses_carved_out_of_prose": extracted,
             "responses_omitting_corrected_status": omitted,
@@ -8201,6 +9121,32 @@ def main(argv=None):
                 "lower_bound_full_cache_usd": plan["full_cache_usd"],
             },
             "reservation": reservation,
+            "spend_journal": accounting.manifest_block(),
+            # THE RATER BUDGET'S OWN RECORD: how many items on it could not be
+            # read, which, and the refusal that followed (None when nothing was
+            # refused on it).
+            "budget_record": {
+                "unreadable_items": spend.SPEND_LEDGER.unverified(
+                    spend.SPEND_BUDGET_RATER)[0],
+                "unreadable_named": list(spend.SPEND_LEDGER.unverified(
+                    spend.SPEND_BUDGET_RATER)[1]),
+                "verified": not spend.SPEND_LEDGER.unverified(
+                    spend.SPEND_BUDGET_RATER)[0],
+                "refusal": record_refusal,
+                "basis": ("an unreadable journal line, journal entry, journal "
+                          "file, state file or unconfirmed migration makes "
+                          "any remaining-budget figure UNVERIFIED and "
+                          "potentially OVERSTATED; while a cap is enforced, "
+                          "no new paid batch is submitted on it"),
+            },
+            # WHERE EACH COLLECTED BATCH'S MONEY WENT, so a resume's
+            # re-collection can be seen not to have charged anything twice.
+            "batch_spend_dispositions": batch_spend,
+            # THE CLOSED VOCABULARY, PUBLISHED, so a reader of this file can
+            # check every disposition above is one this version defines.
+            "batch_spend_disposition_vocabulary": list(
+                BATCH_SPEND_DISPOSITIONS),
+            "seed_source": seed_source,
             # WHETHER THE WRITE TERM WAS MEASURED OR MERELY ABSENT. GPT-5.6
             # introduced a cache-write charge and the installed SDK's usage
             # model declares no field for it, so a manifest reporting $0 of
@@ -8220,9 +9166,16 @@ def main(argv=None):
                 "request_shape_version": index.shape_version,
                 "run_dir": run.run_dir,
                 "run_dirs": list(run.run_dirs),
-                "model": args.model, "ratings": rows})
+                "model": args.model,
+                **session,
+                "max_completion_tokens_basis": (
+                    "each row's max_completion_tokens is read from the "
+                    "submitted body of the request that produced it; "
+                    "max_completion_tokens_source says from where, or why "
+                    "there is none"),
+                "ratings": rows})
     write_json(os.path.join(out_dir, "rater_manifest.json"), manifest)
-    write_json(os.path.join(out_dir, "summary.json"), summary)
+    write_json(os.path.join(out_dir, "summary.json"), dict(summary, **session))
 
     print_summary(summary, top_n=args.top)
     console.out("")
@@ -8283,8 +9236,26 @@ def main(argv=None):
                     f"${projection['upper_bound_usd']:,.2f}")
         console.out(f"    lower bound (one write/patient)"
                     f"${projection['lower_bound_usd']:,.2f}")
+    console.out(f"  output ceiling per rating  "
+                f"{dict(sorted(ceiling_by_rating.items()))}   (read from the "
+                f"submitted bodies: {dict(sorted(ceiling_sources.items()))})")
+    for _line in accounting.report_lines():
+        console.out(_line)
+    if retry_refusal is not None:
+        # THE CODE THE REFUSAL ITSELF LEADS WITH, not a literal: the retry pass
+        # is refused on an unresolved batch record OR on an unverified budget.
+        console.out(f"  RETRY PASS REFUSED: {retry_refusal.split(':', 1)[0]}")
     console.out(f"  wall time    {manifest['wall_time_s']}s")
     console.out(f"  written to   {out_dir}")
+    if budget_stop is not None:
+        console.out(f"  SESSION INCOMPLETE ({SESSION_STOPPED_ON_BUDGET}): "
+                    f"these files hold only the {len(collected_batch_ids)} "
+                    f"batch(es) collected before the spend limit stopped the "
+                    f"session. Uncollected: "
+                    f"{', '.join(session['stop']['uncollected_batch_ids']) or 'none'}.")
+        log.warning("rater.persisted_on_budget_stop",
+                    count=len(rated), attempted=len(index.by_custom_id))
+        return 3
 
     log.info("rater.complete", count=len(rated),
              attempted=len(index.by_custom_id),

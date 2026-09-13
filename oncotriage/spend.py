@@ -599,6 +599,17 @@ class LedgerSeed(NamedTuple):
                  indistinguishable from a group that genuinely spent nothing.
     ``runs``     how many prior run rows were walked.
     ``source``   a ``SEED_SOURCES`` member.
+    ``unreadable``  how many items on this reading's record could NOT be read:
+                 a journal line that would not decode or parse, an entry whose
+                 kind or amount is unusable, a journal file that could not be
+                 opened, a state file the fallback could not read. **A non-zero
+                 value makes ``usd`` UNVERIFIED** -- the skipped items may carry
+                 money, so any remainder computed from ``usd`` is potentially
+                 OVERSTATED -- and it is NOT a floor in ``unpriced``'s sense,
+                 because nothing proves an unreadable item is non-negative
+                 money. The two are kept apart for that reason.
+    ``unreadable_reasons``  the first few of those items, named, for the
+                 refusal an operator reads. Bounded; ``unreadable`` is the count.
     """
 
     usd: float = 0.0
@@ -606,11 +617,28 @@ class LedgerSeed(NamedTuple):
     unpriced: int = 0
     runs: int = 0
     source: str = SEED_SOURCE_NONE
+    unreadable: int = 0
+    unreadable_reasons: tuple = ()
 
     @property
     def is_floor(self) -> bool:
         """Is ``usd`` a floor rather than a total?"""
         return self.unpriced > 0
+
+    def has_unreadable(self) -> bool:
+        """Did this reading skip anything it could not read?
+
+        A METHOD AND NOT A PROPERTY, deliberately: the decorator inventory in
+        ``tests/test_package_invariants.py`` pins every property in the package,
+        and this answer needs no attribute syntax to be read correctly.
+        """
+        return self.unreadable > 0
+
+
+UNREADABLE_REASONS_KEPT = 10
+"""How many unreadable items a reading NAMES. The count is always exact; the
+names are for a refusal line, and a torn journal of ten thousand lines must not
+print ten thousand of them."""
 
 
 # ===========================================================================
@@ -631,6 +659,10 @@ class SpendLedger:
         self._seed = LedgerSeed()
         self._by_source = Counter()
         self._calls_by_source = Counter()
+        # {budget: [reason, ...]} -- what this process could NOT read about a
+        # budget's record. See `mark_unverified`.
+        self._unverified = {}
+        self._unverified_counts = Counter()
         # THE ROLLING WINDOW. One entry per charge, `(monotonic, usd)`, pruned
         # on every write and every read so a server that runs for months holds
         # one window's worth and not one process lifetime's.
@@ -881,6 +913,41 @@ class SpendLedger:
         """
         with self._lock:
             self._seed = seed
+        # AN UNREADABLE SEED MARKS ITS BUDGET, and the mark is ADDED rather
+        # than replaced: `mark_unverified` may already have recorded something
+        # the seed did not read (a state-file migration), and a seed that read
+        # cleanly must not erase that.
+        if isinstance(seed, LedgerSeed) and seed.has_unreadable():
+            self.mark_unverified(seed_budget(seed), seed.unreadable_reasons,
+                                 count=seed.unreadable)
+
+    def mark_unverified(self, budget, reasons, count=None) -> None:
+        """Record that part of ``budget``'s spend record could not be read.
+
+        NEVER RAISES. ``budget`` None -- a seed attributed to no budget -- marks
+        EVERY budget, because an item whose budget cannot be read cannot be
+        ruled out of any of them. ``count`` defaults to ``len(reasons)``; a
+        caller that kept only the first few names passes the true count.
+        """
+        names = [str(r) for r in (reasons or ())]
+        n = len(names) if count is None else int(count)
+        if n <= 0:
+            return
+        targets = (SPEND_BUDGETS if budget not in SPEND_BUDGETS
+                   else (budget,))
+        with self._lock:
+            for b in targets:
+                kept = self._unverified.setdefault(b, [])
+                for name in names:
+                    if len(kept) < UNREADABLE_REASONS_KEPT:
+                        kept.append(name)
+                self._unverified_counts[b] += n
+
+    def unverified(self, budget) -> tuple:
+        """``(count, reasons)`` for ``budget``; ``(0, ())`` when clean."""
+        with self._lock:
+            return (int(self._unverified_counts.get(budget, 0)),
+                    tuple(self._unverified.get(budget, ())))
 
     def reset(self) -> None:
         """Forget everything an earlier run in this process spent."""
@@ -891,6 +958,8 @@ class SpendLedger:
             self._by_source.clear()
             self._calls_by_source.clear()
             self._events.clear()
+            self._unverified.clear()
+            self._unverified_counts.clear()
 
     # -- reading -----------------------------------------------------------
 
@@ -1181,6 +1250,85 @@ class SpendLimitReached(RuntimeError):
         self.source = source
 
 
+SPEND_RECORD_UNVERIFIED = "spend_record_unverified"
+"""The refusal code for a paid dispatch declined because the budget's own spend
+record could not be fully read. One spelling, read by the gate, by the rater's
+two refusal sites, by the ragas harness and by the rater's manifest."""
+
+
+class SpendRecordUnverified(RuntimeError):
+    """A billed request was NOT issued: its budget's record is UNVERIFIED.
+
+    **NOT A ``SpendLimitReached`` SUBCLASS, AND THAT IS A VOCABULARY DECISION.**
+    ``SpendLimitReached.limit`` is ``SPEND_LIMITS``, a CLOSED tuple that Stage 5,
+    the batch runner and the ablation study branch on exhaustively. No limit was
+    reached here -- the remaining budget could not be established -- so putting
+    a third value into ``.limit`` would break that promise, and reusing
+    ``SPEND_LIMIT_CAP`` would tell an operator to raise a cap that is not the
+    problem. Every caller that can meet this catches it by name.
+
+    It is raised BEFORE any request is issued and it never latches
+    ``SPEND_STOP``: a record an operator repairs is not a budget that ran out,
+    and a latch would outlive the repair for the rest of the process.
+    """
+
+    def __init__(self, message, budget=None, source=None, reasons=(),
+                 count=0):
+        super().__init__(message)
+        self.code = SPEND_RECORD_UNVERIFIED
+        self.budget = budget
+        self.source = source
+        self.reasons = tuple(reasons)
+        self.count = count
+
+
+def unverified_record_refusal(source: str) -> Optional[str]:
+    """The refusal text when ``source``'s budget record is unverified, or None.
+
+    NEVER RAISES. It answers None -- no refusal -- in three cases, and the
+    first two are decisions rather than omissions:
+
+      * enforcement is off (``config.SPEND_CAP_ENFORCED`` False) -- the
+        operator has put every budget in measurement mode, and a refusal
+        computed from a remainder nothing enforces would be the only brake
+        still working;
+      * the budget has NO CAP in force (or its cap cannot be read, which
+        ``require_budget``'s own caller reports) -- there is no remainder for a
+        skipped item to overstate, so no dispatch decision rests on it;
+      * nothing on the record was unreadable.
+
+    THE REMAINDER IT QUOTES IS CALLED UNVERIFIED AND POTENTIALLY OVERSTATED,
+    NEVER AN UPPER BOUND. It would be an upper bound on the true remainder only
+    if every unreadable item were non-negative spend, and an item that could not
+    be read cannot be shown to be anything.
+    """
+    try:
+        budget = budget_for(source)
+    except Exception:                                           # noqa: BLE001
+        return None
+    count, reasons = SPEND_LEDGER.unverified(budget)
+    if count <= 0 or not config.SPEND_CAP_ENFORCED:
+        return None
+    try:
+        cap = budget_cap(budget)
+    except SpendCapConfigurationError:
+        return None
+    if cap is None:
+        return None
+    left = cap - budget_spend(budget)
+    shown = "; ".join(reasons) or "no item was named"
+    more = (f" (and {count - len(reasons)} more)"
+            if count > len(reasons) else "")
+    return (f"{SPEND_RECORD_UNVERIFIED}: {count} item(s) on the {budget} "
+            f"budget's spend record could not be read -- {shown}{more}. The "
+            f"remaining budget shown (${left:.2f} of ${cap:.2f}) is UNVERIFIED "
+            f"and potentially OVERSTATED: the unreadable items may carry spend "
+            f"it does not count. NO NEW PAID REQUEST IS ISSUED on this budget. "
+            f"Already-submitted work is still collected. Nothing unreadable was "
+            f"deleted or rewritten; repair or move the named item(s) and run "
+            f"again.")
+
+
 def seconds_until_under_cap(source: str) -> Optional[float]:
     """How long until the rolling window falls back under its cap. Seconds.
 
@@ -1289,6 +1437,22 @@ def require_budget(source: str, where: str, *, latch=None) -> None:
             against the other policy.
     """
     budget = budget_for(source)
+    # ── AN UNVERIFIED RECORD REFUSES FIRST ────────────────────────────────
+    #
+    # Above the cap comparison because that comparison reads the very spend
+    # figure that is in doubt: a session "under its cap" on a record with
+    # unreadable items may not be. Raised, not latched -- see
+    # `SpendRecordUnverified`.
+    _unverified = unverified_record_refusal(source)
+    if _unverified is not None:
+        _count, _reasons = SPEND_LEDGER.unverified(budget)
+        log.warning("a billed request was not issued because its budget's "
+                    "spend record could not be fully read", status="refused",
+                    event="spend_record_unverified", phase=source,
+                    reason=SPEND_RECORD_UNVERIFIED, mode=where, degraded=True)
+        raise SpendRecordUnverified(
+            f"the request was not issued ({where}): {_unverified}",
+            budget=budget, source=source, reasons=_reasons, count=_count)
     if not cap_exceeded(source):
         return
     SPEND_GATE_SKIPS[f"{source}:{SPEND_LIMIT_CAP}"] += 1
@@ -1933,7 +2097,17 @@ def describe_seed(seed: LedgerSeed) -> str:
     of them: ``BUDGET_FOR_SEED_SOURCE`` decides, and a judge session resuming
     $12 must not read as a campaign that has already spent it.
     """
-    if seed.source == SEED_SOURCE_NONE or seed.runs == 0:
+    # THE UNVERIFIED CLAUSE COMES FIRST AND IS CHECKED BEFORE THE "FRESH" TEST,
+    # because a reading that found no readable row AND skipped unreadable ones
+    # is not a fresh run -- it is a record nobody could read, and "Fresh run"
+    # would be the most confident possible wrong statement about it.
+    unverified = (f" -- UNVERIFIED: {seed.unreadable} item(s) on this record "
+                  f"could not be read, so the figure may be LOWER than the "
+                  f"truth and any remainder computed from it potentially "
+                  f"OVERSTATED"
+                  if isinstance(seed, LedgerSeed) and seed.has_unreadable()
+                  else "")
+    if (seed.source == SEED_SOURCE_NONE or seed.runs == 0) and not unverified:
         return ("[Spend] Fresh run: no prior run contributes to any budget "
                 "here.")
     floor = (f" -- A FLOOR, NOT A TOTAL: {seed.unpriced} of {seed.rows} prior "
@@ -1941,7 +2115,7 @@ def describe_seed(seed: LedgerSeed) -> str:
              if seed.is_floor else "")
     return (f"[Spend] Resumed {seed_budget(seed) or 'unattributed'} budget: "
             f"${seed.usd:.2f} already spent across {seed.runs} prior run(s) "
-            f"and {seed.rows} row(s){floor}.")
+            f"and {seed.rows} row(s){floor}{unverified}.")
 
 
 def report_lines() -> list:
@@ -2021,7 +2195,11 @@ def report_lines() -> list:
             lines.append(f"  cap {_budget:<16}${_cap:.2f}"
                          + ("" if config.SPEND_CAP_ENFORCED
                             else "   (MEASURED ONLY -- not enforced)"))
-            lines.append(f"  remaining {_budget:<10}${_cap - _spent:.4f}")
+            _n_unread, _ = SPEND_LEDGER.unverified(_budget)
+            lines.append(f"  remaining {_budget:<10}${_cap - _spent:.4f}"
+                         + (f"   <- UNVERIFIED, potentially OVERSTATED: "
+                            f"{_n_unread} unreadable item(s) on this "
+                            f"budget's record" if _n_unread else ""))
     if SPEND_LEDGER_FAULTS:
         lines.append(f"  UNPRICED RESPONSES  {sum(SPEND_LEDGER_FAULTS.values())}"
                      f"  <- the total above is LOWER than the truth")

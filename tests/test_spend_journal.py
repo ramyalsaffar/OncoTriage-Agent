@@ -124,6 +124,8 @@ def guarded(fn, *a, **kw):
 
 
 def sha256_or_absent(path):
+    if not path:
+        return "<unresolvable>"
     try:
         with io.open(path, "rb") as fh:
             return hashlib.sha256(fh.read()).hexdigest()
@@ -131,7 +133,24 @@ def sha256_or_absent(path):
         return "<absent>"
 
 
-_PROD_JOURNAL = J.journal_path()
+# ── THE PRODUCTION JOURNAL IS RESOLVED WITH THE OVERRIDE REMOVED ─────────────
+#
+# **THIS FILE USED TO READ IT UNDER WHATEVER THE INVOKING SHELL EXPORTED.**
+# `J.journal_path()` honours ONCOTRIAGE_SPEND_JOURNAL, so a run with that
+# variable pointed at a temp file -- which is exactly what a contained run
+# does -- took the TEMP file as "the production journal". Two things then went
+# wrong silently: 8a hashed the temp file and reported the real journal
+# byte-unchanged without ever reading it, and 7g-ii compared a blank override
+# against that ambient path and FAILED for a reason unrelated to its subject.
+# The test constructs its own state now: the variable is removed for this one
+# resolution and put back exactly as found.
+_ENV_AMBIENT = os.environ.get(_SETTINGS.ENV_SPEND_JOURNAL)
+os.environ.pop(_SETTINGS.ENV_SPEND_JOURNAL, None)
+try:
+    _PROD_JOURNAL = J.resolved_journal_path()
+finally:
+    if _ENV_AMBIENT is not None:
+        os.environ[_SETTINGS.ENV_SPEND_JOURNAL] = _ENV_AMBIENT
 _PROD_BEFORE = sha256_or_absent(_PROD_JOURNAL)
 _SRC_BEFORE = {
     p: sha256_or_absent(os.path.join(_CODE_DIR, p))
@@ -561,8 +580,14 @@ print("=" * 74)
 # is the same hole ONCOTRIAGE_INFERENCES_DB fills one store over, and it is
 # closed the same way.
 _env_before = os.environ.get(_SETTINGS.ENV_SPEND_JOURNAL)
+# WHATEVER THE AMBIENT SAYS, captured so 7g-iv can require it back exactly.
+_resolution_before = guarded(J.journal_path)
 _over = os.path.join(TMP, "override.jsonl")
 try:
+    # THE DEFAULT WITH NO OVERRIDE, CONSTRUCTED HERE rather than read from a
+    # module global resolved under the invoking shell's environment.
+    os.environ.pop(_SETTINGS.ENV_SPEND_JOURNAL, None)
+    _default_unset = guarded(J.journal_path)
     os.environ[_SETTINGS.ENV_SPEND_JOURNAL] = _over
     check("7g  the variable moves the default path",
           guarded(J.journal_path), os.path.abspath(_over))
@@ -572,7 +597,12 @@ try:
     os.environ[_SETTINGS.ENV_SPEND_JOURNAL] = "   "
     check("7g-ii a blank value is 'not set' rather than a path, so an "
           "exported-but-empty variable does not resolve to the cwd",
-          guarded(J.journal_path), _PROD_JOURNAL)
+          guarded(J.journal_path), _default_unset)
+    check("7g-ii-a non-degeneracy: the expected default is a real path and is "
+          "NOT the override just used, so 7g-ii can fail",
+          (str(_default_unset).startswith("<RAISED"),
+           _default_unset == os.path.abspath(_over),
+           _default_unset == os.path.abspath("   ")), (False, False, False))
     os.environ[_SETTINGS.ENV_SPEND_JOURNAL] = os.path.join(
         TMP, "no", "such", "dir", "j.jsonl")
     check("7g-iii a MISSING PARENT raises by name rather than being counted "
@@ -584,8 +614,9 @@ finally:
         os.environ.pop(_SETTINGS.ENV_SPEND_JOURNAL, None)
     else:
         os.environ[_SETTINGS.ENV_SPEND_JOURNAL] = _env_before
-check("7g-iv restored: the default resolves again",
-      guarded(J.journal_path), _PROD_JOURNAL)
+check("7g-iv restored: the path resolves exactly as it did before this "
+      "section, under whatever override the invoking environment carries",
+      guarded(J.journal_path), _resolution_before)
 # WALKED, NOT GREPPED. The resolver's own docstring ARGUES about `_from_env`
 # -- it says why it is not used -- so a substring test reports the argument as
 # the thing it argues against. This project has shipped that shape four times;
@@ -654,7 +685,8 @@ print(json.dumps({
     "journal_path": outcome(J.journal_path),
     "resolved": outcome(J.resolved_journal_path),
     "read_entries": outcome(J.read_entries),
-    "total": outcome(lambda: J.total(spend.SPEND_BUDGET_RATER).source),
+    "total": outcome(lambda: [J.total(spend.SPEND_BUDGET_RATER).source,
+                              J.total(spend.SPEND_BUDGET_RATER).unreadable]),
     "find_state_files": outcome(J.find_state_files),
     "bootstrap": outcome(lambda: list(
         J.bootstrap_from_state_files(out=lambda _m: None))),
@@ -686,8 +718,17 @@ check("7i-i  journal_path itself STILL RAISES -- it is asked where the file "
       _D.get("journal_path"), {"raised": "RuntimeError"})
 check("7i-ii ...but resolved_journal_path answers None instead",
       _D.get("resolved"), {"value": None})
+# `total` WAS PINNED AT "fresh" HERE AND THE PIN MOVED, ARGUED RATHER THAN
+# RELAXED. It still DEGRADES -- it returns a seed and raises nothing, which is
+# what this check is about -- but a journal nobody could locate is no longer
+# presented as an empty one: it is one UNREADABLE item on the rater budget's
+# record, so the seed is attributed to the journal and marked unverified, and
+# a session that would spend on it is refused by name instead of starting under
+# a cumulative cap that was never read. "A judge must not refuse to start
+# because a directory is missing" was an argument against RAISING; a named
+# refusal with a remedy (set ONCOTRIAGE_SPEND_JOURNAL) is a different thing.
 for _label, _expected in (("read_entries", []),
-                          ("total", "fresh"),
+                          ("total", [spend.SEED_SOURCE_JOURNAL_RATER, 1]),
                           ("find_state_files", []),
                           ("bootstrap", [0, 0, 0.0]),
                           ("append", False)):
@@ -1899,6 +1940,247 @@ _pZ = fresh()
 check("7d-i-z  RESTORE: append_with_outcome is the real one again -- a leaked "
       "patch would make every section after this measure a stand-in",
       J.append_with_outcome(_entry("z0", 1.0), path=_pZ), J.APPEND_WROTE)
+
+
+print()
+print("=" * 74)
+print("9. WHAT COULD NOT BE READ TRAVELS WITH THE TOTAL (P3)")
+print("=" * 74)
+
+from oncotriage import config as _CONFIG                        # noqa: E402
+
+_RB, _RS = spend.SPEND_BUDGET_RATER, spend.SPEND_SOURCE_RATER
+_CB = spend.SPEND_BUDGET_CAMPAIGN
+
+# ── 9a-9f  THE READER AND THE TOTAL ─────────────────────────────────────
+_p9 = fresh()
+J.record_batch(_RB, _RS, "/s9", "b9", 0.5, "j", path=_p9)
+with io.open(_p9, "ab") as _fh:
+    _fh.write(b"not json\n")
+    _fh.write(b"[1, 2]\n")
+    _fh.write(b'{"no_schema": true}\n')
+    _fh.write(b'{"schema_version": 999}\n')
+    _fh.write(b"\xc3\n")
+_e9, _u9 = J.read_entries_report(_p9)
+check("9a  read_entries_report keeps the readable entry AND names every "
+      "unreadable line by number",
+      ([e.get("unit") for e in _e9], _u9),
+      (["b9"], ["journal line 2: not JSON",
+                "journal line 3: a JSON list, not an entry",
+                "journal line 4: no schema_version",
+                f"journal line 5: schema_version 999 is newer than this "
+                f"build's {J.SCHEMA_VERSION}",
+                "journal line 6: not UTF-8"]))
+check("9b  read_entries is the same entries, the report discarded",
+      [e.get("unit") for e in J.read_entries(_p9)], ["b9"])
+_s9 = J.total(_RB, path=_p9)
+check("9c  total still sums the readable row and CARRIES the unreadable count "
+      "and names",
+      (round(_s9.usd, 6), _s9.rows, _s9.unreadable, _s9.has_unreadable(),
+       len(_s9.unreadable_reasons)), (0.5, 1, 5, True, 5))
+_p9t = fresh()
+with io.open(_p9t, "wb") as _fh:
+    _fh.write(b"{torn\n")
+_s9t = J.total(_RB, path=_p9t)
+check("9d  a journal with NO readable row and an unreadable one is attributed "
+      "to the journal and marked, not read as an empty journal",
+      (_s9t.source, _s9t.rows, _s9t.unreadable),
+      (spend.SEED_SOURCE_JOURNAL_RATER, 0, 1))
+check("9d-i  CLEAN CONTROL: an ABSENT journal is still a fresh seed with "
+      "nothing unreadable",
+      J.total(_RB, path=os.path.join(TMP, "absent-9d.jsonl")),
+      spend.LedgerSeed())
+_p9b = fresh()
+with io.open(_p9b, "w", encoding="utf-8") as _fh:
+    _fh.write(json.dumps({"schema_version": J.SCHEMA_VERSION,
+                          "entry_id": "e1", "kind": "batch", "budget": _CB,
+                          "usd": "x"}) + "\n")
+    _fh.write(json.dumps({"schema_version": J.SCHEMA_VERSION,
+                          "entry_id": "e2", "kind": "mystery", "budget": _CB,
+                          "usd": 1.0}) + "\n")
+check("9e  an unusable ENTRY whose budget IS readable counts against that "
+      "budget only", (J.total(_RB, path=_p9b).unreadable,
+                      J.total(_CB, path=_p9b).unreadable), (0, 2))
+_parent9 = os.path.join(TMP, "file-as-dir-9")
+with io.open(_parent9, "w") as _fh:
+    _fh.write("x")
+_e9o, _u9o = J.read_entries_report(os.path.join(_parent9, "j.jsonl"))
+check("9f  a journal that exists as a path and cannot be OPENED is "
+      "unreadable, not empty",
+      (_e9o, len(_u9o), "could not be opened" in (_u9o[0] if _u9o else "")),
+      ([], 1, True))
+
+# ── 9g-9o  THE LEDGER, THE GATE AND THE BANNERS ─────────────────────────
+_saved9 = (_CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED)
+try:
+    _CONFIG.RATER_SPEND_CAP_USD = 50.0
+    _CONFIG.SPEND_CAP_ENFORCED = True
+    spend.SPEND_LEDGER.reset()
+    check("9g  CLEAN CONTROL: nothing marked, nothing refused",
+          (spend.unverified_record_refusal(_RS),
+           guarded(spend.require_budget, _RS, "9g")), (None, None))
+    spend.SPEND_LEDGER.seed(_s9)
+    _txt9 = spend.unverified_record_refusal(_RS) or ""
+    check("9h  an unreadable seed marks its budget; the refusal names the code, "
+          "calls the remainder UNVERIFIED and potentially OVERSTATED, names the "
+          "item, and never calls it an upper bound",
+          (spend.SPEND_RECORD_UNVERIFIED in _txt9, "UNVERIFIED" in _txt9,
+           "potentially OVERSTATED" in _txt9,
+           "journal line 2: not JSON" in _txt9,
+           "upper bound" in _txt9.lower()), (True, True, True, True, False))
+    check("9i  ...and only the RATER budget is marked",
+          spend.unverified_record_refusal(spend.SPEND_SOURCE_RAGAS_JUDGE),
+          None)
+    _gate9 = guarded(spend.require_budget, _RS, "the 9j probe")
+    check("9j  require_budget RAISES SpendRecordUnverified although the budget "
+          "is nowhere near its cap -- the refusal comes before the cap test",
+          (str(_gate9).startswith("<RAISED SpendRecordUnverified"),
+           spend.cap_exceeded(_RS)), (True, False))
+    check("9j-i  ...and it is NOT a SpendLimitReached, so .limit stays the "
+          "closed SPEND_LIMITS vocabulary",
+          issubclass(spend.SpendRecordUnverified, spend.SpendLimitReached),
+          False)
+    _CONFIG.SPEND_CAP_ENFORCED = False
+    check("9k  enforcement OFF: nothing is refused (measurement mode)",
+          (spend.unverified_record_refusal(_RS),
+           guarded(spend.require_budget, _RS, "9k")), (None, None))
+    _CONFIG.SPEND_CAP_ENFORCED = True
+    _CONFIG.RATER_SPEND_CAP_USD = None
+    check("9l  no cap in force: nothing is refused -- there is no remainder "
+          "to overstate", spend.unverified_record_refusal(_RS), None)
+    _CONFIG.RATER_SPEND_CAP_USD = 50.0
+    check("9m  describe_seed says UNVERIFIED and never 'Fresh run' for a "
+          "record nobody could read; the closing block labels the remainder",
+          ("UNVERIFIED" in spend.describe_seed(_s9t),
+           "Fresh run" in spend.describe_seed(_s9t),
+           any("remaining rater" in ln and "potentially OVERSTATED" in ln
+               for ln in spend.report_lines())), (True, False, True))
+    check("9m-i  CLEAN CONTROL: a fresh seed still reads 'Fresh run', and a "
+          "clean budget's remaining line carries no label",
+          ("Fresh run" in spend.describe_seed(spend.LedgerSeed()),
+           any("remaining campaign" in ln and "UNVERIFIED" in ln
+               for ln in spend.report_lines())), (True, False))
+    check("9n  spend_journal.describe labels the remaining figure",
+          "UNVERIFIED, potentially OVERSTATED" in J.describe(_RB, path=_p9),
+          True)
+    spend.SPEND_LEDGER.reset()
+    spend.SPEND_LEDGER.mark_unverified(None, ["an unattributable line"])
+    check("9o  an item whose budget cannot be read marks EVERY budget",
+          [spend.SPEND_LEDGER.unverified(b)[0] for b in spend.SPEND_BUDGETS],
+          [1] * len(spend.SPEND_BUDGETS))
+    spend.SPEND_LEDGER.reset()
+    check("9o-i  ...and reset clears every mark",
+          [spend.SPEND_LEDGER.unverified(b)[0] for b in spend.SPEND_BUDGETS],
+          [0] * len(spend.SPEND_BUDGETS))
+finally:
+    _CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED = _saved9
+    spend.SPEND_LEDGER.reset()
+check("9o-ii the config the section changed is restored",
+      (_CONFIG.RATER_SPEND_CAP_USD, _CONFIG.SPEND_CAP_ENFORCED), _saved9)
+
+# ── 9p-9q  THE RATER'S FALLBACK SEED ────────────────────────────────────
+_rsb = R.rater_spend_before({R.STATE_SPEND_KEY: 2.0, "batches": [{"id": "a"}]},
+                            journal=_p9t)
+check("9p  the state-file FALLBACK keeps what the journal could not read",
+      (_rsb.source, _rsb.usd, _rsb.unreadable),
+      (spend.SEED_SOURCE_RATER_STATE, 2.0, 1))
+_absent9 = os.path.join(TMP, "absent-9q.jsonl")
+_rsb2 = R.rater_spend_before({R.STATE_SPEND_KEY: "x"}, journal=_absent9)
+check("9q  a recorded spend that is PRESENT and unusable is unreadable, not a "
+      "spend of zero", (_rsb2.usd, _rsb2.unreadable), (0.0, 1))
+check("9q-i  CLEAN CONTROL: an absent key is still a fresh seed",
+      R.rater_spend_before({}, journal=_absent9), spend.LedgerSeed())
+
+# ── 9r  WHAT A SEED ALREADY COUNTS, PER SCOPE ───────────────────────────
+_p9r = fresh()
+for _scope, _unit in (("/S", "b1"), ("/S", "b2"), ("/OTHER", "b3")):
+    J.record_batch(_RB, _RS, _scope, _unit, 0.1, "j", path=_p9r)
+J.append({"entry_id": J.entry_id(_RB, _RS, "/S", "migration"),
+          "kind": J.ENTRY_KIND_MIGRATION, "budget": _RB, "source": _RS,
+          "scope": "/S", "unit": "migration", "usd": 0.1,
+          "covers_batch_ids": ["b2"]}, path=_p9r)
+check("9r  recorded_batch_ids is what total COUNTS for one scope: not another "
+      "scope's batch, and not one a migration merely lists",
+      sorted(J.recorded_batch_ids(_RB, _RS, "/S", J.read_entries(_p9r))),
+      ["b1"])
+
+
+# ── 9s-9w  THE MIGRATION'S REPORT ───────────────────────────────────────
+def _write_state9(root, rel, payload):
+    fp = os.path.join(root, rel)
+    os.makedirs(os.path.dirname(fp), exist_ok=True)
+    with io.open(fp, "w", encoding="utf-8") as fh:
+        fh.write(payload if isinstance(payload, str) else json.dumps(payload))
+    return fp
+
+
+_root9 = os.path.join(TMP, "runs9")
+_write_state9(_root9, "legacy/rater/rater_state.json",
+              {"spend_usd": 1.0, "batches": [{"id": "L1"}]})
+_write_state9(_root9, "torn/rater/rater_state.json", "{not json")
+_write_state9(_root9, "badspend/rater/rater_state.json",
+              {"spend_usd": "x", "batches": [{"id": "B1"}]})
+_write_state9(_root9, "era/rater/rater_state.json",
+              {"spend_usd": 0.5, J.JOURNAL_ERA_STATE_KEY: {"E1": 0.5},
+               "batches": [{"id": "E1"}]})
+_locked9 = os.path.join(_root9, "locked")
+os.makedirs(_locked9)
+os.chmod(_locked9, 0)
+_p9m = fresh()
+try:
+    _rep9 = J.bootstrap_report(root=_root9, path=_p9m, out=lambda _m: None)
+finally:
+    os.chmod(_locked9, 0o755)
+check("9s  the migration writes the readable pre-journal files and skips the "
+      "journal-era one", (_rep9["written"], _rep9["journal_era"],
+                          any("/era/" in str(e.get("scope"))
+                              for e in J.read_entries(_p9m))), (2, 1, False))
+check("9s-i  ...and NAMES the torn state file, the unusable spend and the "
+      "directory it could not walk",
+      (any("torn" in u and "could not be read" in u for u in _rep9["unreadable"]),
+       any("badspend" in u and "spend_usd" in u for u in _rep9["unreadable"]),
+       any("could not be walked" in u for u in _rep9["unreadable"])),
+      (True, True, True))
+
+# WHY THE JOURNAL-ERA SKIP EXISTS, measured on the legacy shape it replaces.
+_root9h = os.path.join(TMP, "runs9h")
+_state_h = _write_state9(_root9h, "s/rater/rater_state.json",
+                         {"spend_usd": 1.0,
+                          "batches": [{"id": "H1"}, {"id": "H2"}]})
+_p9h = fresh()
+J.bootstrap_report(root=_root9h, path=_p9h, out=lambda _m: None)
+J.record_batch(_RB, _RS, _state_h, "H2", 0.7, "j", path=_p9h)
+check("9t  THE DEFECT THE MARKER PREVENTS: a migrated file that LISTED a batch "
+      "not yet collected makes total skip that batch's later entry -- its "
+      "$0.70 never reaches the cap (legacy shape, kept as the record)",
+      round(J.total(_RB, path=_p9h).usd, 6), 1.0)
+_root9e = os.path.join(TMP, "runs9e")
+_state_e = _write_state9(_root9e, "s/rater/rater_state.json",
+                         {"spend_usd": 1.0,
+                          J.JOURNAL_ERA_STATE_KEY: {"H1": 1.0},
+                          "batches": [{"id": "H1"}, {"id": "H2"}]})
+_p9e = fresh()
+J.bootstrap_report(root=_root9e, path=_p9e, out=lambda _m: None)
+J.record_batch(_RB, _RS, _state_e, "H1", 1.0, "j", path=_p9e)
+J.record_batch(_RB, _RS, _state_e, "H2", 0.7, "j", path=_p9e)
+check("9u  ...and the same session carrying the journal-era marker is not "
+      "migrated, so every collected batch counts",
+      round(J.total(_RB, path=_p9e).usd, 6), 1.7)
+_ro9 = os.path.join(TMP, "ro9")
+os.makedirs(_ro9)
+os.chmod(_ro9, 0o555)
+try:
+    _rep9w = J.bootstrap_report(root=_root9h, path=os.path.join(_ro9, "j.jsonl"),
+                                out=lambda _m: None)
+finally:
+    os.chmod(_ro9, 0o755)
+check("9v  a migration the journal did not CONFIRM is on the unreadable list, "
+      "not counted as 'already present'",
+      (any("not confirmed" in u for u in _rep9w["unreadable"]),
+       _rep9w["duplicate"]), (True, 0))
+check("9w  the back-compatible tuple is unchanged in shape and meaning",
+      J.bootstrap_from_state_files(root=_root9h, path=_p9h,
+                                   out=lambda _m: None), (0, 1, 0.0))
 
 
 print()

@@ -700,7 +700,7 @@ python tests/test_docker_qdrant_override_and_readiness.py           # 127 (was 1
 # collision matrix. It DOES exec -- one in-memory copy of
 # oncotriage/fixtures/capture.py with the --resume gate reverted to "the file
 # exists, skip it", argued at _EXEC_ALLOWLIST. Bucket A, ~6 s.
-python tests/test_resume_capture_and_ragas.py                       # 229 (this line said 211 and was stale before this pass reached it; the evaluation-safeguards pass added section 6g-i over the ragas resume identity's judge_reasoning_effort and the omit-sentinel owner, and guarded section 9's artifact reads so a REFUSED resume reports its failures instead of aborting on a bare json.load. MEASURED 2026-09-10. Before that 211, was 210; the allowlist pass PINS this file to the OpenAI arm through tests/_provider_pin.py -- it drives the REAL capture.main(), which REFUSES at the shipped provider and returns 1 before reading a bundle, so without the pin the whole file measures the refusal instead of the resume plan -- and counts the pin's release. Before that 210, was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
+python tests/test_resume_capture_and_ragas.py                       # 232 (MEASURED 2026-09-13, was 229; the SB repair pass added 9i, a ragas run refused on an unreadable campaign record with its clean control. this line said 211 and was stale before this pass reached it; the evaluation-safeguards pass added section 6g-i over the ragas resume identity's judge_reasoning_effort and the omit-sentinel owner, and guarded section 9's artifact reads so a REFUSED resume reports its failures instead of aborting on a bare json.load. MEASURED 2026-09-10. Before that 211, was 210; the allowlist pass PINS this file to the OpenAI arm through tests/_provider_pin.py -- it drives the REAL capture.main(), which REFUSES at the shipped provider and returns 1 before reading a bundle, so without the pin the whole file measures the refusal instead of the resume plan -- and counts the pin's release. Before that 210, was 207; the default-flip pass clears capture.main()'s process-global call-mode pin in drive_main's finally and added the three 2a-pin checks that make the clear a measurement)
 
 # The MCP pass. Same shape, same directory. No keys and NO SPEND -- the judging
 # is stubbed through oncotriage/agent/deps.py. It is NOT offline: sections 4, 5
@@ -15500,7 +15500,17 @@ the reviewer's exact shape.
 # keys, NO SPEND -- no provider client of any kind is built and no request is
 # issued. NOT in the collision matrix; every journal is a temp file and section
 # 8a hashes the PRODUCTION journal before and after. Bucket A.
-python tests/test_spend_journal.py                                  # 233 (this file had NO CLAUDE.md entry at all until this pass, which is why no count was ever stale -- it was never written down. 86 before the three passes; the confirmed-write repair added sections 7c-2, 7d-i and 7d-j and the boundary repair added 7c-3. MEASURED 2026-09-10)
+python tests/test_spend_journal.py                                  # 264 (MEASURED 2026-09-13, was 233; the SB repair pass made 7g build its own environment state -- it failed whenever the invoking shell exported ONCOTRIAGE_SPEND_JOURNAL -- and added section 9 over unreadable records, the journal-era migration skip and the unverified-record gate. this file had NO CLAUDE.md entry at all until this pass, which is why no count was ever stale -- it was never written down. 86 before the three passes; the confirmed-write repair added sections 7c-2, 7d-i and 7d-j and the boundary repair added 7c-3. MEASURED 2026-09-10)
+
+# The money-path safety bundle (the SB pass). Same shape, same directory. No
+# network, no keys, NO SPEND, no model load, no live Qdrant, no corpus, no
+# database. Every journal, state file, run directory and output directory is
+# inside a tempfile.mkdtemp each file removes and asserts gone;
+# ONCOTRIAGE_SPEND_JOURNAL points inside it and the PRODUCTION journal is
+# sha256-compared at the end. Neither is in the collision matrix and neither
+# execs anything. Bucket A.
+python tests/test_rater_batch_spend_accounting.py                   # 106 (MEASURED 2026-09-13, was 60; the SB repair pass added sections 7-10 -- a failed batch affects only its own requests, an unreadable record refuses new spend at the surface, re-collection charges nothing twice, a budget stop writes what was collected marked incomplete): the rater's per-batch journal outcome, the retry-pass refusal, the per-rating output ceiling, and the malformed-batches refusal -- driving the REAL rater main() six times against a stand-in Batch-API client
+python tests/test_spend_checkpoint_backstop.py                      #  54 (MEASURED 2026-09-13): the checkpointer's wall-clock backstop, through the REAL ragas_harness.score_all with every pair hanging and with the event loop blocked
 
 # The hard-kill journaling pass. Same shape, same directory. No network, no
 # keys, NO SPEND -- the judge is a stub metric that charges the ledger and
@@ -16379,6 +16389,117 @@ this item had never exercised -- with `oncotriage/config.py` and
    it is a property of one drift run rather than of the campaign. Stated so the
    absence is a decision.
 
+
+### The money path records what it did, on a clock, and says so on each rating (the SB pass)
+
+**FIVE ITEMS AGAINST FOUR PREMISES, VERIFIED BEFORE ANYTHING WAS EDITED.** No
+paid call, no AWS call, no commit. Every test ran inside an OS sandbox denying
+all outbound traffic except loopback AND under an import-time socket tripwire,
+with `ONCOTRIAGE_SPEND_JOURNAL` pointed at a temp file: the tripwire recorded
+**zero** outbound attempts across every run of this pass, the production spend
+journal is byte-unchanged (`a9682eb9...`, 14,789 bytes), and the renderer
+digest (`5ea2c6cc...`), `PROMPT_VERSION` 1.11.0 and `FINGERPRINT_VERSION` 8 are
+identical to HEAD -- no model-visible classifier input moved.
+
+**P1 -- THE JOURNAL WRITE'S OUTCOME WAS THROWN AWAY AT TWO LAYERS.**
+`spend_journal.append_with_outcome` distinguishes wrote / duplicate / conflict /
+failed / uncertain; `record_batch` reduced that to a bool and both
+`record_batch_spend` call sites in `rater.main()` discarded even the bool. So a
+batch whose journal write failed read exactly like one recorded, nothing retried
+it, and the session went on to buy a retry batch while every LATER session's
+cumulative cap was missing the money.
+
+| where | what |
+|---|---|
+| `spend_journal.record_batch_with_outcome` | one entry built once, offered up to `BATCH_RECORD_MAX_ATTEMPTS` (3) times under the SAME id and amount, retrying only `failed`/`uncertain`; returns `{"outcome", "attempts", "append_outcomes"}` with `outcome` in the closed `BATCH_RECORD_OUTCOMES` (confirmed / duplicate / conflicted / unconfirmed). NEVER RAISES. `record_batch` keeps its bool for back-compatibility |
+| `rater.BatchSpendAccounting` | one per `main()`: `record`, `reconcile` (offers every UNCONFIRMED batch again; CONFLICTED is never retried and never clears), `refusal_reason`, `report_lines`, `manifest_block` |
+| the gate | `submit_batches(..., accounting=)` raises `SpendAccountingUnresolved` above `require_budget`; `main()` reconciles first and then REFUSES the retry pass by name (`spend_accounting_unresolved`) while still collecting and writing every rating already paid for |
+| the surfaces | the console line at the moment a batch fails to confirm; the closing SPEND JOURNAL block; `rater_manifest.json` `cost.spend_journal` and `retry_pass_refused`; the refusal also prints on the budget-stop and refusal exits |
+
+**AN UNCERTAIN WRITE THAT LANDED IS THE CASE THE RETRY MUST NOT DOUBLE**, and it
+does not: the retry offers the same id and amount and the journal answers
+`duplicate`. Measured in section 1 of the new rater test.
+
+**P2 -- `RUN_CHECKPOINT_SECONDS` WAS NOT A WALL-CLOCK BOUND.** `checkpoint`
+evaluates it when called, and the ragas harness calls it on pair completion.
+`RunSpendCheckpointer.start_backstop(measure)` is a daemon thread that every
+`min_seconds / BACKSTOP_TICKS_PER_THRESHOLD` (15 s at the default) runs THE SAME
+threshold decision (`_checkpoint_locked`) under THE SAME lock. `finalize` sets
+the stop event before taking the lock and joins the thread after releasing it;
+a tick that loses the race to finalize returns silently. It is a THREAD rather
+than a loop callback so a blocked event loop cannot stall it, and
+`ragas_harness.main()` starts it with the ledger's measured total.
+**WHAT IT BOUNDS IS UNRECORDED TIME, NOT STORAGE FAILURE**: a refused write stays
+pending exactly as before, and a hard kill still loses whatever was charged
+since the last CONFIRMED write. `tests/test_spend_hard_kill_journaling.py`
+section 6 is unchanged, because its child starts no backstop.
+
+**P3 -- VERIFICATION FOUND ONE CRASHING READER.** `read_state` and
+`bootstrap_from_state_files` tolerate truncated, mid-UTF-8, empty and non-object
+files (the migration counts `migrate:*`). But a state file that DECODES with
+`"batches": [7, ...]` made `refuse_batch_from_other_mode` raise
+`AttributeError` -- a traceback out of `main()`, before any network call -- and
+would have reached the resume path's and the manifest's bare `b["id"]`.
+`state_batches_problem` is a named refusal (`state_batches_malformed`) in
+`main()`'s local guard block and in `refuse_batch_from_other_mode`. **NOT a
+`read_state` -> None**: on a first `--submit` that turns the state into `{}` and
+writes it back over the only record of which paid batches exist.
+
+**P3, REPORTED AND NOT BUILT:** `spend_journal.total()` SKIPS an unreadable,
+unknown-kind or bad-amount entry and counts it, so the remaining rater budget is
+`cap - readable entries` and is OVER-stated by whatever was unreadable -- driven:
+a readable $10 beside a torn $30 record reports $40.00 remaining of $50. Neither
+`spend_journal.describe`, `spend.describe_seed` nor the preflight's "budget
+remaining" line mentions skipped entries, and `LedgerSeed.is_floor` is about
+unpriced migrations only, so the floor/unreliable label does NOT reach the
+surface an operator reads before spending.
+
+**P4 -- EACH RATING RECORDS THE CEILING IT WAS PRODUCED UNDER**, read from the
+submitted request body and never inferred. `submit_batches` parses the uploaded
+bytes (`submitted_ceilings_from_jsonl`); `collect_results` uses those for a
+batch this session submitted and reads the provider's input file
+(`read_submitted_ceilings`, one paced `files.content`) for a batch it did not --
+which is what covers a RESUMED retry. Every `ratings.json` row carries
+`max_completion_tokens` and `max_completion_tokens_source` (closed
+`CEILING_SOURCES`: two present sources, five named absences); the manifest
+counts them. The discriminating case is an api_error retried at the ORIGINAL
+ceiling, which "retry means doubled" reports wrongly.
+
+**ITEM 5 -- `PROVIDER_TOKENS_PER_MINUTE['bedrock_anthropic']` IS 6,000,000**, the
+operator-supplied console value from the 10 RPM / 6M TPM record, PROVISIONAL and
+not read back from the provider. The burndown-multiplier warning is preserved
+and says the edit did not verify it. Two exact pins in
+`tests/test_provider_resilience.py` moved with it (201 -> 203 checks).
+
+**TWENTY-ONE PLANTED REVERTS, TWENTY-ONE CAUGHT**, each into a copy of
+`oncotriage/` and `tests/` with `PYTHONPATH` pointed at it, the editable-install
+finder stripped, a realpath preflight asserting the COPY is what imports, every
+plant asserting its own anchor count and `ast.parse`d before it runs, the whole
+matrix under the same sandbox and tripwire, and the real tree hashed before and
+after (byte-unchanged). Clean controls first. Seven on P1 (retry removed,
+refusal disabled, submit gate removed, reconcile-before-retry removed, the
+original discarded-outcome call site, the never-raises guard narrowed, a
+conflict retried), five on P4 (ceiling inferred from the retry flag, uploaded
+bytes not handed over, resumed input file not read, a bool accepted, a
+duplicated custom_id accepted), two on P3, six on P2 (the ragas wiring removed,
+a tick that does not checkpoint, a finalize that does not stop the thread, a
+tick that ignores `finalized`, a delta measured against CONFIRMED rather than
+ISSUED -- the double count -- and a measure raise escaping the thread), and one
+on item 5.
+
+**THE MATRIX FOUND TWO DEFECTS IN THIS PASS'S OWN TESTS AND NONE BY READING.**
+(i) A plant anchor that matched twice was reported PLANT-FAILED rather than run
+against the wrong site. (ii) The backstop test's `make_writable` did
+`os.remove` then a bare `os.makedirs`, and under matrix load the live backstop
+thread's own append recreated the directory in between -- `FileExistsError`,
+an ABORT that hid the wiring check. `exist_ok=True` now; five consecutive
+standalone runs green afterwards.
+
+**WHAT IS NOT DONE** is listed in the pass's report rather than here; the three
+that matter most are the remaining-budget label above, the budget-stop exit
+that still returns before `ratings.json` is written, and the resume path that
+re-charges the process ledger and the state file's `spend_usd` for a batch the
+journal already holds.
 
 Data and keys live outside this folder. Never write an
 absolute path. The one exception already exists and is

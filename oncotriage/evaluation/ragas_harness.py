@@ -3625,6 +3625,18 @@ def main(argv=None):
         console.out(spend.describe_cap())
         console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
         console.out(spend_journal.describe(spend.SPEND_BUDGET_CAMPAIGN))
+        # ── AN UNVERIFIED RECORD REFUSES BEFORE ANY CLIENT IS BUILT ──────
+        #
+        # Every judge and embedding call is gated by `spend.require_budget`,
+        # which raises on the same condition -- but inside ragas' own retry and
+        # exception handling, where it would surface as one failed pair after
+        # another. This run has nothing already submitted to collect, so the
+        # whole invocation is refused here, once, by name, with nothing sent.
+        _record_refusal = spend.unverified_record_refusal(
+            spend.SPEND_SOURCE_RAGAS_JUDGE)
+        if _record_refusal is not None:
+            raise RagasRefusal(f"nothing was judged. {_record_refusal}",
+                               code=spend.SPEND_RECORD_UNVERIFIED)
         # ── LAYER 2 OF THE INDEPENDENCE GUARD ─────────────────────────
         #
         # ON THE EFFECTIVE MODEL, AFTER `--judge-model`, AND BEFORE THE CLIENT
@@ -3713,6 +3725,17 @@ def main(argv=None):
     _checkpointer = spend_journal.RunSpendCheckpointer(
         spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
         out_dir, _journal_unit, args.judge_model)
+    # ── AND A WALL CLOCK BESIDE THE COMPLETIONS ─────────────────────────
+    #
+    # `spend_checkpoint` fires on PAIR COMPLETION, so a run whose pairs all
+    # hang -- or whose event loop is blocked -- offers nothing further however
+    # long it waits. The backstop is a thread, not a loop callback, precisely so
+    # a stalled loop cannot stall it: every RUN_CHECKPOINT_SECONDS / 4 it reads
+    # the ledger (charged per RESPONSE, so in-flight charges are included) and
+    # runs the same threshold decision under the same lock. It bounds how long
+    # spend goes UNOFFERED; a journal that refuses the write is still pending.
+    # `finalize` in the `finally` below stops and joins it.
+    _checkpointer.start_backstop(lambda: spend.SPEND_LEDGER.measured)
     try:
         scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
                                        journal=journal, reuse=reuse,
