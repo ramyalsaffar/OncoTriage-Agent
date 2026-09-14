@@ -1373,3 +1373,153 @@ Both with driver SIGINT `default_int_handler`; neither launched under `&`.
 
 **B4** (14.7 item 4): `test_provider_resilience` alone, three times, nothing
 else running, under this containment with `b3_run.py` (fresh evidence names).
+
+### 14.13 Batch B4 -- `test_provider_resilience` alone, three times (2026-09-14)
+
+Written for: the operator and the next batch. Run and diagnose only. No
+production source, no test file, no containment-instrumentation change; no
+commit, stash, branch change, reset or cleanup; no paid call; no production
+database connected to. `git log -1` = `3a54230` before and after; `git status
+--short` = this report only. `$TMPDIR` still holds four
+`oncotriage-admission-e1b-*` directories.
+
+Evidence root: `/private/tmp/claude-501/<project-slug>/0cab7ff8-a843-453e-af68-da81d177469e/scratchpad`
+-- driver `b4_run.py` (B3's `b3_run.py` with a fixed suite, a label, a pre-run
+process and load snapshot, and a `RESULTS:` parse), `evidence/b4_run{1,2,3}/`
+(`test.log`, `tw.jsonl`, `fault/`, `preflight.txt`, `summary.json`).
+
+#### 14.13.1 Method and containment
+
+- B1's `sx.sh`, `nonet.sb`, `tw/` and isoroot unchanged. Editable finder
+  stripped. `python -u tests/test_provider_resilience.py`, cwd the live
+  `03- Code`, `subprocess.Popen` with a new session, foreground, never under
+  `&`. Interpreter `/opt/anaconda3/bin/python3`. Driver SIGINT
+  `default_int_handler` in all three runs.
+- Bounds: driver `killpg SIGKILL` at 150 s; independent outer `perl alarm`
+  190 s around each driver. Neither fired.
+- One run at a time. Pre-run `ps` scan for `tests/test_`, `run_serial_tests`,
+  `ci_test_buckets`, `b?_run.py`, `sandbox-exec`: the only hit each time was
+  the launching shell's own command line (pid 63949 / 64033 / 64096). An
+  unrelated idle `python -` (pid 5531, 0.0% CPU, running 2d16h, cwd the
+  project) was present throughout; not a test process. Load averages (1 min)
+  3.07 / 2.83 / 2.65 before runs 1 / 2 / 3, from other applications.
+- Test file = HEAD blob (`git hash-object` = `HEAD:` blob). Live tree digest
+  `2fc195543bd2...`, the same as B3's runs, unchanged before and after each run.
+
+#### 14.13.2 Results
+
+| run | launch (UTC) | pid | exit | time | result | markers | other tripwire records |
+|---|---|---|---|---|---|---|---|
+| b4_run1 | 21:42:56 | 63954 | 0 | 15.4 s | 203/0/0 | 1 | none |
+| b4_run2 | 21:43:26 | 64038 | 0 | 14.8 s | 203/0/0 | 1 | none |
+| b4_run3 | 21:43:46 | 64101 | 0 | 7.8 s | 203/0/0 | 1 | none |
+
+Every run: launch pid = parent marker pid; unattached markers none;
+`sandbox_only_write: denied`; audit hook installed; editable finder stripped;
+profile sha256 `0e78e4017f1e...` at launch and after; no traceback; both decoys
+empty; fault files 64 bytes (the header line only, no dump). The suite spawns no
+child process in these runs (one marker each), so the B3 unmarked-descendant
+gap does not apply to it.
+
+#### 14.13.3 The `pr_solo` failure
+
+- **The saved log.** `4c06bc5d.../evidence/pr_solo/test_provider_resilience.log`,
+  born 11:55:04, last written 11:55:19, launched through that session's
+  `run.sh`. `RESULTS: 202 passed, 1 failed, 0 skipped`. The one failure:
+  section 7, "...and at the node level every attempt started >= one paced
+  interval after the one before", expected True, actual False. Source:
+  `tests/test_provider_resilience.py` line 2092, over run `_r7c`
+  (`{_lost: [throttle, throttle, ok], warmup: [throttle, ok]}`).
+- **How `pr_solo` was launched.** `run.sh` wraps each test in `( ... ) &` and
+  `wait`, uses `python` (not `-u`), and writes no launch record and no marker.
+  So its containment and its interpreter are not evidenced.
+- **Concurrency in that window.** Birth and last-write times of every saved
+  log: nothing else spans 11:55:04-11:55:19. `aff2/test_spend_gate.log` was
+  last written 11:54:57 with no summary and no exit trailer, so when its
+  process ended is NOT evidenced. `aff3` began 11:57:08. Supported: no other
+  saved test log was open. Not shown: that no other test process was alive.
+- **The code under test did not change.** No production file and not
+  `test_provider_resilience.py` was modified between 11:54:15 and 12:12:19
+  (14.1). `pr_diag/cur1-3` (11:57:17-11:57:52, "the tree at the time") and
+  `pr_diag/head1-3` each report 203/0/0. B4 on the post-D1 tree: 203/0/0 x3.
+  The same code has produced 202/1 and 203/0.
+- **What the check measures.** `Scripted.converse` logs `clock.now()` on the
+  shared `FakeClock` at the moment it is entered. The check sorts those logged
+  times and requires every consecutive gap >= the paced interval. The pacer
+  schedules starts `interval` apart (`reserve`), and `wait` loops
+  `sleep(min(remaining, poll))` until `now >= permit.start`. Every waiting
+  thread's sleep advances the one shared clock. So a thread's logged time is
+  `>= permit.start`, by an amount set by what other threads' sleeps did
+  between its `wait` returning and its `clock.now()` read. If an earlier
+  permit logs late and a later permit logs promptly, the sorted gap can fall
+  below the interval while the schedule itself was correct.
+- **DEMONSTRATED.**
+  1. The failure is non-deterministic on unchanged code (above). This rules
+     out a deterministic order dependence in this single-process script as
+     the sole cause.
+  2. A delay at exactly that point is sufficient to produce exactly this
+     failure. `copies/headdelay` and `copies/curdelay` add one line,
+     `time.sleep(0.02)` before the `clock.now()` read in `Scripted.converse`.
+     Verified in this batch: the `headdelay` test file equals the live test
+     except that line. `pr_race` headdelay1-2 and curdelay1-2 each report 202/1
+     with this check as the only failure.
+- **HYPOTHESIS, not demonstrated.** That `pr_solo`'s failure was produced by
+  this race and not by some other non-determinism. The log holds no timestamps
+  from the check, so the failure cannot be tied to the mechanism from saved
+  evidence. That the trigger was host scheduling (load from other
+  applications, the backgrounded launch) is also a hypothesis. Classification:
+  a timing assumption in the test harness (logged time read from a shared
+  virtual clock stands in for the permit's scheduled start). Not a leaked
+  resource: nothing in the evidence points to one.
+- **Section 6's claim "It failed (202/1) only when run beside other suites"
+  stays unsupported.** `new3` and `aff5` failed while other suites ran, and
+  `pr_solo` failed with no other saved log open.
+- **Verdict: UNRESOLVED as to cause.** The check is ESTABLISHED (line 2092,
+  run `_r7c`). Non-determinism and a sufficient mechanism are DEMONSTRATED.
+  Attribution of `pr_solo` to that mechanism is a HYPOTHESIS.
+- **Smallest check that would settle it (not run).** In a disposable copy,
+  make `Scripted.converse` also record the scheduled start of the permit its
+  attempt used (the last `PACER.history(_BEDROCK)` start for that thread), and
+  drive only the `_r7c` scenario in a loop (for example 500 iterations) under a
+  CPU-load generator, with no planted sleep. Settled if some iteration fails
+  the logged-time check while its scheduled starts are all >= the interval
+  apart, and no iteration shows scheduled starts closer than the interval.
+
+#### 14.13.4 B3 skips and network wording, restated
+
+- **`test_storage_run_identity`, 1 skip:** "...and it was READABLE, so that
+  comparison is not two sentinels". **`test_storage_write_durability`, 1 skip
+  (9c):** "...and it was readable, so that comparison is not None == None".
+  Both are the non-degeneracy probe for the production-database byte-identity
+  comparison. Each suite's stated reason: no production database exists at
+  the isolated root's `02- Data/03- Inferences Storage/inferences.db`, so the
+  comparison had nothing to exercise. The comparison itself stayed live and
+  would still catch a run that created the file. This is the designed outcome
+  under containment (isolated root, production never connected). Consequence:
+  B3 does not evidence that either comparison is non-degenerate.
+- **Network, B3.** `test_runner_crash_record_and_db_unification` produced 26
+  `connect-loopback` tripwire records (the closed-port Qdrant probe). No run in
+  B3 produced an external tripwire record. "No network attempts" is inaccurate
+  for B3; the accurate statement is "26 loopback connects in the crash-record
+  suite, no external access recorded". B4's three runs produced no non-marker
+  tripwire record of any kind.
+
+#### 14.13.5 Still unrecorded
+
+- The settling check in 14.13.3.
+- Marker coverage for children spawned with `PYTHONPATH` replaced, prepended
+  or popped (14.12.4), for the four suites named there.
+- Note: this batch's operator brief defines B5 as that instrumentation plus
+  re-runs of `test_ablation_stop_and_lock`, `test_runner_stop_switch`,
+  `test_runner_sigterm_shutdown` and `test_package_invariants`. 14.7 item 5
+  defines B5 differently (the `sim_after` and premise-after re-runs). Both
+  remain open; the brief's definition is taken as the next batch.
+- Carried unchanged: CLAUDE.md's end-state overclaims (14.9.5).
+
+#### 14.13.6 Next single batch
+
+**B5** (brief's definition): instrument the tripwire for children spawned with
+`PYTHONPATH` replaced, prepended or removed, then re-run
+`test_ablation_stop_and_lock`, `test_runner_stop_switch`,
+`test_runner_sigterm_shutdown` and `test_package_invariants`. Nothing in B4
+blocks it.
