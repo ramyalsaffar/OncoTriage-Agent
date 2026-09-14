@@ -16959,7 +16959,7 @@ registered reads as zero in its health record.
 # checkpoint directory is inside a tempfile.mkdtemp removed and asserted gone,
 # and the production inferences.db digest is compared at the end. It EXECS
 # NOTHING: children are scripts written into the temp tree. Bucket A.
-python tests/test_campaign_billing_record.py                        #  91 (MEASURED 2026-09-13 under the network sandbox and tripwire)
+python tests/test_campaign_billing_record.py                        #  97 (MEASURED 2026-09-13 by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
 ```
 
 **SEVENTEEN PLANTED REVERTS, SEVENTEEN CAUGHT, NONE ABORTING** -- each on a
@@ -17101,6 +17101,23 @@ when a predecessor has no registry, omits a required counter (named), or
 disagrees with its own meta count. **Consequence, stated: no database written
 before era 18 can be reused through the historical path.**
 
+**THE P2 RECOVERY FOUND THREE DEFECTS, DROVE EACH, AND FIXED THEM.**
+(i) **The refusal could fail to name its counter.** `detail` was `notes[:10]`, so
+a chain whose predecessors each carried a cohort and a finalization note filled
+the cap first and printed `counter_registration_unproven` naming nothing (six
+predecessors). `HistoricalEvidence.unproven_counters` now carries the names, and
+they lead the untruncated part of `detail`. (ii) **A flush without names left
+the previous flush's registry in place** beside a replaced health record. The
+registry rows are now deleted on every flush and inserted only when names are
+given. (iii) **The reader took any registry as the health record's own.** A
+registry now counts only when its rows carry the meta row's `written_at`, no
+name repeats, its distinct count equals the meta count, and every counter the
+health record values is registered. Failing any of those leaves EVERY required
+counter unproven; a consistent registry that lacks a counter names exactly that
+counter. The production database's one campaign, probed on a backup copy with
+the source opened `mode=ro`, is refused naming all six. See
+`RECOVERY_P2_REPORT.md`.
+
 **P3 -- ONE CAMPAIGN IDENTITY.** `runs.billing_campaign_id` (era 18) is stamped
 durably by `set_run_billing_campaign_id` before the first billed call.
 `queries._CAMPAIGN_EDGE_SQL` stitches on it first; only a run without one falls
@@ -17164,7 +17181,7 @@ on darwin (which re-opens the drive-cache window). Linux containers ignore
 # SPEND, no model load, no corpus. Children run the real main() with stand-in
 # clients and a closed Qdrant port. NOT in the collision matrix; the production
 # digest is compared at the end. It EXECS NOTHING. Bucket A.
-python tests/test_billing_closure.py                                # 178 (MEASURED 2026-09-13 by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
+python tests/test_billing_closure.py                                # 190 (MEASURED 2026-09-13 by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
 ```
 
 **NINETEEN REVERTS, NINETEEN CAUGHT**, each in a copied tree with the editable

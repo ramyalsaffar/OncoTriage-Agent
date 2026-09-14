@@ -151,6 +151,15 @@ def at(container, key, why=None):
         return _Absent(why or f"{type(exc).__name__}: {key!r}")
 
 
+def field(obj, name):
+    """An ATTRIBUTE read that cannot abort the file -- `at` subscripts, and a
+    NamedTuple field read by subscript raises TypeError."""
+    try:
+        return getattr(obj, name)
+    except Exception as exc:                                   # noqa: BLE001
+        return _Absent(f"{type(exc).__name__}: .{name}")
+
+
 def raised(fn, *args, **kwargs):
     try:
         fn(*args, **kwargs)
@@ -750,8 +759,12 @@ check("2c the runner's flush_health records the live registry's names",
            (_R2b,)))), (True, sorted(_NAMES)))
 
 
-def legacy_chain(tag, mutate=None):
-    """A predecessor run that would be COVERED, and the run resuming it."""
+def legacy_chain(tag, mutate=None, reflush=None):
+    """A predecessor run that would be COVERED, and the run resuming it.
+
+    ``reflush(db, run_id)`` runs after the registered flush and before
+    ``mutate`` -- a second writer-side flush, which is the only honest way to
+    produce a registry the WRITER left behind rather than one hand-edited."""
     db = new_db(f"p2_legacy_{tag}.db")
     r1 = _dl.start_run_record("batch", db_path=db, fingerprint=FIXED_FP,
                               resumed=False)
@@ -766,6 +779,8 @@ def legacy_chain(tag, mutate=None):
     conn.close()
     _dl.flush_run_metrics(r1, {}, len(_NAMES), db_path=db,
                           registered_names=_NAMES)
+    if reflush is not None:
+        reflush(db, r1)
     _dl.finalize_run_record(r1, "FAILED", db_path=db)
     if mutate is not None:
         conn = sqlite3.connect(db)
@@ -788,10 +803,20 @@ check("2e *** a database with NO counter registry (pre-era-18) is REFUSED, by "
       "name -- an absent counter row no longer reads as zero ***",
       (_dropped.covered, "counter_registration_unproven" in _dropped.reasons,
        "recorded no counter registry" in _dropped.detail), (False, True, True))
-_missing = legacy_chain(
-    "missing_one",
-    lambda c, r: c.execute("DELETE FROM run_counter_registry WHERE run_id = ? "
-                           "AND name = 'PROVIDER_UNCONFIRMED_BILLING'", (r,)))
+def _build_lacking(counter):
+    """What a build that NEVER REGISTERED ``counter`` writes: the writer keeps
+    the registry and the meta count in step, so BOTH are one short. Deleting
+    the row alone would model a corrupt registry instead (2i-iii)."""
+    def mutate(c, r):
+        c.execute("DELETE FROM run_counter_registry WHERE run_id = ? AND "
+                  "name = ?", (r, counter))
+        c.execute("UPDATE run_metrics SET value = value - 1 WHERE run_id = ? "
+                  "AND category = 'meta' AND name = 'counters_registered'", (r,))
+    return mutate
+
+
+_missing = legacy_chain("missing_one",
+                        _build_lacking("PROVIDER_UNCONFIRMED_BILLING"))
 check("2f *** a registry that omits ONE required counter is REFUSED, naming "
       "that counter ***",
       (_missing.covered, "counter_registration_unproven" in _missing.reasons,
@@ -808,6 +833,145 @@ check("2h the reason is a member of the closed vocabulary, and every OTHER "
       "condition still stands beside it",
       ("counter_registration_unproven" in _dl.HISTORICAL_COVERAGE_REASONS,
        len(_dl.HISTORICAL_COVERAGE_REASONS)), (True, 11))
+
+# ---- the P2 recovery: the refusal NAMES its counters, and a registry counts
+#      only when it is the health record's own. Every scenario below was driven
+#      as a defect against the inherited code before the fix existed.
+_REQUIRED = tuple(_dl.HISTORICAL_UNRECORDED_BILLING_COUNTERS)
+check("2i the clean control names no unproven counter",
+      (field(_covered, "unproven_counters"), "unproven" in str(_covered.detail)),
+      ((), False))
+check("2i-i a database with no registry leaves EVERY required counter "
+      "unproven, by name",
+      field(_dropped, "unproven_counters"), _REQUIRED)
+check("2i-ii a build that never registered one counter names exactly that "
+      "counter -- and nothing else is unproven",
+      (field(_missing, "unproven_counters"),
+       "not its health record's own" in _missing.detail),
+      (("PROVIDER_UNCONFIRMED_BILLING",), False))
+_corrupt = legacy_chain(
+    "row_deleted_count_kept",
+    lambda c, r: c.execute("DELETE FROM run_counter_registry WHERE run_id = ? "
+                           "AND name = 'PROVIDER_UNCONFIRMED_BILLING'", (r,)))
+check("2i-iii a registry row deleted with the meta count left as written is a "
+      "registry that is NOT the health record's own: every required counter "
+      "unproven, not just the deleted one",
+      (_corrupt.covered, field(_corrupt, "unproven_counters"),
+       "not its health record's own" in _corrupt.detail),
+      (False, _REQUIRED, True))
+
+
+def legacy_chain_many(tag, n, mutate):
+    """``n`` stitched predecessors, each would-be covered, then ``mutate``."""
+    db = new_db(f"p2_many_{tag}.db")
+    prior = []
+    for i in range(n):
+        r = _dl.start_run_record("batch", db_path=db, fingerprint=FIXED_FP,
+                                 resumed=bool(i))
+        conn = sqlite3.connect(db)
+        conn.execute("UPDATE runs SET cohort_digest = 'dig' WHERE id = ?", (r,))
+        conn.execute(
+            "INSERT INTO inferences (patient_id, timestamp, estimated_cost_usd, "
+            "llm_classifier_retries, retrieval_channels, run_id) VALUES "
+            "(?, '2026-09-01T00:00:00', 0.1, 0, ?, ?)",
+            (f"p{i}", json.dumps({"dense": {"status": "ablated"}}), r))
+        conn.commit()
+        conn.close()
+        _dl.flush_run_metrics(r, {}, len(_NAMES), db_path=db,
+                              registered_names=_NAMES)
+        _dl.finalize_run_record(r, "FAILED", db_path=db)
+        prior.append(r)
+    conn = sqlite3.connect(db)
+    mutate(conn)
+    conn.commit()
+    conn.close()
+    r_next = _dl.start_run_record("batch", db_path=db, fingerprint=FIXED_FP,
+                                  resumed=True)
+    return _dl.historical_campaign_evidence(r_next, "dig", db_path=db)
+
+
+def _crowd(conn):
+    conn.execute("DELETE FROM run_counter_registry "
+                 "WHERE name = 'PROVIDER_UNCONFIRMED_BILLING'")
+    conn.execute("UPDATE run_metrics SET value = value - 1 WHERE "
+                 "category = 'meta' AND name = 'counters_registered'")
+    conn.execute("UPDATE runs SET cohort_digest = 'other', finished_at = NULL")
+
+
+_many = legacy_chain_many("crowded", 6, _crowd)
+check("2j non-degeneracy: six predecessors each carry a cohort AND a "
+      "finalization note, so ten other notes fill the cap before the registry "
+      "notes are reached",
+      (_many.reasons, _many.run_ids),
+      (("cohort_mismatch", "not_cleanly_finalized",
+        "counter_registration_unproven"), (1, 2, 3, 4, 5, 6)))
+check("2j-i *** the refusal still NAMES the counter, in the field AND in the "
+      "printed detail -- it used to be truncated away ***",
+      (field(_many, "unproven_counters"),
+       "PROVIDER_UNCONFIRMED_BILLING" in str(_many.detail)),
+      (("PROVIDER_UNCONFIRMED_BILLING",), True))
+
+_reflushed = legacy_chain(
+    "reflushed",
+    reflush=lambda db, r: _dl.flush_run_metrics(r, {}, len(_NAMES), db_path=db))
+check("2k *** a flush WITHOUT names removes the previous flush's registry, so "
+      "the health record is no longer read beside another flush's counters ***",
+      (_reflushed.covered, "counter_registration_unproven" in _reflushed.reasons,
+       field(_reflushed, "unproven_counters")), (False, True, _REQUIRED))
+
+_stale = legacy_chain(
+    "stale_stamp",
+    lambda c, r: c.execute("UPDATE run_counter_registry SET written_at = "
+                           "'2000-01-01T00:00:00' WHERE run_id = ?", (r,)))
+check("2l *** a registry stamped by a different flush than the health record "
+      "is REFUSED, every required counter unproven ***",
+      (_stale.covered, "different flush" in _stale.detail,
+       field(_stale, "unproven_counters")), (False, True, _REQUIRED))
+
+_orphan = legacy_chain(
+    "orphan_value",
+    lambda c, r: c.execute(
+        "INSERT INTO run_metrics (run_id, category, name, value, written_at) "
+        "SELECT run_id, 'degradation', 'NOT_A_REGISTERED_COUNTER', 3, "
+        "written_at FROM run_metrics WHERE run_id = ? AND category = 'meta' "
+        "LIMIT 1", (r,)))
+check("2m *** a health record valuing a counter its registry does not name is "
+      "REFUSED -- the two were not produced together ***",
+      (_orphan.covered, "NOT_A_REGISTERED_COUNTER" in _orphan.detail,
+       field(_orphan, "unproven_counters")), (False, True, _REQUIRED))
+
+_repeat = legacy_chain(
+    "repeated_name",
+    lambda c, r: c.execute(
+        "INSERT INTO run_counter_registry (run_id, name, written_at) SELECT "
+        "run_id, name, written_at FROM run_counter_registry WHERE run_id = ? "
+        "LIMIT 1", (r,)))
+check("2n a registry repeating a name (distinct count still equals the meta "
+      "count) is REFUSED",
+      (_repeat.covered, "repeated name" in _repeat.detail),
+      (False, True))
+_two_meta = legacy_chain(
+    "two_meta_rows",
+    lambda c, r: c.execute(
+        "INSERT INTO run_metrics (run_id, category, name, value, written_at) "
+        "SELECT run_id, category, name, value, written_at FROM run_metrics "
+        "WHERE run_id = ? AND category = 'meta' AND "
+        "name = 'counters_registered'", (r,)))
+check("2n-i a health record with TWO counters_registered meta rows is not one "
+      "flush's record: REFUSED, every required counter unproven",
+      (_two_meta.covered, "2 meta rows" in _two_meta.detail,
+       field(_two_meta, "unproven_counters")), (False, True, _REQUIRED))
+_R2c = _dl.start_run_record("batch", db_path=_DB2, fingerprint=FIXED_FP)
+_dl.flush_run_metrics(_R2c, {}, len(_NAMES), db_path=_DB2,
+                      registered_names=_NAMES)
+check("2o the writer: a names-less flush leaves this run with NO registry rows "
+      "and another run's untouched",
+      (_dl.flush_run_metrics(_R2c, {}, len(_NAMES), db_path=_DB2),
+       ro_rows(_DB2, "SELECT COUNT(*) FROM run_counter_registry WHERE "
+                     "run_id = ?", (_R2c,))[0][0],
+       ro_rows(_DB2, "SELECT COUNT(*) FROM run_counter_registry WHERE "
+                     "run_id = ?", (_R2,))[0][0]),
+      (True, 0, len(_NAMES)))
 
 
 # ===========================================================================

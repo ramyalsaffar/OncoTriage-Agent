@@ -5670,10 +5670,15 @@ class BillingRecordSink:
 #   counter_registration_unproven  a predecessor's health record does not show
 #                           that each counter below was REGISTERED when it was
 #                           flushed (``run_counter_registry``, era 18), or its
-#                           registry disagrees with its own meta count. An
-#                           absent ``run_metrics`` row means zero only for a
-#                           counter the producing build registered; for any
-#                           other it means nothing, and is refused by name.
+#                           registry is not the health record's own (another
+#                           flush's timestamp, a repeated name, a count that
+#                           disagrees with the meta row, or a valued counter
+#                           it does not name). An absent ``run_metrics`` row
+#                           means zero only for a counter the producing build
+#                           registered; for any other it means nothing, and is
+#                           refused by name -- ``HistoricalEvidence.
+#                           unproven_counters`` carries the names and they lead
+#                           the untruncated part of ``detail``.
 #   unrecorded_billing_signal  a counter that marks billing absent from the rows
 #                           is non-zero: a lost row write, a possibly-billed
 #                           transport failure, a retried attempt, an unpriced
@@ -5728,6 +5733,11 @@ class HistoricalEvidence(NamedTuple):
     rows: int = 0
     run_ids: tuple = ()
     detail: str = ""
+    # THE REQUIRED COUNTERS WHOSE ZERO IS NOT PROVEN (the P2 recovery), in
+    # ``HISTORICAL_UNRECORDED_BILLING_COUNTERS`` order. A field rather than
+    # prose only, because ``detail`` is truncated and a refusal that must name
+    # its counter cannot depend on how many other notes came first.
+    unproven_counters: tuple = ()
 
 
 def historical_campaign_evidence(run_id, cohort_digest, db_path=None
@@ -5761,8 +5771,8 @@ def historical_campaign_evidence(run_id, cohort_digest, db_path=None
                 f"SELECT COUNT(*) FROM billing_attempts WHERE run_id IN "
                 f"({marks})", prior).fetchone()[0]
             metrics = conn.execute(
-                f"SELECT run_id, category, name, value FROM run_metrics "
-                f"WHERE run_id IN ({marks})", prior).fetchall()
+                f"SELECT run_id, category, name, value, written_at FROM "
+                f"run_metrics WHERE run_id IN ({marks})", prior).fetchall()
             inference_rows = conn.execute(
                 f"SELECT estimated_cost_usd, llm_classifier_retries, "
                 f"retrieval_channels FROM inferences WHERE run_id IN ({marks})",
@@ -5773,8 +5783,9 @@ def historical_campaign_evidence(run_id, cohort_digest, db_path=None
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND "
                 "name = 'run_counter_registry'").fetchone()[0] > 0
             registry = (conn.execute(
-                f"SELECT run_id, name FROM run_counter_registry WHERE run_id "
-                f"IN ({marks})", prior).fetchall() if has_registry else [])
+                f"SELECT run_id, name, written_at FROM run_counter_registry "
+                f"WHERE run_id IN ({marks})", prior).fetchall()
+                if has_registry else [])
         finally:
             conn.close()
     except Exception as exc:                                   # noqa: BLE001
@@ -5794,41 +5805,87 @@ def historical_campaign_evidence(run_id, cohort_digest, db_path=None
     if billed:
         reasons.append("billed_run_without_campaign")
         notes.append(f"{billed} billing row(s) already name a predecessor run")
-    measured = {r for r, cat, name, _v in metrics
+    measured = {r for r, cat, name, _v, _w in metrics
                 if cat == RUN_METRIC_CATEGORY_META
                 and name == RUN_METRIC_META_COUNTERS_REGISTERED}
     for rid in prior:
         if rid not in measured:
             reasons.append("health_record_absent")
             notes.append(f"run {rid} has no health record")
-    # POSITIVE EVIDENCE THAT EACH REQUIRED COUNTER EXISTED AND WAS CONSULTED.
-    # Without it the `value` test below reads an unregistered counter's absent
-    # row as a zero it never measured.
-    meta_count = {r: v for r, cat, name, v in metrics
-                  if cat == RUN_METRIC_CATEGORY_META
-                  and name == RUN_METRIC_META_COUNTERS_REGISTERED}
-    names_by_run = {}
-    for rid, name in registry:
-        names_by_run.setdefault(rid, set()).add(name)
+    # POSITIVE EVIDENCE THAT EACH REQUIRED COUNTER EXISTED AND WAS CONSULTED
+    # BY THE FLUSH THAT WROTE THE HEALTH RECORD BEING READ. Without it the
+    # `value` test below reads an unregistered counter's absent row as a zero
+    # it never measured.
+    #
+    # A REGISTRY IS EVIDENCE ONLY WHEN IT IS THE HEALTH RECORD'S OWN, and four
+    # things are checked because each is a way for it not to be (the P2
+    # recovery; the first three were driven as defects before they were added):
+    #   * its rows carry the meta row's `written_at`. `flush_run_metrics`
+    #     writes both in one transaction under one timestamp, so a registry
+    #     stamped differently describes some OTHER flush's counters;
+    #   * no name repeats, and the distinct count equals the meta count;
+    #   * every counter the health record carries a value for is registered --
+    #     a value for an unregistered name means the two were not produced
+    #     together;
+    #   * every required counter is registered.
+    # A registry failing any of the first three proves nothing about ANY
+    # counter, so every required counter is unproven; the fourth names only
+    # the counters it lacks.
+    meta = {}
+    for r, cat, name, v, w in metrics:
+        if (cat == RUN_METRIC_CATEGORY_META
+                and name == RUN_METRIC_META_COUNTERS_REGISTERED):
+            meta.setdefault(r, []).append((v, w))
+    valued = {}
+    for r, cat, name, _v, _w in metrics:
+        if cat == RUN_METRIC_CATEGORY_DEGRADATION:
+            valued.setdefault(r, set()).add(name)
+    rows_by_run = {}
+    for rid, name, written_at in registry:
+        rows_by_run.setdefault(rid, []).append((name, written_at))
+    unproven = set()
     for rid in prior:
         if rid not in measured:
             continue
-        names = names_by_run.get(rid)
-        if names is None:
+        rows = rows_by_run.get(rid)
+        if not rows:
             reasons.append("counter_registration_unproven")
+            unproven.update(HISTORICAL_UNRECORDED_BILLING_COUNTERS)
             notes.append(f"run {rid} recorded no counter registry, so an "
                          f"absent counter row proves nothing")
             continue
-        if len(names) != meta_count.get(rid):
+        names = {n for n, _w in rows}
+        stamps = {w for _n, w in rows}
+        run_meta = meta[rid]
+        meta_value, meta_stamp = run_meta[0]
+        inconsistent = []
+        if len(run_meta) != 1:
+            inconsistent.append(f"{len(run_meta)} meta rows")
+        if stamps != {meta_stamp}:
+            inconsistent.append("registry written by a different flush than "
+                                "the health record")
+        if len(rows) != len(names):
+            inconsistent.append(f"{len(rows) - len(names)} repeated name(s)")
+        if len(names) != meta_value:
+            inconsistent.append(f"registry names {len(names)} counter(s) and "
+                                f"its health record says {meta_value}")
+        orphans = sorted(valued.get(rid, set()) - names)
+        if orphans:
+            inconsistent.append(f"health record values unregistered "
+                                f"{', '.join(orphans)}")
+        if inconsistent:
             reasons.append("counter_registration_unproven")
-            notes.append(f"run {rid} registry names {len(names)} counter(s) "
-                         f"and its health record says {meta_count.get(rid)}")
+            unproven.update(HISTORICAL_UNRECORDED_BILLING_COUNTERS)
+            notes.append(f"run {rid} counter registry is not its health "
+                         f"record's own: {'; '.join(inconsistent)}")
+            continue
         missing = [c for c in HISTORICAL_UNRECORDED_BILLING_COUNTERS
                    if c not in names]
         if missing:
             reasons.append("counter_registration_unproven")
+            unproven.update(missing)
             notes.append(f"run {rid} never registered {', '.join(missing)}")
-    for rid, cat, name, value in metrics:
+    for rid, cat, name, value, _w in metrics:
         if (cat == RUN_METRIC_CATEGORY_DEGRADATION
                 and name in HISTORICAL_UNRECORDED_BILLING_COUNTERS and value):
             reasons.append("unrecorded_billing_signal")
@@ -5852,10 +5909,20 @@ def historical_campaign_evidence(run_id, cohort_digest, db_path=None
             reasons.append("embedding_spend_not_on_rows")
 
     unique = tuple(r for r in HISTORICAL_COVERAGE_REASONS if r in reasons)
+    unproven_counters = tuple(c for c in HISTORICAL_UNRECORDED_BILLING_COUNTERS
+                              if c in unproven)
+    # THE UNPROVEN COUNTERS LEAD THE DETAIL AND ARE NEVER TRUNCATED. The notes
+    # are capped at ten, and a chain whose runs each carry a cohort and a
+    # finalization note filled the cap before the registry notes were reached,
+    # so the refusal printed `counter_registration_unproven` without naming a
+    # single counter -- driven with six predecessors before this line existed.
+    lead = ([f"unproven counter(s): {', '.join(unproven_counters)}"]
+            if unproven_counters else [])
     return HistoricalEvidence(covered=not unique, reasons=unique,
                               usd=usd if not unique else 0.0,
                               rows=len(inference_rows), run_ids=prior,
-                              detail="; ".join(notes[:10]))
+                              detail="; ".join(lead + notes[:10]),
+                              unproven_counters=unproven_counters)
 
 
 def record_historical_evidence(db_path, *, campaign_id, run_id,
@@ -6644,8 +6711,9 @@ def flush_run_metrics(run_id, totals, counters_registered, db_path=None,
     ``totals``, and is written to ``run_counter_registry`` in the same
     transaction -- that record is what lets a later reader treat a counter's
     missing ``run_metrics`` row as a measured zero. ``None`` writes no registry
-    rows, which a reader must treat as "which counters were consulted is not
-    recorded".
+    rows AND REMOVES any this run already had, so the health record never sits
+    beside a registry some other flush wrote; a reader must treat the absence
+    as "which counters were consulted is not recorded".
 
     Args:
         run_id: what ``start_run_record`` returned. ``None`` is tolerated and
@@ -6788,10 +6856,23 @@ def flush_run_metrics(run_id, totals, counters_registered, db_path=None,
                     "VALUES (?, ?, ?, ?, ?)",
                     [(run_id, category, name, value, written_at)
                      for category, name, value in rows])
-                if registered_names is not None:
+                # THE REGISTRY IS REPLACED ON EVERY FLUSH, NAMES OR NOT (the P2
+                # recovery). It used to be deleted only when names were given,
+                # so a flush without names replaced the health record and LEFT
+                # the previous flush's registry beside it -- a registry
+                # describing counters a different flush consulted, presented
+                # as this record's proof of a zero. Driven before this line
+                # existed. The table check keeps a names-less flush working
+                # against a database this process initialized before the table
+                # was dropped; a flush WITH names still fails loudly there.
+                has_registry = cursor.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'run_counter_registry'").fetchone()[0] > 0
+                if has_registry:
                     cursor.execute(
                         "DELETE FROM run_counter_registry WHERE run_id = ?",
                         (run_id,))
+                if registered_names is not None:
                     cursor.executemany(
                         "INSERT INTO run_counter_registry "
                         "(run_id, name, written_at) VALUES (?, ?, ?)",

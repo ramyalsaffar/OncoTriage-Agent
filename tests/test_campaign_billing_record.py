@@ -1269,7 +1269,9 @@ def _make_legacy(tag, mutate_sql=None):
             "(?, '2026-09-01T00:00:00', ?, 0, ?, 1)",
             (pid, cost, json.dumps({"dense": {"status": "ablated"}})))
     if mutate_sql:
-        dst.execute(mutate_sql)
+        for statement in ((mutate_sql,) if isinstance(mutate_sql, str)
+                          else mutate_sql):
+            dst.execute(statement)
     dst.commit()
     dst.close()
     return db, cp
@@ -1316,6 +1318,47 @@ for _tag, _sql, _reason in (
           (_latest, _billed,
            os.path.exists(os.path.join(_cpu, _runner.CAMPAIGN_RECORD_FILENAME))),
           (("KILLED", None), 0, False))
+
+# ---- 6F: the counter registry through the REAL main() (the P2 recovery).
+# 6q is the positive control for these: the same legacy state, its registry
+# intact as the producing child wrote it, is COVERED. Each case below changes
+# only the registry, so a refusal here is about the registry and nothing else.
+for _tag, _sql, _names in (
+        # A BUILD THAT NEVER REGISTERED ONE COUNTER: the writer keeps the
+        # registry and the meta count in step, so both are one short.
+        ("registry_lacks_counter",
+         ("DELETE FROM run_counter_registry "
+          "WHERE name = 'PROVIDER_UNCONFIRMED_BILLING'",
+          "UPDATE run_metrics SET value = value - 1 WHERE category = 'meta' "
+          "AND name = 'counters_registered'"),
+         ("PROVIDER_UNCONFIRMED_BILLING",)),
+        # A PRE-ERA-18 DATABASE: no registry table and an older stamp. The child
+        # migrates it on open, so the table exists again and is EMPTY for the
+        # predecessor -- exactly what a real era-17 campaign looks like to this
+        # build.
+        ("pre_era_18",
+         ("DROP TABLE run_counter_registry", "PRAGMA user_version = 17"),
+         tuple(_dl.HISTORICAL_UNRECORDED_BILLING_COUNTERS))):
+    _dbu, _cpu = _make_legacy(_tag, _sql)
+    _pu, _pud = child("observe", db=_dbu, cp=_cpu, corpus=_CORP_H, cap=100.0)
+    _text = _pu.stdout + _pu.stderr
+    _conn = sqlite3.connect(_dbu)
+    _latest = _conn.execute(
+        "SELECT status FROM runs ORDER BY id DESC LIMIT 1").fetchone()
+    _billed = _conn.execute("SELECT COUNT(*) FROM billing_attempts").fetchone()[0]
+    _conn.close()
+    check(f"6t-{_tag} *** refused through main() under "
+          f"counter_registration_unproven, before paid work ***",
+          (_pu.returncode, _pud is None,
+           "REFUSING TO START PAID WORK: historical_spend_uncovered" in _text,
+           "counter_registration_unproven" in _text), (1, True, True, True))
+    check(f"6t-{_tag}-i ...and the printed refusal NAMES exactly the unproven "
+          f"counters -- no fewer, and no others",
+          f"unproven counter(s): {', '.join(_names)};" in _text, True)
+    check(f"6t-{_tag}-ii ...run row KILLED, nothing billed, no campaign record",
+          (_latest, _billed,
+           os.path.exists(os.path.join(_cpu, _runner.CAMPAIGN_RECORD_FILENAME))),
+          (("KILLED",), 0, False))
 
 
 #------------------------------------------------------------------------------
