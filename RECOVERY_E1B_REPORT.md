@@ -1185,3 +1185,191 @@ Decoys `decoy_sandbox_only` and `decoy_protected` empty after every run.
 **B3** (14.7 item 3): the suites not run since the D1 edit, under the same
 containment, one at a time, foreground, `test_runner_stop_switch` and
 `test_runner_sigterm_shutdown` last and sequentially.
+
+### 14.12 Batch B3 -- affected suites lacking valid evidence (2026-09-14)
+
+Written for: the operator and the session that runs B4. Run only. No production
+source, no test file edited; no commit, stash, branch change, reset or cleanup;
+no paid call; no production database connected. `git log -1` = `95c9130`;
+`git status --short` clean at start.
+
+Evidence root (this session's scratchpad):
+`/private/tmp/claude-501/<project-slug>/7744765a-7add-44e7-b5f6-3c29697325b8/scratchpad`
+-- driver `b3_run.py`, `evidence/<suite>/{test.log, tw.jsonl, fault/, summary.json}`.
+
+#### 14.12.1 D1, verified
+
+- **D1 is the cancellation-counter fix** (section 10, "a policy-seen
+  cancellation was counted `failed`"). Verified by diffing the E1b session's
+  `copies/fc_premise` against the tree: the only differences are
+  `end_admission_wait(self, cancelled=False)` in `agent/evaluation.py` and
+  `_end_admission_wait(..., cancelled=False)` plus its two `cancelled=True`
+  call sites in `provider_resilience.py`. Both files mtime 12:12:19.
+- **Production has not changed since.** `git diff --name-only 81fd5c7 HEAD` is
+  `RECOVERY_E1B_REPORT.md` and `tests/test_admission_replay_and_wait.py` only.
+  The only test file changed after D1 is the new test (B1-fix, `0f12013`),
+  which no other suite imports; it invalidates no other suite.
+
+#### 14.12.2 Suite list and reasons
+
+Universe: section 6's affected suites. Valid evidence = a run on post-D1
+production with B1's containment evidence (launch record + per-process
+tripwire-loaded markers with the sandbox-only denied write).
+
+- **Group A -- never run on post-D1 production** (last evidence `aff4`/`aff5`/
+  `aff6`, all pre-D1; 14.3): `test_spend_coverage`, `test_spend_budget_split`,
+  `test_storage_run_identity`, `test_storage_schema_guards`,
+  `test_storage_run_metrics_flush`, `test_ablation_stop_and_lock`,
+  `test_api_shutdown_gate`, `test_mcp_deidentified_responses`,
+  `test_runner_crash_record_and_db_unification`,
+  `test_storage_write_durability`, `test_runner_stop_switch`,
+  `test_runner_sigterm_shutdown`.
+- **Group B -- post-D1 production, but containment unevidenced.** The `aff7`
+  runs used `run.sh`: the old tripwire wrote no load marker, so "no tripwire
+  log" cannot be told from an unarmed run (14.3), and all eleven ran
+  concurrently under `&`. Their test files are unchanged since. Suites:
+  `test_agent_bedrock_anthropic_per_trial`, `test_degradation_counter_readers`,
+  `test_agent_stage5_attempt_provenance`, `test_spend_gate`,
+  `test_budget_admission`, `test_agent_stage5_per_trial_calls`,
+  `test_package_invariants`, `test_campaign_billing_record`,
+  `test_billing_closure`.
+- **Not on the list, with reasons:**
+  - `test_admission_replay_and_wait`: valid evidence from B2 (live tree 71/0
+    under full containment, 14.11).
+  - `test_provider_resilience`: same gap as group B, but it is B4's subject
+    (alone, three times, U9); running it here would pre-empt that batch.
+
+Expected counts are the last recorded ones (aff4-aff7), under the isolated
+root: 169, 79, 158 (+1 gated skip), 136, 130, 161, 78, 99, 65, 121 (+1 gated
+skip), 146, 95; and 213, 160, 55, 167, 67, 372, 261/0/0, 128, 388/0/0.
+
+#### 14.12.3 Method and containment
+
+- `b3_run.py` runs ONE suite per invocation: B1's `sx.sh` (sandbox launch
+  record before exec), `nonet.sb` (profile sha256 recorded per run), `tw/`
+  (per-process `tripwire-loaded` markers with the sandbox-only decoy write),
+  B1's isoroot as `ONCOTRIAGE_MAIN_PATH`, editable finder stripped,
+  `python -u tests/<suite>.py` with cwd = the live `03- Code`, `subprocess.Popen`
+  (new session), foreground, never under `&`. Interpreter
+  `/opt/anaconda3/bin/python3`; driver SIGINT `default_int_handler` every run.
+- Bounds: per-run driver kill (`killpg SIGKILL`) 150 s for suites whose
+  recorded time was <= 28 s (>= 5x); 540 s for the child-process suites;
+  plus an independent outer `perl alarm` (190 s / 580 s) around each driver.
+- Per run the summary records: exit, kill, elapsed, summary lines, FAIL lines,
+  traceback count, a sha256 over every `oncotriage/**/*.py` and `tests/**/*.py`
+  before and after (`tree_same`), launch pid vs parent marker, every marker's
+  ppid, unattached markers, sandbox-denied / audit-hook / strip flags on every
+  marker, and every non-marker tripwire record.
+- The four `oncotriage-admission-e1b-*` temp dirs were not touched.
+
+#### 14.12.4 Results
+
+All rows: live tree unchanged before/after, launch pid = parent marker pid,
+**unattached markers: none**, every marker `sandbox_only_write: denied`, audit
+hook installed, editable finder stripped; no external tripwire record; decoys
+empty.
+
+| suite | group | bound | exit | time | result | markers | other tripwire records |
+|---|---|---|---|---|---|---|---|
+| test_spend_budget_split | A | 540 | 0 | 2.8 s | 79/0 | 1 | none |
+| test_spend_coverage | A | 150 | 0 | 5.9 s | 169/0 | 2 | none |
+| test_storage_run_identity | A | 150 | 0 | 1.5 s | 158/0, 1 skip | 2 | none |
+| test_storage_schema_guards | A | 150 | 0 | 1.9 s | 136/0/0 | 1 | none |
+| test_storage_run_metrics_flush | A | 150 | 0 | 25.6 s | 130/0 | 2 | none |
+| test_api_shutdown_gate | A | 150 | 0 | 2.8 s | 78/0 | 1 | none |
+| test_mcp_deidentified_responses | A | 150 | 0 | 1.4 s | 99/0 | 1 | none |
+| test_runner_crash_record_and_db_unification | A | 150 | 0 | 12.0 s | 65/0/0 | 2 | connect-loopback 26 (closed-port probe; same count as pre-D1 `aff5`) |
+| test_storage_write_durability | A | 150 | 0 | 2.5 s | 121/0, 1 skip | 1 | none |
+| test_agent_bedrock_anthropic_per_trial | B | 150 | 0 | 3.5 s | 213/0 | 1 | none |
+| test_degradation_counter_readers | B | 150 | 0 | 2.5 s | 160/0 | 1 | none |
+| test_agent_stage5_attempt_provenance | B | 150 | 0 | 1.6 s | 55/0 | 1 | none |
+| test_spend_gate | B | 150 | 0 | 3.8 s | 167/0 | 2 | none |
+| test_budget_admission | B | 150 | 0 | 19.4 s | 67/0 | 23 | none |
+| test_agent_stage5_per_trial_calls | B | 150 | 0 | 17.8 s | 372/0 | 1 | none |
+
+- `test_mcp_deidentified_responses` prints 2 tracebacks with 99/0: both are the
+  server's own logged `IdentifierLeakError` refusals (after checks 4k and 6e),
+  which the suite drives on purpose. The pre-D1 `aff5` log has the same 2.
+
+Continuation, longer suites (540 s driver bound, 580 s outer alarm), same
+containment facts as the rows above:
+
+| suite | group | bound | exit | time | result | markers | other tripwire records |
+|---|---|---|---|---|---|---|---|
+| test_ablation_stop_and_lock | A | 540 | 0 | 29.0 s | 161/0 | 1 | none |
+| test_package_invariants | B | 540 | 0 | 60.6 s | 261/0/0 | 6 | none |
+| test_campaign_billing_record | B | 540 | 0 | 63.7 s | 128/0 | 63 | none |
+
+- **Containment gap: some descendant processes carry no marker, and that is not
+  "unattached".** Read from the test sources, not from a probe:
+  `test_ablation_stop_and_lock` (line 1505), `test_runner_stop_switch` (1139)
+  and `test_runner_sigterm_shutdown` (788) build child envs as
+  `dict(os.environ)` with `PYTHONPATH` REPLACED by their own hook dir, tests/
+  and the repo; `test_package_invariants._run` (386-388) prepends or POPS
+  `PYTHONPATH`. Those children do not import B1's `sitecustomize`, so the
+  tripwire is not armed in them and they write no marker (ablation: 1 marker
+  for a suite that spawns real subprocesses). What they do inherit: the
+  sandbox (`sandbox-exec` policy applies to descendants), `ONCOTRIAGE_MAIN_PATH`
+  = isoroot, `HF_HUB_OFFLINE=1`, and each suite's own closed-port
+  `ONCOTRIAGE_QDRANT_URL`. So for those processes network denial rests on the
+  sandbox alone, and their count cannot be enumerated from these logs (the
+  marker count is a lower bound on processes). Not repaired: that would be a
+  test or harness change outside B3.
+
+| suite | group | bound | exit | time | result | markers | other tripwire records |
+|---|---|---|---|---|---|---|---|
+| test_billing_closure | B | 540 | 0 | 107.1 s | 388/0/0 | 113 | none |
+
+- Its `[SPEND] BILLING RECORD DISCREPANCY (missing)` lines are the suite's own
+  driven settlement-failure scenarios printing the reconciliation warning;
+  the run is 388/0/0 with no traceback.
+
+Last, consecutively in one foreground chain (270 s driver bound, 290 s outer
+alarm each; recorded times ~14-30 s):
+
+| suite | group | bound | exit | time | result | markers | other tripwire records |
+|---|---|---|---|---|---|---|---|
+| test_runner_stop_switch | A | 270 | 0 | 24.5 s | 146/0 | 2 | none |
+| test_runner_sigterm_shutdown | A | 270 | 0 | 29.7 s | 95/0 | 1 | none |
+
+Both with driver SIGINT `default_int_handler`; neither launched under `&`.
+
+#### 14.12.5 Verdict
+
+- **B3 RECORDED: yes.** 21 of 21 listed suites have a result; no blocker, no
+  kill, no hang, no abort, no traceback other than the two expected ones above.
+  21 evidence directories under `evidence/`.
+- **Every suite reached its expected count with zero failures**: 169, 79,
+  158 (+1 skip), 136, 130, 161, 78, 99, 65, 121 (+1 skip), 146, 95; 213, 160,
+  55, 167, 67, 372, 261/0/0, 128, 388/0/0. No suite was adjusted.
+- **Containment markers.** Every run: launch pid = parent marker pid;
+  **unattached markers: none in any run**; every marker (228 across the batch, summed from the 21 summary.json files)
+  `sandbox_only_write: denied`, audit hook installed, editable finder
+  stripped; zero external tripwire records (the only non-marker records are
+  `test_runner_crash_record_and_db_unification`'s 26 loopback connects);
+  decoys empty; live tree byte-identical before and after every run.
+- **B3 PASSED: qualified, not unconditional.**
+  - 17 suites pass under containment verified to B1's per-process standard.
+  - 4 suites (`test_ablation_stop_and_lock`, `test_package_invariants`,
+    `test_runner_stop_switch`, `test_runner_sigterm_shutdown`) pass, but
+    spawn descendants whose replaced or popped `PYTHONPATH` keeps the
+    tripwire unarmed (14.12.4). For those processes only the inherited
+    sandbox is in force, and it is not evidenced by a marker. If the operator
+    requires a marker for every process, these four are not yet passed under
+    verified containment.
+- **Git.** `git log -1` = `95c9130`; `git status --short` = this report only.
+  The four `oncotriage-admission-e1b-*` dirs in `$TMPDIR` are unchanged (4).
+
+#### 14.12.6 Still unrecorded
+
+- `test_provider_resilience` on post-D1 code under this containment (B4).
+- A marker, or any process accounting, for the unmarked descendants of the
+  four suites above. Closing it needs a harness change (e.g. a `usercustomize`
+  or `PYTHONSTARTUP`-independent tripwire load, or a process-accounting probe
+  under the sandbox); not a B3 action.
+- Carried unchanged: CLAUDE.md's end-state overclaims (14.9.5).
+
+#### 14.12.7 Next single batch
+
+**B4** (14.7 item 4): `test_provider_resilience` alone, three times, nothing
+else running, under this containment with `b3_run.py` (fresh evidence names).
