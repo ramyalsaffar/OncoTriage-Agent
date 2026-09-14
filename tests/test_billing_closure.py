@@ -2293,6 +2293,38 @@ def inject(kind):
 
         runner.fcntl = types.SimpleNamespace(fcntl=fc,
                                              F_FULLFSYNC=real_fcntl.F_FULLFSYNC)
+    elif kind.startswith("settle_"):
+        # P1b: the FIRST settlement of the run finds its row DELETED (missing)
+        # or already SETTLED at $0 by somebody else (conflict). `_deferred`
+        # also refuses the discrepancy row in the database, so it must go to a
+        # marker; `_unrecordable` refuses the marker too.
+        import threading
+        real_settle, lock, state = dl.settle_billing_attempt, threading.Lock(), {}
+
+        def settle(db_path, attempt_id, **kw):
+            with lock:
+                first = not state
+                state.setdefault("attempt_id", attempt_id)
+            if first:
+                if kind.startswith("settle_missing"):
+                    c = sqlite3.connect(db_path)
+                    c.execute("DELETE FROM billing_attempts WHERE attempt_id = ?",
+                              (attempt_id,))
+                    c.commit()
+                    c.close()
+                else:
+                    real_settle(db_path, attempt_id, outcome="not_billed",
+                                settled_usd=0.0)
+            return real_settle(db_path, attempt_id, **kw)
+
+        dl.settle_billing_attempt = settle
+        if kind.endswith(("_deferred", "_unrecordable")):
+            dl.record_settlement_discrepancy = (
+                lambda *a, **k: dl.DISCREPANCY_FAILED)
+        if kind.endswith("_unrecordable"):
+            def no_marker(*a, **k):
+                raise OSError(28, "planted ENOSPC writing the marker")
+            dl.write_discrepancy_marker = no_marker
     else:
         raise SystemExit(f"unknown injection {kind!r}")
 
@@ -2313,7 +2345,7 @@ if cfg["mode"] == "campaign":
          report=spend.report_lines(), calls=CLIENT.calls,
          faults=dict(spend.SPEND_LEDGER_FAULTS), **EXTRA)
 else:
-    dump(**OBSERVED, **EXTRA)
+    dump(**OBSERVED, calls=CLIENT.calls, **EXTRA)
 if EXIT:
     sys.exit(EXIT)
 ''', encoding="utf-8")
@@ -2662,6 +2694,653 @@ check("4u-iii *** AMBIGUOUS through main(): exit 1, zero provider calls, "
        _campu in _outam and "camp-p4b-other" in _outam,
        os.path.exists(record_path(_cpu)), billing_census(_dbu)),
       (1, 0, True, True, False, _census_amb))
+
+
+# ===========================================================================
+section("SECTION 7 -- P1b: the embedding reservation's bound, and settlements "
+        "that did not land (runs before the isolation checks)")
+# ===========================================================================
+#
+# ADDED BY THE P1b RECOVERY SESSION.
+#
+# (1) THE EMBEDDING RESERVATION was `len(text)/3 + 1` tokens, an ESTIMATE a
+# tokenizer can exceed; a response priced above it whose settlement then failed
+# left the durable row, read at the reservation, below the live charge. It is
+# now the provider's DOCUMENTED per-input maximum (8,192) for one string and the
+# per-request maximum (300,000) otherwise, and an undocumented model is refused
+# before dispatch.
+#
+# (2) A SETTLEMENT THAT RETURNS missing, conflict or failed used to top the live
+# ledger up to the reservation and leave the durable record where it was -- for
+# `missing` that is NOTHING, so a fresh process read less than live charged. The
+# shortfall is now its own settled `settlement_discrepancy` row (or a synced
+# marker the runner reconciles before paid work); `missing` also makes a resume
+# REFUSE, and `missing`/`conflict` latch the live run.
+
+_EMB = config.EMBEDDING_MODEL
+_BOUND = _models.EMBEDDING_MAX_INPUT_TOKENS_PER_INPUT.get(_EMB)
+
+
+def _price_emb(tokens, model=None):
+    return _spend.price_usage(model or _EMB, tokens, 0)[0]
+
+
+_RES_EMB = _price_emb(_BOUND or 0)
+check("7a the shipped embedding model's documented per-input bound is 8,192 "
+      "tokens and the per-request bound 300,000, and the reservation prices",
+      (_EMB, _BOUND, _models.EMBEDDING_MAX_INPUT_TOKENS_PER_REQUEST,
+       near(_RES_EMB, 8192 * 0.02 / 1_000_000)),
+      ("text-embedding-3-small", 8192, 300000, True))
+
+_ADVERSARIAL = {
+    "empty": "", "one_char": "a", "nul_bytes": "\x00" * 5,
+    "emoji_4byte": "\U0001F600" * 5000, "digits": "1" * 100_000,
+    "combining": "é" * 3000, "lone_surrogate": "\ud800" * 10,
+    "cjk": "癌" * 20_000, "megabyte_ascii": "x" * 1_000_000,
+}
+check("7b *** every single-string input reserves the documented per-input "
+      "maximum, whatever its length, byte width or Unicode content ***",
+      {k: drive(_models.embedding_reservation_input_tokens, v, _EMB)
+       for k, v in _ADVERSARIAL.items()},
+      {k: 8192 for k in _ADVERSARIAL})
+_NON_STR = {"list_of_str": ["a", "b"], "tuple_of_str": ("a",),
+            "token_array": [1, 2, 3], "token_arrays": [[1], [2]],
+            "bytes": b"abc", "none": None}
+check("7c *** any other input -- a batch, token arrays, bytes, None -- reserves "
+      "the documented per-REQUEST maximum ***",
+      {k: drive(_models.embedding_reservation_input_tokens, v, _EMB)
+       for k, v in _NON_STR.items()},
+      {k: 300000 for k in _NON_STR})
+_UNBOUNDED = {"large": "text-embedding-3-large", "none": None, "empty": "",
+              "unhashable": ["text-embedding-3-small"]}
+check("7d a model with no documented bound is REFUSED by name, including an "
+      "unhashable one",
+      {k: type(raised(_models.embedding_reservation_input_tokens, "x", m)).__name__
+       for k, m in _UNBOUNDED.items()},
+      {k: "EmbeddingReservationUnbounded" for k in _UNBOUNDED})
+
+
+def _old_estimate(text):
+    return int(len(str(text)) / float(config.PROVIDER_RESERVATION_CHARS_PER_TOKEN)) + 1
+
+
+check("7e *** THE OLD ESTIMATE WAS NOT A BOUND: 5,000 four-byte characters "
+      "billed one token each exceed len/3+1; 100,000 digits billed at 30,000 "
+      "tokens exceed it too; neither can exceed the documented bound of a "
+      "request the endpoint accepted ***",
+      (_price_emb(5000) > _price_emb(_old_estimate(_ADVERSARIAL["emoji_4byte"])),
+       _old_estimate("\U0001F600" * 5000) < 5000,
+       _price_emb(5000) <= _RES_EMB, _price_emb(8192) <= _RES_EMB),
+      (True, True, True, True))
+
+_DL_PATCHABLE = ("settle_billing_attempt", "record_settlement_discrepancy",
+                 "write_discrepancy_marker", "billing_attempt_settled_usd")
+_DL_START = {n: getattr(_dl, n) for n in _DL_PATCHABLE}
+_REAL_SETTLE = _DL_START["settle_billing_attempt"]
+
+
+def _restore_dl():
+    for _n, _fn in _DL_START.items():
+        setattr(_dl, _n, _fn)
+
+
+def p1b_case(name, client, call, *, patches=None, discrepancy_dir=None,
+             knobs=None):
+    """Drive one billed attempt with a sink installed and the storage layer
+    patched as named; then read what a FRESH process would, with every patch
+    removed first -- the reader is the shipped one."""
+    db = new_db(f"p1b_{name}.db")
+    run = _dl.start_run_record("batch", db_path=db, fingerprint=FIXED_FP)
+    camp = f"camp-p1b-{name}"
+    deps.set_override(deps.OPENAI_CLIENT, client)
+    live = {}
+    try:
+        with settings(SPEND_CAP_USD=_CAP, SPEND_CAP_ENFORCED=True,
+                      **(knobs or {})):
+            _reset_spend_state()
+            for _n, _fn in (patches or {}).items():
+                setattr(_dl, _n, _fn)
+            _spend.BILLING_RECORD.install(_dl.BillingRecordSink(
+                db, camp, run, discrepancy_dir=discrepancy_dir))
+            try:
+                exc = raised(call)
+                live = {"measured": _spend.SPEND_LEDGER.measured,
+                        "remaining": _spend.remaining(_spend.SPEND_SOURCE_STAGE5),
+                        "tally": _spend.BILLING_RECORD.liability_snapshot(),
+                        "record_faults": dict(_spend.BILLING_RECORD_FAULTS),
+                        "latch": (_spend.SPEND_STOP.requested,
+                                  _spend.SPEND_STOP.limit)}
+            finally:
+                _spend.BILLING_RECORD.clear()
+                _restore_dl()
+            durable_exc = raised(_dl.campaign_billing_total, camp, db_path=db)
+            durable = drive(_dl.campaign_billing_total, camp, db_path=db)
+            resumed_remaining = None
+            if isinstance(durable, _dl.CampaignBilling):
+                _spend.SPEND_LEDGER.reset()
+                _spend.SPEND_STOP.reset()
+                _spend.SPEND_LEDGER.seed(_spend.LedgerSeed(
+                    usd=durable.usd, rows=durable.attempts, runs=1,
+                    source=_spend.SEED_SOURCE_BILLING_RECORD,
+                    unresolved=durable.unresolved))
+                resumed_remaining = _spend.remaining(_spend.SPEND_SOURCE_STAGE5)
+    finally:
+        _restore_dl()
+        deps.clear_override(deps.OPENAI_CLIENT)
+        _reset_spend_state()
+    rows = ro_rows(db, "SELECT attempt_id, kind, state, outcome, reserved_usd, "
+                       "settled_usd, note, reserved_input_tokens FROM "
+                       "billing_attempts ORDER BY rowid")
+    settled_durable = sum(r[5] for r in rows if r[2] == "settled")
+    reserved_durable = [(1, r[4]) for r in rows if r[2] == "reserved"]
+    tally = live.get("tally") or {}
+    return {"exc": exc, "live": live, "durable": durable,
+            "durable_exc": durable_exc, "resumed_remaining": resumed_remaining,
+            "rows": rows, "calls": client.calls, "db": db, "camp": camp,
+            "run": run,
+            "settled_durable": settled_durable,
+            "reserved_durable": (len(reserved_durable),
+                                 sum(u for _n, u in reserved_durable)),
+            "settled_live": sum(v[1] for k, v in tally.items()
+                                if k != _spend.LIABILITY_OPEN),
+            "open_live": tuple(tally.get(_spend.LIABILITY_OPEN, (0, 0.0)))}
+
+
+def _settle_missing(db_path, attempt_id, **kw):
+    conn = sqlite3.connect(db_path)
+    conn.execute("DELETE FROM billing_attempts WHERE attempt_id = ?",
+                 (attempt_id,))
+    conn.commit()
+    conn.close()
+    return _REAL_SETTLE(db_path, attempt_id, **kw)
+
+
+def _settle_conflict_at(amount, outcome):
+    def settle(db_path, attempt_id, **kw):
+        _REAL_SETTLE(db_path, attempt_id, outcome=outcome, settled_usd=amount)
+        return _REAL_SETTLE(db_path, attempt_id, **kw)
+    return settle
+
+
+def _returns(value):
+    return lambda *a, **k: value
+
+
+def _marker_refused(*a, **k):
+    raise OSError(28, "planted ENOSPC writing the marker")
+
+
+_EMB_KW = []
+
+
+def _emb_client(tokens=9, echo=None):
+    def respond(kw):
+        _EMB_KW.append(kw)
+        return _embedding(prompt_tokens=tokens, model=echo)
+    return _Client(embed=respond)
+
+
+_EMB_TEXT = _ADVERSARIAL["emoji_4byte"]
+
+
+def _emb_call():
+    return _models.get_embedding(_EMB_TEXT)
+
+
+def _kinds(case):
+    return [(r[1], r[2]) for r in case["rows"]]
+
+
+def _note_result(row):
+    try:
+        return json.loads(row[6]).get("result")
+    except Exception:                                          # noqa: BLE001
+        return None
+
+
+def parity_holds(case):
+    """THE P1b INVARIANT at the accounting precision.
+
+    (0) SETTLED: the live tally's resolved total equals the durable settled
+        total plus the reservations of attempts whose settlement did not land
+        (a FAILED settlement leaves its row reserved, and live charged that
+        reservation).
+    (1) UNRESOLVED: nothing open live, and the durable reserved rows are exactly
+        the settlements the LIVE process recorded as not landed for a reason
+        other than missing/conflict -- counted from its own fault keys, not
+        from the durable side.
+    (2) TOTAL and (3) REMAINING, through ``spend.remaining``.
+    """
+    faults = case["live"].get("record_faults") or {}
+    unlanded = sum(v for k, v in faults.items()
+                   if k.startswith("ledger_topped_up:")
+                   and k.split(":", 1)[1]
+                   not in _spend.SETTLEMENT_INTEGRITY_RESULTS)
+    return (near(case["settled_live"],
+                 case["settled_durable"] + case["reserved_durable"][1]),
+            case["open_live"][0] == 0
+            and case["reserved_durable"][0] == unlanded,
+            near(case["live"].get("measured"), getattr(case["durable"], "usd",
+                                                        None)),
+            near(case["live"].get("remaining"), case["resumed_remaining"]))
+
+
+# ── 7f..7k: THE BOUND, THROUGH THE REAL get_embedding ───────────────────────
+_EMB_KW.clear()
+_c_ok = p1b_case("emb_ok", _emb_client(), _emb_call)
+check("7f *** a 5,000-emoji query is RESERVED at the documented bound, token "
+      "count and price, and settles at its usage ***",
+      ([(r[1], r[2], r[3], r[7]) for r in _c_ok["rows"]],
+       near(at(at(_c_ok["rows"], 0), 4), _RES_EMB)),
+      ([("attempt", "settled", "response", 8192)], True))
+check("7f-i *** THE REQUEST IS UNCHANGED: the same model, the same input object "
+      "and the same timeout key, nothing added ***",
+      (len(_EMB_KW), sorted(at(_EMB_KW, 0) or {}),
+       at(at(_EMB_KW, 0), "input") is _EMB_TEXT, at(at(_EMB_KW, 0), "model")),
+      (1, ["input", "model", "timeout"], True, _EMB))
+check("7f-ii parity holds for an ordinary response",
+      parity_holds(_c_ok), (True, True, True, True))
+
+_EMB_KW.clear()
+_c_unb = p1b_case("emb_unbounded", _emb_client(), _emb_call,
+                  knobs={"EMBEDDING_MODEL": "text-embedding-3-large"})
+check("7g *** an embedding model with no documented bound is REFUSED BEFORE "
+      "DISPATCH: named exception, zero provider calls, zero billing rows, zero "
+      "spend ***",
+      (type(_c_unb["exc"]).__name__, _c_unb["calls"], len(_EMB_KW),
+       _c_unb["rows"], _c_unb["live"].get("measured")),
+      ("EmbeddingReservationUnbounded", 0, 0, [], 0.0))
+
+_c_at = p1b_case("emb_at_bound_failed", _emb_client(tokens=8192), _emb_call,
+                 patches={"settle_billing_attempt": _returns(_dl.SETTLE_FAILED)})
+check("7h a response AT the bound whose settlement fails leaves only the "
+      "reserved row: no shortfall, no discrepancy row, no latch",
+      (_kinds(_c_at), at(_c_at["live"], "latch")),
+      ([("attempt", "reserved")], (False, None)))
+check("7h-i ...and parity holds exactly", parity_holds(_c_at),
+      (True, True, True, True))
+
+_c_over = p1b_case("emb_over_bound_failed", _emb_client(tokens=9000), _emb_call,
+                   patches={"settle_billing_attempt":
+                            _returns(_dl.SETTLE_FAILED)})
+_disc_over = [r for r in _c_over["rows"] if r[1] == "settlement_discrepancy"]
+check("7i *** a provider that bills BEYOND its documented bound, with the "
+      "settlement failing: the shortfall is its own settled row, and a fresh "
+      "reading equals live ***",
+      (_kinds(_c_over),
+       near(at(at(_disc_over, 0), 5), _price_emb(9000) - _RES_EMB),
+       _note_result(at(_disc_over, 0) or [None] * 7)),
+      ([("attempt", "reserved"), ("settlement_discrepancy", "settled")], True,
+       "failed"))
+check("7i-i ...parity holds, and a recorded discrepancy does not latch",
+      (parity_holds(_c_over), at(_c_over["live"], "latch")),
+      ((True, True, True, True), (False, None)))
+
+_c_echo = p1b_case("emb_echo_pricier_failed", _emb_client(tokens=8000,
+                                                          echo=_WIRE),
+                   _emb_call,
+                   patches={"settle_billing_attempt":
+                            _returns(_dl.SETTLE_FAILED)})
+check("7j *** PRICING, ADVERSARIALLY: an echo naming a model with a higher rate "
+      "prices above the reservation; with the settlement failing the "
+      "discrepancy row carries the difference and parity holds ***",
+      (_spend.price_usage(_WIRE, 8000, 0)[0] > _RES_EMB,
+       [k for k, _s in _kinds(_c_echo)], parity_holds(_c_echo)),
+      (True, ["attempt", "settlement_discrepancy"], (True, True, True, True)))
+
+# ── 7k..7q: missing, conflict, failed, unrecognised -- Stage 5 and Stage 2 ──
+_c_s5_missing = p1b_case("s5_missing",
+                         _Client(chat=lambda kw: _chat_response((321, 45))),
+                         _s5_call, patches={"settle_billing_attempt":
+                                            _settle_missing})
+_disc = [r for r in _c_s5_missing["rows"] if r[1] == "settlement_discrepancy"]
+check("7k *** MISSING (Stage 5): the attempt row is gone, the discrepancy row "
+      "retains the live charge, and the live charge is the reservation ***",
+      (_kinds(_c_s5_missing), near(_c_s5_missing["live"].get("measured"),
+                                   _RESERVE_S5),
+       near(at(at(_disc, 0), 5), _c_s5_missing["live"].get("measured")),
+       _note_result(at(_disc, 0) or [None] * 7)),
+      ([("settlement_discrepancy", "settled")], True, True, "missing"))
+check("7k-i *** a FRESH READING REFUSES by name (BillingRecordIncomplete), "
+      "naming the retained amount -- it does not return a total lower than "
+      "live ***",
+      (type(_c_s5_missing["durable_exc"]).__name__,
+       near(getattr(_c_s5_missing["durable_exc"], "retained_usd", None),
+            _c_s5_missing["live"].get("measured")),
+       f"${_c_s5_missing['live'].get('measured', 0):.6f} is retained"
+       in str(_c_s5_missing["durable_exc"]),
+       isinstance(_c_s5_missing["durable_exc"], _dl.BillingRecordUnreadable)),
+      ("BillingRecordIncomplete", True, True, True))
+check("7k-ii ...the live run is LATCHED, and the fault names the path",
+      (at(_c_s5_missing["live"], "latch"),
+       _c_s5_missing["live"]["record_faults"].get("discrepancy:missing:recorded")),
+      ((True, _spend.SPEND_LIMIT_BILLING_RECORD), 1))
+check("7k-iii settled compared separately: durable settled == live settled; "
+      "nothing unresolved on either side",
+      (near(_c_s5_missing["settled_live"], _c_s5_missing["settled_durable"]),
+       _c_s5_missing["open_live"][0], _c_s5_missing["reserved_durable"][0]),
+      (True, 0, 0))
+
+_c_emb_missing = p1b_case("emb_missing", _emb_client(), _emb_call,
+                          patches={"settle_billing_attempt": _settle_missing})
+check("7l MISSING (Stage 2): the same, at the embedding's reservation",
+      (_kinds(_c_emb_missing), near(_c_emb_missing["live"].get("measured"),
+                                    _RES_EMB),
+       type(_c_emb_missing["durable_exc"]).__name__,
+       at(_c_emb_missing["live"], "latch")),
+      ([("settlement_discrepancy", "settled")], True, "BillingRecordIncomplete",
+       (True, _spend.SPEND_LIMIT_BILLING_RECORD)))
+
+_c_conf_lo = p1b_case("s5_conflict_lower",
+                      _Client(chat=lambda kw: _chat_response((321, 45))),
+                      _s5_call, patches={"settle_billing_attempt":
+                                         _settle_conflict_at(0.0, "not_billed")})
+check("7m *** CONFLICT, stored BELOW live: the stored row stands, the "
+      "discrepancy row carries the shortfall, and a fresh reading EQUALS live "
+      "at the accounting precision ***",
+      (_kinds(_c_conf_lo), parity_holds(_c_conf_lo),
+       near(getattr(_c_conf_lo["durable"], "discrepancy_usd", None),
+            _RESERVE_S5)),
+      ([("attempt", "settled"), ("settlement_discrepancy", "settled")],
+       (True, True, True, True), True))
+check("7m-i ...and the conflict LATCHES the live run",
+      at(_c_conf_lo["live"], "latch"),
+      (True, _spend.SPEND_LIMIT_BILLING_RECORD))
+
+_c_conf_hi = p1b_case("s5_conflict_higher",
+                      _Client(chat=lambda kw: _chat_response((321, 45))),
+                      _s5_call, patches={"settle_billing_attempt":
+                                         _settle_conflict_at(5.0,
+                                                             "possibly_billed")})
+check("7n *** CONFLICT, stored ABOVE live: live is raised to the stored amount, "
+      "so live and resumed agree; the discrepancy row is $0 ***",
+      (near(_c_conf_hi["live"].get("measured"), 5.0),
+       parity_holds(_c_conf_hi),
+       [r[5] for r in _c_conf_hi["rows"] if r[1] == "settlement_discrepancy"]),
+      (True, (True, True, True, True), [0.0]))
+
+_c_conf_blind = p1b_case(
+    "s5_conflict_reader_down",
+    _Client(chat=lambda kw: _chat_response((321, 45))), _s5_call,
+    patches={"settle_billing_attempt": _settle_conflict_at(0.001, "not_billed"),
+             "billing_attempt_settled_usd": _returns(None)})
+check("7o CONFLICT whose stored amount cannot be read: assumed 0, so the "
+      "fresh reading OVER-counts by exactly the stored amount (the safe "
+      "direction), never under",
+      (near(getattr(_c_conf_blind["durable"], "usd", 0)
+            - _c_conf_blind["live"].get("measured", 0), 0.001),
+       _c_conf_blind["resumed_remaining"] is not None
+       and _c_conf_blind["resumed_remaining"]
+       < _c_conf_blind["live"].get("remaining", 0)),
+      (True, True))
+
+_c_weird = p1b_case("s5_unrecognised_result",
+                    _Client(chat=lambda kw: _chat_response((321, 45))),
+                    _s5_call, patches={"settle_billing_attempt":
+                                       _returns("weird")})
+check("7p an UNRECOGNISED settlement result is read as failed: the row stays "
+      "reserved, no discrepancy is owed, parity holds, no latch",
+      (_kinds(_c_weird), parity_holds(_c_weird), at(_c_weird["live"], "latch")),
+      ([("attempt", "reserved")], (True, True, True, True), (False, None)))
+
+_c_s5_over = p1b_case(
+    "s5_over_reservation_failed",
+    _Client(chat=lambda kw: _chat_response((10 ** 7, 45))), _s5_call,
+    patches={"settle_billing_attempt": _returns(_dl.SETTLE_FAILED)})
+check("7q *** Stage 5 priced ABOVE its reservation (the input estimate under-"
+      "counted) with the settlement failing: recorded as a discrepancy, and "
+      "parity holds ***",
+      (_spend.price_usage(_WIRE, 10 ** 7, 45)[0] > _RESERVE_S5,
+       [k for k, _s in _kinds(_c_s5_over)], parity_holds(_c_s5_over)),
+      (True, ["attempt", "settlement_discrepancy"], (True, True, True, True)))
+
+# ── 7r..7x: DEFERRED TO A MARKER, REPEATED RECONCILIATION, NOTHING DURABLE ──
+_MARKERS = os.path.join(_TMP, "p1b_markers_missing")
+_c_def = p1b_case("emb_missing_deferred", _emb_client(), _emb_call,
+                  patches={"settle_billing_attempt": _settle_missing,
+                           "record_settlement_discrepancy":
+                               _returns(_dl.DISCREPANCY_FAILED)},
+                  discrepancy_dir=_MARKERS)
+_marker_files = sorted(os.listdir(_MARKERS)) if os.path.isdir(_MARKERS) else []
+check("7r *** the database refused the discrepancy row: a synced MARKER holds "
+      "it, the run is latched, and until reconciled the record alone reads "
+      "LOW -- which is why the runner reconciles before paid work ***",
+      (len(_marker_files), _kinds(_c_def), at(_c_def["live"], "latch"),
+       _c_def["live"]["record_faults"].get("discrepancy:missing:deferred"),
+       near(getattr(_c_def["durable"], "usd", None), 0.0)),
+      (1, [], (True, _spend.SPEND_LIMIT_BILLING_RECORD), 1, True))
+_rec1 = _dl.reconcile_discrepancy_markers(_MARKERS, _c_def["db"])
+_after1 = raised(_dl.campaign_billing_total, _c_def["camp"], db_path=_c_def["db"])
+check("7r-i *** reconciliation commits it, removes the marker, and the fresh "
+      "reading then REFUSES retaining the live amount ***",
+      (len(_rec1.reconciled), _rec1.unreconciled, drive(os.listdir, _MARKERS),
+       type(_after1).__name__,
+       near(getattr(_after1, "retained_usd", None),
+            _c_def["live"].get("measured"))),
+      (1, (), [], "BillingRecordIncomplete", True))
+_rec2 = _dl.reconcile_discrepancy_markers(_MARKERS, _c_def["db"])
+_marker_payload = {"attempt_id": _rec1.reconciled[0][0] if _rec1.reconciled
+                   else "absent", "campaign_id": _c_def["camp"],
+                   "run_id": _c_def["run"], "source": "query_embedding",
+                   "model": _EMB, "result": "missing",
+                   "live_usd": _RES_EMB, "durable_usd": 0.0,
+                   "shortfall_usd": _RES_EMB, "db_path": _c_def["db"],
+                   "version": _dl.DISCREPANCY_MARKER_VERSION}
+_dl.write_discrepancy_marker(_MARKERS, _marker_payload)
+_rec3 = _dl.reconcile_discrepancy_markers(_MARKERS, _c_def["db"])
+_disc_rows = ro_rows(_c_def["db"], "SELECT COUNT(*), SUM(settled_usd) FROM "
+                                   "billing_attempts WHERE kind = "
+                                   "'settlement_discrepancy'")[0]
+check("7s *** REPEATED RECONCILIATION DOES NOT DOUBLE-COUNT: a second pass is a "
+      "no-op, and a marker LEFT IN PLACE after its row committed is recorded "
+      "again as the SAME row ***",
+      (_rec2, len(_rec3.reconciled), _disc_rows[0],
+       near(_disc_rows[1], _RES_EMB)),
+      (_dl.DiscrepancyReconciliation(), 1, 1, True))
+check("7s-i the retained amount is unchanged after the third pass",
+      near(getattr(raised(_dl.campaign_billing_total, _c_def["camp"],
+                          db_path=_c_def["db"]), "retained_usd", None),
+           _RES_EMB), True)
+
+check("7t a colliding discrepancy at a DIFFERENT amount is FAILED; the stored "
+      "row stands",
+      (_dl.record_settlement_discrepancy(
+          _c_def["db"], attempt_id=_marker_payload["attempt_id"],
+          campaign_id=_c_def["camp"], run_id=_c_def["run"],
+          source="query_embedding", model=_EMB, result="missing",
+          live_usd=1.0, durable_usd=0.0, shortfall_usd=1.0),
+       ro_rows(_c_def["db"], "SELECT COUNT(*) FROM billing_attempts WHERE "
+                             "kind = 'settlement_discrepancy'")[0][0]),
+      (_dl.DISCREPANCY_FAILED, 1))
+
+_BAD = os.path.join(_TMP, "p1b_markers_bad")
+os.makedirs(_BAD)
+Path(os.path.join(_BAD, "junk.json")).write_text("{not json")
+Path(os.path.join(_BAD, "notes.txt")).write_text("x")
+Path(os.path.join(_BAD, ".half.tmp")).write_text("{")
+_other = dict(_marker_payload, attempt_id="otherdb", db_path="/nonexistent/x.db")
+_dl.write_discrepancy_marker(_BAD, _other)
+_wrong_name = dict(_marker_payload, attempt_id="renamed")
+Path(os.path.join(_BAD, "mismatch.json")).write_text(json.dumps(_wrong_name))
+_recbad = _dl.reconcile_discrepancy_markers(_BAD, _c_def["db"])
+check("7u malformed markers are UNRECONCILED by name -- unparseable, not a "
+      "marker, another database, a name that is not its attempt id -- and a "
+      "half-written .tmp is ignored",
+      (sorted(n for n, _d in _recbad.unreconciled), _recbad.reconciled),
+      (["junk.json", "mismatch.json", "notes.txt", "otherdb.json"], ()))
+
+_c_nodir = p1b_case("emb_missing_unrecordable_nodir", _emb_client(), _emb_call,
+                    patches={"settle_billing_attempt": _settle_missing,
+                             "record_settlement_discrepancy":
+                                 _returns(_dl.DISCREPANCY_FAILED)})
+_NOMARK = os.path.join(_TMP, "p1b_markers_refused")
+_c_nomark = p1b_case("emb_missing_unrecordable_marker", _emb_client(),
+                     _emb_call,
+                     patches={"settle_billing_attempt": _settle_missing,
+                              "record_settlement_discrepancy":
+                                  _returns(_dl.DISCREPANCY_FAILED),
+                              "write_discrepancy_marker": _marker_refused},
+                     discrepancy_dir=_NOMARK)
+check("7v *** NOTHING DURABLE (the database and the marker both refused): the "
+      "live run LATCHES and counts it failed. THE STATED BOUND: a fresh reading "
+      "is then LOWER than live by exactly this attempt -- no durable write "
+      "remained to prevent it ***",
+      ([at(c["live"], "latch") for c in (_c_nodir, _c_nomark)],
+       [c["live"]["record_faults"].get("discrepancy:missing:failed")
+        for c in (_c_nodir, _c_nomark)],
+       [near(c["live"].get("measured", 0) - getattr(c["durable"], "usd", 0),
+             _RES_EMB) for c in (_c_nodir, _c_nomark)],
+       os.path.isdir(_NOMARK) and os.listdir(_NOMARK)),
+      ([(True, _spend.SPEND_LIMIT_BILLING_RECORD)] * 2, [1, 1], [True, True],
+       False if not os.path.isdir(_NOMARK) else []))
+
+# ── 7w: the storage vocabulary and the reader's refusals ─────────────────────
+check("7w the discrepancy vocabularies are restated equal across the layers",
+      (_dl.DISCREPANCY_WRITE_RESULTS == _spend.DISCREPANCY_WRITE_RESULTS,
+       _dl.DISCREPANCY_RESULTS == (_spend.SETTLEMENT_MISSING,
+                                   _spend.SETTLEMENT_CONFLICT,
+                                   _spend.SETTLEMENT_FAILED),
+       _dl.BILLING_ATTEMPT_KIND_DISCREPANCY in _dl.BILLING_ATTEMPT_KINDS),
+      (True, True, True))
+_DBW = new_db("p1b_reader.db")
+_RW = _dl.start_run_record("batch", db_path=_DBW, fingerprint=FIXED_FP)
+for _cid, _note, _state in (("c-unparseable", "{bad", "settled"),
+                            ("c-conflict", '{"result": "conflict"}', "settled"),
+                            ("c-reserved", '{"result": "conflict"}', "reserved")):
+    _conn = sqlite3.connect(_DBW)
+    _conn.execute(
+        "INSERT INTO billing_attempts (attempt_id, campaign_id, run_id, kind, "
+        "source, state, reserved_usd, settled_usd, reserved_at, note) VALUES "
+        "(?, ?, ?, 'settlement_discrepancy', 'stage5', ?, 0.5, ?, 'now', ?)",
+        (f"{_cid}:d", _cid, _RW, _state, 0.5 if _state == "settled" else None,
+         _note))
+    _conn.commit()
+    _conn.close()
+check("7w-i the reader: an UNPARSEABLE discrepancy note refuses as incomplete "
+      "(the refusing reading); a conflict one is summed; a RESERVED one is "
+      "unreadable",
+      (type(raised(_dl.campaign_billing_total, "c-unparseable",
+                   db_path=_DBW)).__name__,
+       near(getattr(drive(_dl.campaign_billing_total, "c-conflict",
+                          db_path=_DBW), "usd", None), 0.5),
+       type(raised(_dl.campaign_billing_total, "c-reserved",
+                   db_path=_DBW)).__name__),
+      ("BillingRecordIncomplete", True, "BillingRecordUnreadable"))
+
+# ── 7x..7z: A FRESH PROCESS, THROUGH THE REAL main() ─────────────────────────
+
+
+def p1b_e2e(name, inject):
+    db = os.path.join(_TMP, f"p1b_e2e_{name}.db")
+    cp = os.path.join(_TMP, f"cp_p1b_{name}")
+    os.makedirs(cp)
+    p1, d1 = child("campaign", db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP,
+                   inject=inject)
+    out1 = (p1.stdout or "") + (p1.stderr or "")
+    markers = sorted(os.listdir(os.path.join(cp, _runner.DISCREPANCY_DIRNAME))) \
+        if os.path.isdir(os.path.join(cp, _runner.DISCREPANCY_DIRNAME)) else []
+    p2, d2 = child("observe", db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP)
+    out2 = (p2.stdout or "") + (p2.stderr or "")
+    markers2 = sorted(os.listdir(os.path.join(cp, _runner.DISCREPANCY_DIRNAME))) \
+        if os.path.isdir(os.path.join(cp, _runner.DISCREPANCY_DIRNAME)) else []
+    p3, d3 = child("observe", db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP)
+    out3 = (p3.stdout or "") + (p3.stderr or "")
+    rows = ro_rows(db, "SELECT kind, state, reserved_usd, settled_usd, note FROM "
+                       "billing_attempts")
+    return {"p": (p1, p2, p3), "d": (d1, d2, d3), "out": (out1, out2, out3),
+            "markers": (markers, markers2), "rows": rows,
+            "durable_sum": sum((r[3] if r[1] == "settled" else r[2])
+                               for r in rows),
+            "discrepancies": [r for r in rows if r[0] == "settlement_discrepancy"]}
+
+
+_REFUSE_INCOMPLETE = ("REFUSING TO START PAID WORK: "
+                      + _runner.CAMPAIGN_REFUSAL_BILLING_INCOMPLETE)
+_e_miss = p1b_e2e("missing", "settle_missing")
+_d1, _d2, _d3 = _e_miss["d"]
+check("7x *** MISSING, PROCESS 1: the live run latches on the billing record "
+      "and PRINTS the discrepancy ***",
+      (at(_d1, "latch"), "BILLING RECORD DISCREPANCY (missing)"
+       in _e_miss["out"][0], len(_e_miss["discrepancies"])),
+      ([True, _spend.SPEND_LIMIT_BILLING_RECORD], True, 1))
+check("7x-i *** MISSING, FRESH PROCESS 2: REFUSES paid work by name, exit 1, "
+      "zero provider calls, and prints the retained amount ***",
+      (_e_miss["p"][1].returncode, _REFUSE_INCOMPLETE in _e_miss["out"][1],
+       at(_d2, "calls"),
+       f"${at(at(_e_miss['discrepancies'], 0), 3) or 0:.6f} is retained"
+       in _e_miss["out"][1]),
+      (1, True, 0, True))
+check("7x-ii *** the durable record retains at least what process 1 charged "
+      "(settled and reserved summed), at the accounting precision ***",
+      at(_d1, "measured") is not None
+      and _e_miss["durable_sum"] >= at(_d1, "measured") - _TOL, True)
+check("7x-iii process 3 refuses again; still ONE discrepancy row",
+      (_e_miss["p"][2].returncode, _REFUSE_INCOMPLETE in _e_miss["out"][2],
+       at(_d3, "calls"), len(ro_rows(_TMP and os.path.join(
+           _TMP, "p1b_e2e_missing.db"), "SELECT 1 FROM billing_attempts WHERE "
+           "kind = 'settlement_discrepancy'"))),
+      (1, True, 0, 1))
+
+_e_conf = p1b_e2e("conflict", "settle_conflict")
+_d1, _d2, _d3 = _e_conf["d"]
+check("7y *** CONFLICT, FRESH PROCESS 2: continues the campaign; its seed "
+      "EQUALS process 1's live ledger and its remaining EQUALS process 1's, at "
+      "the accounting precision ***",
+      (at(_d1, "latch"), _e_conf["p"][1].returncode,
+       near(at(at(_d2, "seed"), "usd"), at(_d1, "measured")),
+       near(at(_d2, "remaining"), at(_d1, "remaining")),
+       len(_e_conf["discrepancies"])),
+      ([True, _spend.SPEND_LIMIT_BILLING_RECORD], 0, True, True, 1))
+check("7y-i *** settled and unresolved separately: process 1's live settled "
+      "total equals the durable settled total, and nothing is open or reserved "
+      "on either side ***",
+      (near(sum(v[1] for k, v in (at(_d1, "tally") or {}).items()
+                if k != _spend.LIABILITY_OPEN),
+            sum(r[3] for r in _e_conf["rows"] if r[1] == "settled")),
+       [r for r in _e_conf["rows"] if r[1] == "reserved"],
+       (at(_d1, "tally") or {}).get(_spend.LIABILITY_OPEN, [0])[0]),
+      (True, [], 0))
+check("7y-ii process 3 reads the SAME seed (repeat reads do not grow it)",
+      near(at(at(_d3, "seed"), "usd"), at(at(_d2, "seed"), "usd")), True)
+
+_e_cdef = p1b_e2e("conflict_deferred", "settle_conflict_deferred")
+_d1, _d2, _d3 = _e_cdef["d"]
+check("7z *** CONFLICT DEFERRED: process 1 leaves ONE marker and no "
+      "discrepancy row; process 2 RECONCILES it, prints the amount, removes "
+      "the marker, and its seed EQUALS process 1's live ledger ***",
+      (len(_e_cdef["markers"][0]), _e_cdef["markers"][1],
+       "Reconciled a deferred billing discrepancy (conflict)"
+       in _e_cdef["out"][1],
+       _e_cdef["p"][1].returncode,
+       near(at(at(_d2, "seed"), "usd"), at(_d1, "measured")),
+       len(_e_cdef["discrepancies"])),
+      (1, [], True, 0, True, 1))
+check("7z-i *** process 3: nothing left to reconcile, the SAME seed -- no "
+      "double count ***",
+      ("Reconciled a deferred" in _e_cdef["out"][2],
+       near(at(at(_d3, "seed"), "usd"), at(at(_d2, "seed"), "usd"))),
+      (False, True))
+
+_e_mdef = p1b_e2e("missing_deferred", "settle_missing_deferred")
+check("7z-ii *** MISSING DEFERRED: process 2 reconciles the marker and then "
+      "REFUSES as incomplete; process 3 refuses without reconciling again ***",
+      (len(_e_mdef["markers"][0]), _e_mdef["markers"][1],
+       "Reconciled a deferred billing discrepancy (missing)" in _e_mdef["out"][1],
+       _REFUSE_INCOMPLETE in _e_mdef["out"][1], _e_mdef["p"][1].returncode,
+       "Reconciled a deferred" in _e_mdef["out"][2],
+       _REFUSE_INCOMPLETE in _e_mdef["out"][2], len(_e_mdef["discrepancies"])),
+      (1, [], True, True, 1, False, True, 1))
+
+_e_unr = p1b_e2e("missing_unrecordable", "settle_missing_unrecordable")
+_d1, _d2, _d3 = _e_unr["d"]
+check("7z-iii *** THE STATED BOUND, THROUGH main(): with the database AND the "
+      "marker refusing, process 1 latches and prints 'failed'; process 2 finds "
+      "no durable trace and its seed is BELOW process 1's live ledger ***",
+      (at(_d1, "latch"), "failed." in _e_unr["out"][0],
+       (at(_d1, "billing_faults") or {}).get("discrepancy:missing:failed"),
+       _e_unr["markers"], at(at(_d2, "seed"), "usd") is not None
+       and at(at(_d2, "seed"), "usd") < at(_d1, "measured")),
+      ([True, _spend.SPEND_LIMIT_BILLING_RECORD], True, 1, ([], []), True))
 
 
 # ===========================================================================

@@ -5212,8 +5212,10 @@ def _coerce_run_note(note, run_id):
 
 BILLING_ATTEMPT_KIND_ATTEMPT = "attempt"
 BILLING_ATTEMPT_KIND_HISTORICAL = "historical_evidence"
+BILLING_ATTEMPT_KIND_DISCREPANCY = "settlement_discrepancy"
 BILLING_ATTEMPT_KINDS = (BILLING_ATTEMPT_KIND_ATTEMPT,
-                         BILLING_ATTEMPT_KIND_HISTORICAL)
+                         BILLING_ATTEMPT_KIND_HISTORICAL,
+                         BILLING_ATTEMPT_KIND_DISCREPANCY)
 """What a ``billing_attempts`` row is. CLOSED.
 
   ``attempt``              one billed wire attempt of this build.
@@ -5221,6 +5223,13 @@ BILLING_ATTEMPT_KINDS = (BILLING_ATTEMPT_KIND_ATTEMPT,
                            that predate this record, written ONCE when such a
                            campaign is first resumed. See
                            ``historical_campaign_evidence``.
+  ``settlement_discrepancy``  the liability an attempt's settlement could NOT
+                           put into its own row (P1b): the row was missing, held
+                           a different settlement, or could not be written
+                           while the priced response exceeded its reservation.
+                           Written SETTLED at the shortfall, under the attempt
+                           id plus ``DISCREPANCY_ID_SUFFIX``, so a repeat is
+                           idempotent. See ``record_settlement_discrepancy``.
 """
 
 BILLING_ATTEMPT_STATE_RESERVED = "reserved"
@@ -5416,16 +5425,22 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
             f"{', '.join(problems)}")
 
     historical = kind == BILLING_ATTEMPT_KIND_HISTORICAL
+    # A historical evidence row and a settlement discrepancy (P1b) both record
+    # spend that already happened, so both are written SETTLED at their amount.
+    # Only the historical row carries an outcome: a discrepancy's outcome is the
+    # attempt row's, and its result lives in ``note``.
+    settled_at_write = kind in (BILLING_ATTEMPT_KIND_HISTORICAL,
+                                BILLING_ATTEMPT_KIND_DISCREPANCY)
     now = _billing_now()
     values = (attempt_id, campaign_id, run_id, kind, source, model,
               correlation_id,
-              (BILLING_ATTEMPT_STATE_SETTLED if historical
+              (BILLING_ATTEMPT_STATE_SETTLED if settled_at_write
                else BILLING_ATTEMPT_STATE_RESERVED),
               float(reserved_usd),
-              float(reserved_usd) if historical else None,
+              float(reserved_usd) if settled_at_write else None,
               "historical_evidence" if historical else None,
               _optional_count(input_tokens), _optional_count(output_tokens),
-              now, now if historical else None, note)
+              now, now if settled_at_write else None, note)
 
     def _op():
         # SYNCED AND VERIFIED BEFORE THE TRANSACTION. See DURABILITY OF THE
@@ -5540,6 +5555,267 @@ def settle_billing_attempt(db_path, attempt_id, *, outcome, settled_usd,
     return SETTLE_CONFLICT
 
 
+# ---------------------------------------------------------------------------
+# SETTLEMENT DISCREPANCIES (P1b)
+# ---------------------------------------------------------------------------
+#
+# A settlement that did not land -- ``missing``, ``conflict``, or ``failed``
+# while the priced response exceeded the reservation -- leaves the attempt's own
+# row below what the live ledger charged. ``spend.AttemptLiability`` computes the
+# shortfall; this writes it as its own settled row so every reader of the record
+# sums it. The row id is the attempt id plus ``DISCREPANCY_ID_SUFFIX``, so the
+# same discrepancy recorded twice (a marker reconciled, then reconciled again) is
+# one row. When the database will not take it, the sink writes a synced marker
+# file instead, and the batch runner reconciles markers before any later paid
+# work and refuses by name when it cannot.
+#
+# A ``missing`` DISCREPANCY MAKES THE CAMPAIGN'S RECORD INCOMPLETE. The row this
+# campaign committed is gone, so other rows may be too, and no reader can say
+# how many. ``campaign_billing_total`` raises ``BillingRecordIncomplete`` for it
+# (the retained amount is in the message); ``--fresh`` starts a new campaign.
+
+DISCREPANCY_ID_SUFFIX = ":settlement_discrepancy"
+DISCREPANCY_RESULTS = (SETTLE_MISSING, SETTLE_CONFLICT, SETTLE_FAILED)
+"""The settlement results a discrepancy row may record. CLOSED."""
+
+DISCREPANCY_RECORDED = "recorded"
+DISCREPANCY_DEFERRED = "deferred"
+DISCREPANCY_FAILED = "failed"
+DISCREPANCY_WRITE_RESULTS = (DISCREPANCY_RECORDED, DISCREPANCY_DEFERRED,
+                             DISCREPANCY_FAILED)
+"""Restated from ``spend.DISCREPANCY_WRITE_RESULTS``; a test pins them equal."""
+
+DISCREPANCY_MARKER_VERSION = 1
+_DISCREPANCY_MARKER_SUFFIX = ".json"
+
+
+class BillingRecordIncomplete(BillingRecordUnreadable):
+    """The campaign's record lost a row one of its own processes committed. A
+    SUBCLASS of ``BillingRecordUnreadable``, so a caller that refuses on the
+    parent still refuses; the batch runner names it separately."""
+
+    def __init__(self, message, *, attempt_ids=(), retained_usd=0.0):
+        super().__init__(message)
+        self.attempt_ids = tuple(attempt_ids)
+        self.retained_usd = float(retained_usd)
+
+
+def billing_attempt_settled_usd(db_path, attempt_id):
+    """The amount a SETTLED row holds for ``attempt_id``, or None. NEVER RAISES.
+    None when the row is absent, reserved, unreadable or unsummable."""
+    try:
+        conn = _open_connection(resolve_inference_db_path(db_path),
+                                read_only=True)
+        try:
+            row = conn.execute(
+                "SELECT state, settled_usd FROM billing_attempts WHERE "
+                "attempt_id = ?", (attempt_id,)).fetchone()
+        finally:
+            conn.close()
+    except Exception:                                          # noqa: BLE001
+        return None
+    if (row is None or row[0] != BILLING_ATTEMPT_STATE_SETTLED
+            or not _valid_billing_usd(row[1])):
+        return None
+    return float(row[1])
+
+
+def _discrepancy_note(result, live_usd, durable_usd, shortfall_usd,
+                      attempt_id) -> str:
+    return json.dumps({"result": result, "attempt_id": attempt_id,
+                       "live_usd": float(live_usd),
+                       "durable_usd": float(durable_usd),
+                       "shortfall_usd": float(shortfall_usd)}, sort_keys=True)
+
+
+def record_settlement_discrepancy(db_path, *, attempt_id, campaign_id, run_id,
+                                  source, model, result, live_usd, durable_usd,
+                                  shortfall_usd, correlation_id=None) -> str:
+    """Commit one attempt's settlement shortfall as its own settled row. NEVER
+    RAISES; returns ``DISCREPANCY_RECORDED`` or ``DISCREPANCY_FAILED``.
+
+    IDEMPOTENT: the row id is ``attempt_id + DISCREPANCY_ID_SUFFIX`` and the
+    write is ``reserve_billing_attempt``'s insert-then-read-back, so a repeat at
+    the same amount is recorded once; a colliding row at a different amount is
+    FAILED (the stored one stands and is summed) rather than mistaken for this.
+    """
+    if (not isinstance(attempt_id, str) or not attempt_id
+            or result not in DISCREPANCY_RESULTS
+            or not all(_valid_billing_usd(v)
+                       for v in (live_usd, durable_usd, shortfall_usd))):
+        log.warning("a settlement discrepancy with an invalid result or amount "
+                    "was refused", event="billing_discrepancy_refused",
+                    reason=str(result))
+        return DISCREPANCY_FAILED
+    try:
+        reserve_billing_attempt(
+            db_path, attempt_id=attempt_id + DISCREPANCY_ID_SUFFIX,
+            campaign_id=campaign_id, run_id=run_id, source=source, model=model,
+            input_tokens=None, output_tokens=None,
+            reserved_usd=float(shortfall_usd), correlation_id=correlation_id,
+            kind=BILLING_ATTEMPT_KIND_DISCREPANCY,
+            note=_discrepancy_note(result, live_usd, durable_usd, shortfall_usd,
+                                   attempt_id))
+    except Exception as exc:                                   # noqa: BLE001
+        log.error("a settlement discrepancy could not be committed",
+                  event="billing_discrepancy_failed", reason=str(result),
+                  error_type=type(exc).__name__, error_message=str(exc),
+                  degraded=True)
+        return DISCREPANCY_FAILED
+    return DISCREPANCY_RECORDED
+
+
+def _sync_fd(fd) -> None:
+    """fsync, and F_FULLFSYNC on darwin -- the billing record's own durability
+    bound (see DURABILITY OF THE BILLING WRITES). RAISES ``OSError``."""
+    os.fsync(fd)
+    if sys.platform in BILLING_FULLFSYNC_PLATFORMS:
+        import fcntl
+        if hasattr(fcntl, "F_FULLFSYNC"):
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+
+
+def _safe_marker_stem(attempt_id) -> bool:
+    return (isinstance(attempt_id, str) and 0 < len(attempt_id) <= 128
+            and not attempt_id.startswith(".")
+            and all(c.isascii() and (c.isalnum() or c in "-_")
+                    for c in attempt_id))
+
+
+def write_discrepancy_marker(directory, payload) -> str:
+    """Write one discrepancy marker durably: temp file, sync, rename, directory
+    sync. RAISES ``OSError`` or ``ValueError``; returns the marker path."""
+    attempt_id = payload.get("attempt_id")
+    if not _safe_marker_stem(attempt_id):
+        raise ValueError(f"attempt id {attempt_id!r} cannot name a marker file")
+    if not os.path.isdir(directory):
+        # A NEW DIRECTORY'S ENTRY LIVES IN ITS PARENT, so the parent is synced
+        # too: otherwise a power loss can drop the directory and the marker in
+        # it even though both were synced.
+        os.makedirs(directory, exist_ok=True)
+        pfd = os.open(os.path.dirname(os.path.abspath(directory)), os.O_RDONLY)
+        try:
+            _sync_fd(pfd)
+        finally:
+            os.close(pfd)
+    final = os.path.join(directory, attempt_id + _DISCREPANCY_MARKER_SUFFIX)
+    tmp = os.path.join(directory, f".{attempt_id}.{os.getpid()}."
+                                  f"{threading.get_ident()}.tmp")
+    data = json.dumps(payload, sort_keys=True).encode("utf-8")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        try:
+            os.write(fd, data)
+            _sync_fd(fd)
+        finally:
+            os.close(fd)
+        os.replace(tmp, final)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    dfd = os.open(directory, os.O_RDONLY)
+    try:
+        _sync_fd(dfd)
+    finally:
+        os.close(dfd)
+    return final
+
+
+class DiscrepancyReconciliation(NamedTuple):
+    """What ``reconcile_discrepancy_markers`` did.
+
+    ``reconciled``    ``(attempt_id, result, shortfall_usd, campaign_id)`` per
+                      marker whose row is now committed.
+    ``unreconciled``  ``(marker, detail)`` per marker that is not.
+    ``left_in_place`` markers committed but not removed; the next
+                      reconciliation records them again as the same row.
+    """
+
+    reconciled: tuple = ()
+    unreconciled: tuple = ()
+    left_in_place: tuple = ()
+
+
+_MARKER_FIELDS = {"attempt_id": str, "campaign_id": str, "run_id": int,
+                  "source": str, "result": str, "live_usd": (int, float),
+                  "durable_usd": (int, float), "shortfall_usd": (int, float)}
+
+
+def reconcile_discrepancy_markers(directory, db_path=None
+                                  ) -> DiscrepancyReconciliation:
+    """Commit every discrepancy marker in ``directory`` to the billing record,
+    removing each marker once its row is committed. NEVER RAISES.
+
+    A marker that cannot be parsed, names another database, or cannot be
+    committed is UNRECONCILED; the caller must refuse paid work while any is.
+    A leftover ``.tmp`` file is a marker write that never completed its rename,
+    so it never recorded anything and is ignored.
+    """
+    if directory is None or not os.path.lexists(directory):
+        return DiscrepancyReconciliation()
+    try:
+        names = sorted(os.listdir(directory))
+        db = os.path.realpath(resolve_inference_db_path(db_path))
+    except Exception as exc:                                   # noqa: BLE001
+        return DiscrepancyReconciliation(unreconciled=(
+            (str(directory), f"{type(exc).__name__}: {exc}"),))
+    reconciled, unreconciled, left = [], [], []
+    for name in names:
+        if name.startswith("."):
+            continue
+        path = os.path.join(directory, name)
+        if not name.endswith(_DISCREPANCY_MARKER_SUFFIX):
+            unreconciled.append((name, "not a discrepancy marker"))
+            continue
+        try:
+            with open(path, "rb") as fh:
+                payload = json.loads(fh.read().decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("not a JSON object")
+            for key, kind in _MARKER_FIELDS.items():
+                value = payload.get(key)
+                if isinstance(value, bool) or not isinstance(value, kind):
+                    raise ValueError(f"field {key!r} is {value!r}")
+            if payload.get("version") != DISCREPANCY_MARKER_VERSION:
+                raise ValueError(f"version {payload.get('version')!r}")
+            if name != payload["attempt_id"] + _DISCREPANCY_MARKER_SUFFIX:
+                raise ValueError("file name does not match its attempt id")
+            if os.path.realpath(str(payload.get("db_path"))) != db:
+                raise ValueError(f"names another database: "
+                                 f"{payload.get('db_path')!r}")
+        except Exception as exc:                               # noqa: BLE001
+            unreconciled.append((name, f"{type(exc).__name__}: {exc}"))
+            continue
+        written = record_settlement_discrepancy(
+            db, attempt_id=payload["attempt_id"],
+            campaign_id=payload["campaign_id"], run_id=payload["run_id"],
+            source=payload["source"], model=payload.get("model"),
+            result=payload["result"], live_usd=payload["live_usd"],
+            durable_usd=payload["durable_usd"],
+            shortfall_usd=payload["shortfall_usd"],
+            correlation_id=payload.get("correlation_id"))
+        if written != DISCREPANCY_RECORDED:
+            unreconciled.append((name, "the database did not take the row"))
+            continue
+        reconciled.append((payload["attempt_id"], payload["result"],
+                           float(payload["shortfall_usd"]),
+                           payload["campaign_id"]))
+        try:
+            os.unlink(path)
+            dfd = os.open(directory, os.O_RDONLY)
+            try:
+                _sync_fd(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            left.append(name)
+    return DiscrepancyReconciliation(tuple(reconciled), tuple(unreconciled),
+                                     tuple(left))
+
+
 class CampaignBilling(NamedTuple):
     """What a campaign's cumulative billing record holds. See
     ``campaign_billing_total``."""
@@ -5550,6 +5826,7 @@ class CampaignBilling(NamedTuple):
     unresolved_usd: float = 0.0
     historical_usd: float = 0.0
     run_ids: tuple = ()
+    discrepancy_usd: float = 0.0
 
 
 def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
@@ -5579,7 +5856,7 @@ def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
         try:
             rows = conn.execute(
                 "SELECT attempt_id, run_id, kind, state, reserved_usd, "
-                "settled_usd FROM billing_attempts WHERE campaign_id = ? "
+                "settled_usd, note FROM billing_attempts WHERE campaign_id = ? "
                 "ORDER BY rowid", (campaign_id,)).fetchall()
         finally:
             conn.close()
@@ -5588,12 +5865,18 @@ def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
             f"the billing record for campaign {campaign_id} could not be read "
             f"from {db_path}: {type(exc).__name__}: {exc}") from exc
 
-    usd = unresolved_usd = historical_usd = 0.0
+    usd = unresolved_usd = historical_usd = discrepancy_usd = 0.0
     unresolved = 0
     bad = []
+    incomplete = []
     run_ids = set()
-    for attempt_id, run_id, kind, state, reserved, settled in rows:
+    for attempt_id, run_id, kind, state, reserved, settled, note in rows:
         if state not in BILLING_ATTEMPT_STATES:
+            bad.append(attempt_id)
+            continue
+        if kind == BILLING_ATTEMPT_KIND_DISCREPANCY and \
+                state != BILLING_ATTEMPT_STATE_SETTLED:
+            # Written settled or not at all; a reserved one is not this build's.
             bad.append(attempt_id)
             continue
         if state == BILLING_ATTEMPT_STATE_SETTLED and _valid_billing_usd(settled):
@@ -5608,6 +5891,17 @@ def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
             continue
         if kind == BILLING_ATTEMPT_KIND_HISTORICAL:
             historical_usd += amount
+        elif kind == BILLING_ATTEMPT_KIND_DISCREPANCY:
+            discrepancy_usd += amount
+            # A MISSING SETTLEMENT, OR A NOTE THAT CANNOT SAY WHICH ONE THIS IS,
+            # MAKES THE RECORD INCOMPLETE. Unparseable is read as missing: it is
+            # the refusing reading, and the row is still summed below.
+            try:
+                _result = json.loads(note).get("result")
+            except Exception:                                  # noqa: BLE001
+                _result = None
+            if _result not in (SETTLE_CONFLICT, SETTLE_FAILED):
+                incomplete.append((attempt_id, amount))
         elif kind != BILLING_ATTEMPT_KIND_ATTEMPT:
             bad.append(attempt_id)
             continue
@@ -5618,11 +5912,21 @@ def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
             f"{len(bad)} billing row(s) of campaign {campaign_id} carry an "
             f"amount, state or kind that cannot be summed (first: {bad[:3]}); "
             f"a budget computed without them would be lower than the truth")
+    if incomplete:
+        retained = sum(a for _i, a in incomplete)
+        raise BillingRecordIncomplete(
+            f"campaign {campaign_id}'s billing record lost {len(incomplete)} "
+            f"row(s) its own processes committed (first: "
+            f"{[i for i, _a in incomplete][:3]}); ${retained:.6f} is retained "
+            f"for them, and the record's total ${usd:.6f} cannot be trusted as "
+            f"complete", attempt_ids=[i for i, _a in incomplete],
+            retained_usd=retained)
     return CampaignBilling(usd=usd, attempts=len(rows), unresolved=unresolved,
                            unresolved_usd=unresolved_usd,
                            historical_usd=historical_usd,
                            run_ids=tuple(sorted(r for r in run_ids
-                                                if r is not None)))
+                                                if r is not None)),
+                           discrepancy_usd=discrepancy_usd)
 
 
 class BillingRecordSink:
@@ -5633,7 +5937,7 @@ class BillingRecordSink:
     call, and cleared when the run ends.
     """
 
-    def __init__(self, db_path, campaign_id, run_id):
+    def __init__(self, db_path, campaign_id, run_id, discrepancy_dir=None):
         if not isinstance(campaign_id, str) or not campaign_id:
             raise ValueError(f"campaign_id must be a non-empty string, not "
                              f"{campaign_id!r}")
@@ -5642,6 +5946,10 @@ class BillingRecordSink:
         self.db_path = resolve_inference_db_path(db_path)
         self.campaign_id = campaign_id
         self.run_id = run_id
+        # WHERE A DISCREPANCY GOES WHEN THE DATABASE WILL NOT TAKE IT (P1b).
+        # None means nowhere: such a discrepancy is FAILED and the run latches.
+        self.discrepancy_dir = (None if discrepancy_dir is None
+                                else os.fspath(discrepancy_dir))
 
     def reserve(self, **fields):
         return reserve_billing_attempt(self.db_path,
@@ -5650,6 +5958,32 @@ class BillingRecordSink:
 
     def settle(self, attempt_id, **fields):
         return settle_billing_attempt(self.db_path, attempt_id, **fields)
+
+    def settled_usd(self, attempt_id):
+        return billing_attempt_settled_usd(self.db_path, attempt_id)
+
+    def record_discrepancy(self, **fields):
+        """The database first; a synced marker beside the checkpoint second.
+        NEVER RAISES; returns a ``DISCREPANCY_WRITE_RESULTS`` member."""
+        written = record_settlement_discrepancy(
+            self.db_path, campaign_id=self.campaign_id, run_id=self.run_id,
+            **fields)
+        if written == DISCREPANCY_RECORDED:
+            return DISCREPANCY_RECORDED
+        if self.discrepancy_dir is None:
+            return DISCREPANCY_FAILED
+        payload = dict(fields, campaign_id=self.campaign_id, run_id=self.run_id,
+                       db_path=self.db_path, version=DISCREPANCY_MARKER_VERSION)
+        try:
+            write_discrepancy_marker(self.discrepancy_dir, payload)
+        except Exception as exc:                               # noqa: BLE001
+            log.error("a billing discrepancy could not be committed or deferred",
+                      event="billing_discrepancy_marker_failed",
+                      reason=str(fields.get("result")),
+                      error_type=type(exc).__name__, error_message=str(exc),
+                      degraded=True)
+            return DISCREPANCY_FAILED
+        return DISCREPANCY_DEFERRED
 
 
 # ---------------------------------------------------------------------------

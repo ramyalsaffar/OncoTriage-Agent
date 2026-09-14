@@ -196,9 +196,11 @@ from oncotriage.storage.database_logger import (
     RUN_RECORD_STATUS_STOPPED,
     RUN_RECORD_TERMINAL_STATUSES,
     analyze_database,
+    BillingRecordIncomplete,
     BillingRecordSink,
     BillingRecordUnreadable,
     BillingRecordWriteError,
+    reconcile_discrepancy_markers,
     RUN_STOP_REASON_BILLING_RECORD,
     IDENTITY_NO_EVIDENCE,
     IDENTITY_RECOVERED,
@@ -895,6 +897,8 @@ CAMPAIGN_REFUSAL_BILLING_UNREADABLE = "billing_record_unreadable"
 CAMPAIGN_REFUSAL_BILLING_UNWRITABLE = "billing_record_unwritable"
 CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED = "campaign_identity_unestablished"
 CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE = "fresh_marker_unverifiable"
+CAMPAIGN_REFUSAL_BILLING_INCOMPLETE = "billing_record_incomplete"
+CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED = "billing_discrepancy_unrecorded"
 CAMPAIGN_REFUSAL_REASONS = (CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
                             CAMPAIGN_REFUSAL_RECORD_UNWRITABLE,
                             CAMPAIGN_REFUSAL_RECORD_DISAGREES,
@@ -902,9 +906,16 @@ CAMPAIGN_REFUSAL_REASONS = (CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
                             CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
                             CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
                             CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED,
-                            CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE)
+                            CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE,
+                            CAMPAIGN_REFUSAL_BILLING_INCOMPLETE,
+                            CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED)
 """Why a batch run refused to start paid work. CLOSED; every refusal is raised
 after the run row is opened and BEFORE the first billed call."""
+
+DISCREPANCY_DIRNAME = "batch_runner_billing_discrepancies"
+"""Beside the checkpoint: one synced JSON marker per billing discrepancy the
+database would not take (P1b). Reconciled into the database before any later
+paid work; never removed by ``clear_checkpoint`` or ``--fresh``."""
 
 
 class CampaignBillingRefusal(RuntimeError):
@@ -963,6 +974,19 @@ class CampaignBillingRefusal(RuntimeError):
                 f"{_campaign_record_path()} to continue its campaign, or start a "
                 f"NEW campaign with --fresh, which closes every campaign now in "
                 f"the database by identity.",
+            CAMPAIGN_REFUSAL_BILLING_INCOMPLETE:
+                "A billing row this campaign committed is GONE from the "
+                "database (a settlement found no row to settle), so other "
+                "rows may be gone too and no budget computed from it can be "
+                "trusted. The attempt that found it is retained at the amount "
+                "named above. Restore the database the campaign was written "
+                "to, or start a NEW campaign with --fresh.",
+            CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED:
+                f"A billing discrepancy recorded in {_discrepancy_dir()} could "
+                f"not be committed to the billing record, so a budget read now "
+                f"would be lower than what was charged. Fix the database named "
+                f"above and run again; the marker is reconciled automatically. "
+                f"Do not delete the marker.",
         }.get(self.reason,
               "Fix the inference database the billing record lives in and "
               "run again.")
@@ -987,6 +1011,11 @@ class CampaignBudget(NamedTuple):
 
 def _campaign_record_path() -> Path:
     return Path(paths.checkpoint_path) / CAMPAIGN_RECORD_FILENAME
+
+
+def _discrepancy_dir() -> Path:
+    """Where deferred billing discrepancies live (P1b). See DISCREPANCY_DIRNAME."""
+    return Path(paths.checkpoint_path) / DISCREPANCY_DIRNAME
 
 
 def _durable_sync(fd, *, directory=False) -> None:
@@ -1335,6 +1364,25 @@ def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
         run_id, db_path: the run row and the database it and the billing record
             live in.
     """
+    # EVERY DEFERRED SETTLEMENT DISCREPANCY IS COMMITTED FIRST (P1b). A marker
+    # beside the checkpoint is a liability an earlier process charged and the
+    # database would not take; until it is in the record, any budget read below
+    # is lower than what was charged. Reconciliation is idempotent -- the row id
+    # is derived from the attempt -- so a marker left in place is recorded as
+    # the same row next time, never twice.
+    _recon = reconcile_discrepancy_markers(_discrepancy_dir(), db_path)
+    for _aid, _res, _usd, _cid in _recon.reconciled:
+        console.out(f"[Campaign] Reconciled a deferred billing discrepancy "
+                    f"({_res}) into campaign {_cid}: ${_usd:.6f} retained for "
+                    f"attempt {_aid}.")
+    for _name in _recon.left_in_place:
+        CHECKPOINT_FAULTS["discrepancy_marker_left_in_place"] += 1
+        console.out(f"[Campaign] WARNING: {_name} is committed but could not be "
+                    f"removed; it is reconciled again as the same row.")
+    if _recon.unreconciled:
+        raise CampaignBillingRefusal(
+            CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED,
+            "; ".join(f"{_n}: {_d}" for _n, _d in _recon.unreconciled))
     # AN UNREADABLE RECORD IS NOT A MISSING ONE, and it is not an automatic
     # refusal either any more (the billing closure pass): the billing record is
     # asked first, and only a record whose rows establish nothing is refused
@@ -1446,6 +1494,11 @@ def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
 
     try:
         billing = campaign_billing_total(campaign_id, db_path=db_path)
+    except BillingRecordIncomplete as exc:
+        # BEFORE its parent: a lost row is a different finding with a different
+        # remedy from a row that cannot be read (P1b).
+        raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_INCOMPLETE,
+                                     str(exc)) from exc
     except BillingRecordUnreadable as exc:
         raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
                                      str(exc)) from exc
@@ -4826,7 +4879,8 @@ def main():
         # is reserved in `inferences.billing_attempts` before it is sent. It is
         # cleared on both exits of the try below.
         spend.BILLING_RECORD.install(BillingRecordSink(
-            _reconcile_db, _campaign.campaign_id, _run_record_id))
+            _reconcile_db, _campaign.campaign_id, _run_record_id,
+            discrepancy_dir=_discrepancy_dir()))
 
         # THE RUN IS CLOSED ON EVERY EXIT PATH, and this try exists only for
         # that. MEASURED, not assumed: a process that opens an MLflow run and

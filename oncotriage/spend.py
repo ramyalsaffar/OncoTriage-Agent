@@ -2234,7 +2234,10 @@ class BillingRecord:
     ``TrialMatchState`` reaches neither the embedding call nor the retry
     policy's attempt loop.
 
-    THE SINK IS DUCK-TYPED -- ``reserve(**fields)`` and ``settle(attempt_id,
+    THE SINK IS DUCK-TYPED (P1b adds two OPTIONAL methods,
+    ``settled_usd(attempt_id)`` and ``record_discrepancy(**fields) -> str``; a
+    sink without them has every discrepancy counted FAILED and the run latched)
+    -- ``reserve(**fields)`` and ``settle(attempt_id,
     **fields) -> str`` -- so this module imports no storage layer (see the
     module docstring); ``database_logger.BillingRecordSink`` is the one shipped
     implementation.
@@ -2377,6 +2380,47 @@ class BillingRecord:
             BILLING_RECORD_FAULTS[f"settle:{result}"] += 1
         return result
 
+    def _stored_settlement(self, handle):
+        """The settled amount the durable row now holds for ``handle``, or None.
+        NEVER RAISES. None when the sink cannot say, which every caller reads as
+        the conservative 0 (P1b)."""
+        reader = getattr(handle.sink, "settled_usd", None)
+        if reader is None:
+            BILLING_RECORD_FAULTS["discrepancy:no_settled_reader"] += 1
+            return None
+        try:
+            value = reader(handle.attempt_id)
+        except Exception as exc:                                # noqa: BLE001
+            BILLING_RECORD_FAULTS[
+                f"discrepancy:settled_read_raised:{type(exc).__name__}"] += 1
+            return None
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or value != value or value < 0 or value == float("inf")):
+            return None
+        return float(value)
+
+    def _record_discrepancy(self, handle, result, live_usd, durable_usd,
+                            shortfall_usd) -> str:
+        """Hand one attempt's settlement shortfall to the sink. NEVER RAISES;
+        returns a ``DISCREPANCY_WRITE_RESULTS`` member (P1b)."""
+        writer = getattr(handle.sink, "record_discrepancy", None)
+        if writer is None:
+            BILLING_RECORD_FAULTS["discrepancy:no_writer"] += 1
+            return DISCREPANCY_FAILED
+        try:
+            written = writer(attempt_id=handle.attempt_id,
+                             source=handle.source, model=handle.model,
+                             result=result, live_usd=float(live_usd),
+                             durable_usd=float(durable_usd),
+                             shortfall_usd=float(shortfall_usd),
+                             correlation_id=current_correlation_id())
+        except Exception as exc:                                # noqa: BLE001
+            BILLING_RECORD_FAULTS[
+                f"discrepancy:write_raised:{type(exc).__name__}"] += 1
+            return DISCREPANCY_FAILED
+        return (written if written in DISCREPANCY_WRITE_RESULTS
+                else DISCREPANCY_FAILED)
+
 
 BILLING_RECORD = BillingRecord()
 """The one instance. Installed and cleared by ``oncotriage/batch/runner.py:main()``."""
@@ -2398,9 +2442,11 @@ BILLING_RECORD = BillingRecord()
 # (it persists the durable reservation when a sink is installed), resolved
 # EXACTLY ONCE after. Resolution computes the liability through
 # `attempt_liability`, charges `SPEND_LEDGER` that amount, and settles the
-# durable row at the SAME amount. When the durable settlement does not land,
-# the row stays RESERVED -- every reader charges it at the reservation -- so
-# the ledger is topped up to the reservation too, and the two agree again.
+# durable row at the SAME amount. When the durable settlement does not land
+# (failed, missing, conflict), `AttemptLiability._settlement_did_not_land`
+# charges live the most conservative reading and writes the shortfall as its
+# own durable row (or a marker the runner reconciles), so a resumed reading is
+# never below the live charge (P1b).
 #
 # WHAT IT DOES NOT COVER, STATED: billed paths that do not create one of these
 # -- the rater's Batch API, the ragas harness -- keep their own ledger charges
@@ -2409,6 +2455,35 @@ BILLING_RECORD = BillingRecord()
 LIABILITY_OPEN = "open"
 """The live tally's key for attempts created and not yet resolved -- the
 in-process mirror of a durable row still ``reserved``."""
+
+# THE SETTLEMENT RESULTS THIS MODULE BRANCHES ON (P1b). Restated from
+# ``database_logger.SETTLE_RESULTS`` for the reason ``BILLING_OUTCOMES`` is: this
+# module imports no storage layer, and the sink is duck-typed.
+SETTLEMENT_MISSING = "missing"
+SETTLEMENT_CONFLICT = "conflict"
+SETTLEMENT_FAILED = "failed"
+SETTLEMENTS_LANDED = ("settled", "duplicate")
+"""A settlement whose row now carries exactly this attempt's liability."""
+SETTLEMENT_INTEGRITY_RESULTS = (SETTLEMENT_MISSING, SETTLEMENT_CONFLICT)
+"""Results that prove the durable record was changed under this process."""
+
+DISCREPANCY_RECORDED = "recorded"
+DISCREPANCY_DEFERRED = "deferred"
+DISCREPANCY_FAILED = "failed"
+DISCREPANCY_WRITE_RESULTS = (DISCREPANCY_RECORDED, DISCREPANCY_DEFERRED,
+                             DISCREPANCY_FAILED)
+"""What a sink's ``record_discrepancy`` did. CLOSED.
+
+  ``recorded``  the shortfall row is committed in the billing record.
+  ``deferred``  the database would not take it; a synced marker file holds it
+                and a later run must reconcile it before paid work.
+  ``failed``    neither landed. Nothing durable carries the shortfall; the run
+                is latched and the operator must not trust a resume's budget.
+"""
+
+DISCREPANCY_EPSILON_USD = 1e-9
+"""Below this a shortfall is float noise, not a liability. Equal to the storage
+layer's amount tolerance and to the closure tests' accounting precision."""
 
 
 class AttemptLiability:
@@ -2452,8 +2527,9 @@ class AttemptLiability:
 
         ORDER: the LEDGER first, then the durable write. ``charge_usd`` cannot
         raise, so the in-process budget moves even if everything after it
-        fails; and a durable write that does not land tops the ledger up to the
-        reservation the unsettled row is read at.
+        fails; and a durable write that does not land is handled by
+        ``_settlement_did_not_land``, which keeps a resumed reading at or above
+        this process's charge (P1b).
         """
         if self.resolved_outcome is not None:
             return self.resolved_usd
@@ -2480,19 +2556,83 @@ class AttemptLiability:
         if self.handle is not None:
             result = BILLING_RECORD._write_settlement(self.handle, out,
                                                       float(usd), s_in, s_out)
-            if result not in ("settled", "duplicate"):
-                # THE DURABLE ROW STAYS RESERVED (failed) or holds something
-                # this attempt did not write (conflict, missing); every reader
-                # charges the conservative reading. Top the ledger up to the
-                # reservation so live and resumed agree in the safe direction.
-                top_up = float(self.reserved_usd or 0.0) - float(usd)
-                if top_up > 0:
-                    SPEND_LEDGER.charge_usd(top_up, self.source)
-                    self.resolved_usd = float(self.reserved_usd)
-                BILLING_RECORD_FAULTS[f"ledger_topped_up:{result}"] += 1
+            if result not in SETTLEMENTS_LANDED:
+                self._settlement_did_not_land(result)
         BILLING_RECORD._note_resolved(self.reserved_usd, out,
                                       self.resolved_usd)
         return self.resolved_usd
+
+    def _settlement_did_not_land(self, result) -> None:
+        """Keep a resumed process's reading at or above this process's. NEVER RAISES.
+
+        THE INVARIANT (P1b): for every attempt, what a FRESH process reads from
+        the durable record is never less than what THIS process charged. The
+        settlement did not land, so the attempt's own row does not carry the
+        liability; what it carries instead depends on the result:
+
+          ``missing``   no row. The durable reading is 0.
+          ``conflict``  a row settled by something else. The reading is its
+                        stored amount (0 when that cannot be read).
+          ``failed``    and anything unrecognised: the row stays RESERVED, read
+                        at the reservation. (If the write did land and only its
+                        report failed, the reading is the priced amount; the
+                        conservative assumption over-counts by the shortfall.)
+
+        LIVE is charged the most conservative amount any reading supports --
+        ``max(priced, reservation, stored)`` -- so live never under-states the
+        record either. The SHORTFALL ``live - durable`` is then written as its
+        own settled ``settlement_discrepancy`` row, deterministic in the attempt
+        id so a repeat cannot double-count, or deferred to a synced marker file
+        beside the checkpoint when the database will not take it; the batch
+        runner reconciles such markers before any later paid work, and refuses
+        by name when it cannot.
+
+        ``missing`` AND ``conflict`` ALSO LATCH THE RUN. Both prove the record
+        was changed under a running process -- a row this process committed is
+        gone, or holds a settlement this process did not write -- so nothing
+        further is dispatched against it. A ``missing`` row additionally makes
+        a later resume REFUSE (``BillingRecordIncomplete``): the record lost at
+        least one row this campaign wrote, and no reader can know how many
+        more. A discrepancy that could not be made durable at all latches too.
+        """
+        result_class = (result if result in SETTLEMENT_INTEGRITY_RESULTS
+                        else SETTLEMENT_FAILED)
+        reserved = float(self.reserved_usd or 0.0)
+        priced = float(self.resolved_usd)
+        stored = None
+        if result_class == SETTLEMENT_CONFLICT:
+            stored = BILLING_RECORD._stored_settlement(self.handle)
+        if result_class == SETTLEMENT_MISSING:
+            durable = 0.0
+        elif result_class == SETTLEMENT_CONFLICT:
+            durable = stored if stored is not None else 0.0
+        else:
+            durable = reserved
+        live = max(priced, reserved, stored if stored is not None else 0.0)
+        if live - priced > 0:
+            SPEND_LEDGER.charge_usd(live - priced, self.source)
+            self.resolved_usd = live
+        BILLING_RECORD_FAULTS[f"ledger_topped_up:{result}"] += 1
+        shortfall = max(live - durable, 0.0)
+        integrity = result_class in SETTLEMENT_INTEGRITY_RESULTS
+        written = None
+        if integrity or shortfall > DISCREPANCY_EPSILON_USD:
+            written = BILLING_RECORD._record_discrepancy(
+                self.handle, result_class, live, durable, shortfall)
+            BILLING_RECORD_FAULTS[f"discrepancy:{result_class}:{written}"] += 1
+            log.error("a billed attempt's settlement did not land; the "
+                      "shortfall was written as its own billing row, deferred "
+                      "to a marker, or could not be recorded",
+                      event="billing_settlement_discrepancy", status=written,
+                      phase=self.source, mode=self.where, reason=result_class,
+                      degraded=True)
+            console.out(f"[SPEND] BILLING RECORD DISCREPANCY ({result_class}): "
+                        f"attempt {self.handle.attempt_id} charged "
+                        f"${live:.6f} live, durable reading ${durable:.6f}, "
+                        f"shortfall ${shortfall:.6f} {written}.")
+        if integrity or (written is not None
+                         and written != DISCREPANCY_RECORDED):
+            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, self.where, self.source)
 
 
 def begin_billed_attempt(source, model, input_tokens, output_tokens, *,
