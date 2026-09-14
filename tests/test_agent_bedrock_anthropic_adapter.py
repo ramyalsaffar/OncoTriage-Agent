@@ -1400,16 +1400,16 @@ with provider(config.MATCHING_PROVIDER_BEDROCK_ANTHROPIC,
 check_true("a model with no PRICING_CONFIG row is refused BEFORE any billed "
            "call, rather than raising from inside the writer afterwards",
            "PRICING_CONFIG" in _msg)
-check_true("...and the refusal says the geo rows are inferred", "A6" in _msg)
+check_true("...and the refusal names VERIFY-AT-GO-LIVE (A6)", "A6" in _msg)
 check("every accepted profile prefix yields a PRICED model id, which is the "
       "invariant the two must satisfy TOGETHER",
       sorted(p for p in config.BEDROCK_ANTHROPIC_PROFILE_PREFIXES + ("",)
              if f"{p}anthropic.claude-sonnet-4-6"
              not in config.PRICING_CONFIG["models"]), [])
 
-check("the shipped default's price is the INFERRED geo rate, and the global "
-      "row is the MEASURED one -- they differ, which is what says the "
-      "distinction was actually made",
+check("the shipped default's price is the published GEO rate and the global "
+      "row is the published GLOBAL one (AWS pricing page, 2026-09-14) -- they "
+      "differ, which is what says the distinction was actually made",
       get_model_cost("us.anthropic.claude-sonnet-4-6", 1_000_000, 0)
       == get_model_cost("global.anthropic.claude-sonnet-4-6", 1_000_000, 0),
       False)

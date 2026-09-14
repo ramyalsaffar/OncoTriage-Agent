@@ -1752,8 +1752,9 @@ configuration the bare id is a 400 waiting to happen.
 
 PRICING: whichever value is set here is the key `get_model_cost()` looks up,
 because `inferences.matching_model` records the model that answered. See
-PRICING_CONFIG, and read A6 in the adapter's VERIFY-AT-GO-LIVE list before
-trusting the geo rows -- they are INFERRED, not measured."""
+PRICING_CONFIG. Its Sonnet 4.6 rows were verified against AWS's Amazon Bedrock
+pricing page on 2026-09-14; A6 in the adapter's VERIFY-AT-GO-LIVE list is where
+a console bill is compared against them."""
 
 BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS = 5.0
 """Connect-phase budget for the boto3 client, in seconds.
@@ -3353,9 +3354,9 @@ def _validate_bedrock_anthropic_config():
             f"PRICING_CONFIG. get_model_cost() RAISES on an unpriced model by "
             f"design, so this configuration would spend a live Stage 5 call "
             f"and then fail to write the row it paid for. Add a row for it in "
-            f"oncotriage/config.py -- and read VERIFY-AT-GO-LIVE (A6) first: "
-            f"only the 'global.' row is measured, the rest are inferred at a "
-            f"+10% geo premium.")
+            f"oncotriage/config.py, taken from AWS's Amazon Bedrock pricing "
+            f"page (the Global and the Geo/In-region tables differ), and see "
+            f"VERIFY-AT-GO-LIVE (A6).")
 
     if BEDROCK_ANTHROPIC_CACHE_TTL not in BEDROCK_ANTHROPIC_CACHE_TTLS:
         raise RuntimeError(
@@ -6040,17 +6041,31 @@ PRICING_CONFIG = {
         # absent from this table raises UnknownModelPricingError before a row
         # is written.
         #
-        # READ THIS BEFORE TRUSTING A COST ON THIS BRANCH: ONE ROW IS MEASURED
-        # AND THE OTHERS ARE INFERRED, and they are labelled individually
-        # rather than as a block.
+        # EVERY RATE IN THE SIX ROWS BELOW IS VERIFIED against AWS's Amazon
+        # Bedrock pricing page (the R1b recovery, retrieved 2026-09-14). The
+        # page renders its Claude price cells from its own data endpoint,
+        # b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/bedrockfoundationmodels/
+        # USD/current/bedrockfoundationmodels.json (publication 2026-09-11), and
+        # each "Claude Sonnet 4.6" cell was mapped to its entry. Per 1M tokens:
         #
-        # MEASURED, 2026-08-30, from the AWS Marketplace listing the Claude
-        # Sonnet 4.6 model card names as its own product (prod-ffvjxvh4ltq64),
-        # per 1M tokens, all dimensions published as GLOBAL:
-        #
+        #   Global Cross-region Inference (identical in all 33 regions):
         #     Input                $3.00      Response            $15.00
         #     Cache read           $0.30      Cache write (5m)     $3.75
         #     Cache write (1h)     $6.00      Batch in/out   $1.50 / $7.50
+        #
+        #   Geo and In-region Cross-region Inference (identical in all 19
+        #   regions, including US East (N. Virginia) and EU (London)):
+        #     Input                $3.30      Response            $16.50
+        #     Cache read           $0.33      Cache write (5m)     $4.125
+        #     Cache write (1h)     $6.60      Batch in/out   $1.65 / $8.25
+        #
+        # EARLIER PROVENANCE, KEPT AS HISTORY: the global row was first read from
+        # the AWS Marketplace listing (prod-ffvjxvh4ltq64, 2026-08-30) and the geo
+        # rows were INFERRED at +10%. The page confirms both. AWS publishes the geo
+        # prices as their own row, not as a stated multiplier, so a geo row is
+        # already the geo price and applying a geo factor on top of it would
+        # double count. The page states NO long-context price for this model:
+        # see STAGE5_ATTEMPT_LIMITS, assumption (4).
         #
         # THE CACHE DIMENSIONS ARE MODELLED NOW, ADDITIVELY, AND
         # `get_model_cost()` STILL IS NOT. That function reads "input" and
@@ -6091,95 +6106,70 @@ PRICING_CONFIG = {
         # raises UnknownCachePricingError and stores NULL, which is
         # get_model_cost()'s own refusal applied to the second figure.
         #
-        # INFERRED, NOT MEASURED -- the geo and In-Region rows below. That
-        # listing publishes Global dimensions only. The +10% premium is carried
-        # over from the pattern this project already recorded for GPT-5.6 Terra
-        # (geo $2.20/$13.20 against global $2.00/$12.00 on a $2.00/$12.00 base)
-        # and is corroborated only by secondary sources. It is here rather than
-        # absent because an absent row makes get_model_cost() raise and the
-        # branch unable to write a row at all; it is labelled because a number
-        # nobody measured must not read like one somebody did. VERIFY-AT-GO-LIVE
-        # (A6) is the item that settles it against a console bill.
+        # THE GEO AND IN-REGION ROWS WERE INFERRED UNTIL 2026-09-14 and are now
+        # verified (above). VERIFY-AT-GO-LIVE (A6) remains where a console bill
+        # is compared against them; no bill has been reconciled yet.
         #
-        # bedrock-runtime, global cross-Region profile. MEASURED.
+        # bedrock-runtime, global cross-Region profile. VERIFIED 2026-09-14.
         "global.anthropic.claude-sonnet-4-6": {
             "input": 3.00,
             "output": 15.00,
-            # MEASURED, from the same 2026-08-30 listing as the two rates
-            # above: "Cache read $0.30", "Cache write (5m) $3.75", "Cache
-            # write (1h) $6.00". They are 0.10x, 1.25x and 2.00x this row's
-            # own input rate, which is the multiplier set the five INFERRED
-            # rows below apply to their own inferred base.
+            # VERIFIED 2026-09-14 against the pricing page (above): cache read
+            # $0.30, cache write $3.75 (5m) / $6.00 (1h) -- 0.10x, 1.25x and
+            # 2.00x this row's own input rate. The five geo rows below carry the
+            # same multipliers on their own published base.
             "cache_read": 0.30,
             "cache_write": {"5m": 3.75, "1h": 6.00}
         },
-        # bedrock-runtime, US geographic profile. THE SHIPPED DEFAULT. INFERRED.
+        # bedrock-runtime, US geographic profile. THE SHIPPED DEFAULT. VERIFIED
+        # 2026-09-14.
         "us.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, EU geographic profile. INFERRED.
+        # bedrock-runtime, EU geographic profile. VERIFIED 2026-09-14.
         "eu.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, AU geographic profile. INFERRED.
+        # bedrock-runtime, AU geographic profile. VERIFIED 2026-09-14.
         "au.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, JP geographic profile. INFERRED.
+        # bedrock-runtime, JP geographic profile. VERIFIED 2026-09-14.
         "jp.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, In-Region. Reachable in eu-west-2 alone. INFERRED.
+        # bedrock-runtime, In-Region. Reachable in eu-west-2 alone. VERIFIED
+        # 2026-09-14.
         "anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
@@ -6244,16 +6234,26 @@ PRICING_CONFIG = {
 #       echoes a pricier model is priced above the reservation and is caught by
 #       spend.AttemptLiability's discrepancy rule, not by this bound;
 #   (3) the rates in PRICING_CONFIG and the multipliers below are the provider's;
-#   (4) SONNET 4.6 ON BEDROCK: NO FIRST-PARTY AWS PAGE THIS PROJECT COULD READ
-#       STATES WHETHER A LONG-CONTEXT PREMIUM APPLIES. Anthropic's own pricing
-#       page says Claude 4.6 models bill the full 1M window at standard rates on
-#       its API, and says Bedrock prices independently; the AWS pricing page did
-#       not render its Claude rows to this project's reader (2026-09-14). So the
-#       Sonnet rows carry an ASSUMED CEILING of 2.0x input / 1.5x output -- the
-#       long-context class documented for GPT-5.6 Terra on both providers and
-#       for earlier Claude Sonnet 1M windows. A Bedrock premium ABOVE that would
-#       break the bound. VERIFY AGAINST A CONSOLE BILL (A6) and, if Bedrock
-#       applies no premium, set both multipliers to 1.0.
+#   (4) SONNET 4.6 ON BEDROCK: NO AWS DOCUMENT STATES WHETHER A LONG-CONTEXT
+#       PREMIUM APPLIES, SO THE MULTIPLIERS BELOW ARE ASSUMED AND THE SHIPPED
+#       ARM'S BOUND IS CONDITIONAL ON THEM, NOT PROVEN. Checked 2026-09-14 (the
+#       R1b recovery). The AWS model card states "Context window: 1M tokens" and
+#       no price. The AWS pricing page, and the data endpoint it renders from,
+#       publishes one on-demand rate per class for Claude Sonnet 4.6 (input,
+#       output, batch, 5m and 1h cache write, cache read) with no long-context
+#       row or column, and the page contains no "long context", "200K" or
+#       "context window" text. It shows no long-context column for ANY Claude
+#       model, so that absence is not evidence the page would show a premium if
+#       one existed, and missing documentation does not prove the premium is
+#       zero. Anthropic's own terms for its API do not establish Bedrock's.
+#       So the Sonnet rows carry an ASSUMED CEILING of 2.0x input / 1.5x output
+#       -- the long-context class R1 recorded for GPT-5.6 Terra (not re-read in
+#       R1b). A Bedrock premium ABOVE that would break the bound. The RATES are
+#       verified (PRICING_CONFIG); the multipliers are not. What would settle
+#       it: an AWS statement, or a console bill line for a Sonnet 4.6 request
+#       above 200K input tokens (A6). If Bedrock applies no premium, both
+#       multipliers become 1.0; rows reserved at the higher bound still cover
+#       the lower recomputed one.
 #
 # A MODEL ABSENT FROM THIS TABLE HAS NO ESTABLISHED BOUND AND IS REFUSED BEFORE
 # DISPATCH (Stage5ReservationUnbounded). Priced is not bounded: gpt-4o has a

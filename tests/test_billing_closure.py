@@ -342,6 +342,11 @@ section("SECTION 1 -- P1: one liability rule, both ledgers, every class")
 # 2026-09-14) rather than read out of config.STAGE5_ATTEMPT_LIMITS, and the
 # arithmetic is re-done from PRICING_CONFIG's rates; the owner is then
 # required to agree. A dollar literal pins each shipped result as well.
+# ONE COLUMN IS NOT FROM A DOCUMENT: the Sonnet 4.6 long-context multipliers
+# (2.0 / 1.5) are the ASSUMED ceiling. No AWS document states a long-context
+# price for that model (R1b, 2026-09-14), so for the Sonnet rows the agreement
+# below is agreement with an assumption, not with a proven ceiling. 9q pins
+# the rates to the published prices and the label to "ASSUMED".
 
 _DOC_LIMITS = {
     # model: (context window, max output, long-ctx input x, long-ctx output x,
@@ -3922,7 +3927,9 @@ check("8t the patched storage functions and the console are restored",
 
 
 # ===========================================================================
-section("SECTION 9 -- R1: a Stage 5 reservation is a documented upper bound")
+section("SECTION 9 -- R1: a Stage 5 reservation is the documented-limit bound "
+        "(for Sonnet 4.6 on Bedrock, conditional on ASSUMED long-context "
+        "multipliers; see 9q)")
 # ===========================================================================
 #
 # The independent derivation (_DOC_LIMITS, _indep_bound) is defined once, at
@@ -4418,6 +4425,90 @@ check("9p *** THE WARMUP, through the real call_matching_model_warmup, reserves 
        at(_row_w, 7), at(_row_w, 3),
        near(_c_warm["live"].get("measured"), _B_WARM[2])),
       (1, True, True, 1_050_000, "possibly_billed", True))
+
+
+# ---------------------------------------------------------------------------
+# 9q -- R1b: THE SHIPPED ARM'S TERMS AGAINST AWS's OWN DOCUMENTATION.
+#
+# The rates are TYPED from AWS's Amazon Bedrock pricing page as rendered from
+# its own data endpoint (b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/
+# bedrockfoundationmodels/USD/current/bedrockfoundationmodels.json, publication
+# 2026-09-11, retrieved 2026-09-14), never read out of PRICING_CONFIG: a rate
+# edited without new evidence fails here. Per 1M tokens, (input, output, cache
+# read, 5m cache write, 1h cache write):
+#   "Global Cross-region Inference"            3.00 15.00 0.30 3.75  6.00
+#   "Geo and In-region Cross-region Inference" 3.30 16.50 0.33 4.125 6.60
+# The long-context multipliers are NOT on any AWS page; they are pinned here
+# as the assumption they are, and labelled so in the owner.
+_PUBLISHED_GLOBAL = (3.00, 15.00, 0.30, 3.75, 6.00)
+_PUBLISHED_GEO = (3.30, 16.50, 0.33, 4.125, 6.60)
+_PUBLISHED_SONNET = {
+    "global.anthropic.claude-sonnet-4-6": _PUBLISHED_GLOBAL,
+    "us.anthropic.claude-sonnet-4-6": _PUBLISHED_GEO,
+    "eu.anthropic.claude-sonnet-4-6": _PUBLISHED_GEO,
+    "au.anthropic.claude-sonnet-4-6": _PUBLISHED_GEO,
+    "jp.anthropic.claude-sonnet-4-6": _PUBLISHED_GEO,
+    "anthropic.claude-sonnet-4-6": _PUBLISHED_GEO,
+}
+
+
+def _row_rates(model):
+    row = at(config.PRICING_CONFIG["models"], model, {})
+    cw = at(row, "cache_write", {})
+    return (at(row, "input"), at(row, "output"), at(row, "cache_read"),
+            at(cw, "5m"), at(cw, "1h"))
+
+
+def _rate_of(model, key):
+    b = drive(config.stage5_attempt_bound, model, _M, 1)
+    return b.get(key) if isinstance(b, dict) else b
+
+
+check("9q *** EVERY SONNET 4.6 ROW CARRIES THE RATES AWS PUBLISHES (pricing "
+      "page, retrieved 2026-09-14): Global 3.00/15.00/0.30/3.75/6.00, Geo and "
+      "In-region 3.30/16.50/0.33/4.125/6.60 ***",
+      {m: _row_rates(m) for m in _PUBLISHED_SONNET}, _PUBLISHED_SONNET)
+check("9q-0 non-degeneracy: all six Sonnet 4.6 wire ids are checked, and every "
+      "one of them is a documented Stage 5 wire model",
+      (len(_PUBLISHED_SONNET),
+       sorted(m for m in _PUBLISHED_SONNET
+              if m not in config.STAGE5_ATTEMPT_LIMITS)),
+      (6, []))
+check("9q-i *** NO GEO FACTOR ON TOP OF A GEO ROW: the shipped bound prices input "
+      "at the published 5m write rate x the assumed 2.0 and output at the "
+      "published rate x 1.5, and the geo bound's rates are exactly 1.1x the "
+      "global ones (published, not multiplied again) ***",
+      (_rate_of(_SONNET, "input_rate_per_mtok"),
+       _rate_of(_SONNET, "output_rate_per_mtok"),
+       _rate_of("global.anthropic.claude-sonnet-4-6", "input_rate_per_mtok"),
+       _rate_of("global.anthropic.claude-sonnet-4-6", "output_rate_per_mtok"),
+       _both_numbers(_rate_of(_SONNET, "input_rate_per_mtok"),
+                     _rate_of("global.anthropic.claude-sonnet-4-6",
+                              "input_rate_per_mtok"))
+       and round(_rate_of(_SONNET, "input_rate_per_mtok")
+                 / _rate_of("global.anthropic.claude-sonnet-4-6",
+                            "input_rate_per_mtok"), 9),
+       _both_numbers(_rate_of(_SONNET, "output_rate_per_mtok"),
+                     _rate_of("global.anthropic.claude-sonnet-4-6",
+                              "output_rate_per_mtok"))
+       and round(_rate_of(_SONNET, "output_rate_per_mtok")
+                 / _rate_of("global.anthropic.claude-sonnet-4-6",
+                            "output_rate_per_mtok"), 9)),
+      (4.125 * 2.0, 16.50 * 1.5, 3.75 * 2.0, 15.00 * 1.5, 1.1, 1.1))
+check("9q-ii *** THE ASSUMED MULTIPLIERS ARE LABELLED ASSUMED: every Sonnet 4.6 "
+      "wire model's bound basis says ASSUMED, and no GPT-5.6 Terra basis does ***",
+      {m: ("ASSUMED" in str(_rate_of(m, "basis")))
+       for m in config.STAGE5_ATTEMPT_LIMITS},
+      {m: ("claude-sonnet-4-6" in m) for m in config.STAGE5_ATTEMPT_LIMITS})
+check("9q-iii the assumed Sonnet 4.6 multipliers are exactly 2.0 input / 1.5 "
+      "output on every row: missing documentation is not treated as a zero "
+      "premium, and a change needs new evidence",
+      {m: (at(at(config.STAGE5_ATTEMPT_LIMITS, m),
+              "long_context_input_multiplier"),
+           at(at(config.STAGE5_ATTEMPT_LIMITS, m),
+              "long_context_output_multiplier"))
+       for m in _PUBLISHED_SONNET},
+      {m: (2.0, 1.5) for m in _PUBLISHED_SONNET})
 
 
 # ===========================================================================

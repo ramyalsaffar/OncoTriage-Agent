@@ -471,9 +471,9 @@ check("3a  every Converse row carries both cache keys",
 check("3b  NON-DEGENERACY: there is more than one such row",
       len(_CONVERSE_ROWS) >= 6, True)
 
-# THE MEASURED ROW'S MULTIPLIERS ARE WHAT THE INFERRED ROWS APPLY, so a
-# correction to the geo premium moves a row's five numbers together and cannot
-# leave its cache rates describing a base nobody uses.
+# THE GLOBAL ROW'S MULTIPLIERS ARE WHAT THE GEO ROWS CARRY. Both tables were
+# verified against AWS's Amazon Bedrock pricing page on 2026-09-14, and the
+# published cache rates are 0.10x / 1.25x / 2.00x of each table's own input.
 _G = config.PRICING_CONFIG["models"]["global.anthropic.claude-sonnet-4-6"]
 def multipliers(row):
     """(read, write5m, write1h) as multiples of a row's own input rate.
@@ -490,12 +490,12 @@ def multipliers(row):
             rounded(at(write, "1h", 0) / base, 4))
 
 
-check("3c  the MEASURED row's rates are 0.10x / 1.25x / 2.00x its own input",
+check("3c  the GLOBAL row's rates are 0.10x / 1.25x / 2.00x its own input",
       multipliers(_G), (0.10, 1.25, 2.00))
 _bad = [k for k in _CONVERSE_ROWS
         if multipliers(config.PRICING_CONFIG["models"][k])
         != (0.10, 1.25, 2.00)]
-check("3d  every INFERRED row applies the same multipliers to its own base",
+check("3d  every geo row carries the same multipliers on its own base",
       _bad, [])
 check("3e  the shipped TTL is one the shipped model prices",
       config.BEDROCK_ANTHROPIC_CACHE_TTL in at(
