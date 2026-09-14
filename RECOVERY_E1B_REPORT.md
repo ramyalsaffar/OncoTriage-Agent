@@ -1716,3 +1716,209 @@ log: 0; duplicate markers: none; unattached markers: none; every marker
 replay premise probe, the static checks, and the end-state digest and
 production byte comparison, all of which predate the 12:12 fix. Then B7 (the
 pacing check's scheduled-start fix) and B8 (CLAUDE.md corrections).
+
+### 14.15 Batch B6 -- evidence that predates the 12:12 fix, re-established (2026-09-14)
+
+Written for: the operator and the closure session. Run only: no production
+source or test file edited; no commit, stash, branch change, reset or cleanup;
+no paid call; no network egress; no SQLite connection to a production file.
+`git log -1` = `d177285`, `git status --short` clean at start.
+
+Evidence root: `/private/tmp/claude-501/<project-slug>/81d2e2a8-68f1-4ee9-8e81-b1114ddc5647/scratchpad/evidence/<label>/`.
+
+#### 14.15.1 Code the evidence must cover
+
+- `git diff --stat 81fd5c7 HEAD -- oncotriage/ .github/` is empty: the only
+  commits after `81fd5c7` touch `tests/test_admission_replay_and_wait.py` and
+  this report. Production code on the final tree (`d177285`) is therefore the
+  12:12:19 "final production" of 14.3.
+
+#### 14.15.2 Rerun or reuse, per item (decided before any run)
+
+1. **48-patient admission simulation -- RERUN.** `sim_after.json` (11:38:59)
+   exercised `evaluation.py` and `provider_resilience.py` PRE-D1; D1 changed
+   how a wait ended by a stop is counted (`cancelled` vs `failed`), which is
+   the simulation's "waits entered" column. It also ran under the original
+   `sx.sh` with no launch inventory, below B5's containment standard.
+2. **Replay premise probe -- RERUN.** `premise_after.json` (11:37:58): its
+   `stage5_ack_fail` scenario runs through the same two PRE-D1 modules, and its
+   seven fresh child processes were launched under the pre-B5 harness, so no
+   per-process tripwire evidence exists for them.
+3. **Static checks and bucket classification -- RERUN.** `static/` (12:02:39)
+   is pre-D1 and pre-D2, and `tests/test_admission_replay_and_wait.py` was
+   edited after it (12:13:41 and commit `0f12013`); both checks read that file.
+4. **End state -- RERUN.** The only saved end state (12:06:57) predates the
+   12:12:19 production edit (14.6).
+- **Reused, not rerun:** B1-B5 suite and control results, which already cover
+  the final production code; the start-of-E1b production inventory
+  `4c06bc5d.../evidence/prod_inventory_start.txt` (11:16-11:20, 40 files) as
+  the byte baseline; the start digests `digests_start.json` as the digest
+  baseline.
+
+#### 14.15.3 Harness (scratchpad only)
+
+- B5's harness unchanged and verified by sha256 against 14.14.1: `b5_inv.py`
+  `b87c9298bb5e`, `sx.sh` `2767b8312183`, profile `bf4c6750042a`, shim
+  `f0eb0db88e9b`, tripwire `46eb646ea4c9`, `.pth` `1eaef0647db2`,
+  `tw/sitecustomize.py` `c8fbbbd56a40`.
+- Driver `b6_run.py` (`32040c7c3c99`) = `b5_run.py` (`0d7d64dea57d`) with two
+  changes: evidence goes to this session's scratchpad, and stderr is captured
+  to `stderr.log` separately from stdout, so a probe's JSON result parses
+  (`sim_after.py` writes ~29k warning lines to stderr). Tracebacks are still
+  counted over both streams.
+- Probe scripts copied byte-identically from the original E1b scratchpad
+  (`4c06bc5d`): `sim_after.py` `138958aa0582`, `premise_replay.py`
+  `f93250bacc87`, `digests.py` `fe623664964e`. No script was edited.
+- Production inventory `prod_inv.py` (`fce16c0d5a67`): runs OUTSIDE the
+  sandbox (the sandbox denies these reads), opens each file `rb` and hashes it;
+  no SQLite. Existing `-wal`/`-shm` files are included.
+- Each run: foreground, one at a time, `python -u`, driver kill plus an
+  independent outer `perl alarm`.
+
+#### 14.15.4 Results
+
+Order run: production inventory (pre) -> digests -> static checks -> bucket
+check -> premise probe -> simulation -> simulation repeat -> production
+inventory (post). All NEWLY MEASURED in B6 unless marked reused.
+
+- **Item 4a, digests on the final tree -- PASSED (new).** `evidence/digests/`:
+  `renderer_digest` `5ea2c6cc...c2a956`, `PROMPT_VERSION` 1.11.0,
+  `FINGERPRINT_VERSION` 8, `prompt_T` `8baaa8b8...`, `prompt_F` `db3c2b4d...`,
+  loaded from the live `03- Code/oncotriage/agent/prompts.py`. All five equal
+  `digests_start.json` (reused baseline). Unchanged from the pre-fix value.
+- **Item 3, static checks -- PASSED (new).** `evidence/static_checks/`: 319
+  files compiled, all compiled, exit 0. `evidence/buckets_check/`:
+  "Classification consistent: 151 test files, 132 in bucket A (132 runnable
+  in CI), 5 in bucket B (1 runnable in CI)", exit 0. Both identical to the
+  pre-fix figures of 14.3.
+- **Item 2, replay premise probe -- PASSED as a reproduction (new).**
+  `evidence/premise/` (`test.log` JSON, `summary.json`). All seven scenarios
+  equal `premise_after.json` with 32-hex attempt ids normalised:
+  `ack_fail_inprocess` admitted with a lost acknowledgement (1 reserved $9.00
+  row, $9.00 held); `commit_only` then `replay_same` returned the same id with
+  one row; `replay_mismatch_amount` and `replay_mismatch_cap_none` raised
+  `BillingReservationConflict` naming "fields that disagree: reserved_usd";
+  `stage5_ack_fail` dispatched exactly 1 provider call and settled one
+  $5.826 row. No figure changed from pre-fix.
+- **Item 1, 48-patient simulation -- PASSED on outcomes (new, run twice).**
+  `evidence/sim/`, `evidence/sim_repeat/`, comparisons in `compare.txt` in
+  each. Timeout 600 s and both reservation bounds (assumed $9.042 / $8.250025
+  warmup; no-premium $4.653 / $4.125017) equal pre-fix.
+  - In both runs, across all 28 scenarios: `failed_held` 0, wait timeouts 0,
+    `held_left` 0, `queue_left` 0; no `timed_out` or `failed` wait key appears
+    (keys seen: entered, admitted, cancelled, exhausted); entered equals the
+    sum of outcomes in every scenario.
+  - Every OUTCOME column (completed, failed_held, failed_exhausted,
+    stopped_wait_timeout, stopped_other, not_started_latched, latched,
+    held_left, queue_left) and `spent_this_run_usd` equals `sim_after.json` in
+    all 28 scenarios, and run 1 equals run 2.
+  - The $285 rows equal section 7 exactly, waits included: assumed/cache
+    working 24 completed, 1 exhausted, 11 stopped in flight, 12 not started,
+    `spend_cap`, waits 569 = 551 + 17 + 1; assumed/cache absent 12 / 0 / 12 /
+    24, waits 251 = 227 + 23 + 1; no-premium/cache absent 24 / 1 / 11 / 12,
+    waits 415 = 393 + 21 + 1.
+  - **Figures that changed from pre-fix: wait and decline TALLIES only**, in
+    9 scenarios (e.g. assumed/cache working $83: 379 pre-fix, 498 run 1, 419
+    run 2). Largest "entered" difference: pre-fix vs run 1 119 (9 scenarios),
+    pre-fix vs run 2 68 (9), run 1 vs run 2 79 (10). The tallies vary between
+    two identical post-fix runs by amounts of the same order, so the pre-fix
+    differences are not attributable to the fix; nor is it shown that they
+    are not. Section 7's
+    "waits entered" figures for the $83-$250 rows are therefore one sample,
+    not stable values; its "all admitted" statement holds in both runs.
+  - D1's changed path (a stop the retry policy sees itself, counted
+    `cancelled` instead of `failed`) is not exercised by this simulation:
+    pre-fix and both post-fix runs show no `failed` key. That path's evidence
+    remains check 4n-i (B2).
+- **Item 4b, production files by bytes -- PASSED, with data (new).**
+  `evidence/prod_pre/` (22:19:44Z) and `evidence/prod_post/` (22:21:43Z):
+  40 files under `02- Data/03- Inferences Storage` and `08- Checkpoint`,
+  including the existing `inferences.db-wal` and `inferences.db-shm`, each
+  read as bytes outside the sandbox and hashed; no SQLite. Against the reused
+  baseline `prod_inventory_start.txt` (11:16-11:20, 40 files): 0 added, 0
+  removed, 0 changed, at both points; post equals pre. Limits: the baseline is
+  the start of E1b, so this proves identity at 11:16-11:20, 22:19:44Z and
+  22:21:43Z and cannot exclude a change reverted in between.
+  - **What still had no data:** the two in-suite production comparisons B3
+    found skipped (`test_storage_run_identity`, `test_storage_write_durability`
+    9c) were not rerun and still have no evidence of non-degeneracy under
+    containment, because the isolated root holds no `inferences.db`. The B6
+    comparison above is a separate, operator-side byte comparison of the real
+    files.
+
+#### 14.15.5 Containment coverage, per run (acceptance 2)
+
+| run | exit | time | expected Python | markers | shim | kernel Python | UNMATCHED | helpers (kernel) | external / other tripwire | tree unchanged | alive after |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| digests | 0 | 1.2 s | 1 | 1 | 1 | 1 | 0 | none | 0 / none | True | 0 |
+| static_checks | 0 | 0.8 s | 1 | 1 | 1 | 1 | 0 | none | 0 / none | True | 0 |
+| buckets_check | 0 | 0.1 s | 1 | 1 | 1 | 1 | 0 | none | 0 / none | True | 0 |
+| premise | 0 | 6.3 s | 8 | 8 | 8 | 8 | 0 | caffeinate 7 | 0 / none | True | 0 |
+| sim | 0 | 18.2 s | 1 | 1 | 1 | 1 | 0 | none | 0 / none | True | 0 |
+| sim_repeat | 0 | 18.4 s | 1 | 1 | 1 | 1 | 0 | none | 0 / none | True | 0 |
+
+Live tree digest (oncotriage + tests) in every run: `2fc195543bd2...`.
+
+- Inventory match: 13 expected Python processes across six runs, 13
+  `tripwire-loaded` markers, 13 shim launch records, 13 kernel Python pids;
+  zero unmatched, zero markers without a shim record, zero kernel Python pids
+  without a shim record, zero shim pids absent from the kernel log, zero
+  unattached markers; parent marker = sandbox launch pid in every run. Every
+  marker `sandbox_only_write: denied` and every shim record `sandbox_write:
+  denied`. The premise probe's 7 child processes are all covered.
+- Non-Python helpers: 7 `/usr/bin/caffeinate` in the premise run, each with a
+  kernel sandboxed-exec report.
+- Tripwire: zero external records and zero other record kinds (not even
+  loopback) in every run. Decoys empty. `$TMPDIR` `oncotriage-admission-e1b-*`
+  count 4 before and after every run. Neither the driver kill nor the outer
+  alarm fired; zero tracebacks on either stream.
+- The production inventory runs are deliberately OUTSIDE the sandbox (reads
+  only) and are not part of this table.
+- B5's residuals (fork without exec, an interpreter outside the venv seen only
+  by the lossy kernel log, `sys.prefix` = venv) apply here unchanged.
+
+#### 14.15.6 Recorded versus passed (acceptance 3)
+
+| item | recorded | passed |
+|---|---|---|
+| 1 simulation | yes (2 runs) | yes on outcomes; wait tallies vary run to run |
+| 2 premise probe | yes | yes (reproduces pre-fix) |
+| 3 static + bucket check | yes | yes |
+| 4a digests | yes | yes |
+| 4b production bytes | yes (pre + post) | yes (40 files with data); in-suite comparisons still without data |
+| containment | yes (6 runs) | yes, B5 residuals stated |
+
+#### 14.15.7 Does E1b's original acceptance evidence now stand on the final tree
+
+- Section 7's claims -- `failed_held` 0 at every baseline, no wait timeout,
+  nothing held or queued at the end, the $285 latch -- now rest on two
+  post-fix runs under full containment, not on the pre-D1 run.
+- The replay premise (section 3/4 item 1) reproduces on the final tree.
+- End state (section 12, 14.6): digests unchanged and production bytes
+  unchanged are now VERIFIED on the final tree at 22:19-22:21Z.
+- Not changed by B6: sections 8 and 12 and the status line still hold
+  placeholders, which closure fills; 14.3's control results (B2) are the
+  control evidence.
+
+#### 14.15.8 Still unrecorded
+
+- The two in-suite production comparisons without data (above).
+- Section 13's combined checks (full bucket A through the runner, bucket B,
+  `fixture_replay.py`, check 7z-iii, U1, U9) have not been run by any batch;
+  named here, not acted on.
+- Carried, not acted on: (a) CLAUDE.md's E1b end-state and "held failures: 0"
+  wording, which closure corrects -- the "held failures: 0" claim is now
+  supported by post-fix evidence, the "production files byte-compared at
+  session end" wording still names a comparison the E1b session did not make;
+  (b) the provider-resilience timing-check failure's cause; (c) B5's residuals;
+  (d) `test_package_invariants` runtime 134.9 s vs 60.6 s; (e) the backlog.
+
+#### 14.15.9 Verdict
+
+B6 demonstrated no acceptance blocker. Every item that predated the 12:12 fix
+was re-measured on the final tree under B5 containment and passed; the only
+figures that differ from pre-fix are wait/decline tallies, which also differ
+between two identical post-fix runs by amounts of the same order (up to 79
+against up to 119 from pre-fix). Only closure remains (report
+placeholders, CLAUDE.md corrections, merge), subject to the operator's
+decision on the section 13 checks listed above.
