@@ -1,6 +1,6 @@
 # RECOVERY E1b -- admission follow-up (reservation replay, bounded wait)
 
-Status: **⟨PENDING-STATUS⟩**
+Status: **⟨PENDING-STATUS⟩ -- INCOMPLETE: never filled before the session died. See section 14.**
 
 Written for: the operator and the combined-checks session.
 
@@ -190,7 +190,7 @@ at deadline + timeout, so an entry whose thread died is dropped and counted
 
 ## 6. Tests and results (all under the sandbox and the tripwire, isolated root)
 
-**New file: `tests/test_admission_replay_and_wait.py` -- ⟨PENDING-NEWCOUNT⟩,
+**New file: `tests/test_admission_replay_and_wait.py` -- ⟨PENDING-NEWCOUNT⟩ (INCOMPLETE: never filled; section 14.3 records the saved runs),
 bucket A.** What it drives:
 
 | requirement | checks |
@@ -291,7 +291,7 @@ that the planted file parses, and runs the new test against the copy. A
 preflight confirms the copy is what imports. The live tree's touched files are
 sha256-compared before and after.
 
-⟨PENDING-CONTROLS⟩
+⟨PENDING-CONTROLS⟩ -- INCOMPLETE: never filled. The harness finished at 12:39:37, after this report was last written (12:16:26), and no verdict was recorded. Section 14.3 inventories the saved results.
 
 ## 9. Changes
 
@@ -389,7 +389,7 @@ sha256-compared before and after.
 
 ## 12. End state
 
-⟨PENDING-END⟩
+⟨PENDING-END⟩ -- INCOMPLETE: never filled. The only saved end-state evidence predates the final production edit; see section 14.6.
 
 ## 13. Exact next action for the combined-checks session
 
@@ -406,3 +406,598 @@ working tree:
 4. Decide on U9: fix the `test_provider_resilience` harness race (log the
    permit's start time rather than reading the shared clock at log time), or
    run that suite alone in the combined checks.
+
+## 14. Recovery inventory (2026-09-14, after the context death)
+
+Written for: the operator and the next verification session. This section is a
+read-only inventory. Nothing was re-run, no source was edited, no project module
+was imported, and this report is the only file written. Sections 1-13 above are
+preserved as the previous session left them; the four placeholders are marked
+INCOMPLETE in place and were NOT completed from the diff.
+
+### 14.1 Revision and working tree
+
+- Branch `wip/billing-closure`, HEAD `81fd5c7` (12:43:16, "WIP: E1b partial,
+  context death mid-execution. NOT FOR PUSH"), parent `bf546f4` (E1).
+  `git status --short` is empty, so the committed tree IS the working tree.
+- `81fd5c7` changes 15 files (+3091/-95); the list matches section 9.
+- Last working-tree modification times of those files (nothing is later):
+
+  | time | file |
+  |---|---|
+  | 11:35:12-11:35:38 | `spend.py`, `config.py`, `storage/database_logger.py`, `degradation.py` |
+  | 11:37:17, 11:37:27 | `batch/runner.py`, `ablation/study.py` |
+  | 11:42:51 / 11:48:17 / 11:54:15 / 12:00:26 | `test_spend_coverage.py` / `ci_test_buckets.py` / `test_campaign_billing_record.py` / `test_spend_gate.py` |
+  | **12:12:19** | `agent/evaluation.py`, `provider_resilience.py` (the D1 fix) |
+  | **12:13:41** | `tests/test_admission_replay_and_wait.py` (the D2 timeout edit) |
+  | 12:16:26 / 12:16:33 | this report / `CLAUDE.md` |
+
+  "Final code" below means production as of 12:12:19 plus the new test as of
+  12:13:41.
+- Previous session's scratchpad: `/private/tmp/claude-501/<project-slug>/4c06bc5d-83aa-4669-837e-43666c429c5b/scratchpad`
+  (`evidence/`, `copies/`, `controls_e1b_v2.py`, `run.sh`, `sx.sh`, `tw/`).
+- The separate recovery archive was not found in the project root or in
+  `15- Code Copies`. It was not searched for further; the committed tree is
+  the recovery point.
+- Byte comparison of the saved copies with the commit:
+  - `copies/fc_fixed` (12:11:23) is identical to the committed
+    `evaluation.py`, `provider_resilience.py`, `spend.py` and
+    `database_logger.py`. It differs from the committed new test by 11 lines
+    (the D2 edit).
+  - `copies/fc_premise` (12:10:05) differs from the committed `evaluation.py`
+    by 9 lines and `provider_resilience.py` by 15 lines (D1).
+  - `copies/curdelay` (12:01:30) also differs in both files.
+
+  **Any run that started before 12:12:19 did not test the D1 code.**
+- No renderer module (`agent/patient.py`, `agent/prompts.py`, `constants.py`,
+  `extraction/stage.py`, `utils.py`, `deid.py`) appears in
+  `git diff --name-only ed61ff3 81fd5c7`.
+
+### 14.2 What the saved logs can prove about containment
+
+- `run.sh` does three things for each listed test:
+  - runs them all CONCURRENTLY (`&`, then `wait`) under `sandbox-exec` with
+    the tripwire on `PYTHONPATH`;
+  - writes `<out>/<test>.log` and `<out>/<test>.tw.jsonl`;
+  - appends `exit=N secs=S`.
+- The tripwire opens its log only when it records something. A missing
+  `.tw.jsonl` therefore means "zero records" only if the run was wrapped. The
+  test logs do not record the wrapper; only the `exit=... secs=...` trailer
+  identifies a `run.sh` run.
+- Only two tripwire logs exist in the whole scratchpad, and neither holds an
+  external connection:
+  - `armA.tw.jsonl`, the containment probe, whose refusals are expected:
+    connect-REFUSED 2, getaddrinfo-REFUSED 1, sqlite-REFUSED 1,
+    open-write-REFUSED 1, connect-loopback 1;
+  - `aff5/test_runner_crash_record_and_db_unification.tw.jsonl`:
+    connect-loopback 26.
+- Runs WITH the `run.sh` trailer: `base`, `aff1`-`aff5`, `aff7`.
+- Runs WITHOUT it:
+  - `aff6` (section 6 says foreground and sequential);
+  - `final_new`;
+  - `fix_cancel` (a custom `exit=` with no `secs`).
+
+  For those three, sandbox and tripwire are CLAIMED, not evidenced.
+- `run.sh` launches tests in an asynchronous list. CLAUDE.md records that a
+  shell `&` sets SIGINT to SIG_IGN for the children. By their labels, the E1b
+  shutdown checks set a flag rather than deliver a signal; that was not
+  verified.
+
+### 14.3 Evidence matched to the code version it tested
+
+| evidence | window | code it covers | recorded result | status |
+|---|---|---|---|---|
+| `base/` | 11:21-11:23 | `bf546f4`, before any E1b edit | budget_admission 67/0, billing_closure 388/0/0, campaign_billing_record 128/0, spend_gate 167/0, package_invariants 261/0/0, run_metrics_flush 130/0 | supports section 1 baselines (pre-change) |
+| `digests_start.json` | 11:20:36 | pre-change | renderer `5ea2c6cc...`, PV 1.11.0, FV 8, prompts `8baaa8b8...` / `db3c2b4d...` | supports section 1 |
+| `prod_inventory_start.txt`, `armA_*`, `armC_*` | 11:16-11:20 | n/a | files present; only the armA tripwire kinds were re-examined | section 2 start-of-session probes partly checked |
+| `premise_replay.json`, `sim_before.json` | 11:21 | unchanged code | sim_before: 28 `failed_held` entries, max 48 | supports section 3 as a pattern; table values not re-derived |
+| `premise_after.json` | 11:37:58 | replay fix present (`spend.py` and `database_logger.py` final since 11:35); `evaluation.py` and `provider_resilience.py` PRE-D1 | scenarios: ack_fail_inprocess, commit_only, replay_same (one reserved $9 row each), two mismatch cases, stage5_ack_fail (one settled row) | stale for the Stage 5 scenario; the mismatch `reason` fields read None, so the "conflict naming `reserved_usd`" claim was not located |
+| `sim_after.json` | 11:38:59 | PRE-D1 | 28 `failed_held` entries, max 0; no `timed_out` field present; `.err` has 0 tracebacks | STALE for the final code |
+| `new1`-`new3`, `aff1`-`aff3`, `pr_solo` | 11:38-11:58 | intermediate trees | several non-green: aff1 spend_gate exit 1 after 604 s; aff1 spend_coverage exit 1; new1 exit 1; aff2 campaign_billing_record exit 1; aff2 spend_gate no summary and no trailer (incomplete); aff3 spend_gate exit 1; new3 and pr_solo provider_resilience 202/1 | superseded iterations; not evidence for the final code |
+| `pr_diag/` | 11:56-11:58 | copies `headprod` and the tree at the time | head1-3 and cur1-3 each 203/0/0 | supports part of U9 |
+| `pr_race/` | 12:01-12:02 | `headdelay` / `curdelay` copies (pre-D1) | each 202/1/0 | supports U9's delay reproduction |
+| `aff4/` | 12:00:43-12:02:42 | PRE-D1, pre-D2 | spend_budget_split 79, run_identity 158, counter_readers 160, schema_guards 136, spend_gate 167, spend_coverage 169, run_metrics_flush 130, budget_admission 67, package_invariants 261, billing_closure 388; all exit 0 | matches the section 6 "earlier batches" list, correctly labelled pre-fix; does NOT cover the final code |
+| `aff5/` | 12:03-12:04 | PRE-D1, pre-D2 | mcp_deid 99, attempt_provenance 55, write_durability 121, bedrock_per_trial 213, api_shutdown_gate 78, crash_record 65, per_trial_calls 372, ablation_stop_and_lock 161, campaign_billing_record 128; **provider_resilience 202/1 (exit 1)** | as above |
+| `aff6/` | 12:05-12:06 | PRE-D1, pre-D2 | runner_stop_switch 146/0, runner_sigterm_shutdown 95/0 | as above; no wrapper trailer |
+| `static/` | 12:02:39 | pre-D1, pre-D2 | `static_checks.py` 319 files compiled; buckets consistent, 151 files / 132 in A | STALE for the final tree |
+| `end/` | 12:06:54-57 | PRE-D1 | `digests_end.json` equal to start; `prod_inventory.diff` empty | STALE as an end state (see 14.6) |
+| `controls_e1b/` (v1) | 12:06-12:21 | pre-D1 | clean 68/0; a C1 log at 12:21:32 (the 600 s stall behind D2); `results.json` and `harness.err` are 0 bytes | superseded; v1 never finished |
+| `fix_cancel/` | 12:10-12:11 | `fc_premise` (pre-D1) / `fc_fixed` (final production, pre-D2 test) | premise 70/1 failing 4n-i; fixed 71/0 | supports D1's evidence claim in section 10 |
+| `aff7/` | started 12:12:36 via `run.sh`, concurrent | **final production** | admission_replay_and_wait 71/0 (12:12:36-12:13:31, **before the D2 edit at 12:13:41**); bedrock_per_trial 213/0; counter_readers 160/0; attempt_provenance 55/0; spend_gate 167/0; provider_resilience 203/0/0; budget_admission 67/0; per_trial_calls 372/0; package_invariants 261/0/0; campaign_billing_record 128/0; billing_closure 388/0/0; all exit 0; no tripwire log | verified on the final production code. These suites' test files are unchanged since 12:00:26 or earlier; the new test ran pre-D2 |
+| `final_new/new.log` | 12:16:12-12:16:43 | **final production + final test**; imports the live `03- Code/oncotriage` | RESULTS: 71 passed, 0 failed | result verified on the final tree; containment unevidenced (no trailer, no tripwire log) |
+| `controls_e1b_v2/` | 12:16:43-12:39:37 | final code, copied at run time; `live_tree_unchanged: true` | see the table below | harness finished; never written up |
+
+`controls_e1b_v2/results.json`, as recorded:
+
+| plant | exit | imported copy | summary | recorded failed checks | aborted |
+|---|---|---|---|---|---|
+| clean | 0 | yes | 71/0 | -- | no |
+| C1 replay lookup removed | 1 | yes | 63/8 | 2b 2d 2e 2g 2h 3b 3c 3e | no |
+| C2 replay validation removed | 1 | yes | 68/3 | 2d 2e 3c | no |
+| C3 no wait | 1 | yes | 50/21 | 4a 4c-4n 4n-i 4p-4s 5a-5c | no |
+| **C4 deadline reset per recheck** | **timeout (600 s)** | **not confirmed** | **none** | **none** | **yes** |
+| **C5 cancellation ignored** | 1 | yes | **none** | 4k | **yes** |
+| C6 no FIFO | 1 | yes | 70/1 | 4p | no |
+| C7 timeout does not latch | 1 | yes | 66/5 | 4h 4i 5a-5c | no |
+| C8 Stage 5 gate ignores wait latch | 1 | yes | 69/2 | 4i 6a | no |
+| C9 write lock held across wait | 1 | yes | 69/2 | 4c 4e | no |
+| C10 permit held during wait | 1 | yes | 68/3 | 4b 4d 4n-i | no |
+| C11 runner stop reason is cap | 1 | yes | 70/1 | 5b | no |
+| C12 hold-token replay doubles | 1 | yes | 70/1 | 2i | no |
+| C13 require_budget ignores wait latch | 1 | yes | 70/1 | 4i | no |
+| C14 settled attempt replayable | 1 | yes | 70/1 | 2e | no |
+| C15 policy cancel counted failed | 1 | yes | 70/1 | 4n-i | no |
+
+- **C4 did not fire as a recorded failure.** The run was killed by the harness
+  after 600 s (log 12:22:33-12:32:34).
+  - The log has no RESULTS line and no PASS/FAIL lines at all: stdout was
+    lost at the kill, while stderr JSON survived.
+  - `imported_copy: false` only because the origin marker was never flushed.
+    The surviving `[Paths]` line shows the C4 copy's `settings.py`.
+  - The log carries 2,337 "a billed attempt was not dispatched because budget
+    admission declined it" warnings, reason `headroom_held`.
+  - So under this plant the new test HANGS, despite D2's 5 s file-wide
+    timeout. Which check hangs is unknown.
+- **C5 fired in the abort shape.** Check 4k FAILED, then an uncaught
+  `BudgetAdmissionDeclined` ended the file with no summary.
+- **`tripwire_records: 0` for every control is weaker than it reads.** The
+  harness counts an ABSENT tripwire log as 0 and drops loopback and sqlite-watch
+  records. No control tripwire log survives, so 0 cannot be told apart from an
+  unarmed run.
+- The previous session wrote no interpretation of these results (section 8 is
+  empty). The table above is transcription, not a verdict.
+
+### 14.4 Placeholders and unfinished text
+
+- Line 3 status, the section 6 new-test count, section 8 controls and section 12
+  end state were never filled. Each is now marked INCOMPLETE in place.
+- Section 6 says "The new test's final run, after the D2 timeout edit, is in
+  section 12". Section 12 is empty. The run exists (`final_new`, 71/0) but was
+  never written up.
+- Section 13's "exact next action" predates the controls run and the end state,
+  and was not revised.
+
+### 14.5 Superseded or unsupported claims
+
+1. **Section 6, "Affected suites on the final production code ...
+   `test_admission_replay_and_wait` 71/0".** That `aff7` run ended at
+   12:13:31, before the D2 test edit. Superseded by `final_new` (71/0), the only
+   run of the new test on the final tree.
+2. **Section 2, "every tripwire log across every suite and control run holds
+   zero external records".** The two surviving logs support it. Every other
+   "zero" is inferred from a log's absence, and for `aff6`, `fix_cancel` and
+   `final_new` the wrapper that would arm the tripwire is not evidenced.
+3. **Section 4, "both mismatches -> conflict naming `reserved_usd`".** The
+   `reason` fields in `premise_after.json` read None, and the conflict detail
+   was not found in the fields read. Unverified. The file also predates D1.
+4. **Section 6 / U9, "passed 203/0 ... when run alone. It failed (202/1) only
+   when run beside other suites".** `pr_solo/test_provider_resilience.log`
+   (11:55:04-11:55:19, `run.sh`) reports 202/1. No evidence was found that
+   anything else was running in that window. The contradiction is unresolved.
+5. **Section 7, the 48-patient simulation.** It ran at 11:38, pre-D1. It is
+   not evidence for the final code.
+6. **Section 6, static checks (319 compiled; 151 / 132 bucket A).** Pre-D1 and
+   pre-D2.
+7. **CLAUDE.md, E1b section (written 12:16:33, committed in `81fd5c7`):**
+   - "The production files were compared by bytes at session end": the only
+     comparison is `end/` at 12:06:57. That is before D1, `aff7`, `final_new`
+     and the 23-minute controls run. Unsupported as stated.
+   - "`PROMPT_VERSION`, `FINGERPRINT_VERSION` and
+     `llm_classifier_renderer_digest` are unchanged": compared only at 12:06
+     (pre-D1). Supported structurally, since no renderer module is in the
+     E1/E1b diff; not recomputed on the final tree.
+   - "held failures: 0 at every baseline": from the pre-D1 `sim_after`. Stale.
+   - "`python tests/test_admission_replay_and_wait.py  # 71`": matches
+     `final_new`.
+   - Counts that match final-code evidence: `test_spend_gate` 167 and
+     `test_campaign_billing_record` 128 (`aff7`).
+   - Count on pre-D1 evidence only: `test_spend_coverage` 169 (`aff4`).
+   - It says nothing about firing controls, so it does not overclaim C4.
+
+### 14.6 End-state claims (not recomputed)
+
+- **The report** makes no end-state claim; section 12 is empty.
+- **CLAUDE.md** claims unchanged renderer and prompt digests, and production
+  files compared by bytes at session end.
+- **Saved evidence:** `end/digests_end.json` equals `digests_start.json`, and
+  `end/prod_inventory.diff` is empty, both at 12:06:57. That is before the last
+  production edit (12:12:19) and before every run from 12:12:36 to 12:39:37.
+- **Verdict:**
+  - digests unchanged: plausible, since no renderer module was edited;
+    UNVERIFIED on the final tree;
+  - production byte-identity at session end: UNVERIFIED.
+
+### 14.7 Remaining verification, smallest batches in order (not run)
+
+Every batch runs under sandbox + tripwire + isolated root on `81fd5c7`. Record
+the wrapper and a tripwire log path for every run. Signal-sensitive suites run in
+the foreground, never under `&`.
+
+1. **B1 -- C4 and C5 diagnosis, no edits.**
+   - Re-run the C4 plant alone with unbuffered stdout (`python -u`) and a short
+     harness timeout, to name the check that hangs.
+   - Re-run C5 alone, to name the statement that raises after 4k.
+   - Output: whether the new test needs a bound or guard. That decision, and
+     any test-code change, is a separate item and precedes every batch below.
+     Otherwise all new-test evidence would have to be taken twice.
+2. **B2 -- the new test on the tree that results from B1:**
+   `test_admission_replay_and_wait` once, wrapped, with a tripwire log; then
+   the full controls v2 harness again.
+3. **B3 -- suites not run since the D1 edit:** `test_spend_coverage`,
+   `test_spend_budget_split`, `test_storage_run_identity`,
+   `test_storage_schema_guards`, `test_storage_run_metrics_flush`,
+   `test_ablation_stop_and_lock`, `test_api_shutdown_gate`,
+   `test_mcp_deidentified_responses`,
+   `test_runner_crash_record_and_db_unification`,
+   `test_storage_write_durability`; then `test_runner_stop_switch` and
+   `test_runner_sigterm_shutdown` in the foreground, one after the other.
+4. **B4 -- U9:** `test_provider_resilience` alone, three times, with nothing
+   else running, to settle the `pr_solo` contradiction.
+5. **B5 -- claims resting on pre-D1 runs:** `sim_after.py` and the premise-after
+   probe on the final tree, recording the conflict detail fields; or remove the
+   "held failures: 0" claim from CLAUDE.md.
+6. **B6 -- end state:** recompute the renderer digest, `PROMPT_VERSION`,
+   `FINGERPRINT_VERSION` and both prompt hashes; diff the production inventory
+   against `prod_inventory_start.txt`; run `static_checks.py` and
+   `ci_test_buckets.py --check`.
+7. Then section 13's combined checks (bucket A, bucket B, `fixture_replay.py`,
+   check 7z-iii, U1, U9).
+
+### 14.8 Review of the recovered completion claims
+
+- **Implementation.** The replay fix, the bounded wait, D1 and D2 are all in the
+  commit. The copies confirm D1 was applied between 12:10 and 12:12:19, and D2
+  after 12:11:23.
+- **Tests on the final code.** Only two sets of runs cover the final production
+  code:
+  - `aff7`: eleven files, i.e. the new test (still pre-D2) plus TEN other
+    suites (corrected in B1, 14.9.4; this line said "eleven suites");
+  - `final_new`: the new test post-D2, with no containment evidence.
+
+  Everything else predates D1.
+- **Firing controls.**
+  - 13 of 15 plants produced recorded failures on the final code with the copy
+    confirmed imported.
+  - C5 was caught only by an abort.
+  - C4 hung and was not caught.
+  - Section 10's statement that C15 restores the old D1 call is supported (C15
+    fails 4n-i).
+- **Simulation and premises.** `sim_after` and `premise_after` predate D1. Their
+  results cannot be carried to the final code.
+- **End state.** The only end-state snapshot is 33 minutes too early. No
+  saved evidence shows production files byte-identical at session end.
+- **Not inferred.** A started check is not treated as finished: aff2
+  spend_gate, v1 C1 and C4 have no summaries. An earlier green run is not
+  treated as covering later edits: aff4, aff5 and aff6 are pre-D1.
+
+### 14.9 Batch B1 -- C4 and C5 diagnosis (2026-09-14, 13:00-13:04)
+
+Written for: the operator and the session that applies the fix. Diagnosis only.
+No production source and no test file was edited; no commit, stash, branch
+change, reset or cleanup; no paid call; no production database was opened.
+`git log -1` = `81fd5c7`; `git status --short` shows only this report.
+
+Evidence root (this session's scratchpad):
+`/private/tmp/claude-501/<project-slug>/e36de6c1-18c3-486c-afd9-cd2ff3fb8701/scratchpad`
+-- `evidence/containment/`, `evidence/C4/`, `evidence/C5/` (each run has
+`test.log`, `tw.jsonl`, `fault/fault.<pid>.txt`, `summary.json`), driver
+`b1_run.py`, wrapper `sx.sh`, tripwire `tw/`.
+
+#### 14.9.1 Containment, and the one permitted change
+
+- **The fix (scratchpad harness only, never the pipeline).**
+  - `sx.sh` appends a `sandbox-launch` record (pid, UTC time, profile path and
+    sha256, cwd, argv) to the tripwire log BEFORE `exec`. `sandbox-exec` and
+    `env` exec in place, so the launched python keeps that pid.
+  - `_onc_tripwire.py` writes a `tripwire-loaded` marker from EVERY process
+    that imports it (pid, ppid, argv, audit hook installed). The marker carries
+    a sandbox-only probe: a write into `decoy_sandbox_only`, which the profile
+    denies and the tripwire does not protect, so the sandbox alone decides it.
+  - `sitecustomize.py` adds diagnosis-only per-process fault dumps: one
+    all-thread dump after N s, and an all-thread dump on an uncaught exception.
+- **Profile.** E1b's `nonet.sb` re-pathed to this scratchpad (outbound denied
+  except loopback, `mDNSResponder` denied, writes and data reads denied under
+  the four production directories and the decoy), plus one line denying writes
+  to `decoy_sandbox_only`. Isolated root re-provisioned with
+  `provision_ci_paths.py --root` under the wrapper (exit 0).
+- **Fired before use (`evidence/containment/`).**
+  - provision: launch pid 44722 = marker pid 44722; its child 44730 (ppid
+    44722) also marked; both probes `denied errno=1`.
+  - probe: DNS `getaddrinfo-REFUSED` (x2), protected-decoy sqlite
+    `sqlite-REFUSED`, child marked; raw connect to 192.0.2.1:443
+    `connect-REFUSED` ("tripwire: outbound refused").
+  - negative control: `python -S` (no site, so no tripwire) under the same
+    wrapper -> a launch record for pid 44819 and ZERO markers. An unarmed
+    process is therefore detectable, not inferred.
+  - `decoy_sandbox_only` and `decoy_protected` are empty after every run.
+- **Two defects in my own wrapper, found by running it:** the first launch
+  record broke JSON on a quote in argv, the second on a newline. Both are
+  escaped now; every tripwire log from the C4/C5 runs parses.
+
+#### 14.9.2 C4 -- deadline reset on each recheck
+
+- **What ran.** The v2 plant `C4_deadline_reset_per_recheck` (imported verbatim
+  from `controls_e1b_v2.py`; anchor count 1, parses) in a fresh copy of
+  `oncotriage/` and `tests/`, `python -u`, foreground, alone. One-shot
+  all-thread dump at 40 s; process group SIGKILLed at 75 s. Live tree sha256
+  unchanged; `[e1b] oncotriage imported from` = the copy.
+- **Result.** exit -9 (killed by the driver at 75.0 s), no RESULTS line,
+  30 checks recorded, 0 failed, no traceback. Last check reached: **4e PASS**
+  (log line 467).
+- **Where it hangs.** `tests/test_admission_replay_and_wait.py:1030`, the 4f
+  block:
+  `_exc = raised(s5_call, 9.0, calls=_calls, pacer=CountingPacer())`.
+  Parent stack at 40 s (single thread): `<module>:1030 -> raised:170 ->
+  s5_call:346 -> provider_resilience.execute:1837 -> _await_admission:1566 ->
+  evaluation.await_admission:2131 -> _recording_await:1017 ->
+  spend.HeadroomWait.await_admission:2329 -> wait_for_change:2181`.
+- **Why.** 4f rebinds `_admission_preview` to always answer "fits", so each
+  wait returns RECHECK after ~`ADMISSION_WAIT_RECHECK_SECONDS`, `execute`
+  re-enters `attempt_record.begin()`, which declines `headroom_held` again, and
+  `await_admission` is called again. The plant sets `self.deadline = now +
+  timeout_s` on every call, so `remaining` never reaches 0. The recheck loop in
+  `execute` (lines 1818-1850) re-enters without consuming `max_attempts`, so
+  nothing else ends it. Log: 270 `headroom_held` declines, 3 waits entered,
+  2 ended (4d, 4e); the third (4f) never ends.
+- **Why it hangs instead of recording a failure.** The only bounds on 4f are
+  the wait's own deadline (the thing C4 breaks) and the file-wide 5 s default,
+  which 4f overrides to 1.5 s through the same deadline. `raised()` has no time
+  bound, and 4g's elapsed-time check runs only after the call returns. A bound
+  that lives inside the code under test cannot bound a defect in that code.
+- **Reused evidence.** v2's `C4_deadline_reset_per_recheck.log` (600 s kill,
+  2,337 declines, no summary) ran the same plant on the same code: production
+  final at 12:12:19, test final at 12:13:41, harness started 12:16:43, and
+  `81fd5c7` is that tree. The re-run agrees and adds the check and the stack.
+  v2's stdout loss was the missing `-u`; with `-u` all 30 check lines survived
+  the kill.
+- **Proposed minimal fix (PROPOSAL, not applied).** Run the 4f drive on a
+  daemon thread and `join(1.5 + margin)` (e.g. 6 s). If it is still alive,
+  record a failing check ("4f-0 the timed wait returned within its bound"),
+  then end the planted loop through the path the plant leaves intact:
+  `request_stage5_shutdown()`, join, `clear_stage5_shutdown()`. 4f-4i then
+  record failures instead of the file hanging. Separately, the controls
+  harness should run the test with `python -u`.
+
+#### 14.9.3 C5 -- cancellation ignored
+
+- **What ran.** The v2 plant `C5_cancellation_ignored` (anchor count 1,
+  parses), same harness, alone. Dump timer 90 s, kill at 150 s (neither
+  fired). Live tree unchanged; imported the copy.
+- **Result.** exit 1 after 19.8 s, no RESULTS line, 39 checks recorded,
+  **1 failed: 4k**, 1 traceback. 4k actual vs expected:
+  `(True, False, True, '_Absent', [], 0)` vs
+  `(True, True, False, 'Stage5ShutdownRequested', [], 1)` -- not prompt,
+  thread still alive, no exception, no cancelled count.
+- **The statement that raises.** `tests/test_admission_replay_and_wait.py:1087`,
+  `holder = begin(9.0)` inside `cancel_case`, reached from the **4l** call at
+  line 1111 (the `SPEND_STOP.trip` trigger). It raises
+  `BudgetAdmissionDeclined [headroom_held, process authority]`: "$0.000000
+  committed plus $9.000000 held by this process's open reservations plus its
+  own $9.000000 would exceed" the $10 cap.
+- **Why there is $9 held after `reset_spend()`.** The 4k waiter thread leaked
+  into 4l.
+  - Under the plant, the top-of-loop cancellation check is gone, and the
+    mid-loop `if cancelled(): continue` skips every recheck while the shutdown
+    flag is set. So the waiter ignores the flag and also never notices the
+    holder's release.
+  - `cancel_case` joins 5 s, resolves the holder, joins 5 s again, then calls
+    `clear_stage5_shutdown()` and returns. It never checks that the thread
+    ended.
+  - With the flag cleared, the waiter's next recheck fits, `execute`
+    re-admits it and it holds $9. Log order: 4k FAIL (line 500); waiter
+    "wait ended, admitted" at 20:03:51.640 (line 503, the 5th and last wait
+    ending: admitted x3 = 4d, 4e, 4k-waiter; timed_out x2 = 4h, 4j); 4l's
+    decline at the same millisecond (line 504); traceback (line 505).
+  - At the abort the all-thread dump shows ONE thread, so the waiter had
+    dispatched and exited by then. The hold it took was still counted when
+    4l's `begin` ran.
+- **Why the file aborted instead of recording a failure.** `cancel_case` calls
+  `begin()` bare, outside `drive()`/`raised()`, at module level, so a decline
+  there is an uncaught exception. The harness helpers protect the calls INSIDE
+  `check()` arguments, not the case's setup.
+- **Reused evidence.** v2's `C5_cancellation_ignored.log` (4k FAIL, traceback
+  ending in the same `cancel_case` line 1087 from the 4l lambda) is the same
+  plant on the same code; the re-run matches it.
+- **Proposed minimal fix (PROPOSAL, not applied).** In `cancel_case`:
+  1. guard `holder = begin(9.0)` (return an `_Absent` marker and let the
+     caller's check fail) instead of calling it bare;
+  2. before returning, clear the shutdown flag, resolve the holder and
+     `join()` the waiter with a bound; return `thread.is_alive()` after that
+     join as part of the result, so a waiter that would leak fails its own
+     check (4k-4n) and the next case's `reset_spend()` runs only after it has
+     ended.
+
+#### 14.9.4 Containment markers in both runs, and the count correction
+
+- **Markers.** Both runs: the parent plus all five section-3 children
+  (`commit_then_die`, `replay`, `mismatch`, `new_attempt`, `ack_fail_stage5`),
+  each with `ppid` = the parent. Five is the full set by construction: the
+  file's only other `run_child` / `runner_child` calls are in 4s-4u and
+  section 5, which neither run reached.
+  - C4: launch pid 44894 = parent marker 44894; children 44906, 44908, 44913,
+    44918, 44920.
+  - C5: launch pid 45125 = parent marker 45125; children 45137, 45145, 45150,
+    45152, 45159.
+  - All 12 processes: `sandbox_only_write: denied errno=1`, audit hook
+    installed, editable finder stripped. Each wrote its own `fault.<pid>.txt`
+    header, independently confirming the sitecustomize loaded.
+  - No other tripwire records in either run: no external, no loopback, no
+    sqlite-watch (the test's databases live in its own temp directory).
+- **Left behind, not cleaned (cleanup is outside this batch).** The killed C4
+  run and the aborted C5 run each left the test's temp directory:
+  `$TMPDIR/oncotriage-admission-e1b-ljsa4i7v` and `...-s36rsdnq`. Three older
+  ones from the previous session remain beside them. Both plant copies were
+  removed by the driver.
+- **Count correction (no rerun).** Section 14.8 said "`aff7`: eleven suites".
+  `aff7` holds eleven logs: `test_admission_replay_and_wait` plus TEN other
+  suites. Corrected in place. Section 6's list has the same eleven names and
+  does not state a count.
+
+#### 14.9.5 Noted for a later batch (not acted on)
+
+- CLAUDE.md's E1b section overclaims the end state. It says production files
+  were compared by bytes at session end, but the only comparison was `end/`
+  at 12:06:57, before D1. Its "held failures: 0" rests on the pre-D1
+  `sim_after` run.
+- My own driver compared only the seven E1b-touched files before and after
+  each run, not the production directories (the sandbox denies reads there);
+  the sandbox and tripwire refusals are the evidence nothing reached them.
+
+#### 14.9.6 Next single batch
+
+**B1-fix:** apply the two test-harness proposals above to
+`tests/test_admission_replay_and_wait.py` (and `python -u` in the controls
+harness), then re-run the clean control, C4 and C5 alone under this
+containment (launch record + per-process markers). Pass criteria: clean 71+/0,
+C4 and C5 each end in a RESULTS line with recorded failures and no kill or
+traceback. B2 onward (14.7) waits for it.
+
+### 14.10 Batch B1-fix -- the two test-harness fixes, and three controls (2026-09-14)
+
+Written for: the operator and the session that runs B2. Only
+`tests/test_admission_replay_and_wait.py` and the scratchpad controls harness
+were edited. No production source, no commit, stash, branch change or reset,
+no paid call, no network egress; no production database was opened.
+`git log -1` = `81fd5c7`.
+
+Evidence root (this session's scratchpad):
+`/private/tmp/claude-501/<project-slug>/8f4a06c3-ed8a-4caf-ac86-3a08394850c7/scratchpad`
+-- `evidence/{clean,C4,C5}/` (`test.log`, `tw.jsonl`, `fault/`, `summary.json`),
+`evidence/*.driver.out`, driver `b1fix_run.py`, the edit script
+`apply_fix.py`, and `test_before_fix.py` (the test as committed).
+
+#### 14.10.1 What changed and why
+
+- **`halt_with_live_worker(where)` (new harness helper).** Records a failing
+  check, prints the RESULTS block and ends the process with `os._exit(1)`.
+  Called only when a worker thread is still alive after every bound and after
+  the cancellation meant to end it, so no configuration restore, attribute
+  rebind or `reset_spend()` ever runs underneath a live worker. It skips the
+  file's own temp-directory removal on that path.
+- **Fix 1, check 4f.** The `s5_call` now runs on a daemon thread joined for
+  6 s (the wait's own timeout is 1.5 s; 4g already requires < 2.4 s).
+  - If the thread is still alive: check `4f-0` is recorded as FAILED, the
+    shutdown flag is set (the plant leaves the top-of-loop cancellation
+    intact), and the thread is joined again for 6 s.
+  - If it still has not exited: `halt_with_live_worker("4f-0b")`.
+  - Only after the thread is confirmed exited is the flag cleared and the
+    `with settings(...), rebound(...)` block allowed to restore.
+  - `_exc` and `_elapsed` are read from the thread's result box. 4f-4i are
+    unchanged.
+  - On shipped code no extra check is recorded, so the count stays 71.
+- **Fix 2, `cancel_case` (4k-4n).**
+  - `holder = begin(9.0)` goes through `drive()`. A decline returns
+    `entered False`, `took inf`, the absent marker as the box, and the cleanup
+    tuple, so the caller's check fails instead of the file aborting.
+  - `holder.resolve(...)` also goes through `drive()`.
+  - The box and calls the checks read are SNAPSHOTTED after the existing second
+    join, before cleanup, so cleanup cannot let a waiter that ignored its
+    trigger dispatch and then read as a success (this protects 4n).
+  - Cleanup: clear shutdown and drain, then join for the case's own wait
+    timeout + 5 s (35 s). A SPEND_STOP stays latched, so such a waiter ends at
+    its own timeout rather than being re-admitted. Any reservation the waiter
+    took is resolved by the retry policy as it returns.
+  - `cancel_case` returns a sixth value, `cleanup = (thread alive, open holds,
+    campaign queue depth)`. 4k, 4l, 4m and 4n each gained that element with
+    expected `(False, 0, 0)`; after each, a live thread calls
+    `halt_with_live_worker`.
+  - No existing element of 4k-4n was removed or relaxed; each tuple only grew.
+- **Controls harness.** `controls_e1b_v2.py` (the E1b session's scratchpad)
+  now launches the test with `python -u`; the original is saved beside it as
+  `controls_e1b_v2.py.pre_b1fix`. It was NOT run in this batch. The three runs
+  used `b1fix_run.py`: B1's `b1_run.py` with evidence and copies redirected to
+  this scratchpad, plus the profile sha256 at run time. Plants still come
+  verbatim from `controls_e1b_v2.py`, and the containment (`sx.sh`,
+  `nonet.sb`, `tw/`, decoys, isoroot) is B1's, unchanged.
+- **Cleanup.** B1's two killed-run temp dirs,
+  `oncotriage-admission-e1b-ljsa4i7v` and `...-s36rsdnq` (13:02/13:03, test
+  fixtures only, 1.5 MB each), were removed. The three older ones from the
+  previous session (`2aq8yzbd`, `bcxkhuek`, `fqu95qug`) were left, as they are
+  not B1's.
+
+#### 14.10.2 Clean control
+
+- `evidence/clean/`: exit 0, 32.2 s, not killed, **`RESULTS: 71 passed, 0
+  failed`**, 71 checks, 0 tracebacks. The copy was imported; the live E1b
+  files were unchanged before and after.
+- Profile sha256 `0e78e401...` at run time equals the launch record's and B1's.
+- Markers: launch pid 48244 = parent marker 48244 (ppid 48243, the driver).
+  15 descendant processes, all marked: 11 children of 48244 (48258, 48263,
+  48265, 48270, 48273, 48309, 48314, 48316, 48327, 48341, 48349) and 4
+  grandchildren (48323, 48337, 48346, 48357). All 16 report
+  `sandbox_only_write: denied errno=1`, audit hook installed and editable finder
+  stripped. No other tripwire records: none external, none loopback, no
+  sqlite-watch.
+
+#### 14.10.3 C4 -- deadline reset on each recheck
+
+- `evidence/C4/`: the plant was copied verbatim (anchor count 1, parses) and
+  the copy was imported. Exit 1 after 36.6 s, not killed.
+  **`RESULTS: 68 passed, 4 failed`**, 72 checks (4f-0 exists only on this
+  path), 0 tracebacks, driver exit 0 inside a 400 s perl alarm.
+- Recorded failures, all intended:
+  - `4f-0`: actual `'still waiting'` after the 6 s join. The shutdown flag then
+    ended the worker, since `halt_with_live_worker` was not reached.
+  - `4g`: `(1, 24, False)` against `(1, 1, True)`, i.e. one wait object with
+    24 distinct deadlines and elapsed out of range. This is the defect itself.
+  - `4h`: `Stage5ShutdownRequested`, no latch, 0 `timed_out`, where
+    `Stage5SpendStopped` naming `admission_wait` was expected. The plant never
+    times out.
+  - `4i`: no `admission_wait` latch, so neither gate refuses.
+- Everything after 4i passed, including 4k-4n with cleanup `(False, 0, 0)` and
+  section 5's runner children. B1's hang is now a recorded failure.
+- Markers: launch pid 48392 = parent marker 48392 (ppid 48391). 15
+  descendants, all marked: children 48406, 48409, 48411, 48416, 48418, 48458,
+  48466, 48471, 48500, 48508, 48518; grandchildren 48487, 48504, 48517, 48530.
+  All 16 report `denied errno=1`, audit hook installed, editable finder
+  stripped. No other tripwire records. Profile sha256 `0e78e401...` at launch
+  and at the end.
+
+#### 14.10.4 C5 -- cancellation ignored
+
+- `evidence/C5/`: the plant was copied verbatim (anchor count 1, parses) and
+  the copy was imported. Exit 1 after 80.9 s, not killed.
+  **`RESULTS: 68 passed, 3 failed`**, 71 checks, 0 tracebacks, driver exit 0.
+- Recorded failures, all intended. 4k, 4l and 4m each read
+  `(True, False, True, '_Absent', ...)`: entered, but not interrupted within
+  one poll, the thread still alive after 5 s, and no exception. 4k also shows 0
+  `cancelled` against 1.
+  - **Each cleanup element read `(False, 0, 0)`.** The waiter exited and left
+    no hold and no queue entry, so 4l no longer aborts on a leaked $9 hold, and
+    each case failed only on its own interruption fact.
+- 4n and 4n-i PASS under this plant. 4n-i's stop is seen by the retry policy
+  after a positive preview, not by `await_admission`'s cancellation. This is
+  new information: v2's C5 run aborted at 4l and never reached them.
+- The 80.9 s (clean: 32 s) is the cleanup joins waiting out the planted
+  waiters. The 4l waiter ends only at its own 30 s timeout, since SPEND_STOP
+  stays latched.
+- Markers: launch pid 48532 = parent marker 48532 (ppid 48531). 15
+  descendants, all marked: children 48546, 48548, 48553, 48557, 48562, 48701,
+  48706, 48711, 48722, 48730, 48735; grandchildren 48718, 48729, 48734, 48742.
+  All 16 report `denied errno=1`, audit hook installed, editable finder
+  stripped. No other tripwire records. Profile sha256 unchanged.
+- All three runs removed their own test temp directory (check 7c passed in
+  each), and `b1fix_run.py` removed each plant copy. Only the three
+  previous-session temp dirs remain in `$TMPDIR`.
+
+#### 14.10.5 Still unrecorded
+
+- **`halt_with_live_worker` has never executed.** No run reached a live worker
+  after cancellation (4f-0b) or a leaked waiter (4k-0 to 4n-0). The same holds
+  for the failing branch of each cleanup element. These are guards verified by
+  reading, not by a firing plant.
+- **`controls_e1b_v2.py` with `-u` was not run.** The full 15-plant controls
+  set on the fixed test is B2's.
+- C1-C3 and C6-C15 were not re-run against the edited test. Their recorded
+  failures in 14.3 are from the pre-fix test.
+- C4 now reports 72 checks and every other run 71, because `4f-0` is recorded
+  only when it fails. A harness comparing totals across plants must allow this.
+- The CLAUDE.md run-block count (`# 71`) remains correct for the clean file.
+  CLAUDE.md was not edited, and its end-state overclaims (14.9.5) are carried.
+
+#### 14.10.6 Next single batch
+
+**B2:** on this tree, under the same containment, run the new test once and
+then `controls_e1b_v2.py all` (now `-u`), foreground. Pass criteria: clean
+71/0; every plant, C4 and C5 included, ends in a RESULTS line with recorded
+failures and no kill or traceback.

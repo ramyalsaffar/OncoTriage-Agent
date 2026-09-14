@@ -185,6 +185,26 @@ def wait_until(predicate, timeout=10.0, step=0.01):
     return False
 
 
+def halt_with_live_worker(where):
+    """A worker thread outlived every bound this file gives it. Restoring
+    configuration, rebinding a module attribute back, or calling
+    ``reset_spend()`` underneath a thread that is still inside the retry policy
+    would corrupt whatever it does next, and every later check would measure
+    that corruption. So record the failure, print the results so far, and end
+    the process here. Reached only when a defect keeps a worker alive past
+    both its bound and the cancellation meant to end it."""
+    check(f"{where} *** the worker thread exited before any shared state was "
+          f"restored ***", "still alive", "exited")
+    print("\n" + "=" * 78)
+    print(f"RESULTS: {_RESULTS['passed']} passed, {_RESULTS['failed']} failed")
+    print("=" * 78)
+    for _label in _FAILURES:
+        print(f"  FAILED: {_label}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1)
+
+
 _TMP = tempfile.mkdtemp(prefix="oncotriage-admission-e1b-")
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(oncotriage.__file__)))
 _TESTS = os.path.dirname(os.path.abspath(__file__))
@@ -1026,9 +1046,34 @@ with settings(SPEND_CAP_ENFORCED=True, SPEND_CAP_USD=10.0,
         rebound(_spend.HeadroomWait, "await_admission", _recording_await):
     _h = begin(9.0)
     _calls = []
+    # THE CALL RUNS ON A THREAD WITH A BOUNDED JOIN. The only bound on this call
+    # is the wait's own deadline, which is the thing a defect here would break,
+    # so without an outside bound that defect HANGS the file instead of failing
+    # it (the C4 firing control: deadline reset on each recheck). A worker that
+    # outlives the bound is a recorded failure, is ended through the shutdown
+    # flag, and must be seen to exit before anything above is restored.
+    _4F_JOIN_S = 6.0
+    _4f_box = {}
     _t0 = time.monotonic()
-    _exc = raised(s5_call, 9.0, calls=_calls, pacer=CountingPacer())
-    _elapsed = time.monotonic() - _t0
+
+    def _4f_drive():
+        _4f_box["exc"] = raised(s5_call, 9.0, calls=_calls,
+                                pacer=CountingPacer())
+        _4f_box["elapsed"] = time.monotonic() - _t0
+
+    _4f_thread = threading.Thread(target=_4f_drive, daemon=True)
+    _4f_thread.start()
+    _4f_thread.join(_4F_JOIN_S)
+    if _4f_thread.is_alive():
+        check(f"4f-0 *** the timed wait returned within {_4F_JOIN_S} s of a "
+              f"1.5 s timeout ***", "still waiting", "returned")
+        _ev.request_stage5_shutdown("e1b 4f: the timed wait outlived its bound")
+        _4f_thread.join(_4F_JOIN_S)
+        if _4f_thread.is_alive():
+            halt_with_live_worker("4f-0b")
+        _ev.clear_stage5_shutdown()
+    _exc = at(_4f_box, "exc")
+    _elapsed = at(_4f_box, "elapsed")
 check("4f non-degeneracy: the preview always said 'fits', so the waiter went "
       "back to real admission and was declined again at least three times",
       (len(_deadlines) >= 3,
@@ -1084,7 +1129,13 @@ def cancel_case(trigger, *, drain=False):
     with settings(SPEND_CAP_ENFORCED=True, SPEND_CAP_USD=10.0,
                   ADMISSION_WAIT_TIMEOUT_SECONDS=30.0,
                   ADMISSION_WAIT_RECHECK_SECONDS=0.2):
-        holder = begin(9.0)
+        # GUARDED: a decline here (a hold left by an earlier case) is a
+        # recorded failure of the caller's check, not a traceback.
+        holder = drive(begin, 9.0)
+        if isinstance(holder, _Absent):
+            return (False, float("inf"), None, {"exc": holder}, [],
+                    (False, _spend.SPEND_LEDGER.held_count(),
+                     _spend.ADMISSION_QUEUE.depth(_spend.SPEND_BUDGET_CAMPAIGN)))
         calls = []
         thread, box = spawn_call(9.0, calls=calls, pacer=CountingPacer(),
                                  drain=drain)
@@ -1094,38 +1145,67 @@ def cancel_case(trigger, *, drain=False):
         thread.join(5.0)
         took = time.monotonic() - t0
         alive = thread.is_alive()
-        holder.resolve(_spend.BILLING_OUTCOME_NOT_BILLED)
+        drive(holder.resolve, _spend.BILLING_OUTCOME_NOT_BILLED)
         thread.join(5.0)
+        # What the checks read is taken HERE, before the cleanup below can let a
+        # waiter that ignored its trigger go on to dispatch.
+        seen_box, seen_calls = dict(box), list(calls)
+        # CLEANUP: forget the shutdown and the drain, then give a waiter still
+        # running its own wait timeout to end; a SPEND_STOP is left latched, so
+        # such a waiter ends at that timeout rather than being re-admitted. Any
+        # reservation the waiter took is resolved by the retry policy as it
+        # returns. The caller's check fails if the thread is still alive or a
+        # hold or queue entry is left, and the file stops before the next
+        # case's reset_spend() can run underneath it.
+        _ev.clear_stage5_shutdown()
+        thread.join(float(config.ADMISSION_WAIT_TIMEOUT_SECONDS) + 5.0)
+        cleanup = (thread.is_alive(), _spend.SPEND_LEDGER.held_count(),
+                   _spend.ADMISSION_QUEUE.depth(_spend.SPEND_BUDGET_CAMPAIGN))
     _ev.clear_stage5_shutdown()
-    return entered, took, alive, box, calls
+    return entered, took, alive, seen_box, seen_calls, cleanup
 
 
 _prompt = config.PROVIDER_WAIT_POLL_SECONDS + 0.5
-_e, _took, _alive, _box, _calls = cancel_case(
+_e, _took, _alive, _box, _calls, _cleanup = cancel_case(
     lambda: _ev.request_stage5_shutdown("e1b SIGTERM stand-in"))
 check("4k *** SHUTDOWN (the SIGTERM / Ctrl-C flag) interrupts a 30 s wait within "
-      "one poll interval, as Stage5ShutdownRequested, with no dispatch ***",
+      "one poll interval, as Stage5ShutdownRequested, with no dispatch; the "
+      "waiter exited and left no hold or queue entry ***",
       (_e, _took < _prompt, _alive, type(at(_box, "exc")).__name__, _calls,
-       waits("cancelled")),
-      (True, True, False, "Stage5ShutdownRequested", [], 1))
-_e, _took, _alive, _box, _calls = cancel_case(
+       waits("cancelled"), _cleanup),
+      (True, True, False, "Stage5ShutdownRequested", [], 1, (False, 0, 0)))
+if _cleanup[0]:
+    halt_with_live_worker("4k-0")
+_e, _took, _alive, _box, _calls, _cleanup = cancel_case(
     lambda: _spend.SPEND_STOP.trip(_spend.SPEND_LIMIT_CALL_CEILING, "e1b", _S5))
 check("4l *** A SPEND STOP latched elsewhere interrupts it promptly, as "
-      "Stage5SpendStopped ***",
-      (_e, _took < _prompt, _alive, type(at(_box, "exc")).__name__, _calls),
-      (True, True, False, "Stage5SpendStopped", []))
-_e, _took, _alive, _box, _calls = cancel_case(
+      "Stage5SpendStopped; the waiter exited and left no hold or queue "
+      "entry ***",
+      (_e, _took < _prompt, _alive, type(at(_box, "exc")).__name__, _calls,
+       _cleanup),
+      (True, True, False, "Stage5SpendStopped", [], (False, 0, 0)))
+if _cleanup[0]:
+    halt_with_live_worker("4l-0")
+_e, _took, _alive, _box, _calls, _cleanup = cancel_case(
     lambda: _ev.request_stage5_drain("e1b STOP stand-in"), drain=True)
 check("4m *** THE OPERATOR'S STOP (drain) interrupts a wait where drain applies "
-      "(nothing paid in the current attempt), as Stage5DrainRequested ***",
-      (_e, _took < _prompt, _alive, type(at(_box, "exc")).__name__, _calls),
-      (True, True, False, "Stage5DrainRequested", []))
-_e, _took, _alive, _box, _calls = cancel_case(
+      "(nothing paid in the current attempt), as Stage5DrainRequested; the "
+      "waiter exited and left no hold or queue entry ***",
+      (_e, _took < _prompt, _alive, type(at(_box, "exc")).__name__, _calls,
+       _cleanup),
+      (True, True, False, "Stage5DrainRequested", [], (False, 0, 0)))
+if _cleanup[0]:
+    halt_with_live_worker("4m-0")
+_e, _took, _alive, _box, _calls, _cleanup = cancel_case(
     lambda: _ev.request_stage5_drain("e1b STOP stand-in"), drain=False)
 check("4n ...and, as the drain's existing contract says, it does NOT cancel a "
       "wait where drain does not apply: that attempt was STILL WAITING after the "
-      "drain, and was admitted when the hold settled",
-      (_e, _alive, "exc" in _box, _calls), (True, True, False, ["call"]))
+      "drain, and was admitted when the hold settled; it then exited and left "
+      "no hold or queue entry",
+      (_e, _alive, "exc" in _box, _calls, _cleanup),
+      (True, True, False, ["call"], (False, 0, 0)))
+if _cleanup[0]:
+    halt_with_live_worker("4n-0")
 
 # A STOP SEEN BY THE RETRY POLICY ITSELF, after a positive preview and before
 # re-admission, ends the wait CANCELLED (the E1b self-review defect: it was
