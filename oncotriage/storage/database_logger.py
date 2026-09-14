@@ -89,7 +89,7 @@ import time
 import urllib.parse
 from collections import Counter
 from datetime import datetime, timezone
-from typing import Dict, NamedTuple
+from typing import Dict, NamedTuple, Optional
 
 from oncotriage import paths
 from oncotriage import settings
@@ -5965,6 +5965,127 @@ def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
                            run_ids=tuple(sorted(r for r in run_ids
                                                 if r is not None)),
                            discrepancy_usd=discrepancy_usd)
+
+
+BILLING_SOURCE_STAGE5 = "stage5"
+"""``spend.SPEND_SOURCE_STAGE5``, restated: this module does not import
+``spend``, and a test pins the two equal."""
+
+STAGE5_AT_RESERVATION_OUTCOMES = ("response_unpriced", "possibly_billed",
+                                  "abandoned")
+"""``spend.BILLING_OUTCOMES_AT_RESERVATION``, restated for the same reason: the
+settled outcomes whose amount IS the reservation, so a settled row of one of
+them is only as good as the reservation it was settled at."""
+
+
+class UnprovenStage5Liability(NamedTuple):
+    """One Stage 5 billing row whose amount is not a proven upper bound."""
+
+    attempt_id: str
+    state: str
+    outcome: Optional[str]
+    model: Optional[str]
+    amount_usd: Optional[float]
+    reason: str
+
+
+def _stage5_reservation_unproven_reason(model, reserved, in_tokens, out_tokens,
+                                        note) -> Optional[str]:
+    """Why one Stage 5 reservation is NOT a proven upper bound, or None. PURE.
+
+    PROVEN means: the row's note records the documented-limit basis at the
+    CURRENT version, and the bound recomputed from that note -- for the row's
+    model, its request ceiling and its wire attempts -- is covered by what the
+    row reserved, in input tokens, output tokens and dollars. A row reserved
+    before the bound existed carries no such note and is never assumed to
+    satisfy it; a row whose recomputed bound has since risen (a price or limit
+    changed) no longer covers it and is re-examined.
+    """
+    try:
+        meta = json.loads(note) if isinstance(note, str) else None
+    except Exception:                                          # noqa: BLE001
+        meta = None
+    if not isinstance(meta, dict) or \
+            meta.get("reservation_basis") != _config.STAGE5_RESERVATION_BASIS:
+        return "no documented-limit basis recorded (reserved as an estimate)"
+    if meta.get("basis_version") != _config.STAGE5_RESERVATION_BASIS_VERSION:
+        return (f"reserved under basis version {meta.get('basis_version')!r}, "
+                f"not {_config.STAGE5_RESERVATION_BASIS_VERSION}")
+    try:
+        bound = _config.stage5_attempt_bound(
+            model, meta.get("requested_output_tokens"),
+            meta.get("wire_attempts"))
+    except _config.Stage5ReservationUnbounded as exc:
+        return f"no documented bound can be established now: {exc}"
+    if not _valid_billing_usd(reserved):
+        return "its reserved amount cannot be read"
+    shortfalls = []
+    if (_optional_count(in_tokens) or 0) < bound["input_tokens"]:
+        shortfalls.append(f"input tokens {in_tokens} < {bound['input_tokens']}")
+    if (_optional_count(out_tokens) or 0) < bound["output_tokens"]:
+        shortfalls.append(
+            f"output tokens {out_tokens} < {bound['output_tokens']}")
+    if float(reserved) < bound["usd"] - 1e-9:
+        shortfalls.append(f"${float(reserved):.6f} < ${bound['usd']:.6f}")
+    if shortfalls:
+        return ("reserved below the documented-limit bound recomputed now ("
+                + "; ".join(shortfalls) + ")")
+    return None
+
+
+def stage5_unproven_liabilities(campaign_id, db_path=None) -> list:
+    """The campaign's Stage 5 liabilities whose amount is not a proven upper
+    bound (R1). RAISES ``BillingRecordUnreadable`` when the record cannot be
+    read.
+
+    WHICH ROWS: ``kind = 'attempt'`` and ``source = 'stage5'`` that are either
+    still RESERVED (a fresh process charges them at their reservation) or
+    SETTLED at an outcome whose amount IS the reservation
+    (``STAGE5_AT_RESERVATION_OUTCOMES``). A settled ``response`` holds its
+    priced usage and ``not_billed`` holds a provable zero, so neither depends
+    on the reservation. Embedding rows have their own bound (P1b) and are not
+    examined here.
+
+    A RESUME REFUSES ON ANY ROW RETURNED. No durable evidence in this project
+    establishes what such an attempt was really billed, and assuming its old
+    reservation covers the charge is exactly the undercount R1 removes.
+    """
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise BillingRecordUnreadable(
+            f"no campaign id to read the billing record for: {campaign_id!r}")
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        conn = _open_connection(db_path, read_only=True)
+        try:
+            rows = conn.execute(
+                "SELECT attempt_id, state, outcome, model, reserved_usd, "
+                "reserved_input_tokens, reserved_output_tokens, note FROM "
+                "billing_attempts WHERE campaign_id = ? AND kind = ? AND "
+                "source = ? ORDER BY rowid",
+                (campaign_id, BILLING_ATTEMPT_KIND_ATTEMPT,
+                 BILLING_SOURCE_STAGE5)).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:                                   # noqa: BLE001
+        raise BillingRecordUnreadable(
+            f"the billing record for campaign {campaign_id} could not be read "
+            f"from {db_path}: {type(exc).__name__}: {exc}") from exc
+    unproven = []
+    for (attempt_id, state, outcome, model, reserved, in_tok, out_tok,
+         note) in rows:
+        if state == BILLING_ATTEMPT_STATE_SETTLED:
+            if outcome not in STAGE5_AT_RESERVATION_OUTCOMES:
+                continue
+        elif state != BILLING_ATTEMPT_STATE_RESERVED:
+            continue
+        reason = _stage5_reservation_unproven_reason(model, reserved, in_tok,
+                                                     out_tok, note)
+        if reason is not None:
+            unproven.append(UnprovenStage5Liability(
+                attempt_id, state, outcome, model,
+                float(reserved) if _valid_billing_usd(reserved) else None,
+                reason))
+    return unproven
 
 
 class BillingRecordSink:

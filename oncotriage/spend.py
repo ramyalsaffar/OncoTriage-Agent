@@ -2398,7 +2398,8 @@ class BillingRecord:
         with self._lock:
             return self._sink
 
-    def reserve(self, source, model, input_tokens, output_tokens, *, where):
+    def reserve(self, source, model, input_tokens, output_tokens, *, where,
+                reserved_usd=None, note=None):
         """Persist a reservation before a billed dispatch. Returns a handle, or
         None when no sink is installed. RAISES ``BillingRecordUnavailable`` when
         a sink is installed and the reservation could not be made durable -- the
@@ -2406,6 +2407,14 @@ class BillingRecord:
 
         ``where`` names the call site for the latch banner, on ``SpendStop``'s
         own convention.
+
+        ``reserved_usd`` (R1) is an upper bound ALREADY PRICED by the owner of
+        the bound: Stage 5's documented-limit bound prices input at its dearest
+        class and a long-context multiplier, which ``price_usage`` cannot
+        express. None prices the tokens at the base rates, exactly as before.
+        An explicit amount that is not a positive finite number is UNPRICED.
+        ``note`` is stored on the row verbatim and is passed to the sink only
+        when it is not None, so a duck-typed sink that predates it still works.
         """
         sink = self.installed_sink()
         if sink is None:
@@ -2419,7 +2428,8 @@ class BillingRecord:
                 "the campaign's durable billing record latched earlier in this "
                 "run (" + (SPEND_STOP.cause or "cause not recorded") + "), so "
                 "no further billed request is dispatched")
-        usd, fault = price_usage(model, input_tokens, output_tokens)
+        usd, fault = _reservation_price(model, input_tokens, output_tokens,
+                                        reserved_usd)
         if usd is None:
             BILLING_RECORD_FAULTS["reserve:unpriced"] += 1
             SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source,
@@ -2429,10 +2439,13 @@ class BillingRecord:
                 f"({fault}), so it was not dispatched")
         attempt_id = uuid.uuid4().hex
         try:
-            sink.reserve(attempt_id=attempt_id, source=source, model=model,
-                         input_tokens=int(input_tokens),
-                         output_tokens=int(output_tokens), reserved_usd=usd,
-                         correlation_id=current_correlation_id())
+            fields = dict(attempt_id=attempt_id, source=source, model=model,
+                          input_tokens=int(input_tokens),
+                          output_tokens=int(output_tokens), reserved_usd=usd,
+                          correlation_id=current_correlation_id())
+            if note is not None:
+                fields["note"] = note
+            sink.reserve(**fields)
         except Exception as exc:                                # noqa: BLE001
             BILLING_RECORD_FAULTS[f"reserve:{type(exc).__name__}"] += 1
             log.error("a billed attempt's reservation could not be persisted; "
@@ -2656,18 +2669,25 @@ class AttemptLiability:
     dispatch. With no sink it never raises.
     """
 
-    def __init__(self, source, model, input_tokens, output_tokens, *, where):
+    def __init__(self, source, model, input_tokens, output_tokens, *, where,
+                 reserved_usd=None, note=None):
         self.source = source
         self.model = model
         self.where = where
         # PRICED ONCE, HERE, whether or not a sink is installed: the ledger's
         # possibly-billed charge needs it on every process, and the durable
         # reservation (below) is priced by the same function, so the two cannot
-        # hold different upper bounds for one attempt.
-        self.reserved_usd, self.reservation_fault = price_usage(
-            model, input_tokens, output_tokens)
+        # hold different upper bounds for one attempt. An explicit, already
+        # priced bound (R1) is used verbatim by BOTH, through one helper.
+        self.reserved_usd, self.reservation_fault = _reservation_price(
+            model, input_tokens, output_tokens, reserved_usd)
+        # A BOUNDED attempt is one whose reservation claims to be a proven
+        # upper bound; a response priced above it breaks that claim (R1).
+        self.bounded = reserved_usd is not None
         self.handle = BILLING_RECORD.reserve(source, model, input_tokens,
-                                             output_tokens, where=where)
+                                             output_tokens, where=where,
+                                             reserved_usd=reserved_usd,
+                                             note=note)
         self.resolved_outcome = None
         self.resolved_usd = None
         BILLING_RECORD._note_open(self.reserved_usd)
@@ -2710,6 +2730,22 @@ class AttemptLiability:
             # no sink (see `attempt_liability`); counted, never silent.
             SPEND_LEDGER_FAULTS[f"unpriced_reservation:{self.model}"] += 1
             usd = 0.0
+        if (self.bounded and out == BILLING_OUTCOME_RESPONSE
+                and self.reserved_usd is not None
+                and float(usd) > float(self.reserved_usd) + 1e-9):
+            # THE BOUND WAS BROKEN (R1). A reservation derived from documented
+            # provider limits was exceeded by a PRICED response -- a provider
+            # billing beyond its own limit, or an echo naming a pricier model.
+            # The liability below is still charged at the priced amount, and a
+            # settlement that does not land still writes the shortfall; what
+            # this adds is that the broken assumption is NAMED, because a
+            # process death on a later attempt would be under-covered by it.
+            BILLING_RECORD_FAULTS[f"bound_exceeded:{self.source}"] += 1
+            log.error("a billed response was priced above its documented-limit "
+                      "reservation; the reservation is not an upper bound for "
+                      "this provider or model",
+                      event="billing_bound_exceeded", status="error",
+                      phase=self.source, mode=self.where, degraded=True)
         self.resolved_outcome, self.resolved_usd = out, float(usd)
         if out != BILLING_OUTCOME_NOT_BILLED:
             SPEND_LEDGER.charge_usd(float(usd), self.source)
@@ -2859,13 +2895,34 @@ class AttemptLiability:
                             cause)
 
 
+def _reservation_price(model, input_tokens, output_tokens, reserved_usd):
+    """``(usd, None)`` for a reservation, or ``(None, fault_key)``. PURE.
+
+    None prices the tokens at the base rates (``price_usage``). An explicit
+    amount (R1) must be a positive finite number and is used verbatim; anything
+    else is unpriced, never zero.
+    """
+    if reserved_usd is None:
+        return price_usage(model, input_tokens, output_tokens)
+    if (isinstance(reserved_usd, bool)
+            or not isinstance(reserved_usd, (int, float))
+            or reserved_usd != reserved_usd
+            or reserved_usd in (float("inf"), float("-inf"))
+            or reserved_usd <= 0):
+        return None, f"bad_reserved_usd:{type(reserved_usd).__name__}"
+    return float(reserved_usd), None
+
+
 def begin_billed_attempt(source, model, input_tokens, output_tokens, *,
-                         where) -> AttemptLiability:
+                         where, reserved_usd=None,
+                         note=None) -> AttemptLiability:
     """Create one billed attempt's liability, BEFORE dispatch. RAISES
     ``BillingRecordUnavailable`` when a durable sink is installed and the
-    reservation could not be persisted; the caller must then not dispatch."""
+    reservation could not be persisted; the caller must then not dispatch.
+
+    ``reserved_usd`` and ``note`` (R1): see ``BillingRecord.reserve``."""
     return AttemptLiability(source, model, input_tokens, output_tokens,
-                            where=where)
+                            where=where, reserved_usd=reserved_usd, note=note)
 
 
 # ===========================================================================

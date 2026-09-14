@@ -6195,6 +6195,260 @@ PRICING_CONFIG = {
 }
 
 
+# ===========================================================================
+# STAGE 5 BILLED-ATTEMPT UPPER BOUND (the R1 recovery)
+# ===========================================================================
+#
+# WHAT THIS REPLACES. A Stage 5 attempt used to reserve ``(characters /
+# PROVIDER_RESERVATION_CHARS_PER_TOKEN) + 1`` input tokens plus its output
+# ceiling, priced at the base input rate. That is an ESTIMATE: a tokenizer can
+# emit more tokens than characters / 3, a cache WRITE bills above the base input
+# rate, and a long-context request bills above both. So a response could be
+# priced above its reservation, and when every durable write after dispatch
+# failed (P1c item 2), a fresh process read the reservation -- below the charge.
+#
+# THE BOUND IS DERIVED FROM DOCUMENTED PROVIDER LIMITS, NEVER FROM THE TEXT, on
+# P1b's embedding precedent (oncotriage/agent/models.py). For ONE wire request:
+#
+#   billed input tokens  <= context_window_tokens
+#       The provider refuses, and does not bill, a prompt longer than its
+#       context window. Anthropic ("Context windows", read 2026-09-14): "If the
+#       input alone already exceeds the model's context window, the API returns
+#       a 400 invalid_request_error ('prompt is too long') on every model." A
+#       400 is classified CATEGORY_CLIENT -> not billed.
+#   billed output tokens <= min(the request's own output ceiling,
+#                               max_output_tokens)
+#       The ceiling the adapter puts in the request. Reasoning/thinking tokens are
+#       INSIDE it: Anthropic, "Thinking tokens are a subset of your max_tokens
+#       parameter, are billed as output tokens"; the installed OpenAI SDK
+#       (1.99.9) documents max_completion_tokens and max_output_tokens as "An
+#       upper bound for the number of tokens that can be generated ...,
+#       including visible output tokens and reasoning tokens".
+#
+# PRICED AT THE DEAREST CLASS EACH HALF CAN BILL, whatever the request looks
+# like: input at max(base input, cache read, cache write) x the long-context
+# input multiplier; output at the output rate x the long-context output
+# multiplier. The two halves are bounded INDEPENDENTLY (no "input + output <=
+# window" coupling is assumed), so a long-context price that applies "for the
+# full request" is covered too.
+#
+# EVERY WIRE REQUEST IS COVERED. One reservation per policy attempt (see
+# provider_resilience.execute); an SDK that retries INSIDE one send multiplies
+# the bound by matching_sdk_attempts_per_call(), which is 1 on all three arms as
+# shipped.
+#
+# THE DOCUMENTED ASSUMPTIONS, STATED RATHER THAN IMPLIED:
+#   (1) the provider enforces its own documented context window and output
+#       ceiling on the tokens it bills;
+#   (2) Bedrock bills the model the request NAMED (the wire id); a response that
+#       echoes a pricier model is priced above the reservation and is caught by
+#       spend.AttemptLiability's discrepancy rule, not by this bound;
+#   (3) the rates in PRICING_CONFIG and the multipliers below are the provider's;
+#   (4) SONNET 4.6 ON BEDROCK: NO FIRST-PARTY AWS PAGE THIS PROJECT COULD READ
+#       STATES WHETHER A LONG-CONTEXT PREMIUM APPLIES. Anthropic's own pricing
+#       page says Claude 4.6 models bill the full 1M window at standard rates on
+#       its API, and says Bedrock prices independently; the AWS pricing page did
+#       not render its Claude rows to this project's reader (2026-09-14). So the
+#       Sonnet rows carry an ASSUMED CEILING of 2.0x input / 1.5x output -- the
+#       long-context class documented for GPT-5.6 Terra on both providers and
+#       for earlier Claude Sonnet 1M windows. A Bedrock premium ABOVE that would
+#       break the bound. VERIFY AGAINST A CONSOLE BILL (A6) and, if Bedrock
+#       applies no premium, set both multipliers to 1.0.
+#
+# A MODEL ABSENT FROM THIS TABLE HAS NO ESTABLISHED BOUND AND IS REFUSED BEFORE
+# DISPATCH (Stage5ReservationUnbounded). Priced is not bounded: gpt-4o has a
+# PRICING_CONFIG row and no entry here.
+#
+# THE PACER IS NOT CHANGED. provider_resilience's token-quota reservation keeps
+# its ESTIMATE (evaluation._reservation_input_tokens), because it paces against a
+# tokens-per-minute quota and is corrected to actual usage on completion;
+# reserving a whole context window there would throttle every run to a few
+# requests a minute. The bound governs MONEY only.
+
+_SONNET_46_BEDROCK_LIMITS = {
+    # AWS model card, docs.aws.amazon.com/bedrock/latest/userguide/
+    # model-card-anthropic-claude-sonnet-4-6.html (read 2026-09-14):
+    # "Context window: 1M tokens", "Max output tokens: 64K", Standard tier only.
+    "context_window_tokens": 1_000_000,
+    "max_output_tokens": 64_000,
+    # ASSUMED CEILING -- see (4) above.
+    "long_context_input_multiplier": 2.0,
+    "long_context_output_multiplier": 1.5,
+    # The PRICING_CONFIG row carries its cache-write rates per TTL.
+    "cache_write_multiplier": None,
+    "basis": ("AWS model card 2026-09-14: 1M context, 64K output; long-context "
+              "multipliers ASSUMED (unverified on Bedrock)"),
+}
+
+_TERRA_BEDROCK_LIMITS = {
+    # AWS model card, docs.aws.amazon.com/bedrock/latest/userguide/
+    # model-card-openai-gpt-56-terra.html (read 2026-09-14): "Context window: 1M
+    # tokens"; long context (more than 272K input tokens) Geo CRIS $4.40 input /
+    # $5.50 30m cache write / $19.80 output against short $2.20 / $2.75 / $13.20
+    # -- exactly 2.0x input, 1.5x output, and a cache write of 1.25x input. The
+    # card states no max output; OpenAI's model page states 128,000.
+    "context_window_tokens": 1_000_000,
+    "max_output_tokens": 128_000,
+    "long_context_input_multiplier": 2.0,
+    "long_context_output_multiplier": 1.5,
+    "cache_write_multiplier": 1.25,
+    "basis": ("AWS model card 2026-09-14: 1M context, long-context 2x input / "
+              "1.5x output, cache write 1.25x; OpenAI: 128K output"),
+}
+
+STAGE5_ATTEMPT_LIMITS = {
+    "global.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "us.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "eu.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "au.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "jp.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "openai.gpt-5.6-terra": _TERRA_BEDROCK_LIMITS,
+    "us.openai.gpt-5.6-terra": _TERRA_BEDROCK_LIMITS,
+    "global.openai.gpt-5.6-terra": _TERRA_BEDROCK_LIMITS,
+    "gpt-5.6-terra": {
+        # OpenAI model page, developers.openai.com/api/docs/models/gpt-5.6-terra
+        # (read 2026-09-14): "1,050,000 context window", "128,000 max output
+        # tokens"; "Prompts with >272K input tokens are priced at 2x input and
+        # 1.5x output for the full request"; cache writes "billed at 1.25x the
+        # uncached input token rate".
+        "context_window_tokens": 1_050_000,
+        "max_output_tokens": 128_000,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+        "cache_write_multiplier": 1.25,
+        "basis": ("OpenAI model page 2026-09-14: 1.05M context, 128K output, "
+                  ">272K 2x input / 1.5x output, cache write 1.25x"),
+    },
+}
+"""Documented per-request limits of every Stage 5 wire model this project can
+dispatch to. CLOSED: a wire model absent here is refused before dispatch."""
+
+STAGE5_RESERVATION_BASIS = "stage5_documented_limit"
+"""The ``reservation_basis`` a bounded Stage 5 reservation records in its billing
+row's ``note``. A resume trusts an unresolved Stage 5 reservation only when its
+note carries this basis at ``STAGE5_RESERVATION_BASIS_VERSION`` and its amount
+still covers the bound recomputed from the note."""
+
+STAGE5_RESERVATION_BASIS_VERSION = 1
+"""Bump when the bound's derivation changes, so rows reserved under the old
+derivation are re-examined by a resume rather than trusted."""
+
+
+class Stage5ReservationUnbounded(RuntimeError):
+    """No sound upper bound on a Stage 5 attempt's billed cost could be
+    established, so the request was NOT dispatched (R1). A ``RuntimeError`` and
+    not a ``ValueError``, on ``UnknownModelPricingError``'s footing."""
+
+
+def _positive_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def stage5_attempt_bound(model, requested_output_tokens, wire_attempts):
+    """The upper bound one Stage 5 policy attempt may be billed. PURE. RAISES
+    ``Stage5ReservationUnbounded`` when no sound bound can be established.
+
+    Returns a dict: ``input_tokens``, ``output_tokens``, ``usd``,
+    ``input_rate_per_mtok``, ``output_rate_per_mtok``, ``model``,
+    ``requested_output_tokens``, ``wire_attempts``, ``basis``.
+
+    ``requested_output_tokens`` is the ceiling the request carries (never a
+    smaller one); ``wire_attempts`` is how many wire requests one send may make
+    inside its SDK. The text of the prompt is deliberately NOT an argument: the
+    bound holds whatever the text is.
+    """
+    def refuse(why):
+        raise Stage5ReservationUnbounded(
+            f"Stage 5 wire model {model!r}: {why}; no upper bound on what the "
+            f"attempt is billed can be reserved, so it was not dispatched")
+
+    try:
+        limits = STAGE5_ATTEMPT_LIMITS.get(model)
+    except TypeError:
+        limits = None
+    if not isinstance(limits, dict):
+        refuse("no documented limits in config.STAGE5_ATTEMPT_LIMITS")
+    window = limits.get("context_window_tokens")
+    max_out = limits.get("max_output_tokens")
+    if not _positive_int(window) or not _positive_int(max_out):
+        refuse("its documented context window or output limit is not a "
+               "positive integer")
+    long_in = limits.get("long_context_input_multiplier")
+    long_out = limits.get("long_context_output_multiplier")
+    if not (_is_number(long_in) and _is_number(long_out)
+            and long_in >= 1.0 and long_out >= 1.0):
+        refuse("its long-context multipliers are not numbers >= 1.0")
+    cw_mult = limits.get("cache_write_multiplier")
+    if cw_mult is not None and not (_is_number(cw_mult) and cw_mult >= 1.0):
+        refuse("its cache_write_multiplier is not None or a number >= 1.0")
+    if not _positive_int(requested_output_tokens):
+        refuse(f"the request's output ceiling {requested_output_tokens!r} is "
+               f"not a positive integer")
+    if not _positive_int(wire_attempts):
+        refuse(f"wire attempts per send {wire_attempts!r} is not a positive "
+               f"integer")
+
+    row = PRICING_CONFIG.get("models", {}).get(model)
+    if not isinstance(row, dict):
+        refuse("it has no PRICING_CONFIG row")
+    base_in, base_out = row.get("input"), row.get("output")
+    if not (_is_number(base_in) and _is_number(base_out)
+            and base_in > 0 and base_out > 0):
+        refuse("its PRICING_CONFIG input or output rate is not a positive "
+               "number")
+    input_rates = [base_in]
+    cache_read = row.get("cache_read")
+    if cache_read is not None:
+        if not (_is_number(cache_read) and cache_read >= 0):
+            refuse("its PRICING_CONFIG cache_read rate is not a number")
+        input_rates.append(cache_read)
+    cache_write = row.get("cache_write")
+    if cache_write is not None:
+        if (not isinstance(cache_write, dict) or not cache_write
+                or not all(_is_number(v) and v >= 0
+                           for v in cache_write.values())):
+            refuse("its PRICING_CONFIG cache_write map is not a map of numbers")
+        # THE TTL THE REQUEST ACTUALLY SENDS, when the row prices it; every TTL
+        # otherwise (a request with no cache point, or a TTL the row does not
+        # name), because the dearest write it could be billed at is then the
+        # only rate that is a bound.
+        ttl = BEDROCK_ANTHROPIC_CACHE_TTL
+        input_rates.append(cache_write[ttl] if ttl in cache_write
+                           else max(cache_write.values()))
+    elif cw_mult is None:
+        refuse("neither its PRICING_CONFIG row nor its documented limits say "
+               "what a cache write bills")
+    if cw_mult is not None:
+        input_rates.append(base_in * cw_mult)
+
+    in_rate = max(input_rates) * long_in
+    out_rate = base_out * long_out
+    in_tokens = window * wire_attempts
+    out_tokens = min(requested_output_tokens, max_out) * wire_attempts
+    return {
+        "model": model,
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
+        "input_rate_per_mtok": in_rate,
+        "output_rate_per_mtok": out_rate,
+        "usd": (in_tokens * in_rate + out_tokens * out_rate) / 1_000_000.0,
+        "requested_output_tokens": requested_output_tokens,
+        "wire_attempts": wire_attempts,
+        "basis": limits.get("basis"),
+    }
+
+
+def stage5_reservation_note(bound) -> str:
+    """The JSON a bounded reservation stores in its billing row's ``note``."""
+    return json.dumps({"reservation_basis": STAGE5_RESERVATION_BASIS,
+                       "basis_version": STAGE5_RESERVATION_BASIS_VERSION,
+                       "requested_output_tokens":
+                           bound["requested_output_tokens"],
+                       "wire_attempts": bound["wire_attempts"]},
+                      sort_keys=True)
+
+
 # Pricing for the independent LLM rater (oncotriage/evaluation/rater.py), which
 # calls a DIFFERENT vendor over the Message Batches API. It is a separate table
 # from PRICING_CONFIG on purpose, and the reason is a contract rather than a

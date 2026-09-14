@@ -2056,16 +2056,20 @@ class _Stage5AttemptRecord:
     patient fails, is not checkpointed, and a resume runs it.
     """
 
-    def __init__(self, model, input_tokens, output_tokens):
+    def __init__(self, model, input_tokens, output_tokens, reserved_usd=None,
+                 note=None):
         self._model = model
         self._input = input_tokens
         self._output = output_tokens
+        self._reserved_usd = reserved_usd
+        self._note = note
 
     def begin(self):
         try:
             return spend.begin_billed_attempt(
                 spend.SPEND_SOURCE_STAGE5, self._model, self._input,
-                self._output, where="a Stage 5 billed attempt")
+                self._output, where="a Stage 5 billed attempt",
+                reserved_usd=self._reserved_usd, note=self._note)
         except spend.BillingRecordUnavailable as exc:
             raise Stage5SpendStopped(f"the request was not issued: {exc}",
                                      limit=spend.SPEND_LIMIT_BILLING_RECORD
@@ -2225,12 +2229,18 @@ def _classify_matching_failure(exc: BaseException):
 
 
 def _reservation_input_tokens(system_prompt: str, user_prompt: str) -> int:
-    """A deliberately HIGH estimate of one attempt's input tokens.
+    """A deliberately HIGH ESTIMATE of one attempt's input tokens, FOR PACING.
 
     The system and user text plus the structured-output schema every trial
     call carries, over ``config.PROVIDER_RESERVATION_CHARS_PER_TOKEN`` -- which
     is set below either measured tokenizer's ratio precisely so this over-
     reserves. Rounded UP by one token. Only a configured token quota reads it.
+
+    IT IS NOT A BILLING BOUND (R1). It used to size the attempt's durable
+    billing reservation too, and a tokenizer can emit more tokens than
+    characters / 3, so a response could be priced above it. The billing
+    reservation is ``config.stage5_attempt_bound`` now; this stays the pacer's,
+    which is corrected to actual usage on completion.
     """
     _chars = (len(system_prompt or "") + len(user_prompt or "")
               + len(str(build_response_format())))
@@ -2291,27 +2301,35 @@ def _execute_matching_call(send, system_prompt: str, user_prompt: str, *,
                            max_output: int, drain_applies: bool):
     """Run one logical Stage 5 call through ``provider_resilience.execute``.
 
-    THE RESERVATION is the estimated input plus the request's own
-    ``max_output`` -- the value the adapter puts in the request, never a smaller
-    one: request identity is frozen and pacing does not get to change it.
+    TWO RESERVATIONS, AND THEY ARE DIFFERENT QUANTITIES (R1).
 
-    A POSSIBLY-BILLED FAILURE IS CHARGED THAT SAME UPPER BOUND to the spend
-    ledger, priced at the wire model. The ledger used to be charged only when a
-    response arrived, which assumed a zero for a read timeout or a dropped
-    connection that the provider may well have billed.
+      * THE BILLING RESERVATION -- what the attempt's liability and its durable
+        row hold, what a possibly-billed failure is charged, and what a fresh
+        process reads while the attempt is unresolved -- is
+        ``config.stage5_attempt_bound``: the wire model's documented context
+        window plus the request's own ``max_output``, priced at the dearest
+        class each can bill, times the wire requests one send may make. It is
+        established FIRST, so a model with no documented bound is refused here
+        by name (``config.Stage5ReservationUnbounded``) before the pacer, the
+        budget-bearing reservation or the request.
+      * THE PACER'S token reservation keeps the ESTIMATED input plus
+        ``max_output`` -- the value the adapter puts in the request, never a
+        smaller one: request identity is frozen and pacing does not get to
+        change it. It is corrected to actual usage on completion.
 
     THE CHARGE IS ISSUED BY THE ATTEMPT RECORD, NOT BY ``on_possibly_billed``
-    (the billing closure pass). That callback now REPORTS the upper bound for
-    the policy's unconfirmed-billing tally and charges nothing, because the
-    attempt record charged it: charging in both would bill the attempt twice.
+    (the billing closure pass). That callback REPORTS the upper bound for the
+    policy's unconfirmed-billing tally and charges nothing, because the attempt
+    record charged it: charging in both would bill the attempt twice.
     """
+    _bound = config.stage5_attempt_bound(
+        config.matching_wire_model(), max_output,
+        config.matching_sdk_attempts_per_call())
     _input = _reservation_input_tokens(system_prompt, user_prompt)
     _max_output = int(max_output)
 
     def _upper_bound_usd(_verdict) -> float:
-        usd, _fault = spend.price_usage(config.matching_wire_model(), _input,
-                                        _max_output)
-        return float(usd or 0.0)
+        return float(_bound["usd"])
 
     return provider_resilience.execute(
         send,
@@ -2333,9 +2351,30 @@ def _execute_matching_call(send, system_prompt: str, user_prompt: str, *,
         on_possibly_billed=_upper_bound_usd,
         usage_tokens_of=_usage_token_total,
         # THE DURABLE HALF OF THE SAME ACCOUNTING. See `_Stage5AttemptRecord`.
-        attempt_record=_Stage5AttemptRecord(config.matching_wire_model(),
-                                            _input, _max_output),
+        # Sized by the documented-limit bound, not by the pacer's estimate.
+        attempt_record=_Stage5AttemptRecord(
+            _bound["model"], _bound["input_tokens"], _bound["output_tokens"],
+            reserved_usd=_bound["usd"],
+            note=config.stage5_reservation_note(_bound)),
         label="stage5")
+
+
+def assert_stage5_reservation_bounded(*, per_trial: bool) -> None:
+    """Refuse, before anything is rendered or spent, a Stage 5 configuration
+    whose billed attempts have no documented upper bound (R1).
+
+    ONE OWNER (``config.stage5_attempt_bound``), TWO CALL SITES: the node top,
+    so a configuration defect arrives as ONE named error rather than as a
+    refusal inside every dispatch; and ``_execute_matching_call``, which every
+    public entry point reaches. Both ceilings the node can send are checked --
+    the trial ceiling always and the warmup's in per-trial mode.
+    """
+    _wire = config.matching_wire_model()
+    _attempts = config.matching_sdk_attempts_per_call()
+    config.stage5_attempt_bound(_wire, config.MATCHING_MAX_TOKENS, _attempts)
+    if per_trial:
+        config.stage5_attempt_bound(
+            _wire, config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS, _attempts)
 
 
 def _transport_exhaustion_note(exc: Optional[BaseException]) -> Optional[str]:
@@ -5573,6 +5612,10 @@ CLINICAL TRIALS:
     # surface only; see assert_per_trial_provider_supported.
     if _per_trial_calls:
         assert_per_trial_provider_supported()
+    # THE BILLED-ATTEMPT BOUND IS ESTABLISHED HERE TOO (R1), on the same
+    # footing: a wire model with no documented limits is refused once, by name,
+    # before the first request of the patient.
+    assert_stage5_reservation_bounded(per_trial=_per_trial_calls)
     if _per_trial_calls and _parallel_bound < 1:
         raise PerTrialParallelismError(
             "MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS must be >= 1 when "

@@ -205,6 +205,7 @@ from oncotriage.storage.database_logger import (
     IDENTITY_NO_EVIDENCE,
     IDENTITY_RECOVERED,
     campaign_billing_total,
+    stage5_unproven_liabilities,
     historical_campaign_evidence,
     campaign_closure_snapshot,
     normalise_closed_campaigns,
@@ -899,6 +900,7 @@ CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED = "campaign_identity_unestablished"
 CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE = "fresh_marker_unverifiable"
 CAMPAIGN_REFUSAL_BILLING_INCOMPLETE = "billing_record_incomplete"
 CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED = "billing_discrepancy_unrecorded"
+CAMPAIGN_REFUSAL_RESERVATION_UNBOUNDED = "billing_reservation_unbounded"
 CAMPAIGN_REFUSAL_REASONS = (CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
                             CAMPAIGN_REFUSAL_RECORD_UNWRITABLE,
                             CAMPAIGN_REFUSAL_RECORD_DISAGREES,
@@ -908,7 +910,8 @@ CAMPAIGN_REFUSAL_REASONS = (CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
                             CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED,
                             CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE,
                             CAMPAIGN_REFUSAL_BILLING_INCOMPLETE,
-                            CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED)
+                            CAMPAIGN_REFUSAL_DISCREPANCY_UNRECORDED,
+                            CAMPAIGN_REFUSAL_RESERVATION_UNBOUNDED)
 """Why a batch run refused to start paid work. CLOSED; every refusal is raised
 after the run row is opened and BEFORE the first billed call."""
 
@@ -987,6 +990,16 @@ class CampaignBillingRefusal(RuntimeError):
                 f"would be lower than what was charged. Fix the database named "
                 f"above and run again; the marker is reconciled automatically. "
                 f"Do not delete the marker.",
+            CAMPAIGN_REFUSAL_RESERVATION_UNBOUNDED:
+                "The Stage 5 liabilities named above were reserved, or settled "
+                "at their reservation, at an amount that is NOT a proven upper "
+                "bound (before the documented-limit bound existed, or under an "
+                "older derivation), so each attempt's real charge may exceed "
+                "what the record holds and a budget read now may be lower than "
+                "what was spent. Nothing in this project establishes their "
+                "real charge; confirm them against the provider's bill. There "
+                "is no automatic reconciliation. --fresh starts a NEW campaign "
+                "whose budget does NOT include them.",
         }.get(self.reason,
               "Fix the inference database the billing record lives in and "
               "run again.")
@@ -1502,6 +1515,24 @@ def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
     except BillingRecordUnreadable as exc:
         raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
                                      str(exc)) from exc
+    # A LIABILITY WHOSE AMOUNT IS NOT A PROVEN BOUND REFUSES THE RESUME (R1),
+    # before any paid work. Never assumed to satisfy the bound.
+    try:
+        unproven = stage5_unproven_liabilities(campaign_id, db_path=db_path)
+    except BillingRecordUnreadable as exc:
+        raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
+                                     str(exc)) from exc
+    if unproven:
+        held = sum(u.amount_usd or 0.0 for u in unproven)
+        raise CampaignBillingRefusal(
+            CAMPAIGN_REFUSAL_RESERVATION_UNBOUNDED,
+            f"campaign {campaign_id} holds {len(unproven)} Stage 5 "
+            f"liabilit{'y' if len(unproven) == 1 else 'ies'} totalling "
+            f"${held:.6f} whose amount is not a proven upper bound (first: "
+            + "; ".join(f"{u.attempt_id} {u.state}"
+                        f"{'/' + u.outcome if u.outcome else ''} {u.model} "
+                        f"${(u.amount_usd or 0.0):.6f}: {u.reason}"
+                        for u in unproven[:3]) + ")")
     prior_runs = set(r for r in billing.run_ids if r != run_id)
     if evidence is not None:
         prior_runs |= set(evidence.run_ids)

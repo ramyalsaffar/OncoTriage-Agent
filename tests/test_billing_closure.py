@@ -72,8 +72,10 @@ import ast
 import contextlib
 import fcntl
 import hashlib
+import inspect
 import json
 import shutil
+import signal
 import sqlite3
 import stat
 import subprocess
@@ -257,6 +259,12 @@ def settings(**knobs):
             setattr(config, key, value)
 
 
+def with_settings_value(key, value, fn):
+    """Call fn() with one config attribute set to value, restored after."""
+    with settings(**{key: value}):
+        return fn()
+
+
 def _reset_spend_state():
     _spend.SPEND_LEDGER.reset()
     _spend.SPEND_STOP.reset()
@@ -328,9 +336,66 @@ _pr.full_jitter_delay = lambda retry_number, rng=None: 0.0
 section("SECTION 1 -- P1: one liability rule, both ledgers, every class")
 # ===========================================================================
 
-_RESERVE_S5 = _spend.price_usage(
-    _WIRE, _ev._reservation_input_tokens("system prompt", "user prompt"),
-    config.MATCHING_MAX_TOKENS)[0]
+#
+# THE EXPECTED AMOUNTS ARE DERIVED HERE, INDEPENDENTLY OF THE OWNER. The limits
+# below are TYPED from the documents (AWS and OpenAI model cards, read
+# 2026-09-14) rather than read out of config.STAGE5_ATTEMPT_LIMITS, and the
+# arithmetic is re-done from PRICING_CONFIG's rates; the owner is then
+# required to agree. A dollar literal pins each shipped result as well.
+
+_DOC_LIMITS = {
+    # model: (context window, max output, long-ctx input x, long-ctx output x,
+    #         cache-write multiplier or None when the pricing row maps TTLs)
+    "us.anthropic.claude-sonnet-4-6": (1_000_000, 64_000, 2.0, 1.5, None),
+    "global.anthropic.claude-sonnet-4-6": (1_000_000, 64_000, 2.0, 1.5, None),
+    "gpt-5.6-terra": (1_050_000, 128_000, 2.0, 1.5, 1.25),
+    "us.openai.gpt-5.6-terra": (1_000_000, 128_000, 2.0, 1.5, 1.25),
+}
+
+
+def _indep_bound(model, requested_out, attempts=1, ttl="5m"):
+    window, max_out, long_in, long_out, cw_mult = _DOC_LIMITS[model]
+    row = config.PRICING_CONFIG["models"][model]
+    rates = [row["input"], row.get("cache_read", 0.0)]
+    if "cache_write" in row:
+        cw = row["cache_write"]
+        rates.append(cw[ttl] if ttl in cw else max(cw.values()))
+    if cw_mult is not None:
+        rates.append(row["input"] * cw_mult)
+    in_tok = window * attempts
+    out_tok = min(requested_out, max_out) * attempts
+    return (in_tok, out_tok,
+            (in_tok * max(rates) * long_in
+             + out_tok * row["output"] * long_out) / 1e6)
+
+
+# THE STAGE 5 RESERVATION IS THE DOCUMENTED-LIMIT BOUND (R1). It used to be the
+# pacer's chars/3 input estimate plus the output ceiling -- $0.38 on this file's
+# probe prompt -- which a real answer can exceed. Every expectation below that
+# reads _RESERVE_S5 now reads the independent derivation, and the check pins it.
+_RESERVE_S5 = _indep_bound(_WIRE, config.MATCHING_MAX_TOKENS,
+                           config.matching_sdk_attempts_per_call())[2]
+_S5_BOUND = config.stage5_attempt_bound(
+    _WIRE, config.MATCHING_MAX_TOKENS, config.matching_sdk_attempts_per_call())
+check("1-bound this file dispatches to gpt-5.6-terra (the pinned OpenAI arm); "
+      "its Stage 5 reservation is the documented-limit bound, $5.826, derived "
+      "independently and equal to the owner's",
+      (_WIRE, near(_RESERVE_S5, 5.826), near(_S5_BOUND["usd"], _RESERVE_S5)),
+      ("gpt-5.6-terra", True, True))
+
+
+def _open_s5(db, attempt_id, campaign_id, run_id):
+    """An UNRESOLVED Stage 5 reservation of the shape the shipped code now
+    writes: at the bound, with its basis marker. A resume refuses an unmarked
+    Stage 5 reservation by name (R1), so a recovery fixture that fabricated one
+    at an arbitrary amount would test that refusal instead of the recovery."""
+    return _dl.reserve_billing_attempt(
+        db, attempt_id=attempt_id, campaign_id=campaign_id, run_id=run_id,
+        source="stage5", model=_S5_BOUND["model"],
+        input_tokens=_S5_BOUND["input_tokens"],
+        output_tokens=_S5_BOUND["output_tokens"],
+        reserved_usd=_S5_BOUND["usd"],
+        note=config.stage5_reservation_note(_S5_BOUND))
 
 
 def parity(name, client, call, classify=None):
@@ -1629,10 +1694,7 @@ def billing_census(db):
 
 
 _dbr, _cpr, _campr = campaign_setup("zero_success")
-_dl.reserve_billing_attempt(_dbr, attempt_id="zero_success-open",
-                            campaign_id=_campr, run_id=1, source="stage5",
-                            model=_WIRE, input_tokens=1, output_tokens=1,
-                            reserved_usd=0.40)
+_open_s5(_dbr, "zero_success-open", _campr, 1)
 _census_r = billing_census(_dbr)
 os.remove(record_path(_cpr))
 _rr = next_run(_dbr, resumed=False)
@@ -1641,11 +1703,12 @@ check("4q *** a MISSING record with NO checkpoint (zero completed patients) is "
       "RECOVERED: same campaign, and the budget carries its settled charge AND "
       "its unresolved reservation ***",
       (getattr(_br, "decision", None), getattr(_br, "campaign_id", None) == _campr,
-       near(getattr(getattr(_br, "seed", None), "usd", None), 1.65),
+       near(getattr(getattr(_br, "seed", None), "usd", None), 7.076),
        getattr(getattr(_br, "seed", None), "unresolved", None)),
       (_runner.CAMPAIGN_DECISION_RECOVERED, True, True, 1))
-check("4q-i non-degeneracy: the billing record held two rows and $1.65 before "
-      "the recovery", _census_r, (2, 1.65))
+check("4q-i non-degeneracy: the billing record held two rows and $7.076 "
+      "($1.25 settled + the $5.826 Stage 5 bound) before the recovery",
+      _census_r, (2, 7.076))
 os.remove(record_path(_cpr))
 _rr2 = next_run(_dbr, resumed=False)
 _br2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rr2,
@@ -1653,7 +1716,7 @@ _br2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rr2,
 check("4q-ii *** REPEATED recovery duplicates nothing: the same campaign, the "
       "same seed, and the billing record unchanged row for row ***",
       (getattr(_br2, "campaign_id", None) == _campr,
-       near(getattr(getattr(_br2, "seed", None), "usd", None), 1.65),
+       near(getattr(getattr(_br2, "seed", None), "usd", None), 7.076),
        billing_census(_dbr)),
       (True, True, _census_r))
 
@@ -1795,10 +1858,7 @@ def bill(db, campaign, run_id, tag, settled, reserved):
     _dl.settle_billing_attempt(db, f"{tag}-s", outcome="response",
                                settled_usd=settled)
     if reserved:
-        _dl.reserve_billing_attempt(db, attempt_id=f"{tag}-o",
-                                    campaign_id=campaign, run_id=run_id,
-                                    source="stage5", model=_WIRE, input_tokens=1,
-                                    output_tokens=1, reserved_usd=reserved)
+        _open_s5(db, f"{tag}-o", campaign, run_id)
 
 
 def seed_of(budget):
@@ -1825,7 +1885,7 @@ _ry1 = next_run(_dby, resumed=False)
 _by1 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ry1,
              _dby)
 _campy_new = field(_by1, "campaign_id")
-bill(_dby, _campy_new, _ry1, "restored-new", 0.75, 0.40)
+bill(_dby, _campy_new, _ry1, "restored-new", 0.75, True)
 _dl.finalize_run_record(_ry1, "FAILED", db_path=_dby)
 check("4y non-degeneracy: --fresh closed the old campaign by identity, the "
       "restored copy holds only its run 1, and the NEW campaign billed at a run "
@@ -1833,7 +1893,7 @@ check("4y non-degeneracy: --fresh closed the old campaign by identity, the "
       "unresolved reservation",
       (sorted(_closed_y) if isinstance(_closed_y, dict) else _closed_y,
        field(_by1, "decision"), _ry1 <= _latest_y, census(_dby)),
-      ([_campy_old], _runner.CAMPAIGN_DECISION_NEW, True, (3, 2.4)))
+      ([_campy_old], _runner.CAMPAIGN_DECISION_NEW, True, (3, 7.826)))
 os.remove(record_path(_cpy))
 _ry2 = next_run(_dby, resumed=False)
 _by2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ry2,
@@ -1842,7 +1902,7 @@ check("4y-i *** THE P4c DEFECT: after the restore the missing record is "
       "RECOVERED -- the new campaign, its settled charge AND its unresolved "
       "reservation -- and the closed old campaign's $1.25 is not in it ***",
       (field(_by2, "decision"), field(_by2, "campaign_id") == _campy_new,
-       near(field(field(_by2, "seed"), "usd"), 1.15),
+       near(field(field(_by2, "seed"), "usd"), 6.576),
        field(field(_by2, "seed"), "unresolved")),
       (_runner.CAMPAIGN_DECISION_RECOVERED, True, True, 1))
 _census_y = census(_dby)
@@ -1853,7 +1913,7 @@ _by3 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ry3,
 check("4y-ii *** REPEATED recovery adds no charge: the same campaign, the same "
       "seed, and the billing record unchanged row for row ***",
       (field(_by3, "campaign_id") == _campy_new,
-       near(field(field(_by3, "seed"), "usd"), 1.15), census(_dby)),
+       near(field(field(_by3, "seed"), "usd"), 6.576), census(_dby)),
       (True, True, _census_y))
 
 # 4z: A CRASH BETWEEN THE MARKER AND THE CHECKPOINT REMOVAL.
@@ -1868,7 +1928,7 @@ check("4z the marker was persisted and the process died before clearing: the "
        near(field(field(_bz1, "seed"), "usd"), 1.25),
        os.path.exists(os.path.join(_cpz, _runner.FRESH_MARKER_FILENAME))),
       (_runner.CAMPAIGN_DECISION_CONTINUED, True, True, True))
-bill(_dbz, _campz, _rz1, "post-crash", 0.50, 0.30)
+bill(_dbz, _campz, _rz1, "post-crash", 0.50, True)
 _dl.finalize_run_record(_rz1, "FAILED", db_path=_dbz)
 os.remove(record_path(_cpz))
 _rz2 = next_run(_dbz, resumed=False)
@@ -1878,7 +1938,7 @@ check("4z-i *** the campaign touched a run its closure does not name, so the "
       "closure no longer covers it: a lost record RECOVERS it with every charge, "
       "pre- and post-crash, including the reservation ***",
       (field(_bz2, "decision"), field(_bz2, "campaign_id") == _campz,
-       near(field(field(_bz2, "seed"), "usd"), 2.05),
+       near(field(field(_bz2, "seed"), "usd"), 7.576),
        field(field(_bz2, "seed"), "unresolved")),
       (_runner.CAMPAIGN_DECISION_RECOVERED, True, True, 1))
 _dbz3, _cpz3, _campz3 = campaign_setup("crash_fresh_nothing_since")
@@ -2119,6 +2179,10 @@ pr.full_jitter_delay = lambda retry_number, rng=None: 0.0
 config.SPEND_CAP_ENFORCED = True
 config.SPEND_CAP_USD = cfg["cap"]
 WIRE = config.matching_wire_model()
+# R1: the largest usage the documented limits admit for one trial attempt.
+_BOUND = config.stage5_attempt_bound(WIRE, config.MATCHING_MAX_TOKENS,
+                                     config.matching_sdk_attempts_per_call())
+MAX_USAGE = (_BOUND["input_tokens"], _BOUND["output_tokens"])
 
 def dump(**kw):
     with open(cfg["out"], "w") as fh:
@@ -2145,6 +2209,10 @@ class Client:
         user = kw["messages"][1]["content"]
         if user == "priced":
             return response(WIRE, 1000, 100)
+        if user == "max":
+            return response(WIRE, *MAX_USAGE)
+        if user == "over":
+            return response(WIRE, 10**7, 100)
         if user == "unpriced":
             return response("closure-unpriced-model", 1000, 100)
         if user == "possibly":
@@ -2185,6 +2253,8 @@ runner.build_matching_graph = lambda *a, **k: object()
 runner.tracking = Tracking()
 runner.run_resample = lambda **k: None
 OBSERVED = {}
+import threading
+ONCE, ONCE_LOCK = {"done": False}, threading.Lock()
 
 def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
             db_path=None):
@@ -2199,6 +2269,19 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
                 ev.call_matching_model("system prompt", user)
             except Exception:
                 pass
+    elif cfg["mode"] in ("s5max", "s5over"):
+        # R1: ONE Stage 5 attempt for the whole run, answering at the
+        # documented maximum ("max") or beyond it ("over").
+        with ONCE_LOCK:
+            go = not ONCE["done"]
+            ONCE["done"] = True
+        if go:
+            try:
+                ev.call_matching_model("system prompt",
+                                       "max" if cfg["mode"] == "s5max"
+                                       else "over")
+            except Exception as exc:
+                ONCE["exc"] = repr(exc)
     elif not OBSERVED:
         seed = spend.SPEND_LEDGER.seeded
         OBSERVED.update(
@@ -2316,6 +2399,24 @@ def inject(kind):
         dl.settle_billing_attempt = settle
         if kind == "ack_unverifiable":
             dl.billing_attempt_stored_state = lambda *a, **k: None
+    elif kind == "kill_after_answer":
+        # R1: the provider ANSWERS, and the process dies before anything after
+        # the answer -- the settlement included -- can run.
+        import signal
+        real_create = CLIENT.create
+        def create(**kw):
+            real_create(**kw)
+            os.kill(os.getpid(), signal.SIGKILL)
+        CLIENT.create = create
+        CLIENT.chat = types.SimpleNamespace(completions=CLIENT)
+    elif kind == "total_fail":
+        # R1 (P1c item 2): EVERY durable write after dispatch fails -- the
+        # settlement, the discrepancy row and the marker file.
+        dl.settle_billing_attempt = lambda *a, **k: dl.SETTLE_FAILED
+        dl.record_settlement_discrepancy = lambda *a, **k: dl.DISCREPANCY_FAILED
+        def no_marker(*a, **k):
+            raise OSError(28, "planted ENOSPC writing the marker")
+        dl.write_discrepancy_marker = no_marker
     elif kind.startswith("settle_"):
         # P1b: the FIRST settlement of the run finds its row DELETED (missing)
         # or already SETTLED at $0 by somebody else (conflict). `_deferred`
@@ -2362,12 +2463,12 @@ EXTRA = dict(exit_code=EXIT, inject=cfg.get("inject"),
              billing_faults=dict(spend.BILLING_RECORD_FAULTS),
              latch=[spend.SPEND_STOP.requested, spend.SPEND_STOP.limit],
              latch_cause=spend.SPEND_STOP.cause)
-if cfg["mode"] == "campaign":
+if cfg["mode"] in ("campaign", "s5max", "s5over"):
     dump(measured=spend.SPEND_LEDGER.measured, total=spend.SPEND_LEDGER.total,
          remaining=spend.remaining(spend.SPEND_SOURCE_STAGE5),
          tally={k: list(v) for k, v in snap.items()},
          report=spend.report_lines(), calls=CLIENT.calls,
-         faults=dict(spend.SPEND_LEDGER_FAULTS), **EXTRA)
+         faults=dict(spend.SPEND_LEDGER_FAULTS), once=ONCE, **EXTRA)
 else:
     dump(**OBSERVED, calls=CLIENT.calls, **EXTRA)
 if EXIT:
@@ -2626,9 +2727,7 @@ _pu1, _du1 = child("campaign", db=_dbu, cp=_cpu, corpus=_CORPUS, cap=_E2E_CAP)
 _campu = at(drive(lambda: json.loads(Path(record_path(_cpu)).read_text())),
             "campaign_id")
 _run1u = at(at(drive(ro_rows, _dbu, "SELECT MIN(id) FROM runs"), 0), 0)
-drive(_dl.reserve_billing_attempt, _dbu, attempt_id="p4b-open",
-      campaign_id=_campu, run_id=_run1u, source="stage5", model=_WIRE,
-      input_tokens=1, output_tokens=1, reserved_usd=0.40)
+drive(_open_s5, _dbu, "p4b-open", _campu, _run1u)
 _totu = drive(_dl.campaign_billing_total, _campu, db_path=_dbu)
 check("4u non-degeneracy: process 1 ran main() to its end with ZERO completed "
       "patients (no checkpoint), twelve settled attempts, and one reservation "
@@ -3073,14 +3172,20 @@ check("7m-i ...and the conflict LATCHES the live run",
       at(_c_conf_lo["live"], "latch"),
       (True, _spend.SPEND_LIMIT_BILLING_RECORD))
 
+# The planted stored amount was $5.00, above the old $0.38 estimate. Under
+# R1 the live charge of an unverified Stage 5 attempt is the $5.826 bound, so
+# "stored ABOVE live" needs an amount above the bound.
+_ABOVE_BOUND = 7.0
+check("7n-0 non-degeneracy: the planted stored amount is ABOVE the Stage 5 "
+      "reservation", _ABOVE_BOUND > _RESERVE_S5 + 1e-6, True)
 _c_conf_hi = p1b_case("s5_conflict_higher",
                       _Client(chat=lambda kw: _chat_response((321, 45))),
                       _s5_call, patches={"settle_billing_attempt":
-                                         _settle_conflict_at(5.0,
+                                         _settle_conflict_at(_ABOVE_BOUND,
                                                              "possibly_billed")})
 check("7n *** CONFLICT, stored ABOVE live: live is raised to the stored amount, "
       "so live and resumed agree; the discrepancy row is $0 ***",
-      (near(_c_conf_hi["live"].get("measured"), 5.0),
+      (near(_c_conf_hi["live"].get("measured"), _ABOVE_BOUND),
        parity_holds(_c_conf_hi),
        [r[5] for r in _c_conf_hi["rows"] if r[1] == "settlement_discrepancy"]),
       (True, (True, True, True, True), [0.0]))
@@ -3546,12 +3651,12 @@ check("8h `failed` reported while the row is GONE: VERIFIED missing -- a "
 
 _c8i = p1b_case("p1c_rereserved", _s5_low(), _s5_call,
                 patches={"settle_billing_attempt": _sql_then_failed(
-                    "UPDATE billing_attempts SET reserved_usd = 5.0 WHERE "
+                    "UPDATE billing_attempts SET reserved_usd = 7.0 WHERE "
                     "attempt_id = ?", lambda aid: (aid,))})
 check("8i `failed` reported while the RESERVED row carries an amount this "
       "process did not reserve: a CONFLICT at that amount -- live is raised to "
       "it, the run latches, and a fresh reading EQUALS live",
-      (near(_meas(_c8i), 5.0), at(_c8i["live"], "cause"),
+      (near(_meas(_c8i), _ABOVE_BOUND), at(_c8i["live"], "cause"),
        near(getattr(_c8i["durable"], "usd", None), _meas(_c8i)),
        near(_c8i["resumed_remaining"], _c8i["live"].get("remaining"))),
       (True, _spend.BILLING_RECORD_CAUSE_CONFLICT, True, True))
@@ -3814,6 +3919,505 @@ check("8t the patched storage functions and the console are restored",
       (_dl.billing_attempt_stored_state is _DL_START["billing_attempt_stored_state"],
        _dl.settle_billing_attempt is _SETTLE_START,
        _spend.console is _CONSOLE_START), (True, True, True))
+
+
+# ===========================================================================
+section("SECTION 9 -- R1: a Stage 5 reservation is a documented upper bound")
+# ===========================================================================
+#
+# The independent derivation (_DOC_LIMITS, _indep_bound) is defined once, at
+# SECTION 1, because the P1..P1c expectations above read it too.
+
+
+def _owner(model, requested_out, attempts=1):
+    b = drive(config.stage5_attempt_bound, model, requested_out, attempts)
+    return ((b["input_tokens"], b["output_tokens"], b["usd"])
+            if isinstance(b, dict) else b)
+
+
+def _same(a, b):
+    return (isinstance(a, tuple) and isinstance(b, tuple) and a[:2] == b[:2]
+            and near(a[2], b[2]))
+
+
+# A PLANTED DEFECT CAN LEAVE A VALUE ABSENT OR NONE; these keep the checks below
+# from ABORTING the file on a comparison and report a failure instead.
+def _round9(v):
+    return (round(v, 9) if isinstance(v, (int, float))
+            and not isinstance(v, bool) else v)
+
+
+def _both_numbers(a, b):
+    return all(isinstance(x, (int, float)) and not isinstance(x, bool)
+               for x in (a, b))
+
+
+_M = config.MATCHING_MAX_TOKENS
+check("9a *** THE OWNER AGREES WITH THE INDEPENDENT DERIVATION for every wire "
+      "model the three arms dispatch to, trial and warmup ceilings ***",
+      {m: (_same(_owner(m, _M), _indep_bound(m, _M)),
+           _same(_owner(m, 1), _indep_bound(m, 1))) for m in _DOC_LIMITS},
+      {m: (True, True) for m in _DOC_LIMITS})
+check("9a-i the shipped arm's numbers, as dollar literals: $9.042 a trial "
+      "attempt, $8.250025 a warmup, on 1,000,000 / 32,000 tokens",
+      (_M, at(_owner("us.anthropic.claude-sonnet-4-6", _M), 0),
+       near(at(_owner("us.anthropic.claude-sonnet-4-6", _M), 2), 9.042, 1e-6),
+       near(at(_owner("us.anthropic.claude-sonnet-4-6", 1), 2), 8.25002475,
+            1e-9)),
+      (32000, 1_000_000, True, True))
+check("9a-ii the dormant arms, as literals: gpt-5.6-terra $5.826, "
+      "us.openai.gpt-5.6-terra $6.1336",
+      (near(at(_owner("gpt-5.6-terra", _M), 2), 5.826, 1e-9),
+       near(at(_owner("us.openai.gpt-5.6-terra", _M), 2), 6.1336, 1e-9)),
+      (True, True))
+
+_SONNET = "us.anthropic.claude-sonnet-4-6"
+check("9b *** THE CACHE-WRITE CLASS IS INCLUDED: the request's TTL is priced; a "
+      "1h TTL raises the bound; no cache point prices the dearest TTL; Terra's "
+      "1.25x write is above its input ***",
+      (with_settings_value("BEDROCK_ANTHROPIC_CACHE_TTL", "1h",
+                           lambda: _same(_owner(_SONNET, _M),
+                                         _indep_bound(_SONNET, _M, ttl="1h"))),
+       with_settings_value("BEDROCK_ANTHROPIC_CACHE_TTL", None,
+                           lambda: _same(_owner(_SONNET, _M),
+                                         _indep_bound(_SONNET, _M, ttl=None))),
+       at(_owner(_SONNET, _M), 2) < _indep_bound(_SONNET, _M, ttl="1h")[2],
+       config.stage5_attempt_bound("gpt-5.6-terra", _M, 1)[
+           "input_rate_per_mtok"] == 2.00 * 1.25 * 2.0),
+      (True, True, True, True))
+check("9b-i the output ceiling is the REQUEST's, clamped to the model's "
+      "documented maximum; wire attempts multiply BOTH halves",
+      (at(_owner(_SONNET, 100_000), 1), at(_owner(_SONNET, 1), 1),
+       _same(_owner(_SONNET, _M, 3), _indep_bound(_SONNET, _M, 3)),
+       near(at(_owner(_SONNET, _M, 3), 2), 3 * at(_owner(_SONNET, _M), 2),
+            1e-9)),
+      (64_000, 1, True, True))
+
+
+def _old_estimate_usd(text_chars, max_out):
+    schema = len(str(_ev.build_response_format()))
+    tokens = int((text_chars + schema) / 3.0) + 1
+    return _spend.price_usage(_WIRE, tokens, max_out)[0], tokens
+
+
+_old_cjk, _old_cjk_tokens = _old_estimate_usd(20_000, _M)
+_schema_chars = len(str(_ev.build_response_format()))
+check("9c *** THE OLD ESTIMATE WAS NOT A BOUND: 20,000 CJK characters a "
+      "tokenizer bills one token each exceed chars/3; the documented bound "
+      "covers that and the whole window at the dearest class ***",
+      (_old_cjk_tokens < 20_000 + _schema_chars,
+       _spend.price_usage(_WIRE, 20_000 + _schema_chars, _M)[0] > _old_cjk,
+       _spend.price_usage(_WIRE, 1_050_000, _M)[0]
+       <= at(_owner(_WIRE, _M), 2),
+       near(at(_owner(_WIRE, _M), 2),
+            (1_050_000 * 5.00 + _M * 18.00) / 1e6, 1e-9)),
+      (True, True, True, True))
+
+# THE BOUND DOES NOT READ THE TEXT, measured through the REAL executor with the
+# policy stubbed out so nothing is dispatched: the attempt record carries the
+# same reservation for every prompt, while the PACER's estimate follows it.
+_EXEC_SEEN = []
+_REAL_EXECUTE = _pr.execute
+
+
+def _capture_execute(send, **kw):
+    _EXEC_SEEN.append(kw)
+    return "not-dispatched"
+
+
+_PROMPTS = {"empty": "", "nul": "\x00" * 10, "one": "a",
+            "cjk": "中" * 200_000, "emoji": "\U0001F600" * 50_000,
+            "combining": "é" * 30_000, "four_mb": "x" * (4 * 1024 * 1024)}
+_pr.execute = _capture_execute
+try:
+    for _name, _text in _PROMPTS.items():
+        drive(_ev._execute_matching_call, lambda: None, _text, _text,
+              max_output=_M, drain_applies=False)
+finally:
+    _pr.execute = _REAL_EXECUTE
+_recs = [kw.get("attempt_record") for kw in _EXEC_SEEN]
+check("9d *** EVERY PROMPT -- empty, NUL, 1 char, 200k CJK, 50k emoji, combining "
+      "marks, 4 MB -- reserves the SAME documented bound; the pacer's estimate "
+      "is unchanged and still follows the text ***",
+      (len(_recs), sorted({(getattr(r, "_input", None),
+                            getattr(r, "_output", None),
+                            _round9(getattr(r, "_reserved_usd", None)))
+                           for r in _recs}, key=repr),
+       [kw.get("reservation_tokens") for kw in _EXEC_SEEN]
+       == [_ev._reservation_input_tokens(t, t) + _M for t in _PROMPTS.values()],
+       len({kw.get("reservation_tokens") for kw in _EXEC_SEEN}) > 1),
+      (len(_PROMPTS), [(1_050_000, _M, round(5.826, 9))], True, True))
+_note = drive(json.loads, getattr(at(_recs, 0), "_note", None))
+check("9d-i the reservation note records the basis, its version, the request's "
+      "ceiling and the wire attempts",
+      _note, {"basis_version": config.STAGE5_RESERVATION_BASIS_VERSION,
+              "requested_output_tokens": _M,
+              "reservation_basis": config.STAGE5_RESERVATION_BASIS,
+              "wire_attempts": 1})
+check("9d-ii the policy and the helper are restored", _pr.execute is _REAL_EXECUTE,
+      True)
+
+# REFUSAL: the shipped check refuses every shape that is not a sound bound.
+_REFUSE_CASES = {
+    "unknown model": ("no-such-model", _M, 1),
+    "priced, undocumented model": ("gpt-4o-2024-08-06", _M, 1),
+    "None model": (None, _M, 1),
+    "unhashable model": ([], _M, 1),
+    "bool ceiling": (_SONNET, True, 1),
+    "zero ceiling": (_SONNET, 0, 1),
+    "zero wire attempts": (_SONNET, _M, 0),
+    "bool wire attempts": (_SONNET, _M, True),
+}
+check("9e *** NO SOUND BOUND IS REFUSED BY NAME: unknown, priced-but-"
+      "undocumented, None and unhashable models, and bad ceilings or attempts "
+      "***",
+      {k: type(raised(config.stage5_attempt_bound, *v)).__name__
+       for k, v in _REFUSE_CASES.items()},
+      {k: "Stage5ReservationUnbounded" for k in _REFUSE_CASES})
+
+
+def _with_limits(model, **changes):
+    saved = config.STAGE5_ATTEMPT_LIMITS.get(model)
+    config.STAGE5_ATTEMPT_LIMITS[model] = dict(saved, **changes)
+    try:
+        return type(raised(config.stage5_attempt_bound, model, _M, 1)).__name__
+    finally:
+        config.STAGE5_ATTEMPT_LIMITS[model] = saved
+
+
+check("9e-i a malformed documented-limits entry refuses: a bool window, a zero "
+      "output limit, a multiplier below 1, no cache-write class at all",
+      (_with_limits(_SONNET, context_window_tokens=True),
+       _with_limits(_SONNET, max_output_tokens=0),
+       _with_limits("gpt-5.6-terra", long_context_input_multiplier=0.5),
+       _with_limits("gpt-5.6-terra", cache_write_multiplier=None),
+       config.STAGE5_ATTEMPT_LIMITS[_SONNET]["context_window_tokens"]),
+      ("Stage5ReservationUnbounded",) * 4 + (1_000_000,))
+
+_c_refuse = p1b_case("r1_refused",
+                     _Client(chat=lambda kw: _chat_response((1000, 100))),
+                     lambda: _ev.call_matching_model("system prompt",
+                                                     "user prompt"),
+                     knobs={"MATCHING_MODEL": "gpt-4o-2024-08-06"})
+check("9f *** REFUSED BEFORE DISPATCH, THROUGH THE REAL call_matching_model: a "
+      "priced wire model with no documented limits raises by name with ZERO "
+      "provider calls, ZERO billing rows and ZERO spend ***",
+      (type(_c_refuse["exc"]).__name__, _c_refuse["calls"], _c_refuse["rows"],
+       _c_refuse["live"].get("measured")),
+      ("Stage5ReservationUnbounded", 0, [], 0.0))
+check("9f-i the node-top guard refuses the same configuration once, and passes "
+      "the shipped one in both call modes",
+      (with_settings_value("MATCHING_MODEL", "gpt-4o-2024-08-06",
+                           lambda: type(raised(
+                               _ev.assert_stage5_reservation_bounded,
+                               per_trial=True)).__name__),
+       raised(_ev.assert_stage5_reservation_bounded, per_trial=True),
+       raised(_ev.assert_stage5_reservation_bounded, per_trial=False)),
+      ("Stage5ReservationUnbounded", None, None))
+# BY AST, NOT BY TEXT: the node's own comments name call_matching_model
+# hundreds of lines above the guard, so a text search reports prose.
+_node_calls = sorted(
+    (n.lineno, getattr(n.func, "id", None) or getattr(n.func, "attr", ""))
+    for n in ast.walk(ast.parse(inspect.getsource(
+        _ev.node_llm_classifier_evaluation)))
+    if isinstance(n, ast.Call))
+_guard_lines = [ln for ln, nm in _node_calls
+                if nm == "assert_stage5_reservation_bounded"]
+_dispatch_lines = [ln for ln, nm in _node_calls
+                   if nm.startswith("call_matching_model")]
+check("9f-ii the node CALLS the guard before its first dispatch call (by AST)",
+      (len(_guard_lines), bool(_dispatch_lines),
+       bool(_guard_lines) and bool(_dispatch_lines)
+       and min(_guard_lines) < min(_dispatch_lines)), (1, True, True))
+
+# THE REQUEST IS UNCHANGED: the kwargs the provider receives are identical
+# whether the reservation is the documented bound or a trivial stand-in.
+_KW = []
+_rec_client = _Client(chat=lambda kw: (_KW.append(kw),
+                                       _chat_response((1000, 100)))[1])
+p1b_case("r1_request_bound", _rec_client,
+         lambda: _ev.call_matching_model("system prompt", "user prompt"))
+_REAL_BOUND = config.stage5_attempt_bound
+config.stage5_attempt_bound = lambda m, r, a: dict(
+    _REAL_BOUND(m, r, a), usd=0.001, input_tokens=1, output_tokens=1)
+try:
+    p1b_case("r1_request_trivial", _Client(
+        chat=lambda kw: (_KW.append(kw), _chat_response((1000, 100)))[1]),
+        lambda: _ev.call_matching_model("system prompt", "user prompt"))
+finally:
+    config.stage5_attempt_bound = _REAL_BOUND
+check("9g *** THE REQUEST IS UNCHANGED BY THE BOUND: identical kwargs with the "
+      "documented bound and with a trivial one; the ceiling is the request's ***",
+      (len(_KW), repr(at(_KW, 0)) == repr(at(_KW, 1)),
+       at(at(_KW, 0), "max_completion_tokens"),
+       config.stage5_attempt_bound is _REAL_BOUND),
+      (2, True, _M, True))
+
+# THE DURABLE ROW, AND A RESPONSE AT / A FAILURE UNDER THE BOUND.
+_B_WIRE = _indep_bound(_WIRE, _M)
+_c_resp = p1b_case("r1_response", _Client(
+    chat=lambda kw: _chat_response((_B_WIRE[0], _B_WIRE[1]))),
+    lambda: _ev.call_matching_model("system prompt", "user prompt"))
+check("9h *** THE ROW IS RESERVED AT THE BOUND: amount, input and output tokens; "
+      "a response at the documented maximum usage settles at its priced amount, "
+      "which is at or below the reservation; the resume reader proves it ***",
+      (near(at(at(_c_resp["rows"], 0), 4), _B_WIRE[2]),
+       at(at(_c_resp["rows"], 0), 7), at(at(_c_resp["rows"], 0), 3),
+       _both_numbers(at(at(_c_resp["rows"], 0), 5),
+                     at(at(_c_resp["rows"], 0), 4))
+       and at(at(_c_resp["rows"], 0), 5) <= at(at(_c_resp["rows"], 0), 4),
+       drive(_dl.stage5_unproven_liabilities, _c_resp["camp"],
+             db_path=_c_resp["db"]),
+       parity_holds(_c_resp)),
+      (True, 1_050_000, "response", True, [], (True, True, True, True)))
+_c_pb = p1b_case("r1_possibly", _Client(
+    chat=lambda kw: _throw(RuntimeError("possibly billed"))),
+    lambda: _ev.call_matching_model("system prompt", "user prompt"))
+check("9h-i a possibly-billed failure is charged THE BOUND live and durably, and "
+      "the resume reader proves the settled-at-reservation row",
+      (at(at(_c_pb["rows"], 0), 3), near(at(at(_c_pb["rows"], 0), 5), _B_WIRE[2]),
+       near(_c_pb["live"].get("measured"), _B_WIRE[2]),
+       drive(_dl.stage5_unproven_liabilities, _c_pb["camp"], db_path=_c_pb["db"])),
+      ("possibly_billed", True, True, []))
+_c_over = p1b_case("r1_over", _Client(
+    chat=lambda kw: _chat_response((10**7, 100))),
+    lambda: _ev.call_matching_model("system prompt", "user prompt"))
+check("9h-ii a response BEYOND the documented window is priced above the bound "
+      "and NAMED as a broken bound (counted), still charged at its priced "
+      "amount, and settled durably at it",
+      (_fault(_c_over, "bound_exceeded:stage5"),
+       near(_c_over["live"].get("measured"),
+            _spend.price_usage(_WIRE, 10**7, 100)[0]),
+       at(at(_c_over["rows"], 0), 3), parity_holds(_c_over)),
+      (1, True, "response", (True, True, True, True)))
+
+# THE RESUME READER, OVER FABRICATED ROWS.
+_DB9 = new_db("r1_reader.db")
+_RUN9 = _dl.start_run_record("batch", db_path=_DB9, fingerprint=FIXED_FP)
+_GOOD_NOTE = config.stage5_reservation_note(
+    config.stage5_attempt_bound(_WIRE, _M, 1))
+
+
+def _fab(aid, *, source="stage5", state="reserved", outcome=None, usd=None,
+         note=_GOOD_NOTE, model=_WIRE, in_tok=1_050_000, out_tok=_M, camp="c9"):
+    usd = _B_WIRE[2] if usd is None else usd
+    _dl.reserve_billing_attempt(_DB9, attempt_id=aid, campaign_id=camp,
+                                run_id=_RUN9, source=source, model=model,
+                                input_tokens=in_tok, output_tokens=out_tok,
+                                reserved_usd=usd, note=note)
+    if state == "settled":
+        _dl.settle_billing_attempt(_DB9, aid, outcome=outcome, settled_usd=usd)
+
+
+_fab("ok-reserved")
+_fab("ok-possibly", state="settled", outcome="possibly_billed")
+_fab("old-reserved", usd=0.38484, note=None, in_tok=13304)
+_fab("old-possibly", state="settled", outcome="possibly_billed", usd=0.38484,
+     note=None, in_tok=13304)
+_fab("old-response", state="settled", outcome="response", usd=0.01, note=None,
+     in_tok=13304)
+_fab("old-notbilled", state="settled", outcome="not_billed", usd=0.0, note=None)
+_fab("embedding-old", source="query_embedding", usd=0.0001, note=None,
+     model=config.EMBEDDING_MODEL)
+_fab("old-but-huge", usd=1000.0, note=None)
+_fab("old-version", note=json.dumps(dict(json.loads(_GOOD_NOTE),
+                                         basis_version=0)))
+_fab("tampered-low", usd=_B_WIRE[2] - 0.01)
+_fab("tokens-low", in_tok=13304)
+_fab("model-undocumented", model="gpt-4o-2024-08-06")
+_fab("note-garbage", note="{not json")
+_unproven9 = drive(_dl.stage5_unproven_liabilities, "c9", db_path=_DB9)
+check("9i *** THE RESUME READER: an estimate-era reservation or settled-at-"
+      "reservation row is UNPROVEN whatever its amount (even $1,000); a proven "
+      "row is not; a settled response, a not-billed zero and an embedding row are "
+      "not examined; an older basis version, an amount or token count below the "
+      "recomputed bound, an undocumented model and a garbage note are unproven "
+      "***",
+      sorted(u.attempt_id for u in _unproven9)
+      if isinstance(_unproven9, list) else _unproven9,
+      sorted(["old-reserved", "old-possibly", "old-but-huge", "old-version",
+              "tampered-low", "tokens-low", "model-undocumented",
+              "note-garbage"]))
+check("9i-i the reader raises BillingRecordUnreadable on a database it cannot "
+      "open, and names no campaign as empty",
+      (type(raised(_dl.stage5_unproven_liabilities, "c9",
+                   db_path=os.path.join(_TMP, "absent", "x.db"))).__name__,
+       type(raised(_dl.stage5_unproven_liabilities, "")).__name__),
+      ("BillingRecordUnreadable", "BillingRecordUnreadable"))
+check("9i-ii the storage layer's restated vocabularies equal spend's",
+      (_dl.BILLING_SOURCE_STAGE5 == _spend.SPEND_SOURCE_STAGE5,
+       set(_dl.STAGE5_AT_RESERVATION_OUTCOMES)
+       == set(_spend.BILLING_OUTCOMES_AT_RESERVATION)), (True, True))
+
+# ── FRESH PROCESSES, THROUGH THE REAL main() ───────────────────────────────
+_B_E2E = _indep_bound(_WIRE, _M)
+
+
+def r1_e2e(name, mode, inject=None, prepare=None):
+    db = os.path.join(_TMP, f"r1_e2e_{name}.db")
+    cp = os.path.join(_TMP, f"cp_r1_{name}")
+    os.makedirs(cp)
+    p1, d1 = child(mode, db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP,
+                   inject=inject)
+    if prepare is not None:
+        prepare(db)
+    p2, d2 = child("observe", db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP)
+    p3, d3 = child("observe", db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP)
+    rows = (ro_rows(db, "SELECT kind, state, outcome, reserved_usd, settled_usd, "
+                        "note, source FROM billing_attempts ORDER BY rowid")
+            if os.path.exists(db) else [])
+    return {"p": (p1, p2, p3), "d": (d1, d2, d3),
+            "out": tuple((p.stdout or "") + (p.stderr or "")
+                         for p in (p1, p2, p3)), "rows": rows}
+
+
+_k = r1_e2e("kill_after_answer", "s5max", inject="kill_after_answer")
+_k1, _k2, _k3 = _k["d"]
+_priced_max = _spend.price_usage(_WIRE, _B_E2E[0], _B_E2E[1])[0]
+check("9j *** SIGKILL AFTER THE PROVIDER ANSWERED AT ITS DOCUMENTED MAXIMUM: "
+      "process 1 died; the durable row is RESERVED at the bound; fresh process "
+      "2's seed equals the bound and COVERS the answer's priced charge; process "
+      "3 reads the same seed ***",
+      (_k["p"][0].returncode, [(r[1], near(r[3], _B_E2E[2])) for r in _k["rows"]],
+       _k["p"][1].returncode, near(at(at(_k2, "seed"), "usd"), _B_E2E[2]),
+       _both_numbers(at(at(_k2, "seed"), "usd"), _priced_max)
+       and at(at(_k2, "seed"), "usd") >= _priced_max,
+       at(at(_k2, "seed"), "unresolved"),
+       near(at(at(_k3, "seed"), "usd"), at(at(_k2, "seed"), "usd"))),
+      (-signal.SIGKILL, [("reserved", True)], 0, True, True, 1, True))
+
+_t = r1_e2e("total_fail", "s5max", inject="total_fail")
+_t1, _t2, _t3 = _t["d"]
+check("9k *** EVERY DURABLE WRITE AFTER THE ANSWER FAILS (settlement, "
+      "discrepancy row, marker) at the documented maximum usage: process 1's "
+      "live ledger is the reservation; fresh process 2's seed EQUALS it and "
+      "covers the priced charge; no latch was needed; process 3 agrees ***",
+      (at(_t1, "calls"), near(at(_t1, "measured"), _B_E2E[2]),
+       _both_numbers(at(_t1, "measured"), _priced_max)
+       and at(_t1, "measured") >= _priced_max, at(_t1, "latch"),
+       _t["p"][1].returncode,
+       near(at(at(_t2, "seed"), "usd"), at(_t1, "measured")),
+       near(at(at(_t3, "seed"), "usd"), at(at(_t2, "seed"), "usd")),
+       [r[1] for r in _t["rows"]]),
+      (1, True, True, [False, None], 0, True, True, ["reserved"]))
+
+_o = r1_e2e("total_fail_over", "s5over", inject="total_fail")
+_o1, _o2, _o3 = _o["d"]
+check("9l *** THE P1c $20 CASE (10,000,000 prompt tokens: TEN TIMES the "
+      "documented window) with every durable write failing: process 1 NAMES the "
+      "broken bound and latches; the fresh seed is the reservation and is below "
+      "the live charge -- the one cell outside R1's documented assumption, "
+      "pinned rather than hidden ***",
+      (_faults_of(_o1).get("bound_exceeded:stage5"), at(_o1, "latch"),
+       near(at(_o1, "measured"), _spend.price_usage(_WIRE, 10**7, 100)[0]),
+       near(at(at(_o2, "seed"), "usd"), _B_E2E[2]),
+       _both_numbers(at(at(_o2, "seed"), "usd"), at(_o1, "measured"))
+       and at(at(_o2, "seed"), "usd") < at(_o1, "measured")),
+      (1, [True, _spend.SPEND_LIMIT_BILLING_RECORD], True, True, True))
+
+
+def _plant_old(state, outcome=None):
+    def prepare(db):
+        run = ro_rows(db, "SELECT MAX(id) FROM runs")[0][0]
+        camp = ro_rows(db, "SELECT campaign_id FROM billing_attempts LIMIT 1")[0][0]
+        _dl.reserve_billing_attempt(db, attempt_id=f"old-{state}",
+                                    campaign_id=camp, run_id=run,
+                                    source="stage5", model=_WIRE,
+                                    input_tokens=13304, output_tokens=_M,
+                                    reserved_usd=0.38484)
+        if state == "settled":
+            _dl.settle_billing_attempt(db, f"old-{state}", outcome=outcome,
+                                       settled_usd=0.38484)
+    return prepare
+
+
+_REFUSE_UNBOUNDED = ("REFUSING TO START PAID WORK: "
+                     + _runner.CAMPAIGN_REFUSAL_RESERVATION_UNBOUNDED)
+_old_r = r1_e2e("old_reserved", "s5max", prepare=_plant_old("reserved"))
+_old_p = r1_e2e("old_possibly", "s5max",
+                prepare=_plant_old("settled", "possibly_billed"))
+check("9m *** AN OLD UNDERESTIMATED RESERVATION, IN A FRESH PROCESS: process 2 "
+      "REFUSES paid work by name, exit 1, ZERO provider calls, naming the row "
+      "and its amount; process 3 refuses again. Same for a settled-at-"
+      "reservation possibly_billed row ***",
+      [(e["p"][0].returncode, e["p"][1].returncode,
+        _REFUSE_UNBOUNDED in e["out"][1], at(e["d"][1], "calls"),
+        "old-" in e["out"][1] and "$0.384840" in e["out"][1],
+        e["p"][2].returncode, _REFUSE_UNBOUNDED in e["out"][2])
+       for e in (_old_r, _old_p)],
+      [(0, 1, True, 0, True, 1, True)] * 2)
+check("9m-i the refusal is in the closed vocabulary and its remedy names the "
+      "provider's bill and --fresh",
+      (_runner.CAMPAIGN_REFUSAL_RESERVATION_UNBOUNDED
+       in _runner.CAMPAIGN_REFUSAL_REASONS,
+       "provider's bill" in _old_r["out"][1], "--fresh" in _old_r["out"][1]),
+      (True, True, True))
+
+_clean = r1_e2e("clean", "s5max")
+_c1, _c2, _c3 = _clean["d"]
+check("9n *** CLEAN CONTROL: an ordinary run dispatches (one call, one settled "
+      "response) and resumes normally -- process 2 continues with a seed EQUAL "
+      "to process 1's live ledger, and process 3 agrees ***",
+      (_clean["p"][0].returncode, at(_c1, "calls"),
+       [(r[1], r[2]) for r in _clean["rows"]], _clean["p"][1].returncode,
+       near(at(at(_c2, "seed"), "usd"), at(_c1, "measured")),
+       _clean["p"][2].returncode,
+       near(at(at(_c3, "seed"), "usd"), at(at(_c2, "seed"), "usd"))),
+      (0, 1, [("settled", "response")], 0, True, 0, True))
+
+# ADVERSARIAL PRICING AND THE WARMUP, IN PROCESS.
+_PRICIEST = max(config.PRICING_CONFIG["models"],
+                key=lambda m: config.PRICING_CONFIG["models"][m].get("input", 0))
+_wire_at_max = _spend.price_usage(_WIRE, _B_WIRE[0], _B_WIRE[1])[0]
+_echo_price = _spend.price_usage(_PRICIEST, _B_WIRE[0], _B_WIRE[1])[0]
+_c_echo9 = p1b_case("r1_echo_pricier", _Client(
+    chat=lambda kw: _chat_response((_B_WIRE[0], _B_WIRE[1]), model=_PRICIEST)),
+    lambda: _ev.call_matching_model("system prompt", "user prompt"))
+check("9o *** AN ECHO NAMING THE PRICIEST PRICED MODEL at the wire's documented "
+      "maximum usage: priced above what the wire model charges, still AT OR "
+      "BELOW the reservation (input is bounded at the dearest class x the "
+      "long-context multiplier), not counted as a broken bound, parity holds ***",
+      (_PRICIEST != _WIRE,
+       _both_numbers(_echo_price, _wire_at_max) and _echo_price > _wire_at_max,
+       _both_numbers(_echo_price, _B_WIRE[2]) and _echo_price <= _B_WIRE[2],
+       _fault(_c_echo9, "bound_exceeded:stage5"), parity_holds(_c_echo9)),
+      (True, True, True, None, (True, True, True, True)))
+
+
+def _truncated_response(tokens):
+    resp = _chat_response(tokens)
+    resp.choices[0].finish_reason = "length"
+    return resp
+
+
+_c_trunc = p1b_case("r1_truncated", _Client(
+    chat=lambda kw: _truncated_response((_B_WIRE[0], _B_WIRE[1]))),
+    lambda: _ev.call_matching_model("system prompt", "user prompt"))
+_row_t = at(_c_trunc["rows"], 0)
+check("9o-i a TRUNCATED response (finish_reason 'length') at the output ceiling "
+      "and the documented window settles as a response at its priced amount, at "
+      "or below the reservation; the resume reader proves the row; parity holds",
+      (at(_row_t, 3),
+       _both_numbers(at(_row_t, 5), at(_row_t, 4))
+       and at(_row_t, 5) <= at(_row_t, 4),
+       drive(_dl.stage5_unproven_liabilities, _c_trunc["camp"],
+             db_path=_c_trunc["db"]), parity_holds(_c_trunc)),
+      ("response", True, [], (True, True, True, True)))
+
+_B_WARM = _indep_bound(_WIRE, config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS)
+_c_warm = p1b_case("r1_warmup_possibly", _Client(
+    chat=lambda kw: _throw(RuntimeError("warmup lost"))),
+    lambda: _ev.call_matching_model_warmup("system prompt"))
+_row_w = at(_c_warm["rows"], 0)
+check("9p *** THE WARMUP, through the real call_matching_model_warmup, reserves "
+      "ITS OWN documented bound (the full window at the dearest class plus its "
+      "one-token ceiling: $5.250018 on this wire), and a possibly-billed warmup is "
+      "charged exactly that, live and durably ***",
+      (config.MATCHING_PER_TRIAL_WARMUP_MAX_OUTPUT_TOKENS,
+       near(_B_WARM[2], 5.250018), near(at(_row_w, 4), _B_WARM[2]),
+       at(_row_w, 7), at(_row_w, 3),
+       near(_c_warm["live"].get("measured"), _B_WARM[2])),
+      (1, True, True, 1_050_000, "possibly_billed", True))
 
 
 # ===========================================================================

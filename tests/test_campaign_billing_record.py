@@ -197,6 +197,30 @@ _TMP = tempfile.mkdtemp(prefix="oncotriage-billing-record-")
 _PROD_DB = _paths.inferences_path
 _PROD_DIGEST_BEFORE = digest(_PROD_DB)
 _WIRE = config.matching_wire_model()
+
+
+def _terra_stage5_bound_usd(requested_out):
+    """The Stage 5 reservation for gpt-5.6-terra, derived independently of
+    config.STAGE5_ATTEMPT_LIMITS. Limits TYPED from OpenAI's model card (read
+    2026-09-14): a 1,050,000-token context, 128,000 max output, cache writes at
+    1.25x input. The long-context premium is the assumed ceiling (2.0x input,
+    1.5x output). Rates come from PRICING_CONFIG."""
+    row = config.PRICING_CONFIG["models"]["gpt-5.6-terra"]
+    in_rate = max(row["input"], row.get("cache_read", 0.0), row["input"] * 1.25)
+    return (1_050_000 * in_rate * 2.0
+            + min(requested_out, 128_000) * row["output"] * 1.5) / 1e6
+
+
+def _open_s5(db, attempt_id, campaign_id, run_id):
+    """An UNRESOLVED Stage 5 reservation of the shape the shipped code writes:
+    at the documented-limit bound, with its basis marker (R1)."""
+    bound = config.stage5_attempt_bound(
+        _WIRE, config.MATCHING_MAX_TOKENS, config.matching_sdk_attempts_per_call())
+    return _dl.reserve_billing_attempt(
+        db, attempt_id=attempt_id, campaign_id=campaign_id, run_id=run_id,
+        source="stage5", model=bound["model"],
+        input_tokens=bound["input_tokens"], output_tokens=bound["output_tokens"],
+        reserved_usd=bound["usd"], note=config.stage5_reservation_note(bound))
 _JITTER_START = _pr.full_jitter_delay
 _POLICY_START = _spend.policy()
 _CONFIG_KEYS = ("MATCHING_PER_TRIAL_CALLS_ENABLED",
@@ -507,9 +531,12 @@ def hook_drive(behaviour, classify=None):
             "measured": measured}
 
 
-_RESERVE_EXPECTED = _spend.price_usage(
-    _WIRE, _ev._reservation_input_tokens("system prompt", "user prompt"),
-    config.MATCHING_MAX_TOKENS)[0]
+# R1: the Stage 5 reservation is the documented-limit bound ($5.826 here), not
+# the chars/3 input estimate plus the output ceiling ($0.38) it used to be.
+_RESERVE_EXPECTED = _terra_stage5_bound_usd(config.MATCHING_MAX_TOKENS)
+check("3a-0 this file's wire is gpt-5.6-terra and its Stage 5 reservation, "
+      "derived independently, is $5.826",
+      (_WIRE, near(_RESERVE_EXPECTED, 5.826)), ("gpt-5.6-terra", True))
 
 _ok = hook_drive(lambda kw: _openai_response('{"evaluations": []}', (321, 45)))
 check("3a a response: one row, settled 'response' at its priced usage",
@@ -1272,9 +1299,7 @@ _DB_K = os.path.join(_TMP, "kill_between.db")
 _CP_K = os.path.join(_TMP, "cp_k")
 _pk, _ = child("kill_between", db=_DB_K, cp=_CP_K, corpus=_CORP_K, cap=100.0)
 _rows_k = billing_rows(_DB_K) if os.path.exists(_DB_K) else []
-_expected_res = _spend.price_usage(
-    _WIRE, _ev._reservation_input_tokens("system prompt", "user prompt"),
-    config.MATCHING_MAX_TOKENS)[0]
+_expected_res = _terra_stage5_bound_usd(config.MATCHING_MAX_TOKENS)
 check("6g non-degeneracy: the child reached the provider and was SIGKILLed",
       (_pk.returncode, os.path.exists(os.path.join(_CP_K, "sent"))),
       (-signal.SIGKILL, True))
@@ -1743,11 +1768,7 @@ _r3, _r3d = entry_point("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
 _run_fresh_r = [r[0] for r in sqlite3.connect(f"file:{_DB_R}?mode=ro", uri=True)
                 .execute("SELECT id FROM runs WHERE billing_campaign_id = ?",
                          (_R_FRESH,))]
-_dl.reserve_billing_attempt(_DB_R, attempt_id="p4c-open",
-                            campaign_id=_R_FRESH,
-                            run_id=at(_run_fresh_r, 0), source="stage5",
-                            model=_WIRE, input_tokens=1, output_tokens=1,
-                            reserved_usd=0.40)
+_open_s5(_DB_R, "p4c-open", _R_FRESH, at(_run_fresh_r, 0))
 _liab_r = campaign_liability(_DB_R, _R_FRESH)
 check("6zb-i non-degeneracy: in the RESTORED copy the fresh campaign billed at "
       "run(s) whose NUMBER the newer database had already used, and now holds "
@@ -1866,10 +1887,7 @@ _c3, _c3d = entry_point("billed_then_zero", db=_DB_C, cp=_CP_C, corpus=_CORP_F,
                         cap=100.0)
 _run_c3 = sqlite3.connect(f"file:{_DB_C}?mode=ro", uri=True).execute(
     "SELECT MAX(id) FROM runs").fetchone()[0]
-_dl.reserve_billing_attempt(_DB_C, attempt_id="p4c-crash-open",
-                            campaign_id=_C_CAMP, run_id=_run_c3,
-                            source="stage5", model=_WIRE, input_tokens=1,
-                            output_tokens=1, reserved_usd=0.40)
+_open_s5(_DB_C, "p4c-crash-open", _C_CAMP, _run_c3)
 _liab_c = campaign_liability(_DB_C, _C_CAMP)
 check("6ze-i the next ordinary run (REAL entry point) continued that campaign "
       "and billed after the closure",
