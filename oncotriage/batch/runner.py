@@ -204,7 +204,8 @@ from oncotriage.storage.database_logger import (
     IDENTITY_RECOVERED,
     campaign_billing_total,
     historical_campaign_evidence,
-    latest_run_id,
+    campaign_closure_snapshot,
+    normalise_closed_campaigns,
     record_historical_evidence,
     recover_campaign_identity,
     set_run_billing_campaign_id,
@@ -776,10 +777,10 @@ def clear_checkpoint() -> None:
     A missing record is recovered from the billing record whenever its rows
     establish one open campaign, so what closes one is either its FINISHED run
     (a clean finish; ``recover_campaign_identity`` treats that campaign as
-    closed) or the ``--fresh`` watermark the entry point records BEFORE calling
-    this (``record_fresh_start``). A caller that clears the checkpoint of an
-    unfinished campaign without that watermark will see the campaign continued,
-    which over-counts and never under-counts.
+    closed) or the ``--fresh`` marker the entry point records BEFORE calling
+    this (``record_fresh_start``), which closes campaigns by identity. A caller
+    that clears the checkpoint of an unfinished campaign without that marker
+    will see the campaign continued, which over-counts and never under-counts.
     """
     cp = _checkpoint_path()
     if cp.exists():
@@ -835,16 +836,28 @@ def clear_all() -> None:
 CAMPAIGN_RECORD_FILENAME = "batch_runner_campaign.json"
 CAMPAIGN_RECORD_VERSION = 1
 
-# THE --fresh WATERMARK (P4b). A deleted identity record is RECOVERED from the
-# billing record whether or not a checkpoint exists, so "no record" can no longer
+# THE --fresh MARKER. A deleted identity record is RECOVERED from the billing
+# record whether or not a checkpoint exists (P4b), so "no record" can no longer
 # mean "start a new campaign" on its own -- and `--fresh` removes the record. The
-# gesture therefore records, durably and BEFORE the record is removed, the
-# highest run id that exists at that moment: every campaign whose runs all sit at
-# or below it is closed for this checkpoint directory, and recovery skips it. A
-# campaign started after `--fresh` has runs above the watermark and is still
-# recovered. The file is never deleted by the runner; a later `--fresh` raises it.
+# gesture therefore records, durably and BEFORE the record is removed, WHICH
+# campaigns it closed: every billing campaign the database names, each with the
+# runs it had touched as (run id, started_at) pairs. Recovery skips a campaign
+# while every run it touches is one of those pairs (`recover_campaign_identity`).
+# The runner never deletes the file; a later `--fresh` ADDS closures to it and
+# never removes one.
+#
+# VERSION 1 RECORDED A RUN NUMBER AND IT UNDER-COUNTED (P4c). P4b's marker held
+# "every campaign through run N", and run numbers are not identities: restore an
+# older copy of the database and its new runs reuse numbers at or below N, so a
+# campaign billed after the restore was skipped and the restart began at $0 --
+# measured in fresh processes, $1.25 settled and $0.40 reserved at run 21 under a
+# marker written at run 100, and a seed of $0.00. A version-1 marker is NEVER
+# converted into identities: the only database it could be converted against is
+# the current one, and whether that is the database it was written against is
+# exactly what a run number cannot say. See `_recover_under_fresh_marker`.
 FRESH_MARKER_FILENAME = "batch_runner_fresh_start.json"
-FRESH_MARKER_VERSION = 1
+FRESH_MARKER_VERSION = 2
+FRESH_MARKER_LEGACY_VERSION = 1
 
 CAMPAIGN_DECISION_NEW = "new"
 CAMPAIGN_DECISION_CONTINUED = "continued"
@@ -881,13 +894,15 @@ CAMPAIGN_REFUSAL_HISTORICAL_UNCOVERED = "historical_spend_uncovered"
 CAMPAIGN_REFUSAL_BILLING_UNREADABLE = "billing_record_unreadable"
 CAMPAIGN_REFUSAL_BILLING_UNWRITABLE = "billing_record_unwritable"
 CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED = "campaign_identity_unestablished"
+CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE = "fresh_marker_unverifiable"
 CAMPAIGN_REFUSAL_REASONS = (CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
                             CAMPAIGN_REFUSAL_RECORD_UNWRITABLE,
                             CAMPAIGN_REFUSAL_RECORD_DISAGREES,
                             CAMPAIGN_REFUSAL_HISTORICAL_UNCOVERED,
                             CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
                             CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
-                            CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED)
+                            CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED,
+                            CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE)
 """Why a batch run refused to start paid work. CLOSED; every refusal is raised
 after the run row is opened and BEFORE the first billed call."""
 
@@ -938,6 +953,16 @@ class CampaignBillingRefusal(RuntimeError):
                 f"configuration and cohort. Resuming under a guessed identity "
                 f"would start the budget from the wrong campaign's spend. "
                 f"Restore the record, or start a NEW campaign with --fresh.",
+            CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE:
+                f"{_fresh_marker_path()} was written by an earlier build and "
+                f"records only a run-number cutoff. Run numbers are not "
+                f"identities once a database has been restored or replaced, and "
+                f"here applying and ignoring that cutoff recover different "
+                f"campaigns, so this run cannot tell which charges it must "
+                f"carry. Restore the identity record "
+                f"{_campaign_record_path()} to continue its campaign, or start a "
+                f"NEW campaign with --fresh, which closes every campaign now in "
+                f"the database by identity.",
         }.get(self.reason,
               "Fix the inference database the billing record lives in and "
               "run again.")
@@ -1053,17 +1078,41 @@ def _fresh_marker_path() -> Path:
     return Path(paths.checkpoint_path) / FRESH_MARKER_FILENAME
 
 
-def read_fresh_watermark() -> int:
-    """The ``--fresh`` watermark for this checkpoint directory, or 0 when none.
+class FreshMarker(NamedTuple):
+    """What this checkpoint directory's ``--fresh`` marker says. See
+    ``read_fresh_marker``."""
+
+    version: int
+    closed_campaigns: dict
+    legacy_cutoff: int = None
+    superseded_legacy_marker: object = None
+
+
+def _fresh_marker_shape_refusal(mp):
+    return CampaignBillingRefusal(
+        CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
+        f"the --fresh marker {mp} does not have the shape of a version-"
+        f"{FRESH_MARKER_VERSION} or version-{FRESH_MARKER_LEGACY_VERSION} marker")
+
+
+def read_fresh_marker():
+    """This checkpoint directory's ``--fresh`` marker, or None when there is none.
 
     RAISES ``CampaignBillingRefusal`` (``campaign_record_unreadable``) when the
-    marker exists and cannot be read: it decides which campaigns a missing
-    identity record may be recovered from, and a marker nobody can read is not a
-    marker that closed nothing.
+    marker exists and cannot be read, or has neither version's shape: it decides
+    which campaigns a missing identity record may be recovered from, and a
+    marker nobody can read is not a marker that closed nothing.
+
+    VERSION 2 carries ``closed_campaigns``, validated by
+    ``normalise_closed_campaigns`` -- the validator recovery applies -- so a
+    closure accepted here is one recovery applies. VERSION 1 carries only
+    ``closed_through_run_id`` and is returned as ``legacy_cutoff`` with NO
+    closures: it is never converted into campaign identities here or anywhere
+    (see the marker block above).
     """
     mp = _fresh_marker_path()
     if not mp.exists():
-        return 0
+        return None
     try:
         with open(mp, "rb") as fh:
             data = json.loads(fh.read().decode("utf-8"))
@@ -1072,46 +1121,99 @@ def read_fresh_watermark() -> int:
             CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
             f"the --fresh marker {mp} could not be read: "
             f"{type(exc).__name__}: {exc}") from exc
-    wm = data.get("closed_through_run_id") if isinstance(data, dict) else None
-    if (not isinstance(data, dict)
-            or data.get("version") != FRESH_MARKER_VERSION
-            or isinstance(wm, bool) or not isinstance(wm, int) or wm < 0):
-        raise CampaignBillingRefusal(
-            CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
-            f"the --fresh marker {mp} does not have the shape of a version-"
-            f"{FRESH_MARKER_VERSION} marker")
-    return wm
+    if not isinstance(data, dict):
+        raise _fresh_marker_shape_refusal(mp)
+    version = data.get("version")
+    if isinstance(version, bool):
+        raise _fresh_marker_shape_refusal(mp)
+    if version == FRESH_MARKER_LEGACY_VERSION:
+        cutoff = data.get("closed_through_run_id")
+        if isinstance(cutoff, bool) or not isinstance(cutoff, int) or cutoff < 0:
+            raise _fresh_marker_shape_refusal(mp)
+        return FreshMarker(version, {}, cutoff, None)
+    if version == FRESH_MARKER_VERSION:
+        closed = normalise_closed_campaigns(data.get("closed_campaigns"))
+        superseded = data.get("superseded_legacy_marker")
+        if ("closed_campaigns" not in data or closed is None
+                or not (superseded is None or isinstance(superseded, dict))):
+            raise _fresh_marker_shape_refusal(mp)
+        return FreshMarker(version, closed, None, superseded)
+    raise _fresh_marker_shape_refusal(mp)
 
 
-def record_fresh_start(db_path=None) -> int:
-    """Close every existing campaign for this checkpoint directory, durably.
+def record_fresh_start(db_path=None) -> dict:
+    """Close every existing campaign for this checkpoint directory, durably, BY
+    IDENTITY. RAISES ``CampaignBillingRefusal``; returns the closures written.
 
-    RAISES ``CampaignBillingRefusal`` and returns the watermark. Called by the
-    entry point's ``--fresh`` BEFORE ``clear_checkpoint()``, so a refusal here
-    has discarded nothing and billed nothing.
+    Called by the entry point's ``--fresh`` BEFORE ``clear_checkpoint()``, so a
+    refusal here has discarded nothing and billed nothing.
 
-    The watermark never goes DOWN: a marker already holding a higher number (a
-    database swapped for an older copy) keeps it. An UNREADABLE existing marker
-    is replaced -- ``--fresh`` is the gesture that means "close what is there".
+    WHAT IT CLOSES: every billing campaign the database names, with the runs each
+    has touched (``campaign_closure_snapshot``), plus the campaign a readable
+    identity record names -- whose stamp may have failed before it reached the
+    database. EARLIER CLOSURES ARE KEPT: a version-2 marker's closures are
+    unioned in, campaign by campaign, so a database swapped for an older copy
+    between two ``--fresh`` gestures loses none of them.
+
+    A VERSION-1 MARKER IS NOT CONVERTED. Its run-number cutoff is kept as
+    provenance under ``superseded_legacy_marker`` and decides nothing from here
+    on; the closures written are the current database's, taken by identity.
+    Dropping the cutoff's exclusion can only give recovery MORE candidates --
+    a campaign continued (over-counting) or a named refusal -- never fewer
+    charges.
+
+    AN UNREADABLE MARKER IS COPIED ASIDE, COUNTED AND REPLACED. ``--fresh`` is
+    the gesture that closes what is there; the closures the unreadable file held
+    are lost, and losing a closure can only over-count.
     """
     try:
-        latest = latest_run_id(db_path)
+        snapshot = campaign_closure_snapshot(db_path)
     except BillingRecordUnreadable as exc:
         raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
                                      str(exc)) from exc
+    closed = {cid: {tuple(p) for p in pairs} for cid, pairs in snapshot.items()}
     try:
-        previous = read_fresh_watermark()
+        record = read_campaign_record()
     except CampaignBillingRefusal:
-        previous = 0
-    watermark = max(latest, previous)
-    _write_json_durably(_fresh_marker_path(),
-                        {"version": FRESH_MARKER_VERSION,
-                         "closed_through_run_id": watermark,
-                         "recorded_at": datetime.now().isoformat()})
-    console.out(f"[--fresh] Every campaign through run {watermark} is closed "
-                f"for this checkpoint directory; a missing identity record will "
-                f"not be recovered from any of them.")
-    return watermark
+        record = None
+    if record is not None:
+        closed.setdefault(record["campaign_id"], set())
+    payload = {"version": FRESH_MARKER_VERSION}
+    try:
+        previous = read_fresh_marker()
+    except CampaignBillingRefusal as exc:
+        previous = None
+        CHECKPOINT_FAULTS["fresh_marker_unreadable"] += 1
+        kept, err, key = preserve_corrupt_file(_fresh_marker_path(), ".corrupt",
+                                               keep_original=True)
+        if err is not None:
+            CHECKPOINT_FAULTS[f"fresh_marker_corrupt_copy:{key}"] += 1
+        payload["replaced_unreadable_marker"] = str(kept) if kept else None
+        console.out(f"[--fresh] WARNING: the existing marker was unreadable "
+                    f"({exc.detail}); "
+                    + (f"it was copied to {kept}. " if kept else
+                       f"it could NOT be copied aside ({err}). ")
+                    + "The closures it held are replaced by the campaigns now "
+                      "in the database.")
+    if previous is not None:
+        for cid, pairs in previous.closed_campaigns.items():
+            closed.setdefault(cid, set()).update(pairs)
+        if previous.legacy_cutoff is not None:
+            payload["superseded_legacy_marker"] = {
+                "version": previous.version,
+                "closed_through_run_id": previous.legacy_cutoff}
+        elif previous.superseded_legacy_marker is not None:
+            payload["superseded_legacy_marker"] = previous.superseded_legacy_marker
+    written = {cid: [list(p) for p in sorted(pairs, key=lambda p: (p[0],
+                                                                  p[1] or ""))]
+               for cid, pairs in sorted(closed.items())}
+    payload["closed_campaigns"] = written
+    payload["recorded_at"] = datetime.now().isoformat()
+    _write_json_durably(_fresh_marker_path(), payload)
+    console.out(f"[--fresh] {len(written)} campaign(s) closed by identity for "
+                f"this checkpoint directory; a missing identity record will not "
+                f"be recovered from any of them unless it bills again.")
+    return written
 
 
 def write_campaign_record(campaign_id, fingerprint, cohort_digest) -> None:
@@ -1176,6 +1278,43 @@ def _write_json_durably(cr, payload) -> None:
             f"{type(exc).__name__}: {exc}") from exc
 
 
+def _recover_under_fresh_marker(run_id, cohort_digest, db_path):
+    """``recover_campaign_identity`` under this directory's ``--fresh`` marker.
+    RAISES ``CampaignBillingRefusal``.
+
+    A version-2 marker's closures are passed as they are. A VERSION-1 marker's
+    run-number cutoff is NOT applied on trust (P4c): recovery is asked twice,
+    once ignoring the cutoff and once applying it. When both name the same state
+    and campaign, the cutoff decides nothing here and that answer stands. When
+    they differ, the cutoff alone would decide which campaign -- and so which
+    charges -- this run carries, and a run number cannot establish that the
+    database is the one the marker was written against: refused as
+    ``fresh_marker_unverifiable``, before any billed call.
+    """
+    marker = read_fresh_marker()
+    if marker is None or marker.legacy_cutoff is None:
+        return recover_campaign_identity(
+            run_id, cohort_digest, db_path=db_path,
+            closed_campaigns=(marker.closed_campaigns if marker else None))
+    ignoring = recover_campaign_identity(run_id, cohort_digest, db_path=db_path)
+    applying = recover_campaign_identity(
+        run_id, cohort_digest, db_path=db_path,
+        closed_through_run_id=marker.legacy_cutoff)
+    if (ignoring.state, ignoring.campaign_id) == (applying.state,
+                                                  applying.campaign_id):
+        return ignoring
+
+    def _said(r):
+        return r.state + (f" ({r.campaign_id})" if r.campaign_id else "")
+
+    raise CampaignBillingRefusal(
+        CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE,
+        f"{_fresh_marker_path()} is a version-{FRESH_MARKER_LEGACY_VERSION} "
+        f"marker recording only 'every campaign through run "
+        f"{marker.legacy_cutoff}'; ignoring that cutoff the billing record "
+        f"answers {_said(ignoring)}, applying it answers {_said(applying)}")
+
+
 def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
                                db_path) -> CampaignBudget:
     """Decide this invocation's billing campaign and read its cumulative record.
@@ -1220,13 +1359,10 @@ def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
         # a NEW campaign at $0 while its settled charges and unresolved
         # reservations sat in the billing record: measured in two fresh
         # processes, $1.65 of liabilities and a seed of $0.00. A deliberate
-        # `--fresh` stays separate through the watermark it records beside the
-        # checkpoint (`record_fresh_start`): campaigns it closed are not
-        # candidates.
-        watermark = read_fresh_watermark()
-        recovery = recover_campaign_identity(run_id, cohort_digest,
-                                             db_path=db_path,
-                                             closed_through_run_id=watermark)
+        # `--fresh` stays separate through the campaigns it closed by identity
+        # (`record_fresh_start`, P4c): they are not candidates while they have
+        # billed nothing since.
+        recovery = _recover_under_fresh_marker(run_id, cohort_digest, db_path)
         if recovery.state not in (IDENTITY_RECOVERED, IDENTITY_NO_EVIDENCE):
             raise CampaignBillingRefusal(
                 CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED,

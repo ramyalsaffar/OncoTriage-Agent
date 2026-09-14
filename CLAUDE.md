@@ -16959,7 +16959,7 @@ registered reads as zero in its health record.
 # checkpoint directory is inside a tempfile.mkdtemp removed and asserted gone,
 # and the production inferences.db digest is compared at the end. It EXECS
 # NOTHING: children are scripts written into the temp tree. Bucket A.
-python tests/test_campaign_billing_record.py                        # 115 (MEASURED 2026-09-13 by the P4b recovery session under the same containment; was 111. The +4 are 6za..6za-iii: a deleted identity record through the REAL entry point, recovered without a flag, and a NEW campaign under --fresh. Before that 111, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 97. The +14 are 6f-i..6f-v, the summary surface over the zero-success restart's database, and 6u..6z, --fresh through the REAL entry point read back at the summary surface. Before that 97, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
+python tests/test_campaign_billing_record.py                        # 127 (MEASURED 2026-09-13 by the P4c recovery session under the same containment; was 115. The +12 are 6zb..6ze through the REAL entry point in fresh processes: the restored older database recovered with both charge classes and repeated recovery, a legacy marker refused with no patient started and --fresh over it, an unreadable marker refused, an unwritable marker leaving the checkpoint and record byte-unchanged, and the crash between marker and checkpoint removal. Before that 115, MEASURED 2026-09-13 by the P4b recovery session under the same containment; was 111. The +4 are 6za..6za-iii: a deleted identity record through the REAL entry point, recovered without a flag, and a NEW campaign under --fresh. Before that 111, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 97. The +14 are 6f-i..6f-v, the summary surface over the zero-success restart's database, and 6u..6z, --fresh through the REAL entry point read back at the summary surface. Before that 97, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
 ```
 
 **SEVENTEEN PLANTED REVERTS, SEVENTEEN CAUGHT, NONE ABORTING** -- each on a
@@ -17233,7 +17233,7 @@ on darwin (which re-opens the drive-cache window). Linux containers ignore
 # SPEND, no model load, no corpus. Children run the real main() with stand-in
 # clients and a closed Qdrant port. NOT in the collision matrix; the production
 # digest is compared at the end. It EXECS NOTHING. Bucket A.
-python tests/test_billing_closure.py                                # 256 (MEASURED 2026-09-13 by the P4b recovery session under the network sandbox with production reads denied, the audit-hook tripwire and an isolated root; was 231. The +25 are 4q..4q-x (a missing record with no checkpoint recovered, repeated recovery, the --fresh watermark, an unreadable marker, ambiguity, the entry-point ordering), 4w-* (an identity-write failure while recovering a billed campaign, and the corrected refusal) and 4u..4u-iii (the same through the REAL main() in fresh processes). Before that 231, MEASURED 2026-09-13 by the P4 recovery session under the network sandbox, an audit-hook tripwire and an isolated project root; was 193. The +38 are 4f-i, 4f-ii, 4r..4r-ii and the section-4 continuation's failure injections through the REAL main(), 4s-* and 4t. Before that 193, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 190. The +3 are 3h, 3h-i and 3f-i. Before that 190, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
+python tests/test_billing_closure.py                                # 274 (MEASURED 2026-09-13 by the P4c recovery session under the network sandbox with production reads denied, the audit-hook tripwire and an isolated root; was 256. The +18 are 4y..4zd: the restored older database with both charge classes, the crash between marker and checkpoint removal, (id, started_at) identity, malformed closures, legacy version-1 markers refused or moot, and --fresh over a legacy or unreadable marker; 4q-iii/vi/viii were rewritten for identity closures. Before that 256, MEASURED 2026-09-13 by the P4b recovery session under the network sandbox with production reads denied, the audit-hook tripwire and an isolated root; was 231. The +25 are 4q..4q-x (a missing record with no checkpoint recovered, repeated recovery, the --fresh watermark, an unreadable marker, ambiguity, the entry-point ordering), 4w-* (an identity-write failure while recovering a billed campaign, and the corrected refusal) and 4u..4u-iii (the same through the REAL main() in fresh processes). Before that 231, MEASURED 2026-09-13 by the P4 recovery session under the network sandbox, an audit-hook tripwire and an isolated project root; was 193. The +38 are 4f-i, 4f-ii, 4r..4r-ii and the section-4 continuation's failure injections through the REAL main(), 4s-* and 4t. Before that 193, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 190. The +3 are 3h, 3h-i and 3f-i. Before that 190, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
 ```
 
 **NINETEEN REVERTS, NINETEEN CAUGHT**, each in a copied tree with the editable
@@ -17253,9 +17253,20 @@ files), the index pin (+1), `_WRITE_LOCK` sites 9 -> 10, `test_spend_gate.py`
    settled charges and unresolved reservations sat in the billing record
    (measured in two fresh processes: $1.65, seed $0.00). Recovery now runs
    whenever the record is missing, and `--fresh` stays separate through a
-   durable per-directory watermark (`batch_runner_fresh_start.json`,
-   `runner.record_fresh_start`), written BEFORE the checkpoint is cleared:
-   campaigns whose runs all sit at or below it are not recovered.
+   durable per-directory marker (`batch_runner_fresh_start.json`,
+   `runner.record_fresh_start`), written BEFORE the checkpoint is cleared.
+   **P4c replaced its run-number cutoff with campaign IDENTITIES**: the P4b
+   marker skipped every campaign at or below a run number, and a restored older
+   database reuses run numbers, so a campaign billed after the restore was
+   skipped and the restart began at $0 (measured in fresh processes: $1.25
+   settled + $0.40 reserved at run 21 under a marker written at run 100, seed
+   $0.00). A version-2 marker names each campaign it closed with the runs it had
+   touched as `(id, started_at)`; recovery skips a campaign only while every run
+   it touches is one of those, so a campaign that bills again after a closure (a
+   `--fresh` that died before clearing, or another directory's adoption) is
+   judged as open. A version-1 marker is never converted: with the record
+   missing, recovery is asked with and without its cutoff, and where the two
+   disagree ordinary paid startup is refused as `fresh_marker_unverifiable`.
 2. **Recovery can adopt ANOTHER checkpoint directory's campaign** when that is
    the only open campaign sharing the configuration and cohort in one database.
    The direction is over-counting, but the two campaigns would then share a

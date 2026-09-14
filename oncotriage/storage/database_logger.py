@@ -6053,44 +6053,140 @@ class CampaignIdentityRecovery(NamedTuple):
     detail: str = ""
 
 
-def latest_run_id(db_path=None) -> int:
-    """The highest ``runs.id`` in the database, or 0. RAISES ``BillingRecordUnreadable``.
+def normalise_closed_campaigns(value):
+    """``{campaign_id: frozenset((run_id, started_at), ...)}``, or None when
+    ``value`` does not have that shape. ``None`` is the empty map.
 
-    0 when the database file or its ``runs`` table does not exist yet -- a
-    database no run has opened holds no campaign to close. The file is never
-    CREATED here: a read-only open of an absent path is not attempted.
+    ONE VALIDATOR FOR BOTH READERS: the batch runner reads a ``--fresh`` marker
+    through it and ``recover_campaign_identity`` applies what it returns, so a
+    closure the runner accepted is exactly the closure recovery applies. A run id
+    is a non-negative int (never a bool); ``started_at`` is a string or None.
+    """
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        return None
+    out = {}
+    for cid, pairs in value.items():
+        if (not isinstance(cid, str) or not cid
+                or isinstance(pairs, (str, bytes, dict))):
+            return None
+        try:
+            items = list(pairs)
+        except TypeError:
+            return None
+        norm = set()
+        for item in items:
+            if isinstance(item, (str, bytes, dict)):
+                return None
+            try:
+                rid, started = item
+            except (TypeError, ValueError):
+                return None
+            if isinstance(rid, bool) or not isinstance(rid, int) or rid < 0:
+                return None
+            if started is not None and not isinstance(started, str):
+                return None
+            norm.add((rid, started))
+        out[cid] = frozenset(norm)
+    return out
 
-    Read by the batch runner's ``--fresh`` gesture, which records this number as
-    the point through which every existing campaign is closed for that
-    checkpoint directory (see ``recover_campaign_identity``).
+
+def _run_pair_key(pair):
+    return (pair[0], pair[1] or "")
+
+
+def _touched_run_pairs(conn, campaign_id, run_columns, tables):
+    """The ``(run_id, started_at)`` pairs ``campaign_id`` has touched.
+
+    The runs its billing rows name, and the runs whose ``billing_campaign_id``
+    carries it. ONE DEFINITION, read by ``campaign_closure_snapshot`` when
+    ``--fresh`` closes a campaign and by ``recover_campaign_identity`` when it
+    asks whether that closure still covers the campaign -- two readers of
+    "touched" that disagreed would make a closure void, or valid, for a reason
+    that has nothing to do with the campaign. ``started_at`` is None for a run a
+    billing row names and no run row carries. No parameter list is built, so a
+    campaign with any number of runs is one query each.
+    """
+    pairs = {}
+    billed = set()
+    if "billing_attempts" in tables:
+        billed = {r[0] for r in conn.execute(
+            "SELECT DISTINCT run_id FROM billing_attempts WHERE campaign_id = ?",
+            (campaign_id,))}
+        if "runs" in tables:
+            for rid, started in conn.execute(
+                    "SELECT id, started_at FROM runs WHERE id IN (SELECT run_id "
+                    "FROM billing_attempts WHERE campaign_id = ?)",
+                    (campaign_id,)):
+                pairs[rid] = started
+    if "billing_campaign_id" in run_columns:
+        for rid, started in conn.execute(
+                "SELECT id, started_at FROM runs WHERE billing_campaign_id = ?",
+                (campaign_id,)):
+            pairs[rid] = started
+    for rid in billed:
+        pairs.setdefault(rid, None)
+    return set(pairs.items())
+
+
+def campaign_closure_snapshot(db_path=None) -> dict:
+    """Every billing campaign the database names, with the runs each has touched.
+    RAISES ``BillingRecordUnreadable``.
+
+    ``{campaign_id: [[run_id, started_at], ...]}``, sorted, JSON-shaped. The
+    campaigns are ``billing_attempts.campaign_id`` and ``runs.billing_campaign_id``;
+    the runs are ``_touched_run_pairs``. ``{}`` when the file or its tables do
+    not exist; the file is never CREATED here.
+
+    Read by the batch runner's ``--fresh`` gesture (``record_fresh_start``),
+    which records this map as the campaigns it closed (P4c). A run is recorded
+    as ``(id, started_at)`` rather than by its id because ids are reused when an
+    older copy of the database is restored -- the defect this replaced.
     """
     try:
         db_path = resolve_inference_db_path(db_path)
         if not os.path.exists(db_path):
-            return 0
+            return {}
         conn = _open_connection(db_path, read_only=True)
         try:
             tables = {r[0] for r in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table'")}
-            if "runs" not in tables:
-                return 0
-            found = conn.execute("SELECT MAX(id) FROM runs").fetchone()[0]
+            run_columns = ({r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+                           if "runs" in tables else set())
+            ids = set()
+            if "billing_attempts" in tables:
+                ids.update(r[0] for r in conn.execute(
+                    "SELECT DISTINCT campaign_id FROM billing_attempts"))
+            if "billing_campaign_id" in run_columns:
+                ids.update(r[0] for r in conn.execute(
+                    "SELECT DISTINCT billing_campaign_id FROM runs WHERE "
+                    "billing_campaign_id IS NOT NULL"))
+            snapshot = {}
+            for cid in ids:
+                if not isinstance(cid, str) or not cid:
+                    raise ValueError(f"a billing campaign id reads back as "
+                                     f"{cid!r}")
+                pairs = _touched_run_pairs(conn, cid, run_columns, tables)
+                for rid, started in pairs:
+                    if (isinstance(rid, bool) or not isinstance(rid, int)
+                            or (started is not None
+                                and not isinstance(started, str))):
+                        raise ValueError(f"campaign {cid}'s run reads back as "
+                                         f"({rid!r}, {started!r})")
+                snapshot[cid] = [list(p) for p in sorted(pairs,
+                                                         key=_run_pair_key)]
         finally:
             conn.close()
     except Exception as exc:                                   # noqa: BLE001
         raise BillingRecordUnreadable(
-            f"the latest run id in {db_path} could not be read: "
+            f"the billing campaigns in {db_path} could not be read: "
             f"{type(exc).__name__}: {exc}") from exc
-    if found is None:
-        return 0
-    if isinstance(found, bool) or not isinstance(found, int) or found < 0:
-        raise BillingRecordUnreadable(
-            f"runs.id in {db_path} reads back as {found!r}, not a run id")
-    return found
+    return dict(sorted(snapshot.items()))
 
 
 def recover_campaign_identity(run_id, cohort_digest, db_path=None,
-                              closed_through_run_id=0
+                              closed_campaigns=None, closed_through_run_id=0
                               ) -> CampaignIdentityRecovery:
     """Which billing campaign the rows say ``run_id`` continues. NEVER RAISES.
 
@@ -6098,14 +6194,35 @@ def recover_campaign_identity(run_id, cohort_digest, db_path=None,
     stamp is what candidates must match -- and ``cohort_digest`` is the
     checkpoint's or the current cohort's.
 
-    ``closed_through_run_id`` is the ``--fresh`` watermark recorded beside the
-    checkpoint (0 when none): a campaign every one of whose runs is at or below
-    it was deliberately closed by ``--fresh`` in this checkpoint directory and is
-    not a candidate, whatever its latest status. A campaign with ANY run above it
-    is judged as before, so a campaign started after ``--fresh`` is still found.
-    A value that is not a non-negative int is ``unreadable``: a watermark nobody
-    can read must not decide which charges are forgotten.
+    ``closed_campaigns`` is what this checkpoint directory's ``--fresh`` marker
+    recorded (P4c): ``{campaign_id: [(run_id, started_at), ...]}``, the runs
+    each campaign had touched when ``--fresh`` closed it (see
+    ``campaign_closure_snapshot``). A campaign in it is skipped, before any other
+    test, WHILE every run it touches now is one of those pairs. A campaign that
+    has touched a run since -- ``--fresh`` died before it cleared the identity
+    record and the next run continued the campaign, or another checkpoint
+    directory adopted it -- is no longer covered by the closure and is judged as
+    an open campaign: skipping it would forget the charges made after the
+    closure. A run is ``(id, started_at)`` and not its id, because ids are reused
+    when an older copy of the database is restored; ``started_at`` is compared
+    for EQUALITY only, so no clock is trusted.
+
+    ``closed_through_run_id`` is the LEGACY run-number cutoff a version-1 marker
+    recorded (P4b); only the batch runner's legacy comparison passes it. A
+    campaign every one of whose runs is at or below it is skipped. It is not an
+    identity, and the runner never applies it on trust (see
+    ``runner._recover_under_fresh_marker``).
+
+    A value of either that does not have its documented shape is
+    ``unreadable``: a closure nobody can read must not decide which charges are
+    forgotten.
     """
+    closed = normalise_closed_campaigns(closed_campaigns)
+    if closed is None:
+        return CampaignIdentityRecovery(
+            IDENTITY_UNREADABLE,
+            detail=f"the --fresh closures ({type(closed_campaigns).__name__}) "
+                   f"do not have the shape of a closed-campaign map")
     if (isinstance(closed_through_run_id, bool)
             or not isinstance(closed_through_run_id, int)
             or closed_through_run_id < 0):
@@ -6179,6 +6296,11 @@ def recover_campaign_identity(run_id, cohort_digest, db_path=None,
                             (rid,)).fetchone()[0]
                         if worked:
                             unbilled_work.add((cid, rid))
+            closure_pairs = {
+                cid: {p for p in _touched_run_pairs(conn, cid, run_columns,
+                                                    tables)
+                      if p[0] != run_id}
+                for cid in members if cid in closed}
         finally:
             conn.close()
     except Exception as exc:                                   # noqa: BLE001
@@ -6192,10 +6314,26 @@ def recover_campaign_identity(run_id, cohort_digest, db_path=None,
         # CLOSED BY --fresh, AND DECIDED BEFORE ANY OTHER TEST. A campaign the
         # operator deliberately closed is not evidence about this run, so neither
         # its foreign runs nor its lost rows may turn a fresh start into a refusal.
+        #
+        # BY IDENTITY, AND ONLY WHILE THE CLOSURE STILL DESCRIBES THE CAMPAIGN
+        # (P4c). The P4b watermark closed every campaign at or below a run
+        # NUMBER, and run numbers are reused when an older copy of the database
+        # is restored: measured in fresh processes, a campaign that billed $1.25
+        # settled and $0.40 reserved at run 21 of a restored database was skipped
+        # under a marker written at run 100, and the restart began at $0.00.
+        if cid in closed:
+            late = sorted(closure_pairs.get(cid, set()) - closed[cid],
+                          key=_run_pair_key)
+            if not late:
+                notes.append(f"campaign {cid} was closed by --fresh")
+                continue
+            notes.append(f"campaign {cid} was closed by --fresh but has since "
+                         f"touched run(s) {[p[0] for p in late]} its closure "
+                         f"does not name, so it is judged as open")
         if (closed_through_run_id and touched
                 and max(touched) <= closed_through_run_id):
-            notes.append(f"campaign {cid} was closed by --fresh (every run at or "
-                         f"below run {closed_through_run_id})")
+            notes.append(f"campaign {cid} is at or below the legacy --fresh "
+                         f"cutoff run {closed_through_run_id}")
             continue
         foreign = sorted(touched - same_ids)
         if foreign:
@@ -6227,7 +6365,8 @@ def recover_campaign_identity(run_id, cohort_digest, db_path=None,
         return CampaignIdentityRecovery(
             IDENTITY_AMBIGUOUS, candidates=tuple(open_ids),
             detail=(f"{len(open_ids)} open billing campaigns share this "
-                    f"configuration and cohort: {', '.join(open_ids)}"))
+                    f"configuration and cohort: {', '.join(open_ids)}"
+                    + (f" ({'; '.join(notes)})" if notes else "")))
     return CampaignIdentityRecovery(IDENTITY_NO_EVIDENCE,
                                     detail="; ".join(notes))
 

@@ -1653,14 +1653,21 @@ check("4q-ii *** REPEATED recovery duplicates nothing: the same campaign, the "
        billing_census(_dbr)),
       (True, True, _census_r))
 
-# --fresh CLOSES WHAT EXISTS, DURABLY, AND ONLY WHAT EXISTS.
-_fresh_wm = drive(_runner.record_fresh_start, db_path=_dbr)
+# --fresh CLOSES WHAT EXISTS, DURABLY, AND ONLY WHAT EXISTS -- BY IDENTITY (P4c).
+_fresh_closed = drive(_runner.record_fresh_start, db_path=_dbr)
 _fresh_marker = os.path.join(_cpr, _runner.FRESH_MARKER_FILENAME)
-check("4q-iii the --fresh watermark is the database's latest run id, written "
-      "durably beside the checkpoint",
-      (_fresh_wm, at(drive(lambda: json.loads(Path(_fresh_marker).read_text())),
-                     "closed_through_run_id")),
-      (_rr2, _rr2))
+_marker_json = drive(lambda: json.loads(Path(_fresh_marker).read_text()))
+_started_r = dict(ro_rows(_dbr, "SELECT id, started_at FROM runs"))
+_first_r = min(_started_r)
+check("4q-iii --fresh records the campaign it closed BY IDENTITY, with every "
+      "run it had touched as (run id, started_at), in a version-2 marker "
+      "written beside the checkpoint",
+      (at(_marker_json, "version"),
+       sorted(at(_marker_json, "closed_campaigns") or {}),
+       at(at(_marker_json, "closed_campaigns"), _campr),
+       _fresh_closed == at(_marker_json, "closed_campaigns")),
+      (2, [_campr],
+       [[r, _started_r.get(r)] for r in sorted({_first_r, _rr, _rr2})], True))
 os.remove(record_path(_cpr))
 _rf = next_run(_dbr, resumed=False)
 _bf = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rf, _dbr)
@@ -1681,14 +1688,24 @@ os.remove(record_path(_cpr))
 _ra = next_run(_dbr, resumed=False)
 _ba = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ra, _dbr)
 check("4q-v *** a campaign started AFTER --fresh is still recovered when its "
-      "record goes missing -- the watermark closes only what existed ***",
+      "record goes missing -- the marker closes only what existed ***",
       (getattr(_ba, "decision", None), getattr(_ba, "campaign_id", None),
        near(getattr(getattr(_ba, "seed", None), "usd", None), 0.75)),
       (_runner.CAMPAIGN_DECISION_RECOVERED, _camp_after, True))
+_prior_closed = dict(at(_marker_json, "closed_campaigns") or {})
+_prior_closed["camp-closed-in-another-copy"] = [[7, "2026-01-01T00:00:00"]]
 Path(_fresh_marker).write_text(json.dumps(
-    {"version": _runner.FRESH_MARKER_VERSION, "closed_through_run_id": 999}))
-check("4q-vi the watermark never goes DOWN: a marker already higher keeps its "
-      "number", drive(_runner.record_fresh_start, db_path=_dbr), 999)
+    {"version": _runner.FRESH_MARKER_VERSION,
+     "closed_campaigns": _prior_closed}))
+_again = drive(_runner.record_fresh_start, db_path=_dbr)
+check("4q-vi *** a LATER --fresh keeps every closure an earlier one recorded "
+      "-- including one for a campaign this database does not hold -- and adds "
+      "the campaigns the database holds now ***",
+      (sorted(_again) if isinstance(_again, dict) else _again,
+       at(_again, "camp-closed-in-another-copy"),
+       at(_again, _campr) == at(_prior_closed, _campr)),
+      (sorted([_campr, _camp_after, "camp-closed-in-another-copy"]),
+       [[7, "2026-01-01T00:00:00"]], True))
 Path(_fresh_marker).write_text("{not json")
 os.remove(record_path(_cpr))
 _ru = next_run(_dbr, resumed=False)
@@ -1699,9 +1716,10 @@ check("4q-vii an UNREADABLE --fresh marker beside a missing record is REFUSED by
        os.path.exists(record_path(_cpr))),
       (_runner.CAMPAIGN_REFUSAL_RECORD_UNREADABLE, True, False))
 _abs_db = os.path.join(_TMP, "absent", "never.db")
-check("4q-viii latest_run_id on a database that does not exist is 0 and does "
-      "not create it", (drive(_dl.latest_run_id, _abs_db),
-                        os.path.exists(os.path.dirname(_abs_db))), (0, False))
+check("4q-viii the closure snapshot of a database that does not exist is empty "
+      "and does not create it",
+      (drive(getattr(_dl, "campaign_closure_snapshot", None), _abs_db),
+       os.path.exists(os.path.dirname(_abs_db))), ({}, False))
 
 # AMBIGUITY STILL REFUSES WITHOUT A CHECKPOINT.
 _dbq, _cpq, _campq = campaign_setup("ambiguous_zero")
@@ -1736,6 +1754,282 @@ _fresh_order = [n for _, _, n in sorted(_fresh_calls)
 check("4q-x *** the entry point's --fresh records the watermark BEFORE "
       "clear_checkpoint() removes the identity record ***",
       _fresh_order, ["record_fresh_start", "clear_checkpoint"])
+
+# ── 4y..4zf: THE --fresh MARKER BY IDENTITY (P4c) ─────────────────────────────
+#
+# THE P4b MARKER REMEMBERED A RUN NUMBER, AND RUN NUMBERS ARE REUSED. Restore an
+# older copy of the database and its new runs take numbers at or below the
+# marker's cutoff, so a campaign billed after the restore was skipped and the
+# restart began at $0. Measured in fresh processes before the fix: $1.25 settled
+# and $0.40 reserved at run 21 under a marker written at run 100, seed $0.00.
+
+
+def census(db):
+    return at(drive(ro_rows, db, "SELECT COUNT(*), ROUND(COALESCE(SUM(CASE WHEN "
+                                 "state = 'settled' THEN settled_usd ELSE "
+                                 "reserved_usd END), 0), 9) FROM "
+                                 "billing_attempts"), 0)
+
+
+def restore_copy(src, dst):
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(dst + suffix):
+            os.remove(dst + suffix)
+    shutil.copyfile(src, dst)
+
+
+def write_marker(cp, payload):
+    Path(os.path.join(cp, _runner.FRESH_MARKER_FILENAME)).write_text(
+        json.dumps(payload) if not isinstance(payload, str) else payload)
+
+
+def bill(db, campaign, run_id, tag, settled, reserved):
+    _dl.reserve_billing_attempt(db, attempt_id=f"{tag}-s", campaign_id=campaign,
+                                run_id=run_id, source="stage5", model=_WIRE,
+                                input_tokens=1, output_tokens=1,
+                                reserved_usd=settled)
+    _dl.settle_billing_attempt(db, f"{tag}-s", outcome="response",
+                               settled_usd=settled)
+    if reserved:
+        _dl.reserve_billing_attempt(db, attempt_id=f"{tag}-o",
+                                    campaign_id=campaign, run_id=run_id,
+                                    source="stage5", model=_WIRE, input_tokens=1,
+                                    output_tokens=1, reserved_usd=reserved)
+
+
+def seed_of(budget):
+    seed = field(budget, "seed")
+    return (field(budget, "decision"), field(budget, "campaign_id"),
+            field(seed, "usd"), field(seed, "unresolved"))
+
+
+# 4y: THE RESTORED OLDER DATABASE, BOTH CHARGE CLASSES PRESENT.
+_dby, _cpy, _campy_old = campaign_setup("restored")      # run 1, $1.25, FAILED
+_older_y = os.path.join(_TMP, "restored_older.db")
+_src_y, _dst_y = sqlite3.connect(_dby), sqlite3.connect(_older_y)
+_src_y.backup(_dst_y)
+_src_y.close()
+_dst_y.close()
+for _ in range(4):
+    _dl.finalize_run_record(next_run(_dby, resumed=False), "FINISHED",
+                            db_path=_dby)
+_latest_y = at(at(ro_rows(_dby, "SELECT MAX(id) FROM runs"), 0), 0)
+_closed_y = drive(_runner.record_fresh_start, db_path=_dby)
+_runner.clear_checkpoint()
+restore_copy(_older_y, _dby)
+_ry1 = next_run(_dby, resumed=False)
+_by1 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ry1,
+             _dby)
+_campy_new = field(_by1, "campaign_id")
+bill(_dby, _campy_new, _ry1, "restored-new", 0.75, 0.40)
+_dl.finalize_run_record(_ry1, "FAILED", db_path=_dby)
+check("4y non-degeneracy: --fresh closed the old campaign by identity, the "
+      "restored copy holds only its run 1, and the NEW campaign billed at a run "
+      "number the newer database had already used, with a settled charge AND an "
+      "unresolved reservation",
+      (sorted(_closed_y) if isinstance(_closed_y, dict) else _closed_y,
+       field(_by1, "decision"), _ry1 <= _latest_y, census(_dby)),
+      ([_campy_old], _runner.CAMPAIGN_DECISION_NEW, True, (3, 2.4)))
+os.remove(record_path(_cpy))
+_ry2 = next_run(_dby, resumed=False)
+_by2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ry2,
+             _dby)
+check("4y-i *** THE P4c DEFECT: after the restore the missing record is "
+      "RECOVERED -- the new campaign, its settled charge AND its unresolved "
+      "reservation -- and the closed old campaign's $1.25 is not in it ***",
+      (field(_by2, "decision"), field(_by2, "campaign_id") == _campy_new,
+       near(field(field(_by2, "seed"), "usd"), 1.15),
+       field(field(_by2, "seed"), "unresolved")),
+      (_runner.CAMPAIGN_DECISION_RECOVERED, True, True, 1))
+_census_y = census(_dby)
+os.remove(record_path(_cpy))
+_ry3 = next_run(_dby, resumed=False)
+_by3 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ry3,
+             _dby)
+check("4y-ii *** REPEATED recovery adds no charge: the same campaign, the same "
+      "seed, and the billing record unchanged row for row ***",
+      (field(_by3, "campaign_id") == _campy_new,
+       near(field(field(_by3, "seed"), "usd"), 1.15), census(_dby)),
+      (True, True, _census_y))
+
+# 4z: A CRASH BETWEEN THE MARKER AND THE CHECKPOINT REMOVAL.
+_dbz, _cpz, _campz = campaign_setup("crash_fresh")        # run 1, $1.25, record
+drive(_runner.record_fresh_start, db_path=_dbz)           # ... and then it dies
+_rz1 = next_run(_dbz, resumed=False)
+_bz1 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rz1,
+             _dbz)
+check("4z the marker was persisted and the process died before clearing: the "
+      "next ordinary run CONTINUES the campaign the record still names",
+      (field(_bz1, "decision"), field(_bz1, "campaign_id") == _campz,
+       near(field(field(_bz1, "seed"), "usd"), 1.25),
+       os.path.exists(os.path.join(_cpz, _runner.FRESH_MARKER_FILENAME))),
+      (_runner.CAMPAIGN_DECISION_CONTINUED, True, True, True))
+bill(_dbz, _campz, _rz1, "post-crash", 0.50, 0.30)
+_dl.finalize_run_record(_rz1, "FAILED", db_path=_dbz)
+os.remove(record_path(_cpz))
+_rz2 = next_run(_dbz, resumed=False)
+_bz2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rz2,
+             _dbz)
+check("4z-i *** the campaign touched a run its closure does not name, so the "
+      "closure no longer covers it: a lost record RECOVERS it with every charge, "
+      "pre- and post-crash, including the reservation ***",
+      (field(_bz2, "decision"), field(_bz2, "campaign_id") == _campz,
+       near(field(field(_bz2, "seed"), "usd"), 2.05),
+       field(field(_bz2, "seed"), "unresolved")),
+      (_runner.CAMPAIGN_DECISION_RECOVERED, True, True, 1))
+_dbz3, _cpz3, _campz3 = campaign_setup("crash_fresh_nothing_since")
+drive(_runner.record_fresh_start, db_path=_dbz3)
+os.remove(record_path(_cpz3))
+_rz3 = next_run(_dbz3, resumed=False)
+_bz3 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rz3,
+             _dbz3)
+check("4z-ii ...while a crashed --fresh whose record is then lost, with nothing "
+      "billed since, still closes the campaign: a NEW campaign at $0, which is "
+      "the separation the operator asked for",
+      (field(_bz3, "decision"), field(_bz3, "campaign_id") != _campz3,
+       near(field(field(_bz3, "seed"), "usd"), 0.0)),
+      (_runner.CAMPAIGN_DECISION_NEW, True, True))
+
+# 4za: A RUN IS (id, started_at), NOT ITS NUMBER.
+_dba4, _cpa4, _campa4 = campaign_setup("reused_run_id")
+os.remove(record_path(_cpa4))
+_ra4 = next_run(_dba4, resumed=False)
+_run1_a4, _started1_a4 = at(ro_rows(_dba4, "SELECT id, started_at FROM runs "
+                                           "ORDER BY id LIMIT 1"), 0)
+_same_a4 = _dl.recover_campaign_identity(
+    _ra4, "dig", db_path=_dba4,
+    closed_campaigns={_campa4: [[_run1_a4, _started1_a4]]})
+_other_a4 = _dl.recover_campaign_identity(
+    _ra4, "dig", db_path=_dba4,
+    closed_campaigns={_campa4: [[_run1_a4, "1999-01-01T00:00:00"]]})
+check("4za a closure naming the campaign's run by (id, started_at) closes it",
+      (_same_a4.state, _same_a4.campaign_id), (_dl.IDENTITY_NO_EVIDENCE, None))
+check("4za-i *** a closure naming the SAME run NUMBER with a different "
+      "started_at -- a restored database reusing the number -- does NOT close "
+      "it: recovered ***",
+      (_other_a4.state, _other_a4.campaign_id),
+      (_dl.IDENTITY_RECOVERED, _campa4))
+_bad_closures = ("not a map", {_campa4: [[True, None]]}, {"": []},
+                 {_campa4: [[1]]}, {_campa4: [[-1, None]]},
+                 {_campa4: [[1, 12345]]}, {_campa4: "1,x"})
+check("4za-ii a closure map of the wrong shape is UNREADABLE, never applied",
+      [_dl.recover_campaign_identity(_ra4, "dig", db_path=_dba4,
+                                     closed_campaigns=b).state
+       for b in _bad_closures],
+      [_dl.IDENTITY_UNREADABLE] * len(_bad_closures))
+
+# 4zb: LEGACY (version-1) MARKERS ARE NEVER CONVERTED.
+_V1 = getattr(_runner, "FRESH_MARKER_LEGACY_VERSION", 1)
+_UNVERIFIABLE = getattr(_runner, "CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE",
+                        "<absent>")
+# On the restored database of 4y: ignoring a cutoff, the old campaign and the
+# new one are both open (ambiguous); applying cutoff 5, both are skipped (no
+# evidence). The two readings disagree, so the cutoff alone would decide.
+_paths._RESOLVED["checkpoint_path"] = _cpy + os.sep
+os.remove(record_path(_cpy))
+write_marker(_cpy, {"version": _V1, "closed_through_run_id": _latest_y})
+_census_b = census(_dby)
+_rb1 = next_run(_dby, resumed=False)
+_eb1 = raised(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rb1,
+              _dby)
+check("4zb *** a version-1 marker whose cutoff DECIDES the answer is refused by "
+      "name before any billed call: no identity record written, nothing billed, "
+      "and both readings named ***",
+      (getattr(_eb1, "reason", None), os.path.exists(record_path(_cpy)),
+       census(_dby), "ambiguous" in str(_eb1) and "no_evidence" in str(_eb1)),
+      (_UNVERIFIABLE, False, _census_b, True))
+_dbm, _cpm, _campm = campaign_setup("legacy_moot")          # run 1
+_rm1 = next_run(_dbm, resumed=False)
+drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rm1, _dbm)
+_dl.finalize_run_record(_rm1, "FAILED", db_path=_dbm)       # campaign runs 1, 2
+os.remove(record_path(_cpm))
+write_marker(_cpm, {"version": _V1, "closed_through_run_id": 1})
+_rm2 = next_run(_dbm, resumed=False)
+_bm2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rm2,
+             _dbm)
+check("4zb-i a version-1 marker whose cutoff decides NOTHING (the campaign has a "
+      "run above it, so both readings recover it) does not block: recovered",
+      (field(_bm2, "decision"), field(_bm2, "campaign_id") == _campm),
+      (_runner.CAMPAIGN_DECISION_RECOVERED, True))
+write_marker(_cpm, {"version": _V1, "closed_through_run_id": 99})
+_rm3 = next_run(_dbm, resumed=False)
+_bm3 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rm3,
+             _dbm)
+check("4zb-ii with the identity record PRESENT the marker is not consulted, "
+      "even a version-1 marker whose cutoff would disagree: continued",
+      (field(_bm3, "decision"), field(_bm3, "campaign_id") == _campm),
+      (_runner.CAMPAIGN_DECISION_CONTINUED, True))
+_paths._RESOLVED["checkpoint_path"] = _cpy + os.sep
+write_marker(_cpy, {"version": _V1, "closed_through_run_id": _latest_y})
+_conv = drive(_runner.record_fresh_start, db_path=_dby)
+_conv_json = drive(lambda: json.loads(Path(os.path.join(
+    _cpy, _runner.FRESH_MARKER_FILENAME)).read_text()))
+check("4zb-iii *** --fresh over a version-1 marker writes version-2 closures "
+      "from the CURRENT database by identity, keeps the old cutoff only as "
+      "provenance, and does not turn the cutoff into closures ***",
+      (at(_conv_json, "version"), at(_conv_json, "superseded_legacy_marker"),
+       sorted(_conv) if isinstance(_conv, dict) else _conv),
+      (2, {"version": 1, "closed_through_run_id": _latest_y},
+       sorted([_campy_old, _campy_new])))
+_conv2 = drive(_runner.record_fresh_start, db_path=_dby)
+check("4zb-iv ...and a later --fresh carries that provenance forward",
+      at(drive(lambda: json.loads(Path(os.path.join(
+          _cpy, _runner.FRESH_MARKER_FILENAME)).read_text())),
+         "superseded_legacy_marker"),
+      {"version": 1, "closed_through_run_id": _latest_y})
+
+# 4zc: MALFORMED MARKERS, AND --fresh OVER AN UNREADABLE ONE.
+_malformed = ([], {"version": True, "closed_through_run_id": 1},
+              {"version": 1, "closed_through_run_id": -1},
+              {"version": 1, "closed_through_run_id": "5"},
+              {"version": 2}, {"version": 3, "closed_campaigns": {}},
+              {"version": 2, "closed_campaigns": {"c": [[True, None]]}},
+              {"version": 2, "closed_campaigns": {},
+               "superseded_legacy_marker": "cutoff 5"})
+_paths._RESOLVED["checkpoint_path"] = _cpm + os.sep
+_mal_out = []
+for _payload in _malformed:
+    write_marker(_cpm, _payload)
+    _e = raised(getattr(_runner, "read_fresh_marker", None))
+    _mal_out.append((getattr(_e, "reason", None),
+                     _runner.FRESH_MARKER_FILENAME in str(_e)))
+check("4zc every malformed marker (wrong type, bool or negative or text cutoff, "
+      "missing closures, unknown version, bad closure pair, bad provenance) is "
+      "REFUSED by name when read",
+      _mal_out, [(_runner.CAMPAIGN_REFUSAL_RECORD_UNREADABLE, True)]
+      * len(_malformed))
+write_marker(_cpm, {"version": 2, "closed_campaigns": {}})
+check("4zc-i non-degeneracy: a well-formed empty version-2 marker reads",
+      field(drive(getattr(_runner, "read_fresh_marker", None)), "version"), 2)
+write_marker(_cpm, "{garbage")
+_faults_before = _runner.CHECKPOINT_FAULTS.get("fresh_marker_unreadable", 0)
+_over = drive(_runner.record_fresh_start, db_path=_dbm)
+_mdir = os.listdir(_cpm)
+_copies = [n for n in _mdir if n.startswith(_runner.FRESH_MARKER_FILENAME)
+           and n != _runner.FRESH_MARKER_FILENAME]
+check("4zc-ii --fresh over an UNREADABLE marker copies it aside (bytes kept), "
+      "counts it, and writes a version-2 marker naming the copy",
+      (len(_copies) == 1,
+       drive(lambda: Path(os.path.join(_cpm, _copies[0])).read_text())
+       if _copies else None,
+       _runner.CHECKPOINT_FAULTS.get("fresh_marker_unreadable", 0)
+       - _faults_before,
+       at(drive(lambda: json.loads(Path(os.path.join(
+           _cpm, _runner.FRESH_MARKER_FILENAME)).read_text())), "version"),
+       isinstance(_over, dict) and _campm in _over),
+      (True, "{garbage", 1, 2, True))
+
+# 4zd: A CAMPAIGN THE RECORD NAMES AND THE DATABASE DOES NOT (its stamp failed).
+_dbd, _cpd, _campd = campaign_setup("record_only")
+_rec_d = json.loads(Path(record_path(_cpd)).read_text())
+_rec_d["campaign_id"] = "camp-record-only"
+Path(record_path(_cpd)).write_text(json.dumps(_rec_d))
+_closed_d = drive(_runner.record_fresh_start, db_path=_dbd)
+check("4zd --fresh also closes the campaign a readable identity record names "
+      "when the database holds no row for it",
+      (at(_closed_d, "camp-record-only"), _campd in (_closed_d or {})),
+      ([], True))
+
 
 # ── ITEM 3 (P4b): AN IDENTITY-WRITE FAILURE WHILE RECOVERING A BILLED CAMPAIGN ──
 #

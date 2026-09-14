@@ -590,11 +590,12 @@ if __name__ == "__main__":
                 console.out("[--fresh] Discarding the batch checkpoint. Every "
                             "patient will run again, at one live Stage 5 call "
                             "each.")
-                # THE WATERMARK BEFORE THE DELETION (P4b). A missing identity
-                # record is recovered from the billing record, so removing it is
-                # no longer enough to start a new campaign; the marker is what
-                # closes the existing ones. Written first, so a refusal leaves
-                # the checkpoint and the record exactly as they were.
+                # THE MARKER BEFORE THE DELETION (P4b, by identity since P4c).
+                # A missing identity record is recovered from the billing record,
+                # so removing it is no longer enough to start a new campaign; the
+                # marker, naming the campaigns it closed, is what closes them.
+                # Written first, so a refusal leaves the checkpoint and the record
+                # exactly as they were.
                 try:
                     record_fresh_start()
                 except CampaignBillingRefusal as _fresh_refusal:

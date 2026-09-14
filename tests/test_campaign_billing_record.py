@@ -962,6 +962,11 @@ if mode == "concurrent":
          faults=dict(spend.BILLING_RECORD_FAULTS))
     sys.exit(0)
 
+if mode == "fresh_only":
+    dump(closed=runner.record_fresh_start(),
+         runner_file=os.path.realpath(runner.__file__))
+    sys.exit(0)
+
 def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
             db_path=None):
     name = os.path.basename(str(fhir_path))
@@ -1629,9 +1634,9 @@ if _g3d is None:
     print(tail(_g3, 60))
 _G3 = at(_g3d, "campaign_id")
 check("6za-ii *** --fresh with the record ALREADY deleted still starts a NEW "
-      "campaign: the watermark is recorded before the checkpoint is cleared ***",
+      "campaign: the marker is recorded before the checkpoint is cleared ***",
       (isinstance(_G3, str), _G3 != _G1,
-       "[--fresh] Every campaign through run" in (_g3.stdout + _g3.stderr),
+       "campaign(s) closed by identity" in (_g3.stdout + _g3.stderr),
        os.path.exists(_MARK_G)), (True, True, True, True))
 if os.path.exists(_REC_G):
     os.remove(_REC_G)
@@ -1641,6 +1646,247 @@ if _g4d is None:
     print(tail(_g4, 60))
 check("6za-iii ...and a later deletion recovers the campaign --fresh STARTED, "
       "not the one it closed", at(_g4d, "campaign_id"), _G3)
+
+
+# ---- 6G-iii: THE --fresh MARKER BY IDENTITY, THROUGH THE REAL ENTRY POINT (P4c).
+#          A restored older database, a legacy marker, an unreadable marker, a
+#          marker that cannot be written, and a crash between the marker and the
+#          checkpoint removal -- each in fresh processes.
+
+
+def census(db):
+    rows = billing_rows(db) if os.path.exists(db) else []
+    return (len(rows), round(sum((r["settled_usd"] if r["state"] == "settled"
+                                  else r["reserved_usd"]) or 0 for r in rows), 9))
+
+
+def campaign_liability(db, campaign):
+    rows = billing_rows(db, "campaign_id = ?", (campaign,))
+    return (sum((r["settled_usd"] if r["state"] == "settled"
+                 else r["reserved_usd"]) or 0 for r in rows),
+            sum(1 for r in rows if r["state"] == "reserved"))
+
+
+def restore_copy(src, dst):
+    for suffix in ("", "-wal", "-shm"):
+        if os.path.exists(dst + suffix):
+            os.remove(dst + suffix)
+    shutil.copyfile(src, dst)
+
+
+def db_copy(src, dst):
+    s, d = sqlite3.connect(src), sqlite3.connect(dst)
+    try:
+        s.backup(d)
+    finally:
+        s.close()
+        d.close()
+
+
+def marker_json(cp):
+    return drive(lambda: json.loads(Path(os.path.join(
+        cp, _runner.FRESH_MARKER_FILENAME)).read_text()))
+
+
+def ran_to_end(proc):
+    """A stand-in entry-point run that reached the end of main(), told apart
+    from a refusal by CONTENT rather than by exit code: the stand-in patient
+    never writes through the runner's ledgered writer, so the reconciliation
+    finds zero attempted writes and `reconciliation_exit_code()` is 1 on every
+    such run -- the same code a refusal exits with."""
+    text = proc.stdout + proc.stderr
+    return (proc.returncode, "--- DATABASE WRITE RECONCILIATION ---" in text,
+            "REFUSING TO START PAID WORK" in text,
+            "Traceback (most recent call last)" in text)
+
+
+_RAN = (1, True, False, False)
+
+
+def refused(proc, reason):
+    return (proc.returncode,
+            f"REFUSING TO START PAID WORK: {reason}" in (proc.stdout + proc.stderr))
+
+
+_DB_R = os.path.join(_TMP, "p4c_restored.db")
+_CP_R = os.path.join(_TMP, "cp_p4c_restored")
+_REC_R = os.path.join(_CP_R, _runner.CAMPAIGN_RECORD_FILENAME)
+_r1, _r1d = child("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                  cap=100.0)
+_R_OLD = at(_r1d, "campaign_id")
+_OLDER_R = os.path.join(_TMP, "p4c_older.db")
+db_copy(_DB_R, _OLDER_R)
+_r2, _r2d = child("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                  cap=100.0)
+for _ in range(2):
+    _dl.finalize_run_record(_dl.start_run_record("batch", db_path=_DB_R,
+                                                 fingerprint=FIXED_FP),
+                            "FINISHED", db_path=_DB_R)
+_latest_r = sqlite3.connect(f"file:{_DB_R}?mode=ro", uri=True).execute(
+    "SELECT MAX(id) FROM runs").fetchone()[0]
+_rf, _rfd = entry_point("billed_then_zero", "--fresh", db=_DB_R, cp=_CP_R,
+                        corpus=_CORP_F, cap=100.0)
+if _rfd is None:
+    print(tail(_rf, 60))
+_R_FRESH = at(_rfd, "campaign_id")
+_mj = marker_json(_CP_R)
+check("6zb non-degeneracy: the REAL entry point's --fresh closed the old "
+      "campaign BY IDENTITY with its two runs, and started a NEW campaign",
+      (ran_to_end(_rf), at(_mj, "version"),
+       sorted(at(_mj, "closed_campaigns") or {}),
+       len(at(at(_mj, "closed_campaigns"), _R_OLD) or []),
+       isinstance(_R_FRESH, str) and _R_FRESH != _R_OLD),
+      (_RAN, 2, [_R_OLD], 2, True))
+restore_copy(_OLDER_R, _DB_R)
+_r3, _r3d = entry_point("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                        cap=100.0)
+_run_fresh_r = [r[0] for r in sqlite3.connect(f"file:{_DB_R}?mode=ro", uri=True)
+                .execute("SELECT id FROM runs WHERE billing_campaign_id = ?",
+                         (_R_FRESH,))]
+_dl.reserve_billing_attempt(_DB_R, attempt_id="p4c-open",
+                            campaign_id=_R_FRESH,
+                            run_id=at(_run_fresh_r, 0), source="stage5",
+                            model=_WIRE, input_tokens=1, output_tokens=1,
+                            reserved_usd=0.40)
+_liab_r = campaign_liability(_DB_R, _R_FRESH)
+check("6zb-i non-degeneracy: in the RESTORED copy the fresh campaign billed at "
+      "run(s) whose NUMBER the newer database had already used, and now holds "
+      "settled charges and one unresolved reservation",
+      (ran_to_end(_r3), at(_r3d, "campaign_id") == _R_FRESH,
+       bool(_run_fresh_r) and max(_run_fresh_r) <= _latest_r,
+       _liab_r[0] > 0.40, _liab_r[1]),
+      (_RAN, True, True, True, 1))
+os.remove(_REC_R)
+_r4, _r4d = entry_point("observe", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                        cap=100.0)
+if _r4d is None:
+    print(tail(_r4, 60))
+check("6zb-ii *** THE P4c SCENARIO, END TO END: after the restore, with the "
+      "identity record deleted, a fresh process RECOVERS the fresh campaign "
+      "with every settled charge AND the unresolved reservation -- and none of "
+      "the old campaign's closed charges ***",
+      (ran_to_end(_r4),
+       "(recovered_from_billing_record)" in (_r4.stdout + _r4.stderr),
+       at(_r4d, "campaign_id") == _R_FRESH,
+       near(at(at(_r4d, "seed"), "usd"), _liab_r[0], 1e-9),
+       at(at(_r4d, "seed"), "unresolved")),
+      (_RAN, True, True, True, 1))
+_census_r = census(_DB_R)
+os.remove(_REC_R)
+_r5, _r5d = entry_point("observe", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                        cap=100.0)
+check("6zb-iii *** REPEATED recovery in another fresh process adds no charge: "
+      "the same campaign, the same seed, the billing record unchanged ***",
+      (ran_to_end(_r5), at(_r5d, "campaign_id") == _R_FRESH,
+       near(at(at(_r5d, "seed"), "usd"), _liab_r[0], 1e-9), census(_DB_R)),
+      (_RAN, True, True, _census_r))
+
+# LEGACY (version-1) MARKER: the cutoff decides, so ordinary paid startup is
+# refused by name. `billed_then_zero` calls the stand-in provider from inside the
+# patient, so an absent dump means no patient started and no provider was called.
+os.remove(_REC_R)
+Path(os.path.join(_CP_R, _runner.FRESH_MARKER_FILENAME)).write_text(json.dumps(
+    {"version": 1, "closed_through_run_id": _latest_r}))
+_census_l = census(_DB_R)
+_l1, _l1d = entry_point("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                        cap=100.0)
+check("6zc *** a version-1 marker whose cutoff would decide the campaign: exit "
+      "1, refused as fresh_marker_unverifiable, no patient started (no provider "
+      "call), nothing billed, no identity record written ***",
+      (refused(_l1, getattr(_runner, "CAMPAIGN_REFUSAL_FRESH_MARKER_UNVERIFIABLE",
+                            "<absent>")),
+       _l1d, census(_DB_R), os.path.exists(_REC_R)),
+      ((1, True), None, _census_l, False))
+_l2, _l2d = entry_point("billed_then_zero", "--fresh", db=_DB_R, cp=_CP_R,
+                        corpus=_CORP_F, cap=100.0)
+_mj2 = marker_json(_CP_R)
+check("6zc-i --fresh through the REAL entry point over the version-1 marker "
+      "writes version-2 closures from the database it runs against, keeps the "
+      "cutoff as provenance only, and starts a NEW campaign",
+      (ran_to_end(_l2), at(_mj2, "version"),
+       at(at(_mj2, "superseded_legacy_marker"), "closed_through_run_id"),
+       sorted(at(_mj2, "closed_campaigns") or {}),
+       at(_l2d, "campaign_id") not in (_R_OLD, _R_FRESH)),
+      (_RAN, 2, _latest_r, sorted([_R_OLD, _R_FRESH]), True))
+os.remove(_REC_R)
+Path(os.path.join(_CP_R, _runner.FRESH_MARKER_FILENAME)).write_text("{garbage")
+_census_g = census(_DB_R)
+_u1, _u1d = entry_point("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
+                        cap=100.0)
+check("6zc-ii an UNREADABLE marker beside a missing record: exit 1, refused by "
+      "name naming the marker, no patient started, nothing billed",
+      (refused(_u1, _runner.CAMPAIGN_REFUSAL_RECORD_UNREADABLE),
+       _runner.FRESH_MARKER_FILENAME in (_u1.stdout + _u1.stderr), _u1d,
+       census(_DB_R)),
+      ((1, True), True, None, _census_g))
+
+# A MARKER THAT CANNOT BE WRITTEN: --fresh exits 1 and discards nothing (P4b's
+# guarantee, re-driven over the version-2 writer).
+_DB_W = os.path.join(_TMP, "p4c_unwritable.db")
+_CP_W = os.path.join(_TMP, "cp_p4c_unwritable")
+_CORP_W = make_corpus(os.path.join(_TMP, "corpus_w"), 2)
+_w0, _ = child("legacy_p0", db=_DB_W, cp=_CP_W, corpus=_CORP_W, cap=100.0)
+_ckpt_w = os.path.join(_CP_W, _runner.CHECKPOINT_FILENAME)
+_rec_w = os.path.join(_CP_W, _runner.CAMPAIGN_RECORD_FILENAME)
+_before_w = (digest(_ckpt_w), digest(_rec_w))
+_runs_w = sqlite3.connect(f"file:{_DB_W}?mode=ro", uri=True).execute(
+    "SELECT COUNT(*) FROM runs").fetchone()[0]
+os.makedirs(os.path.join(_CP_W, Path(_runner.FRESH_MARKER_FILENAME).stem
+                         + ".tmp", "blocker"))
+_w1, _ = entry_point("legacy_p0", "--fresh", db=_DB_W, cp=_CP_W,
+                     corpus=_CORP_W, cap=100.0)
+check("6zd non-degeneracy: the campaign left a checkpoint and an identity record",
+      ("absent" not in _before_w, _w0.returncode), (True, 0))
+check("6zd-i *** a --fresh marker that cannot be written: exit 1, the refusal "
+      "printed, the checkpoint and the identity record byte-unchanged, no "
+      "marker, and main() never ran (no new run row) ***",
+      (_w1.returncode,
+       "[--fresh] REFUSING: the --fresh marker could not be recorded"
+       in (_w1.stdout + _w1.stderr),
+       (digest(_ckpt_w), digest(_rec_w)) == _before_w,
+       os.path.exists(os.path.join(_CP_W, _runner.FRESH_MARKER_FILENAME)),
+       sqlite3.connect(f"file:{_DB_W}?mode=ro", uri=True).execute(
+           "SELECT COUNT(*) FROM runs").fetchone()[0]),
+      (1, True, True, False, _runs_w))
+
+# A CRASH BETWEEN MARKER PERSISTENCE AND CHECKPOINT REMOVAL, in fresh processes.
+_DB_C = os.path.join(_TMP, "p4c_crash.db")
+_CP_C = os.path.join(_TMP, "cp_p4c_crash")
+_REC_C = os.path.join(_CP_C, _runner.CAMPAIGN_RECORD_FILENAME)
+_c1, _c1d = child("billed_then_zero", db=_DB_C, cp=_CP_C, corpus=_CORP_F,
+                  cap=100.0)
+_C_CAMP = at(_c1d, "campaign_id")
+_c2, _c2d = child("fresh_only", db=_DB_C, cp=_CP_C, corpus=_CORP_F, cap=100.0)
+check("6ze non-degeneracy: a process persisted the marker naming the campaign "
+      "and exited WITHOUT clearing: the identity record still names it",
+      (_c2.returncode, sorted(at(marker_json(_CP_C), "closed_campaigns") or {}),
+       at(drive(lambda: json.loads(Path(_REC_C).read_text())), "campaign_id")),
+      (0, [_C_CAMP], _C_CAMP))
+_c3, _c3d = entry_point("billed_then_zero", db=_DB_C, cp=_CP_C, corpus=_CORP_F,
+                        cap=100.0)
+_run_c3 = sqlite3.connect(f"file:{_DB_C}?mode=ro", uri=True).execute(
+    "SELECT MAX(id) FROM runs").fetchone()[0]
+_dl.reserve_billing_attempt(_DB_C, attempt_id="p4c-crash-open",
+                            campaign_id=_C_CAMP, run_id=_run_c3,
+                            source="stage5", model=_WIRE, input_tokens=1,
+                            output_tokens=1, reserved_usd=0.40)
+_liab_c = campaign_liability(_DB_C, _C_CAMP)
+check("6ze-i the next ordinary run (REAL entry point) continued that campaign "
+      "and billed after the closure",
+      (ran_to_end(_c3), at(_c3d, "campaign_id") == _C_CAMP,
+       len(billing_rows(_DB_C, "campaign_id = ? AND run_id = ?",
+                        (_C_CAMP, _run_c3))) > 1),
+      (_RAN, True, True))
+os.remove(_REC_C)
+_c4, _c4d = entry_point("observe", db=_DB_C, cp=_CP_C, corpus=_CORP_F,
+                        cap=100.0)
+check("6ze-ii *** with the record then deleted, a fresh process RECOVERS the "
+      "campaign with every charge, pre- and post-crash, including the "
+      "unresolved reservation -- the closure no longer covers it ***",
+      (ran_to_end(_c4), at(_c4d, "campaign_id") == _C_CAMP,
+       near(at(at(_c4d, "seed"), "usd"), _liab_c[0], 1e-9),
+       at(at(_c4d, "seed"), "unresolved")),
+      (_RAN, True, True, 1))
 
 
 #------------------------------------------------------------------------------
