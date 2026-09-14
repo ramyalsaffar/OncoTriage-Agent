@@ -1,6 +1,9 @@
 # RECOVERY E1b -- admission follow-up (reservation replay, bounded wait)
 
-Status: **⟨PENDING-STATUS⟩ -- INCOMPLETE: never filled before the session died. See section 14.**
+Status: **E1b IMPLEMENTED; its acceptance evidence RE-ESTABLISHED on the final
+tree by batches B1-B6 (section 14); closure written (section 15). INCOMPLETE:
+the section 13 combined checks have no passing evidence yet (15.2), and check
+7z-iii REQUIRES DISPOSITION (15.3).**
 
 Written for: the operator and the combined-checks session.
 
@@ -190,8 +193,10 @@ at deadline + timeout, so an entry whose thread died is dropped and counted
 
 ## 6. Tests and results (all under the sandbox and the tripwire, isolated root)
 
-**New file: `tests/test_admission_replay_and_wait.py` -- ⟨PENDING-NEWCOUNT⟩ (INCOMPLETE: never filled; section 14.3 records the saved runs),
-bucket A.** What it drives:
+**New file: `tests/test_admission_replay_and_wait.py` -- 71 checks (filled at
+closure: B2's live-tree run under full containment, `RESULTS: 71 passed, 0
+failed`, 14.11.2; the earlier `final_new` 71/0 had no containment evidence,
+14.3), bucket A.** What it drives:
 
 | requirement | checks |
 |---|---|
@@ -291,7 +296,49 @@ that the planted file parses, and runs the new test against the copy. A
 preflight confirms the copy is what imports. The live tree's touched files are
 sha256-compared before and after.
 
-⟨PENDING-CONTROLS⟩ -- INCOMPLETE: never filled. The harness finished at 12:39:37, after this report was last written (12:16:26), and no verdict was recorded. Section 14.3 inventories the saved results.
+Filled at closure from 14.3, 14.9, 14.10 and 14.11. Nothing was re-run for it.
+
+- **The v2 run above (12:16:43-12:39:37) used the test as committed at
+  12:13:41.** 13 of 15 plants recorded their intended failure. C4 hung (killed
+  at 600 s, no summary) and C5 aborted after failing 4k (14.3).
+  - B1 (14.9) found why. C4 hung in 4f, because the planted per-recheck
+    deadline had no bound outside the code under test. C5 aborted because 4k's
+    waiter leaked into 4l and `cancel_case` called `begin()` bare.
+- **B1-fix (14.10) changed the test harness only.** 4f now runs on a bounded
+  thread and records `4f-0`. `cancel_case` guards `begin()`, joins its waiter
+  and returns a cleanup element. Production code did not change.
+- **B2 (14.11) ran the matrix against the edited test, under full
+  containment.**
+  - Clean: 71/0 on the live tree and on an unplanted copy.
+  - All 15 plants ended in a RESULTS line with no traceback, and each made its
+    intended assertion fail:
+
+| plant | result | failing checks |
+|---|---|---|
+| C1 replay lookup removed | 63/8 | 2b 2d 2e 2g 2h 3b 3c 3e |
+| C2 replay validation removed | 68/3 | 2d 2e 3c |
+| C3 no wait | 50/21 | 4a 4c-4n 4n-i 4p-4s 5a-5c |
+| C4 deadline reset per recheck | 68/4 (72 checks) | 4f-0 4g 4h 4i |
+| C5 cancellation ignored | 68/3 | 4k 4l 4m |
+| C6 no FIFO | 70/1 | 4p |
+| C7 timeout does not latch | 66/5 | 4h 4i 5a 5b 5c |
+| C8 Stage 5 gate ignores wait latch | 69/2 | 4i 6a |
+| C9 write lock held across wait | 69/2 | 4c 4e |
+| C10 permit held during wait | 68/3 | 4b 4d 4n-i |
+| C11 runner stop reason is cap | 70/1 | 5b |
+| C12 hold-token replay doubles | 70/1 | 2i |
+| C13 require_budget ignores wait latch | 70/1 | 4i |
+| C14 settled attempt replayable | 70/1 | 2e |
+| C15 policy cancel counted failed | 70/1 | 4n-i |
+
+- **Extra failures, each traced to its plant in 14.11.2:** C1 (2d 2e 3c), C3
+  (the wait block after 4a) and C7 (5a). None fails for an unrelated reason.
+- **C3:** B2's own 240 s driver bound killed the first attempt. The re-run
+  under 560 s finished in 247.1 s at 50/21.
+- **C4:** 72 checks, because `4f-0` is recorded only when it fails.
+- **NOT EXERCISED:** in B2's 18 runs, `halt_with_live_worker` never executed,
+  and neither did the failure branch of the cleanup element (14.11.4). Those
+  guards are verified by reading only.
 
 ## 9. Changes
 
@@ -382,16 +429,63 @@ sha256-compared before and after.
 - (b) The cap may be insufficient if caching fails, and the judge budget may
   not cover a full 100-patient pass -- both projections.
 - (c) Check 7z-iii at line 3478 aborts under load, and the combined checks must
-  establish WHY its child returned no seed.
+  establish WHY its child returned no seed. (Closure: now REQUIRES DISPOSITION,
+  section 15.3.)
 - (d) Backlog: the maintained per-campaign liability total, the sibling-latch
   cross-directory case, the call-ceiling claim consumed by a decline, held spend
   absent from `report_lines()`.
 
 ## 12. End state
 
-⟨PENDING-END⟩ -- INCOMPLETE: never filled. The only saved end-state evidence predates the final production edit; see section 14.6.
+Filled at closure from 14.11-14.15. Nothing was re-run for it.
+
+- **Tree.** One read-only check at closure: `git diff --name-only 81fd5c7 HEAD`
+  (HEAD `e762b2a`) lists only this report and
+  `tests/test_admission_replay_and_wait.py`. So the production code is the
+  12:12:19 tree that B1-B6 tested.
+- **Digests (B6, 14.15.4): VERIFIED on the final tree.** Renderer
+  `5ea2c6cc...c2a956`, `PROMPT_VERSION` 1.11.0, `FINGERPRINT_VERSION` 8 and both
+  prompt hashes all equal the start digests.
+- **Production files by bytes (B6): VERIFIED at three points only.**
+  - What was compared: the 40 files under `02- Data/03- Inferences Storage`
+    and `08- Checkpoint`, hashed as bytes outside the sandbox, with no SQLite.
+  - When: at 22:19:44Z and 22:21:43Z, against the start inventory taken at
+    11:16-11:20.
+  - Result: 0 added, 0 removed, 0 changed.
+  - Limit: this cannot exclude a change that was made and reverted between
+    those points.
+- **Static checks (B6).** 319 files compiled. Classification consistent: 151
+  test files, 132 in bucket A.
+- **Suites on the final production code under evidenced containment.**
+  - The new test: 71/0 (B2).
+  - 21 affected suites at their expected counts, zero failures (B3, 14.12.5).
+  - Four of them re-run by B5 with every spawned Python process marked:
+    ablation_stop_and_lock 161, runner_stop_switch 146,
+    runner_sigterm_shutdown 95, package_invariants 261/0/0.
+  - `test_provider_resilience`, run alone: 203/0/0 three times (B4).
+- **Simulation (B6, two post-fix runs, 28 scenarios each).**
+  - In both runs: failed_held 0, wait timeouts 0, and nothing held or queued at
+    the end.
+  - Every outcome column equals the section 7 table.
+  - Wait and decline tallies differ between the two identical runs by up to 79.
+- **Replay premise probe (B6).** It reproduces section 4's probe results,
+  including `BillingReservationConflict` naming `reserved_usd`. This settles
+  14.5 item 3.
+- **Network and spend.** No batch recorded an external network attempt, and no
+  paid call was made.
+- **INCOMPLETE:**
+  - the two in-suite production comparisons (`test_storage_run_identity`,
+    `test_storage_write_durability` 9c) had no data under containment
+    (14.13.4);
+  - the section 13 combined checks have no passing evidence (15.2);
+  - check 7z-iii requires disposition (15.3).
 
 ## 13. Exact next action for the combined-checks session
+
+**Superseded at closure by section 15.** Items 1-2 are re-stated in 15.2 and
+15.3. Items 3 and 4 (U1, U9) are DEFERRED by operator ruling. They are
+decisions, not checks, and this older text does not make them mandatory local
+runs.
 
 Under the same containment (sandbox + tripwire + isolated root), on this
 working tree:
@@ -1922,3 +2016,139 @@ between two identical post-fix runs by amounts of the same order (up to 79
 against up to 119 from pre-fix). Only closure remains (report
 placeholders, CLAUDE.md corrections, merge), subject to the operator's
 decision on the section 13 checks listed above.
+
+## 15. Closure (2026-09-14)
+
+Written for: the operator and the post-push session.
+
+Documentation only. No source or test file was edited, nothing was run, and
+nothing was committed. Sources, all read only: sections 14.9-14.15,
+`.github/workflows/ci.yml`, `.github/scripts/ci_test_buckets.py`,
+`tests/run_serial_tests.py`, `tests/test_agent_retrieval_observability.py` and
+`tests/test_billing_closure.py`.
+
+### 15.1 What E1b established, and what it did not
+
+**Established.** All of this is evidence on the final production code, taken
+under evidenced containment:
+
+- **A replayed reservation is recognised in one transaction.** A replay adds no
+  hold and makes no provider call. A mismatch raises
+  `BillingReservationConflict` naming the field that disagrees. (B6 premise
+  probe; checks 2a-3e; controls C1, C2, C12 and C14.)
+- **A `headroom_held` decline on the Stage 5 path waits.**
+  - The wait is bounded and cancellable, and it holds no lock and no permit.
+  - A timeout latches `admission_wait` and stops the run cleanly, with the
+    unfinished patients left for a resume.
+  - Evidence: checks 4a-6a; controls C3-C11, C13 and C15.
+- **The 48-patient simulation has zero held failures** in both post-fix runs
+  (B6).
+- **Renderer and prompt digests are unchanged.** Production files were
+  byte-identical at the three measured points (section 12).
+
+**Not established:**
+
+- the section 13 combined checks (15.2);
+- why check 7z-iii's child returned no seed (15.3);
+- anything under the limits in 15.4, or under U1-U9 and section 10's
+  "Unverified" list.
+
+### 15.2 CI coverage of the remaining section 13 checks
+
+- **A check that appears in the workflow is not evidence that it passed.** Each
+  row below is recorded as "to be recorded after the push" or as "needs a local
+  run".
+- **How the workflow runs.** It triggers on a push to any branch and on
+  `pull_request`. A newer run on the same ref cancels the older one
+  (`cancel-in-progress`), and a cancelled run is not evidence.
+- **The bucket A step has no `if:` condition.** So it is SKIPPED when any
+  earlier step in job `tests` fails: install, provision, the model-cache
+  pre-warm, the classification check or the static checks.
+
+**Runnable checks:**
+
+| check | what runs it | skip conditions | status |
+|---|---|---|---|
+| Full bucket A | workflow `CI`, job `tests`, step "Bucket A — parallel-safe tests" (`ci_test_buckets.py --run A`): 4 workers, every child pointed at a closed Qdrant port with the key removed, `HF_HUB_OFFLINE=1` | skipped if an earlier step fails. A member with a non-empty `needs` entry is listed NOT RUN; B6 recorded 132 of 132 bucket-A members runnable in CI | run by CI/tests, result to be recorded after the push |
+| Serial bucket B | job `tests`, step "Bucket B — serial tests (make serial-tests)" | runs only when `--serial-preconditions` reports `serial_ready=true`. Four of the five members need UMLS `MRCONSO*.RRF`, the Synthea corpus or the `scratch_ecog` corpus. The workflow's own step comment says the not-run branch is the one a GitHub-hosted runner takes, and a report-only step then runs in its place | not covered by CI, needs a local run |
+| `fixture_replay.py` | nothing. It is bucket C in `ci_test_buckets.py`, and `ci.yml` lists it under "NOT RUN, ON PURPOSE" | needs a live Qdrant whose collection digest matches the fixtures. CLAUDE.md also records, verified by running on 2026-09-03, that it refuses before any hook at the shipped provider and that the twelve fixtures are stale | not covered by CI, needs a local run. This closure does not establish whether a local run can produce a pass |
+| `test_agent_retrieval_observability.py` | job `tests`, the bucket A step (it is a bucket A member) | depends on the "Pre-warm the local model cache" step. If that step fails, bucket A is skipped. Under `HF_HUB_OFFLINE=1` an uncached model FAILS rather than downloading. SECTION E records a counted SKIP unless `ONCOTRIAGE_QDRANT_PROBE_URL` is set, and the workflow does not set it | run by CI/tests, result to be recorded after the push. A local isolated-root run first needs the FastEmbed `Qdrant/bm25` model cached under that root's model cache |
+| Check 7z-iii | inside `tests/test_billing_closure.py`, a bucket A member, so the same bucket A step | runs as one of 4 concurrent bucket-A workers, which is under load. Same skip condition as bucket A | run by CI/tests, result to be recorded after the push. A pass does NOT dispose of it (15.3) |
+
+**Decisions, not checks:**
+
+| item | status |
+|---|---|
+| U1: a leaked hold turns churn into a timeout stop | DEFERRED by operator ruling |
+| U9: the `test_provider_resilience` pacing race | DEFERRED by operator ruling |
+
+Section 13 items 3-4 and 14.7 item 7 predate that ruling. They do not make U1
+or U9 mandatory local runs.
+
+### 15.3 Check 7z-iii: REQUIRES DISPOSITION (not deferred)
+
+- **The check.** `tests/test_billing_closure.py` line 3478, "THE STATED BOUND,
+  THROUGH main()". It drives
+  `p1b_e2e("missing_unrecordable", "settle_missing_unrecordable")` through child
+  processes, and reads process 2's seed.
+- **The recorded observation.** Section 11(c) records that the check aborts
+  under load because a child process returned no seed. The operator's brief
+  attributes this finding to B1. Sections 14.9-14.15 do not record it, and this
+  report cites no saved output of the aborting run.
+- **Evidence on the other side.** B3 ran `test_billing_closure` alone under
+  containment and got 388/0/0 (14.12.4), so 7z-iii passed in that run. No saved
+  batch evidence reproduces the abort.
+- **Cause: NEVER ESTABLISHED.** Nobody has established why the child returned
+  no seed.
+- **Disposition needed.** A later batch must run a narrow diagnosis that
+  PRESERVES the child's exit code, stdout and stderr in the no-seed case. A
+  guard that hides the failure is not a disposition: that includes turning the
+  missing seed into a pass or a skip, or recording a failure without the
+  child's evidence.
+
+### 15.4 Remaining limits, in one place
+
+1. **The Stage 5 reservation bound is not proven.** It rests on assumed
+   long-context multipliers: assumed $9.042, against the no-premium $4.653
+   (sections 7 and 11(a)).
+2. **The provider-resilience pacing check can fail intermittently.** It is the
+   test at line 2092, run `_r7c`. A sufficient mechanism was demonstrated, but
+   the cause of the original `pr_solo` failure is unresolved (14.13.3).
+3. **B5's three coverage gaps (14.14.4):**
+   - a process created by fork without exec is invisible to both inventories;
+   - an interpreter launched outside the venv shim is caught only by the lossy
+     kernel log;
+   - B5's children run with `sys.prefix` = the venv, which differs from B1's
+     harness.
+4. **Two in-suite production comparisons had no data under containment**: the
+   `test_storage_run_identity` skip and `test_storage_write_durability` 9c
+   (14.13.4).
+5. **`test_package_invariants` runtime rose without explanation**: 134.9 s
+   under B5 against 60.6 s under B3, cause not measured (14.14.3).
+6. **The production byte comparison has gaps.** It shows identity at 11:16-11:20
+   (the start inventory), 22:19:44Z and 22:21:43Z. It cannot exclude a change
+   made and reverted between 11:20 and 22:19.
+
+Also carried, unchanged: U2-U8, section 10's "Unverified" list, and section
+11(b).
+
+### 15.5 Backlog: deferred, not worked
+
+- the pacing-check fix (U9);
+- the maintained per-campaign liability total (U1's remedy);
+- the sibling-latch cross-directory case;
+- held spend absent from `report_lines()`;
+- the call-ceiling claim consumed by a decline.
+
+### 15.6 Boundary for what follows
+
+- **No repeat of B1-B6.** Their evidence stands and is not re-taken.
+- **What remains after the push is only:**
+  - (a) each check in 15.2 that lacks passing CI evidence, including any CI
+    check that skipped, was cancelled or failed. On a hosted runner that
+    includes serial bucket B and `fixture_replay.py`, which need local runs;
+  - (b) the 7z-iii diagnosis (15.3).
+- **A check covered by a passing CI run** is recorded from that run and is not
+  re-run locally.
+- **If that remainder exceeds one session,** hand off the named remainder
+  without expanding scope.

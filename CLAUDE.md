@@ -17357,11 +17357,27 @@ re-derived (1v needs two reservations; 6A and scenario A need 4.5 responses).
 ### A held decline waits, and a replayed reservation is recognised (E1b)
 
 **TWO FOLLOW-UPS TO E1, BOTH CONFIRMED ON THE UNCHANGED CODE BEFORE ANYTHING WAS
-EDITED.** No paid call, no commit. Every run was under the OS network sandbox
-and the audit-hook tripwire against an isolated project root. The production
-files were compared by bytes at session end. `PROMPT_VERSION`,
-`FINGERPRINT_VERSION` and `llm_classifier_renderer_digest` are unchanged. The
-full account is `RECOVERY_E1B_REPORT.md`.
+EDITED.**
+- **Spend and commits.** No paid call. The work exists only as WIP commits on
+  `wip/billing-closure`, each marked NOT FOR PUSH.
+- **Containment.** The original session's runs claimed the OS network sandbox
+  and the audit-hook tripwire against an isolated project root, but for several
+  of them no wrapper or tripwire evidence survived. Recovery batches B1-B6
+  re-ran the evidence on the final tree, with a sandbox launch record and a
+  tripwire marker for every Python process. No external network attempt was
+  recorded. The residual coverage gaps are in the report's section 15.4.
+- **Production files.** The E1b session's only byte comparison (12:06:57) was
+  taken before its final production edit (12:12:19). Batch B6 compared the 40
+  production files by bytes, outside the sandbox and without SQLite, at
+  22:19:44Z and 22:21:43Z. They were unchanged against the start-of-session
+  inventory (11:16-11:20). That cannot exclude a change made and reverted in
+  between.
+- **Digests.** `PROMPT_VERSION`, `FINGERPRINT_VERSION` and
+  `llm_classifier_renderer_digest` are unchanged, recomputed on the final tree
+  by B6.
+- **Full account.** `RECOVERY_E1B_REPORT.md`. Its section 15 records what E1b
+  did not establish, the CI coverage of the remaining checks, and the open
+  limits.
 
 **1. A REPLAYED RESERVATION WAS COUNTED AS ITS OWN HOLD.**
 `reserve_billing_attempt` decided admission before it asked whether the attempt's
@@ -17413,12 +17429,19 @@ A stop the retry policy sees itself -- after a positive preview, or while
 waiting for the paced slot -- also ends the wait `cancelled`, never `failed`
 (`end_admission_wait(cancelled=True)`; the self-review fix, check 4n-i).
 
-**THE 48-PATIENT SIMULATION, RE-RUN.** At the assumed and the no-premium
-reservations, with the cache working and absent:
+**THE 48-PATIENT SIMULATION, RE-RUN.** The session's own run was taken before
+its final production edit. B6 ran the simulation twice more on the final tree,
+under containment. It covers 28 scenarios: the assumed and the no-premium
+reservations, with the cache working and absent. Both post-fix runs showed:
 - **held failures: 0 at every baseline**;
+- no wait timed out, and nothing is held or queued at the end;
 - 48/48 complete from $0 to $250;
-- at $285 the run latches `spend_cap` with work stopped or not started, and
-  nothing is held or queued afterwards.
+- at $285, three of the four arms latch `spend_cap` with work stopped or not
+  started; the no-premium, cache-working arm completes 48/48.
+
+Every outcome column is identical across the two runs. The wait and decline
+tallies are not: "waits entered" differs by up to 79 between the two identical
+runs, so each tally is one sample rather than a stable value.
 
 **NOT COVERED:** Stage 2's embedding, the rater, and any direct
 `begin_billed_attempt` caller keep E1's immediate decline and are not queued.
