@@ -6536,9 +6536,11 @@ MAX_WORKERS = 12
 # REMAINING budget.
 #
 # THE CAP IS A CAMPAIGN BUDGET AND NOT A PER-INVOCATION ALLOWANCE, which is the
-# whole reason `oncotriage/storage/database_logger.py:campaign_spend_before`
+# whole reason `oncotriage/storage/database_logger.py:campaign_billing_total`
 # exists: a resumed run seeds its ledger with what its predecessors already
-# spent, read out of `inferences.estimated_cost_usd`. Without that, a run that
+# spent, read out of the campaign's cumulative `inferences.billing_attempts`
+# record (it read `inferences.estimated_cost_usd` until the cumulative-spend
+# pass, which describes final attempts only). Without that, a run that
 # tripped the cap and was restarted by a supervisor would get a fresh $300 every
 # time, which is the failure mode a per-run cap has and a campaign cap does not.
 
@@ -6756,7 +6758,7 @@ argument is about what the two bound rather than about tidiness:
     number over two tables is a number whose meaning depends on which of them
     moved.
   * THEY RESUME FROM DIFFERENT STORES. A campaign seeds its ledger from the
-    `runs` chain (`database_logger.campaign_spend_before`); the judge seeds
+    cumulative billing record (`database_logger.campaign_billing_total`); the judge seeds
     from `oncotriage/spend_journal.py`. Two chains were already being compared
     against one cap, which is the conflation `spend.SPEND_BUDGETS` removes.
 

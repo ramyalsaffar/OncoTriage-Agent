@@ -194,19 +194,47 @@ def get_embedding(text: str) -> List[float]:
     # than a silent full-price dense search.
     spend.require_budget(spend.SPEND_SOURCE_EMBEDDING,
                          "Stage 2's dense retrieval channel")
-    response = deps.get_openai_client().embeddings.create(
-        model=config.EMBEDDING_MODEL,
-        input=text,
-        # The STRUCTURED Timeout, so an unreachable host still fails on the
-        # SDK's 5s connect phase rather than waiting out the 30s read budget.
-        #
-        # CALLED, not imported. In the package the structured timeouts are lazy,
-        # because building one constructs a throwaway OpenAI client to read the
-        # SDK's own default connect phase -- so importing the value would need
-        # credentials at import, which is exactly what pass 20c-1 removed from
-        # File 03.
-        timeout=config.get_embedding_request_timeout(),
-    )
+    # ── THE DURABLE RESERVATION, BEFORE THE REQUEST ────────────────────────
+    #
+    # A campaign's cumulative billing record (spend.BILLING_RECORD) counts this
+    # call too: the embedding is billed in the same budget as Stage 5 and is on
+    # no inference row, so a resumed campaign could not otherwise see it. The
+    # reservation is the text over the project's deliberately LOW chars-per-token
+    # ratio -- an over-estimate -- and a response settles at its real usage. With
+    # no sink installed this is a no-op. A reservation that cannot be persisted
+    # RAISES, and Stage 2's channel handler degrades to BM25-only exactly as for
+    # an unreachable endpoint -- nothing is dispatched.
+    #
+    # A FAILED REQUEST IS CHARGED AT THE RESERVATION IN BOTH LEDGERS (the
+    # billing closure pass), because nothing here can say the provider did not
+    # bill it. It used to settle at the reservation DURABLY while the in-process
+    # ledger charged nothing, so a live process admitted spending a resume would
+    # refuse. `AttemptLiability.resolve` charges the ledger and settles the row
+    # from one number; see spend.attempt_liability.
+    _reservation = spend.begin_billed_attempt(
+        spend.SPEND_SOURCE_EMBEDDING, config.EMBEDDING_MODEL,
+        int(len(str(text)) / float(config.PROVIDER_RESERVATION_CHARS_PER_TOKEN))
+        + 1, 0, where="Stage 2's dense retrieval channel")
+    try:
+        response = deps.get_openai_client().embeddings.create(
+            model=config.EMBEDDING_MODEL,
+            input=text,
+            # The STRUCTURED Timeout, so an unreachable host still fails on the
+            # SDK's 5s connect phase rather than waiting out the 30s read budget.
+            #
+            # CALLED, not imported. In the package the structured timeouts are
+            # lazy, because building one constructs a throwaway OpenAI client to
+            # read the SDK's own default connect phase -- so importing the value
+            # would need credentials at import, which is exactly what pass 20c-1
+            # removed from File 03.
+            timeout=config.get_embedding_request_timeout(),
+        )
+    except Exception:
+        _reservation.resolve(spend.BILLING_OUTCOME_POSSIBLY_BILLED)
+        raise
+    except BaseException:
+        _reservation.resolve(spend.BILLING_OUTCOME_ABANDONED)
+        raise
     # ── THE CHARGE, IMMEDIATELY AFTER THE RESPONSE ────────────────────────
     #
     # `usage.completion_tokens` DOES NOT EXIST ON AN EMBEDDING RESPONSE and is
@@ -219,13 +247,14 @@ def get_embedding(text: str) -> List[float]:
     # input rate against a figure that already includes it.
     #
     # THE MODEL IS THE ECHOED ONE, falling back to the configured id, which is
-    # `_charge_spend`'s rule one module over: the provider bills what it
-    # answered with.
+    # `_Stage5AttemptRecord.response`'s rule one module over: the provider bills
+    # what it answered with.
     _usage = getattr(response, "usage", None)
-    spend.SPEND_LEDGER.charge(
-        getattr(response, "model", None) or config.EMBEDDING_MODEL,
-        getattr(_usage, "prompt_tokens", None), 0,
-        source=spend.SPEND_SOURCE_EMBEDDING)
+    _reservation.resolve(
+        spend.BILLING_OUTCOME_RESPONSE,
+        model=getattr(response, "model", None) or config.EMBEDDING_MODEL,
+        prompt_tokens=getattr(_usage, "prompt_tokens", None),
+        completion_tokens=0)
     return response.data[0].embedding
 
 

@@ -1372,10 +1372,14 @@ check("matching_provider is TEXT in the real schema",
 # content-keyed table in this schema, which is exactly why the pin is kept
 # EXACT -- a table keyed by content is what a lookup table for this column
 # would look like, and only naming the members separates the two.
+# `run_counter_registry` (era 18, the billing closure pass) is keyed by run and
+# counter NAME, and holds degradation-counter names -- not provider or model
+# strings -- so it is not a lookup table for `matching_provider` either.
 check("...and no lookup table was introduced for it",
       sorted(_tables),
-      ["drift_metrics", "drift_reference", "inferences", "run_environment",
-       "run_metrics", "runs", "trial_matches"])
+      ["billing_attempts", "drift_metrics", "drift_reference", "inferences",
+       "run_counter_registry", "run_environment", "run_metrics", "runs",
+       "trial_matches"])
 # `drift_reference` JOINED THE SET AT SCHEMA ERA 16 AND IT IS NOT A LOOKUP
 # TABLE FOR THIS COLUMN, which is what this assertion is about. It is the drift
 # redesign's designation store -- one row per reference an operator chose, with

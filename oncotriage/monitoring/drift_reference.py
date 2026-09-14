@@ -553,7 +553,7 @@ null-safe equality, so two all-NULL stamps compare equal and every unstamped
 run in the table would be "the same configuration". ``fingerprint_version`` is
 ``run_fingerprint``'s own key for "this configuration was never recorded", and
 it is what the resolvability test reads -- the same guard
-``campaign_spend_before`` and ``campaign_summary`` both make.
+``campaign_run_ids`` and ``campaign_summary`` both make.
 """
 
 PAIR_VERIFIED = "verified"
@@ -830,7 +830,7 @@ def _fingerprint_key(columns, values):
     ``run_id`` (the LEFT JOIN gives NULLs), a run written before fingerprinting,
     and a caller that stamped nothing; in all three the configuration was never
     recorded, and comparing two unrecorded configurations as equal is the
-    null-safe-equality trap ``campaign_spend_before`` already guards against.
+    null-safe-equality trap ``campaign_run_ids`` already guards against.
     """
     if not columns:
         return None

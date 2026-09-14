@@ -1940,6 +1940,24 @@ def _spend_gate(phase, counter, *, where, count=None):
     which is a defect report rather than a budget event, and an operator reading
     it is sent to the traceback rather than to ``config.SPEND_CAP_USD``.
     """
+    # A RUN LATCHED BY ITS BILLING RECORD DISPATCHES NOTHING FURTHER, AND IT IS
+    # ASKED FIRST. The cap and the ceiling are about how much was spent; this is
+    # about whether a charge can still be COUNTED, and a request sent without
+    # that is spend a resumed campaign cannot see. Declining here rather than
+    # letting the attempt's own reservation refuse keeps the refusal off the
+    # retry policy's path entirely.
+    if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_BILLING_RECORD:
+        spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_BILLING_RECORD}"] += 1
+        log.warning("a Stage 5 request was not issued because the campaign's "
+                    "durable billing record could not be written",
+                    stage=5, status="stopped",
+                    event="stage5_billing_record_declined", phase=phase,
+                    reason=spend.SPEND_LIMIT_BILLING_RECORD, count=count,
+                    degraded=True)
+        return Stage5SpendStopped(
+            "the request was not issued: the campaign's durable billing record "
+            "could not be written earlier in this run",
+            limit=spend.SPEND_LIMIT_BILLING_RECORD)
     if spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5):
         spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_CAP}"] += 1
         # THE LATCH IS ASKED FOR RATHER THAN TAKEN, and that one condition is
@@ -2011,28 +2029,63 @@ def _spend_gate(phase, counter, *, where, count=None):
     return None
 
 
-def _charge_spend(response):
-    """Charge one billed response to the run ledger. NEVER RAISES.
+class _Stage5AttemptRecord:
+    """``provider_resilience.execute``'s ``attempt_record`` for one logical call.
 
-    CALLED IMMEDIATELY AFTER EVERY BILLED RESPONSE, AT ALL THREE SITES, AND
-    THAT PLACEMENT IS WHAT BOUNDS THE OVERSHOOT. The gate reads a number that is
-    current to within the requests actually in flight; charging where the node
-    folds its accumulators instead would leave a whole patient's wave
-    unaccounted, because per-trial mode dispatches every request before the node
-    reads any of them. See ``config.SPEND_CAP_USD``'s overshoot block.
+    ONE WIRE ATTEMPT, ONE LIABILITY. ``begin`` creates a
+    ``spend.AttemptLiability`` after the pacer's wait and BEFORE ``send()`` --
+    which persists the durable reservation when a sink is installed -- and each
+    of the three resolutions resolves it exactly once.
 
-    IT IS NOT THE SAME ARITHMETIC AS ``_billed_so_far()`` AND MUST NOT BE
-    FOLDED INTO IT. Those accumulators are per INVOCATION and reset on every
-    retry, which is the under-count ``run_harness.price_result`` documents; this
-    is per PROCESS and counts every attempt. Two ledgers, two questions.
+    THE LEDGER IS CHARGED HERE AND NOWHERE ELSE (the billing closure pass).
+    It used to be charged by ``_charge_spend`` at the three node call sites for
+    a response and by ``_charge_upper_bound`` for a possibly-billed failure,
+    while the durable row was settled here -- two writers pricing one attempt,
+    which disagreed on an unpriceable response ($0 in the ledger, the
+    reservation durably). ``AttemptLiability.resolve`` charges both from ONE
+    number. The charge is now issued INSIDE the retry policy, immediately after
+    ``send()`` returns, which is earlier than the call-site charge it replaces
+    and so keeps the overshoot bound at the requests actually in flight.
 
-    IT PRICES ON THE ECHOED MODEL, which is what the provider bills and what
-    ``inferences.matching_model`` stores.
+    It runs whether or not a durable sink is installed -- the API, the MCP
+    server and the ablation study charge their ledgers through it too.
+
+    A RESERVATION THAT CANNOT BE PERSISTED BECOMES ``Stage5SpendStopped``, so
+    every place that must not isolate a stop to its trial covers this too: the
+    patient fails, is not checkpointed, and a resume runs it.
     """
-    usage = getattr(response, "usage", None)
-    spend.SPEND_LEDGER.charge(getattr(response, "model", None),
-                              getattr(usage, "prompt_tokens", None),
-                              getattr(usage, "completion_tokens", None))
+
+    def __init__(self, model, input_tokens, output_tokens):
+        self._model = model
+        self._input = input_tokens
+        self._output = output_tokens
+
+    def begin(self):
+        try:
+            return spend.begin_billed_attempt(
+                spend.SPEND_SOURCE_STAGE5, self._model, self._input,
+                self._output, where="a Stage 5 billed attempt")
+        except spend.BillingRecordUnavailable as exc:
+            raise Stage5SpendStopped(f"the request was not issued: {exc}",
+                                     limit=spend.SPEND_LIMIT_BILLING_RECORD
+                                     ) from exc
+
+    def response(self, token, result):
+        usage = getattr(result, "usage", None)
+        token.resolve(spend.BILLING_OUTCOME_RESPONSE,
+                      model=getattr(result, "model", None),
+                      prompt_tokens=getattr(usage, "prompt_tokens", None),
+                      completion_tokens=getattr(usage, "completion_tokens",
+                                                None))
+
+    def failure(self, token, verdict):
+        token.resolve(
+            spend.BILLING_OUTCOME_POSSIBLY_BILLED
+            if verdict.billing == provider_resilience.BILLING_POSSIBLY_BILLED
+            else spend.BILLING_OUTCOME_NOT_BILLED)
+
+    def abandoned(self, token):
+        token.resolve(spend.BILLING_OUTCOME_ABANDONED)
 
 
 # ---------------------------------------------------------------------------
@@ -2245,13 +2298,19 @@ def _execute_matching_call(send, system_prompt: str, user_prompt: str, *,
     ledger, priced at the wire model. The ledger used to be charged only when a
     response arrived, which assumed a zero for a read timeout or a dropped
     connection that the provider may well have billed.
+
+    THE CHARGE IS ISSUED BY THE ATTEMPT RECORD, NOT BY ``on_possibly_billed``
+    (the billing closure pass). That callback now REPORTS the upper bound for
+    the policy's unconfirmed-billing tally and charges nothing, because the
+    attempt record charged it: charging in both would bill the attempt twice.
     """
     _input = _reservation_input_tokens(system_prompt, user_prompt)
     _max_output = int(max_output)
 
-    def _charge_upper_bound(_verdict) -> float:
-        return spend.SPEND_LEDGER.charge(config.matching_wire_model(),
-                                         _input, _max_output)
+    def _upper_bound_usd(_verdict) -> float:
+        usd, _fault = spend.price_usage(config.matching_wire_model(), _input,
+                                        _max_output)
+        return float(usd or 0.0)
 
     return provider_resilience.execute(
         send,
@@ -2270,8 +2329,11 @@ def _execute_matching_call(send, system_prompt: str, user_prompt: str, *,
         classify=_classify_matching_failure,
         sdk_attempts=config.matching_sdk_attempts_per_call(),
         cancelled=_stage5_cancellation(drain_applies=drain_applies),
-        on_possibly_billed=_charge_upper_bound,
+        on_possibly_billed=_upper_bound_usd,
         usage_tokens_of=_usage_token_total,
+        # THE DURABLE HALF OF THE SAME ACCOUNTING. See `_Stage5AttemptRecord`.
+        attempt_record=_Stage5AttemptRecord(config.matching_wire_model(),
+                                            _input, _max_output),
         label="stage5")
 
 
@@ -5908,20 +5970,37 @@ CLINICAL TRIALS:
         the only honest number available and is strictly better than a zero
         that asserts no spend.
 
-        ``calls_made`` IS THE PRESENCE MARKER AND THE GUARD IS THE POINT.
-        It is incremented immediately after a response is returned and
-        immediately before ``response.usage`` is read, so ``calls_made == 0``
-        means no usage object was ever obtained by this invocation -- the very
-        first request raised before any response arrived. The tokens that
-        request may have been billed are unknown TO THIS PROCESS and are not
-        recoverable from anywhere inside it, so the keys are left ABSENT rather
-        than written as 0. What the caller then stores is a 0 supplied by
-        ``_pipeline_provenance()``, not by a measurement here; the two are
-        separable in the row because ``llm_classifier_calls`` is written on
-        every return now and reads 0 while ``llm_classifier_prompt_sha256`` is
-        non-NULL, which is the signature of "Stage 5 ran and no call was
-        counted". Estimating from prompt length instead would put a number in
-        a measurement column that no provider ever reported.
+        ALL THREE KEYS ARE WRITTEN ON EVERY CALL, ZEROS INCLUDED, AND THE
+        ABSENT-WHEN-ZERO GUARD THAT STOOD HERE WAS A DEFECT. ``calls_made == 0``
+        means this ATTEMPT obtained no usage object -- its first request raised
+        before any response arrived, or a gate declined it before anything was
+        sent. The guard left the keys ABSENT on that path, on the argument that
+        ``_pipeline_provenance()``'s ``state.get(..., 0)`` would supply the
+        zero. That is true of a patient's FIRST attempt and false of every later
+        one: LangGraph keeps a channel's last written value until a node writes
+        it again, and this node re-enters itself, so an absent key published the
+        EARLIER attempt's figure. The smoke database's row 7 is the shape --
+        ``llm_classifier_calls = 1`` and 12,101 input tokens (that patient's
+        warmup) beside ``llm_classifier_call_details = '[]'`` and an error saying
+        the final attempt issued nothing. Both orders are driven through the
+        real graph and writer by
+        tests/test_agent_stage5_attempt_provenance.py.
+
+        THE ZERO IS STILL NOT AN ESTIMATE. ``calls_made`` is incremented at
+        every site that folds tokens into ``input_tokens`` / ``output_tokens``,
+        so both are 0 exactly when it is: what is written is this attempt's own
+        measured accumulators, not a number invented for an absence. The tokens
+        a request that raised before any response may have been billed remain
+        unknown TO THIS PROCESS, exactly as before, and the row still separates
+        that case -- ``llm_classifier_calls`` reads 0 while
+        ``llm_classifier_prompt_sha256`` is non-NULL, the signature of "Stage 5
+        ran and no call was counted". Estimating from prompt length instead
+        would put a number in a measurement column that no provider ever
+        reported. What the process DOES know about such a request -- the upper
+        bound ``provider_resilience`` charges for a possibly-billed failure --
+        is in ``spend.SPEND_LEDGER``, which is cumulative across attempts and is
+        what the cap enforces; resetting this attempt's figures erases nothing
+        from it.
 
         ``llm_classifier_calls`` IS CARRIED FOR THE SAME REASON THE TOKENS ARE.
         It was written on the success return only, so a refusal after a real
@@ -5976,8 +6055,6 @@ CLINICAL TRIALS:
             at ``run_harness.price_result``; it is not introduced or worsened
             here, and it is why the stored total is a floor.
         """
-        if not calls_made:
-            return {}
         return {
             "llm_classifier_input_tokens": input_tokens,
             "llm_classifier_output_tokens": output_tokens,
@@ -6169,12 +6246,12 @@ CLINICAL TRIALS:
                     system_prompt, prompt_, prompt_cache_key=cache_key_)
             except Exception as exc:              # noqa: BLE001 -- see above
                 return ("error", exc)
-            # CHARGED HERE AND NOT WHERE THE SEND LOOP READS IT. A response in
-            # hand has been billed whether or not this node ever consumes it --
-            # `_account_unconsumed` exists precisely because per-trial mode
-            # abandons some of them -- and the gate's whole value is that the
-            # number it reads is current.
-            _charge_spend(_response)
+            # ALREADY CHARGED, INSIDE `call_matching_model`, by the attempt
+            # record's resolution -- not where the send loop reads it. A
+            # response in hand has been billed whether or not this node ever
+            # consumes it (`_account_unconsumed` exists precisely because
+            # per-trial mode abandons some of them), and the gate's whole value
+            # is that the number it reads is current. See _Stage5AttemptRecord.
             return ("ok", _response)
 
         # THE ALIGNMENT IS ASSERTED, NOT ASSUMED, and `zip` is exactly why: it
@@ -6489,9 +6566,9 @@ CLINICAL TRIALS:
                     event="per_trial_shutdown_before_warmup",
                     retry=retry_count + 1, count=len(_dispatch_pairs),
                     reason=_gate_reason, degraded=True)
-            elif _spend_gate(spend.SPEND_SKIP_WARMUP_KEY_PREFIX,
-                             _call_counter,
-                             where="a Stage 5 cache warmup") is not None:
+            elif (_gate_refusal := _spend_gate(
+                    spend.SPEND_SKIP_WARMUP_KEY_PREFIX, _call_counter,
+                    where="a Stage 5 cache warmup")) is not None:
                 # THE GATE FIRED BEFORE THE CACHE WRITER, SO THIS PATIENT SENDS
                 # NOTHING AND COSTS NOTHING. It is the shutdown branch above,
                 # reached for the other reason and handled identically:
@@ -6504,9 +6581,18 @@ CLINICAL TRIALS:
                 # path is real, and a send loop left holding chunks would send
                 # every one of them -- at full price, against a cache nothing
                 # wrote, after the budget was declared spent.
+                # THE GATE'S OWN LIMIT IS CARRIED, because the floor's sentence
+                # branches on it: a billing-record latch reported as "the
+                # campaign has spent $X" would send an operator to the cap.
+                _gate_limit = getattr(_gate_refusal, "limit", None)
                 _warmup_error = Stage5SpendStopped(
-                    f"no Stage 5 request was issued for this patient: the "
-                    f"campaign has spent ${spend.SPEND_LEDGER.total:.2f}")
+                    (f"no Stage 5 request was issued for this patient: "
+                     f"{_gate_refusal}"
+                     if _gate_limit == spend.SPEND_LIMIT_BILLING_RECORD
+                     else f"no Stage 5 request was issued for this patient: "
+                          f"the campaign has spent "
+                          f"${spend.SPEND_LEDGER.total:.2f}"),
+                    limit=_gate_limit)
                 _warmup_error_source = WARMUP_SOURCE_SPEND_LIMIT
                 pending.clear()
                 log.warning(
@@ -6600,12 +6686,11 @@ CLINICAL TRIALS:
                     # `_billed_so_far()` is what the floor below returns, and a
                     # warmup whose cache could not be confirmed must still show
                     # up as the one billed call it was.
-                    # CHARGED BEFORE IT IS ACCOUNTED, so the ledger carries
-                    # the warmup even on the paths where `_confirm_cache_write`
-                    # then fails the patient: a refused warmup is still a billed
-                    # request, and a gate that only counted the ones that
-                    # succeeded would under-enforce by exactly the failures.
-                    _charge_spend(_warmup_response)
+                    # ALREADY CHARGED before it is accounted -- by the attempt
+                    # record inside `call_matching_model_warmup` -- so the
+                    # ledger carries the warmup even on the paths where
+                    # `_confirm_cache_write` then fails the patient: a refused
+                    # warmup is still a billed request.
                     _account_warmup(_warmup_response)
                     _confirm_cache_write(_warmup_response,
                                          WARMUP_SOURCE_WARMUP)
@@ -6904,9 +6989,10 @@ CLINICAL TRIALS:
         # what makes the retry the IDENTICAL request the design says it is:
         # tests/test_agent_stage5_per_trial_calls.py section 7b compares the
         # two requests as bytes rather than taking that on trust.
+        # Charged inside `call_matching_model` by the attempt record (the
+        # billing closure pass); nothing here charges the ledger a second time.
         _live = call_matching_model(system_prompt, _user_prompt_for(chunk),
                                     prompt_cache_key=_cache_key)
-        _charge_spend(_live)
         return _live
 
     def _account_unconsumed() -> int:
@@ -7136,7 +7222,7 @@ CLINICAL TRIALS:
     # the counter that answers.
     per_trial_succeeded = 0
 
-    def _per_trial_call_census() -> Dict:
+    def _per_trial_call_census(*, wave_final: bool) -> Dict:
         """How many trial calls this invocation issued, lost and got answers to.
 
         WHY IT LEAVES THE NODE AT ALL. `per_trial_failed_calls` was read by two
@@ -7196,7 +7282,26 @@ CLINICAL TRIALS:
         graph back in here and both counters restart at zero, so a patient that
         spent three attempts reports the last one's census. That is the
         pre-existing behaviour of the token accumulators beside it.
+
+        ``wave_final`` IS REQUIRED, WITH NO DEFAULT, AND IT DECIDES THE ANSWER.
+        ``True`` on the two exits that have read their whole wave -- the
+        all-failed floor and the success return -- and ``False`` on the four
+        that return with the wave part-read -- the API error, the refusal, the
+        parse error and the non-list body -- which get the None triple: "this
+        attempt's wave accounting does not describe the run", the reading the
+        grouped arm gets. Those four used to leave the keys ABSENT, and absent
+        is not None in a node that re-enters itself: LangGraph keeps the last
+        written value, so a floor followed by a mid-loop failure published the
+        FLOOR's census beside the later attempt's tokens. No default, because a
+        default would let a new exit skip the question and publish a part-read
+        prefix as a total, which is the argument this helper exists for.
         """
+        if not wave_final:
+            return {
+                "llm_classifier_per_trial_calls_attempted": None,
+                "llm_classifier_per_trial_calls_failed": None,
+                "llm_classifier_per_trial_calls_answered": None,
+            }
         if not _per_trial_calls:
             return {
                 "llm_classifier_per_trial_calls_attempted": None,
@@ -7407,10 +7512,15 @@ CLINICAL TRIALS:
                 "llm_classifier_output_split_threshold": split_threshold,
                 "llm_classifier_output_ceiling": MATCHING_MAX_TOKENS,
                 "llm_classifier_raw_response": "",
-                # What the calls that DID return were billed. Empty when this
-                # was the first request and no usage object ever arrived; see
-                # _billed_so_far for why absent rather than zero.
+                # What the calls that DID return were billed. Zeros, written
+                # explicitly, when this was the first request and no usage
+                # object ever arrived; see _billed_so_far for why a key left
+                # absent here would publish an EARLIER attempt's figure.
                 **_billed_so_far(),
+                # THE WAVE'S CENSUS AS None, WRITTEN RATHER THAN LEFT ABSENT:
+                # an absent key keeps an EARLIER attempt's census across a
+                # re-entry. See `_per_trial_call_census`.
+                **_per_trial_call_census(wave_final=False),
                 # The model that answered the earlier chunks of this batch, if
                 # any. None when the first call raised, which is the same value
                 # this key had before and reads as "Stage 5 obtained no
@@ -7685,6 +7795,10 @@ CLINICAL TRIALS:
                 # every call before this one AND for the refusing call itself,
                 # above. Recording zeros here was the defect.
                 **_billed_so_far(),
+                # THE WAVE'S CENSUS AS None, WRITTEN RATHER THAN LEFT ABSENT:
+                # an absent key keeps an EARLIER attempt's census across a
+                # re-entry. See `_per_trial_call_census`.
+                **_per_trial_call_census(wave_final=False),
                 "error": error_msg,
                 "llm_classifier_prompt_version": PROMPT_VERSION,
                 "llm_classifier_prompt_sha256": system_prompt_sha256,
@@ -7825,6 +7939,10 @@ CLINICAL TRIALS:
                 # inside it. Writing zeros was not a gap in the accumulation,
                 # it was a gap in the return.
                 **_billed_so_far(),
+                # THE WAVE'S CENSUS AS None, WRITTEN RATHER THAN LEFT ABSENT:
+                # an absent key keeps an EARLIER attempt's census across a
+                # re-entry. See `_per_trial_call_census`.
+                **_per_trial_call_census(wave_final=False),
                 "error": error_msg,
                 # The prompt WAS rendered before this return -- every one of Stage
                 # 5's early returns sits below the render call -- so the hash is a
@@ -7904,6 +8022,10 @@ CLINICAL TRIALS:
                 # inside it. Writing zeros was not a gap in the accumulation,
                 # it was a gap in the return.
                 **_billed_so_far(),
+                # THE WAVE'S CENSUS AS None, WRITTEN RATHER THAN LEFT ABSENT:
+                # an absent key keeps an EARLIER attempt's census across a
+                # re-entry. See `_per_trial_call_census`.
+                **_per_trial_call_census(wave_final=False),
                 "error": error_msg,
                 # The prompt WAS rendered before this return -- every one of Stage
                 # 5's early returns sits below the render call -- so the hash is a
@@ -8009,7 +8131,7 @@ CLINICAL TRIALS:
         #
         # WHY `pending.append` AND NOT AN INLINE CALL. Re-queuing sends the
         # retry back through `_obtain` and then through every line of this loop:
-        # the shutdown gate, the spend gate, `_charge_spend`, the usage
+        # the shutdown gate, the spend gate, the attempt record's charge, the usage
         # accumulators, the answering-model check, the cache-read check and its
         # own ledger row. An inline call would have to reproduce all of that or
         # silently skip it. `pending` is a LIFO and this appends to the end, so
@@ -8334,8 +8456,17 @@ CLINICAL TRIALS:
                 # branch above would have told an operator that somebody
                 # interrupted a run nobody touched; this names the budget,
                 # which is where the remedy is.
-                _what = ("a spend limit was reached before this patient's "
-                         "wave was dispatched, so no request was issued at all")
+                # THE BILLING-RECORD LATCH SHARES THIS SOURCE AND NOT THIS
+                # SENTENCE: "a spend limit was reached" would send an operator
+                # to the cap for a stop whose remedy is the database.
+                _what = (("the campaign's durable billing record could not be "
+                          "written, so no request was dispatched for this "
+                          "patient")
+                         if getattr(_warmup_error, "limit", None)
+                         == spend.SPEND_LIMIT_BILLING_RECORD
+                         else ("a spend limit was reached before this "
+                               "patient's wave was dispatched, so no request "
+                               "was issued at all"))
             elif _warmup_error_source == WARMUP_SOURCE_FALLBACK_WRITER:
                 _what = ("the provider refused the dedicated warmup's shape "
                          "and the fallback's cache writer then failed, so the "
@@ -8392,9 +8523,10 @@ CLINICAL TRIALS:
             # THE WAVE'S CENSUS, ON A RETURN WHERE IT IS FINAL. This floor is
             # reached only after `pending` is exhausted or cleared, so both
             # counters have stopped moving -- unlike the mid-loop returns
-            # above, which leave the wave part-read and would publish a prefix
-            # as a total. See `_per_trial_call_census`.
-            **_per_trial_call_census(),
+            # above, which leave the wave part-read and write the None triple
+            # rather than a prefix reported as a total. See
+            # `_per_trial_call_census`.
+            **_per_trial_call_census(wave_final=True),
             **_billed_so_far(),
             "matching_model": model_answered,
             "error": error_msg,
@@ -9399,13 +9531,16 @@ CLINICAL TRIALS:
         # llm_classifier_prompt_sha256. 0 is therefore a measurement.
         "hallucinated_trials": len(hallucinated_ids),
         # HOW MANY TRIAL CALLS THIS WAVE ISSUED, LOST AND GOT ANSWERS TO.
-        # Written here and on the all-failed floor, and deliberately NOT on the
-        # mid-loop returns: those end the node with `pending` part-read, so any
-        # census they carried would be a prefix reported as a total -- exactly
-        # `hallucinated_trials`' own argument two lines up. A key that is never
-        # written leaves `state.get()` at None, which is the same tri-state the
-        # grouped arm gets by construction. See `_per_trial_call_census`.
-        **_per_trial_call_census(),
+        # COUNTED here and on the all-failed floor (`wave_final=True`); the
+        # mid-loop returns write the None triple instead (`wave_final=False`),
+        # because they end the node with `pending` part-read, so any count they
+        # carried would be a prefix reported as a total -- exactly
+        # `hallucinated_trials`' own argument two lines up. None is WRITTEN
+        # there rather than left absent: this node re-enters itself, and a key
+        # never written keeps an earlier attempt's census. None is the same
+        # tri-state the grouped arm gets by construction. See
+        # `_per_trial_call_census`.
+        **_per_trial_call_census(wave_final=True),
         "llm_classifier_calls": calls_made,
         "llm_classifier_raw_response": response_text,
         "llm_classifier_prompt": prompt,

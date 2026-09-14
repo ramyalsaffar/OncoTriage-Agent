@@ -498,11 +498,13 @@ class _TrackingStandIn:
 
 _PATCHED = ("build_bm25_index_from_qdrant", "build_matching_graph", "tracking",
             "load_results", "clear_checkpoint", "load_checkpoint",
-            "process_patient", "run_batch", "run_resample")
+            "process_patient", "run_batch", "run_resample",
+            "establish_billing_campaign")
 
 
 def drive_main(db_path, corpus, *, checkpoint_dir, process_patient=None,
-               run_batch=None, load_checkpoint=None):
+               run_batch=None, load_checkpoint=None,
+               establish_billing_campaign=None):
     """Run the REAL main() against a scratch tree. Returns (console text, exc).
 
     The restore is in a ``finally`` and is asserted by the caller: a stand-in
@@ -522,6 +524,8 @@ def drive_main(db_path, corpus, *, checkpoint_dir, process_patient=None,
         _runner.load_results = lambda *a, **k: []
         _runner.clear_checkpoint = lambda *a, **k: None
         _runner.load_checkpoint = load_checkpoint or (lambda *a, **k: set())
+        if establish_billing_campaign is not None:
+            _runner.establish_billing_campaign = establish_billing_campaign
         _runner.tracking = tracking
         _runner.run_resample = lambda **k: None
         if run_batch is not None:
@@ -792,7 +796,19 @@ _resume_corpus = _make_corpus(os.path.join(_TMP, "resume_fhir"), 3)
 _resume_text, _resume_exc, _resume_tracking = drive_main(
     _RESUME_DB, _resume_corpus, checkpoint_dir=_RESUME_CP,
     process_patient=erroring_patient,
-    load_checkpoint=lambda *a, **k: {"patient0"})
+    load_checkpoint=lambda *a, **k: {"patient0"},
+    # A FAKED RESUME NEEDS A FAKED CAMPAIGN (the cumulative-spend pass). The
+    # checkpoint above is a stand-in with no predecessor run behind it, and
+    # the real establish_billing_campaign correctly REFUSES a resume that no
+    # durable evidence identifies (historical_spend_uncovered: not_identified)
+    # -- tests/test_campaign_billing_record.py measures that refusal. This
+    # section's subject is the `resumed` column and tag, so it gets the
+    # smallest object that satisfies the caller: a continued campaign with an
+    # empty billing-record seed.
+    establish_billing_campaign=lambda *a, **k: _runner.CampaignBudget(
+        "stand-in-campaign", _runner.CAMPAIGN_DECISION_CONTINUED,
+        _runner.spend.LedgerSeed(
+            source=_runner.spend.SEED_SOURCE_BILLING_RECORD)))
 
 
 def _tag(tracking):

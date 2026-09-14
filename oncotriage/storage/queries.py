@@ -265,11 +265,12 @@ class Query:
     """
 
     __slots__ = ("key", "sql", "heading", "render", "blank_after", "notes",
-                 "requires", "requires_columns", "clean_message")
+                 "requires", "requires_columns", "optional_columns",
+                 "clean_message")
 
     def __init__(self, key, sql, heading=None, render="to_string",
                  blank_after=True, notes=(), requires=(), requires_columns=(),
-                 clean_message=None):
+                 clean_message=None, optional_columns=()):
         self.key = key
         self.sql = sql
         self.heading = heading
@@ -278,6 +279,16 @@ class Query:
         self.notes = tuple(notes)
         self.requires = tuple(requires)
         self.requires_columns = tuple(tuple(pair) for pair in requires_columns)
+        # ``(table, column)`` pairs the SQL names and which a database may lack
+        # WITHOUT the query losing its meaning (the billing closure pass). When
+        # one is absent, ``run()`` renders every reference to it -- qualified by
+        # an alias bound to that table -- as ``NULL``, instead of the query
+        # being skipped. It exists for ``runs.billing_campaign_id``: a database
+        # older than era 18 has no run carrying one, so NULL is the TRUE value
+        # there, and skipping the whole run view over it hid the Run Health tab
+        # on every read-only pre-era-18 database. A column whose absence changes
+        # what the query means belongs in ``requires_columns``, never here.
+        self.optional_columns = tuple(tuple(pair) for pair in optional_columns)
         # What ``render='empty_or_to_string'`` prints INSTEAD of an empty frame.
         # ``None`` keeps CONSISTENCY_CLEAN_MESSAGE, which is what the one
         # pre-existing user of that mode has always printed, so no existing
@@ -1269,8 +1280,8 @@ cohort -- which is exactly the fragmentation this query exists to undo.
 
 IT MOVED TO ``oncotriage/storage/database_logger.py`` (the spend-gate pass) AND
 IS IMPORTED, NOT RESTATED. A second consumer appeared --
-``campaign_spend_before``, which walks the SAME chain backwards to seed a
-resumed run's budget -- and it lives one layer DOWN, in the module that owns the
+the backward chain walk that seeded a resumed run's budget (deleted by the
+cumulative-spend pass; ``campaign_run_ids`` walks the chain now) -- and it lives one layer DOWN, in the module that owns the
 `runs` table, so it cannot import this one (this imports it, and the reverse is
 a cycle). The choice was between a third copy of a three-member tuple whose
 whole value is that adding a status is a deliberate edit, or one owner in the
@@ -1425,17 +1436,37 @@ writer's own tuple. Grows by itself when a field is gated."""
 
 _CAMPAIGN_EDGE_SQL = f"""    edge AS (
         SELECT r.id AS edge_run_id,
-               CASE WHEN r.resumed = 1 THEN (
+               CASE WHEN r.{CAMPAIGN_STAMP_COLUMN} IS NULL THEN NULL
+               ELSE COALESCE(
+                   CASE WHEN r.billing_campaign_id IS NOT NULL THEN (
+                       SELECT MAX(prevc.id)
+                         FROM runs prevc
+                        WHERE prevc.id < r.id
+                          AND prevc.billing_campaign_id = r.billing_campaign_id
+                          AND prevc.{CAMPAIGN_STAMP_COLUMN} IS NOT NULL
+                   ) END,
+                   CASE WHEN r.resumed = 1 THEN (
                    SELECT MAX(prev.id)
                      FROM runs prev
                     WHERE prev.id < r.id
                       AND prev.status IN ({_CAMPAIGN_STATUS_LIST_SQL})
                       AND prev.{CAMPAIGN_STAMP_COLUMN} IS NOT NULL
+                      AND prev.billing_campaign_id IS NULL
 {_CAMPAIGN_FINGERPRINT_MATCH_SQL}
-               ) END AS parent_id
+                   ) END)
+               END AS parent_id
           FROM runs r
     )"""
 """Each run and the run it continues, or NULL.
+
+THE BILLING CAMPAIGN ID IS READ FIRST (the billing closure pass, era 18). A run
+carrying ``billing_campaign_id`` continues the nearest preceding stamped run
+carrying the SAME id, whatever its status and whatever ``resumed`` says: a
+zero-success restart continues one budget, and reporting it as a second campaign
+was the display defect. Only a run with no such id falls back to the rule below,
+and that rule now attaches only to runs that carry no id either, so it cannot
+glue a run onto another billing campaign. ``database_logger.campaign_parent_map``
+is this CTE in Python; a test pins the two.
 
 The alias is `prev` rather than `p` DELIBERATELY. `p` is bound to a different
 subquery in the same statement, and while SQL scoping keeps them apart,
@@ -2559,6 +2590,8 @@ QUERIES = (
         # SQL is declared here whether or not the query would survive without
         # it. Declaring more than strictly necessary costs a skip on a database
         # that could half-answer; not declaring it costs the derivation check.
+        # Optional, for campaign_summary's reason: see there.
+        optional_columns=(("runs", "billing_campaign_id"),),
         requires_columns=(("inferences", "run_id"),
                           ("runs", "matching_call_mode"), ("runs", "resumed")),
         notes=(
@@ -2603,6 +2636,10 @@ QUERIES = (
         -- is not COALESCEd to 0: a measured "not a resume" and an unrecorded
         -- one are different facts.
         r.resumed,
+        -- THE BILLING CAMPAIGN THIS RUN SPENT UNDER (era 18). A zero-success
+        -- restart reads `resumed = 0` and carries its predecessor's id here,
+        -- which is what says the two rows are one budget.
+        r.billing_campaign_id AS billing_campaign_id,
         r.fingerprint_version,
         r.llm_classifier_prompt_version,
         r.llm_classifier_renderer_digest,
@@ -2763,6 +2800,12 @@ QUERIES = (
         # row is no longer a coincidence worth a comment -- it is what a
         # GENERATED predicate over a widening tuple does, and the derived check
         # is the only thing that has ever caught it.
+        # `runs.billing_campaign_id` (era 18, the billing closure pass) is
+        # OPTIONAL rather than required: on an older database no run carries
+        # one, the stitch then takes exactly the pre-era-18 rule, and rendering
+        # the column as NULL is the true reading -- where requiring it would
+        # hide the campaign view on every read-only older database.
+        optional_columns=(("runs", "billing_campaign_id"),),
         requires_columns=(("inferences", "run_id"),
                           ("runs", "campaign_cohort_seed"),
                           ("runs", "campaign_cohort_size"),
@@ -2870,6 +2913,10 @@ WITH RECURSIVE
         SELECT m.campaign_id                                AS campaign_id,
                COUNT(*)                                     AS runs,
                MAX(m.member_run_id)                         AS last_run_id,
+               -- THE BILLING CAMPAIGN, one value per stitched campaign by
+               -- construction: members either carry the id the stitch followed
+               -- or are pre-era-18 runs that carry none.
+               MAX(r.billing_campaign_id)                   AS billing_campaign_id,
                MIN(r.started_at)                            AS first_started_at,
                MAX(r.finished_at)                           AS last_finished_at,
                SUM(CASE WHEN r.finished_at IS NULL
@@ -2908,6 +2955,10 @@ WITH RECURSIVE
                             AND m2.member_run_id > pth.at_run)
     )
 SELECT s.campaign_id,
+       -- THE ID THE BUDGET IS KEYED BY (`billing_attempts.campaign_id`), beside
+       -- the root run id this query has always called `campaign_id`. NULL for a
+       -- campaign whose runs predate era 18 or installed no billing sink.
+       s.billing_campaign_id,
        pa.run_ids,
        s.runs,
        CASE WHEN s.runs > 1 THEN 1 ELSE 0 END              AS stitched,
@@ -4418,7 +4469,33 @@ def run(conn, key) -> pd.DataFrame:
     absent = missing_requirements(conn, key)
     if absent:
         raise MissingTableError(missing_table_message(key, absent))
-    return pd.read_sql_query(QUERIES_BY_KEY[key].sql, conn)
+    return pd.read_sql_query(render_sql(conn, key), conn)
+
+
+def render_sql(conn, key) -> str:
+    """``key``'s SQL with every ABSENT optional column rendered as ``NULL``.
+
+    Only references qualified by an alias ``sql_table_aliases`` binds to that
+    column's table are rewritten, so a CTE column of the same name (``s.x`` over
+    a derived table) is left alone. A query declaring no optional columns is
+    returned verbatim. Presence is read with ``PRAGMA table_info``; a table the
+    database lacks is ``requires``' business and is refused before this runs.
+    """
+    query = QUERIES_BY_KEY[key]
+    sql = query.sql
+    if not query.optional_columns:
+        return sql
+    bound = sql_table_aliases(sql)
+    for table, column in query.optional_columns:
+        present = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column in present:
+            continue
+        aliases = sorted(a for a, t in bound.items() if t == table)
+        if not aliases:
+            continue
+        sql = re.sub(r"\b(?:" + "|".join(re.escape(a) for a in aliases)
+                     + r")\s*\.\s*" + re.escape(column) + r"\b", "NULL", sql)
+    return sql
 
 
 def run_all(conn, keys=None, stop_on_error=True) -> Dict:

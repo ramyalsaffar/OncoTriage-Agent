@@ -126,9 +126,13 @@ on first call rather than at import.
 """
 
 import contextlib
+import fcntl
 import glob
 import json
 import os
+import sys
+import uuid
+from typing import NamedTuple
 import random
 import sqlite3
 import threading
@@ -192,7 +196,17 @@ from oncotriage.storage.database_logger import (
     RUN_RECORD_STATUS_STOPPED,
     RUN_RECORD_TERMINAL_STATUSES,
     analyze_database,
-    campaign_spend_before,
+    BillingRecordSink,
+    BillingRecordUnreadable,
+    BillingRecordWriteError,
+    RUN_STOP_REASON_BILLING_RECORD,
+    IDENTITY_NO_EVIDENCE,
+    IDENTITY_RECOVERED,
+    campaign_billing_total,
+    historical_campaign_evidence,
+    record_historical_evidence,
+    recover_campaign_identity,
+    set_run_billing_campaign_id,
     finalize_run_record,
     flush_run_metrics,
     log_inference,
@@ -749,11 +763,19 @@ def describe_checkpoint_state(kept_reason: str) -> str:
 
 
 def clear_checkpoint() -> None:
-    """Delete checkpoint file to start a fresh run."""
+    """Delete checkpoint file to start a fresh run.
+
+    THE CAMPAIGN IDENTITY RECORD GOES WITH IT, and that is what ends a campaign
+    for billing purposes: both callers -- ``--fresh`` and a run that covered its
+    cohort cleanly -- mean "the next invocation starts a new campaign with a new
+    budget". A checkpoint cleared while its campaign record survived would make
+    that next invocation inherit a finished campaign's spend.
+    """
     cp = _checkpoint_path()
     if cp.exists():
         cp.unlink()
         console.out("[Checkpoint] Cleared.")
+    clear_campaign_record()
 
 
 def clear_results() -> None:
@@ -769,6 +791,388 @@ def clear_all() -> None:
     clear_checkpoint()
     clear_results()
     console.out("[State] All batch runner state cleared. Ready for fresh run.")
+
+
+# ===========================================================================
+# THE CAMPAIGN'S BILLING IDENTITY (the cumulative-spend pass)
+# ===========================================================================
+#
+# WHY A FILE BESIDE THE CHECKPOINT, WRITTEN BEFORE THE FIRST BILLED CALL.
+# `_resumed` is `bool(completed_ids)`, and the checkpoint is written only when a
+# patient SUCCEEDS. So a campaign whose first process billed patients that all
+# failed -- a cache write Converse could not confirm, a parse failure on every
+# retry -- left no checkpoint, and the next process was a FRESH campaign with a
+# fresh budget: the money was spent and then forgotten. The campaign's identity
+# therefore cannot be the checkpoint; it is this record, created at the top of
+# the first invocation, inherited by every later one, and removed only by the
+# two gestures that mean "a new campaign": `--fresh` and a clean finish (both
+# through `clear_checkpoint`).
+#
+# `runs.resumed` IS UNCHANGED and still means "the checkpoint handed this run
+# completed patients". A zero-success restart therefore reads `resumed = 0`.
+# THE DIVERGENCE THIS PARAGRAPH USED TO STATE IS CLOSED (the billing closure
+# pass): the campaign id is stamped on the run row as `runs.billing_campaign_id`
+# before the first billed call, and `campaign_summary` stitches on it first, so
+# a zero-success restart is one campaign in the summary as in the budget.
+#
+# THE RECORD IS WRITTEN DURABLY, TO THE FILESYSTEM'S GUARANTEE: fsync, and on
+# darwin F_FULLFSYNC (measured: fsync alone returned in 0.018 ms on this APFS
+# volume and F_FULLFSYNC in 9.4 ms -- the first does not reach the drive), then
+# the rename, then the directory. A record lost anyway -- deleted, or corrupted
+# by something other than this writer -- is RECOVERED from the billing record
+# where its rows establish one campaign, and refused by name where they do not.
+
+CAMPAIGN_RECORD_FILENAME = "batch_runner_campaign.json"
+CAMPAIGN_RECORD_VERSION = 1
+
+CAMPAIGN_DECISION_NEW = "new"
+CAMPAIGN_DECISION_CONTINUED = "continued"
+CAMPAIGN_DECISION_RECONFIGURED = "new_after_reconfiguration"
+CAMPAIGN_DECISION_HISTORICAL = "historical_evidence"
+CAMPAIGN_DECISION_RECOVERED = "recovered_from_billing_record"
+CAMPAIGN_DECISIONS = (CAMPAIGN_DECISION_NEW, CAMPAIGN_DECISION_CONTINUED,
+                      CAMPAIGN_DECISION_RECONFIGURED,
+                      CAMPAIGN_DECISION_HISTORICAL,
+                      CAMPAIGN_DECISION_RECOVERED)
+"""How this invocation's billing campaign was decided. CLOSED.
+
+  ``new``                        no campaign record and no checkpoint.
+  ``continued``                  a campaign record whose stamp matches this run.
+  ``new_after_reconfiguration``  a campaign record with no checkpoint whose
+                                 stamp does NOT match: by the stitch rule a
+                                 re-configured run is a new campaign, which is
+                                 also what ``--fresh`` would produce.
+  ``historical_evidence``        a checkpoint from a build that predates the
+                                 billing record, whose prior spend was
+                                 DEMONSTRATED covered by durable evidence.
+  ``recovered_from_billing_record``  the identity record was missing or
+                                 unreadable, and the billing record established
+                                 exactly one open campaign for this
+                                 configuration and cohort (the billing closure
+                                 pass). The record is rewritten with that id.
+"""
+
+CAMPAIGN_REFUSAL_RECORD_UNREADABLE = "campaign_record_unreadable"
+CAMPAIGN_REFUSAL_RECORD_UNWRITABLE = "campaign_record_unwritable"
+CAMPAIGN_REFUSAL_RECORD_DISAGREES = "campaign_record_disagrees_with_checkpoint"
+CAMPAIGN_REFUSAL_HISTORICAL_UNCOVERED = "historical_spend_uncovered"
+CAMPAIGN_REFUSAL_BILLING_UNREADABLE = "billing_record_unreadable"
+CAMPAIGN_REFUSAL_BILLING_UNWRITABLE = "billing_record_unwritable"
+CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED = "campaign_identity_unestablished"
+CAMPAIGN_REFUSAL_REASONS = (CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
+                            CAMPAIGN_REFUSAL_RECORD_UNWRITABLE,
+                            CAMPAIGN_REFUSAL_RECORD_DISAGREES,
+                            CAMPAIGN_REFUSAL_HISTORICAL_UNCOVERED,
+                            CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
+                            CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
+                            CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED)
+"""Why a batch run refused to start paid work. CLOSED; every refusal is raised
+after the run row is opened and BEFORE the first billed call."""
+
+
+class CampaignBillingRefusal(RuntimeError):
+    """This invocation may not start paid work. ``reason`` is a
+    ``CAMPAIGN_REFUSAL_REASONS`` member; nothing has been billed."""
+
+    def __init__(self, reason, detail):
+        super().__init__(f"{reason}: {detail}")
+        self.reason = reason
+        self.detail = detail
+
+    def lines(self):
+        remedy = {
+            CAMPAIGN_REFUSAL_HISTORICAL_UNCOVERED:
+                "The checkpoint predates the durable billing record and no "
+                "durable evidence covers every charge its runs made. Resuming "
+                "it would start the budget below what was spent. To start a "
+                "NEW campaign run with --fresh, which discards the checkpoint "
+                "and re-bills every patient.",
+            CAMPAIGN_REFUSAL_RECORD_UNREADABLE:
+                f"Inspect or remove {_campaign_record_path()}; removing it "
+                f"with a checkpoint still present makes the campaign "
+                f"historical. --fresh starts a new campaign.",
+            CAMPAIGN_REFUSAL_RECORD_DISAGREES:
+                f"The checkpoint and {_campaign_record_path()} describe "
+                f"different configurations. --fresh starts a new campaign.",
+            CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED:
+                f"{_campaign_record_path()} is missing or unreadable, and the "
+                f"billing record does not establish ONE open campaign for this "
+                f"configuration and cohort. Resuming under a guessed identity "
+                f"would start the budget from the wrong campaign's spend. "
+                f"Restore the record, or start a NEW campaign with --fresh.",
+        }.get(self.reason,
+              "Fix the inference database the billing record lives in and "
+              "run again.")
+        return ["=" * 80,
+                f"[Campaign] REFUSING TO START PAID WORK: {self.reason}",
+                f"[Campaign] {self.detail}",
+                f"[Campaign] {remedy}",
+                "[Campaign] NOTHING HAS BEEN BILLED.",
+                "=" * 80]
+
+
+class CampaignBudget(NamedTuple):
+    """The billing campaign this invocation runs under. See
+    ``establish_billing_campaign``."""
+
+    campaign_id: str
+    decision: str
+    seed: object
+    evidence: object = None
+    recovery: object = None
+
+
+def _campaign_record_path() -> Path:
+    return Path(paths.checkpoint_path) / CAMPAIGN_RECORD_FILENAME
+
+
+def _durable_sync(fd, *, directory=False) -> None:
+    """Flush ``fd`` to the filesystem's guarantee. RAISES ``OSError``.
+
+    ``os.fsync`` first; then, on darwin, ``F_FULLFSYNC``, because fsync there
+    returns once the data reaches the drive rather than once the drive has
+    flushed its write cache. A DIRECTORY that refuses ``F_FULLFSYNC`` keeps its
+    fsync -- the rename's metadata is then bounded by what fsync reaches --
+    and the refusal is counted rather than failing every campaign on a
+    filesystem that does not support the call on directories (measured: APFS
+    accepts it).
+    """
+    os.fsync(fd)
+    if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
+        try:
+            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+        except OSError as exc:
+            if not directory:
+                raise
+            CHECKPOINT_FAULTS[f"campaign_dir_fullfsync:{type(exc).__name__}"] += 1
+
+
+def clear_campaign_record() -> None:
+    """Remove the campaign identity record. Called only by ``clear_checkpoint``.
+
+    NEVER RAISES. It runs at the end of a finished run and under ``--fresh``,
+    and a read-only checkpoint directory -- a filled disk, a remounted share --
+    must not turn a completed campaign into a traceback. A record that could
+    not be removed is COUNTED and SAID: the next run will CONTINUE this
+    campaign's budget, which over-counts rather than under-counts, and the line
+    names the file an operator removes to start fresh.
+    """
+    cr = _campaign_record_path()
+    try:
+        if cr.exists():
+            cr.unlink()
+            # THE REMOVAL IS SYNCED TOO. A clean finish whose unlink rolled back
+            # on a host crash would hand the next run this campaign's budget --
+            # the over-counting direction, and still wrong.
+            _dir = os.open(str(cr.parent), os.O_RDONLY)
+            try:
+                _durable_sync(_dir, directory=True)
+            finally:
+                os.close(_dir)
+            console.out("[Campaign] Identity record cleared; the next run "
+                        "starts a new campaign.")
+    except OSError as exc:
+        CHECKPOINT_FAULTS[f"campaign_clear:{type(exc).__name__}"] += 1
+        console.out(f"[Campaign] WARNING: {cr} could not be removed ({exc}). "
+                    f"The next run will CONTINUE this campaign's budget rather "
+                    f"than start a new one; remove the file to start fresh.")
+
+
+def read_campaign_record():
+    """The campaign record, or None when there is none. RAISES
+    ``CampaignBillingRefusal`` when it exists and cannot be read -- a record that
+    exists and is unreadable is not the same as no record, and treating it as
+    none would hand a continuing campaign a fresh budget."""
+    cr = _campaign_record_path()
+    if not cr.exists():
+        return None
+    try:
+        with open(cr, "rb") as fh:
+            data = json.loads(fh.read().decode("utf-8"))
+    except Exception as exc:                                   # noqa: BLE001
+        raise CampaignBillingRefusal(
+            CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
+            f"{cr} could not be read: {type(exc).__name__}: {exc}") from exc
+    if (not isinstance(data, dict)
+            or data.get("version") != CAMPAIGN_RECORD_VERSION
+            or not isinstance(data.get("campaign_id"), str)
+            or not data.get("campaign_id")
+            or not isinstance(data.get("fingerprint"), dict)):
+        raise CampaignBillingRefusal(
+            CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
+            f"{cr} does not have the shape of a version-"
+            f"{CAMPAIGN_RECORD_VERSION} campaign record")
+    return data
+
+
+def write_campaign_record(campaign_id, fingerprint, cohort_digest) -> None:
+    """Persist the campaign identity DURABLY. RAISES ``CampaignBillingRefusal``.
+
+    Temp file, durable sync, ``os.replace``, then a durable sync of the
+    directory: the record is what makes a restart continue a budget, so it has
+    to exist on disk before the first billed call rather than merely have been
+    handed to the OS. See ``_durable_sync`` for why fsync alone is not that on
+    darwin. The bound is the filesystem's and the hardware's guarantee.
+    """
+    cr = _campaign_record_path()
+    tmp = cr.with_suffix(".tmp")
+    payload = {"version": CAMPAIGN_RECORD_VERSION, "campaign_id": campaign_id,
+               "created_at": datetime.now().isoformat(),
+               "fingerprint": fingerprint, "cohort_digest": cohort_digest}
+    try:
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            _durable_sync(fh.fileno())
+        os.replace(tmp, cr)
+        _dir = os.open(str(cr.parent), os.O_RDONLY)
+        try:
+            _durable_sync(_dir, directory=True)
+        finally:
+            os.close(_dir)
+    except Exception as exc:                                   # noqa: BLE001
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+        raise CampaignBillingRefusal(
+            CAMPAIGN_REFUSAL_RECORD_UNWRITABLE,
+            f"{cr} could not be written: {type(exc).__name__}: {exc}") from exc
+
+
+def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
+                               db_path) -> CampaignBudget:
+    """Decide this invocation's billing campaign and read its cumulative record.
+    RAISES ``CampaignBillingRefusal``; returns the campaign and the ledger seed.
+
+    Called by ``main()`` AFTER the run row is opened (the historical evidence
+    walks the stitch from it) and BEFORE the first billed call. The order of the
+    two durable writes for a historical campaign is load-bearing: the evidence
+    row first, the identity record second, so a crash between them leaves an
+    orphaned row under an id nothing resumes rather than a resumable campaign
+    without its history.
+
+    Args:
+        resumed: whether the checkpoint handed this run completed patients --
+            ``main()``'s ``_resumed``.
+        fingerprint, cohort_digest: this run's stamp, as gated by the
+            checkpoint.
+        run_id, db_path: the run row and the database it and the billing record
+            live in.
+    """
+    # AN UNREADABLE RECORD IS NOT A MISSING ONE, and it is not an automatic
+    # refusal either any more (the billing closure pass): the billing record is
+    # asked first, and only a record whose rows establish nothing is refused
+    # under the unreadable reason it always was.
+    try:
+        record, corrupt = read_campaign_record(), None
+    except CampaignBillingRefusal as exc:
+        if exc.reason != CAMPAIGN_REFUSAL_RECORD_UNREADABLE:
+            raise
+        record, corrupt = None, exc
+    evidence = recovery = None
+    if record is None and (corrupt is not None or resumed):
+        # A MISSING RECORD WITH A CHECKPOINT, OR ANY UNREADABLE ONE: ask the
+        # billing record which campaign this run continues. `no_evidence` falls
+        # through to the paths that existed before; every other non-recovery is
+        # a refusal, because a guessed identity is a guessed budget.
+        recovery = recover_campaign_identity(run_id, cohort_digest,
+                                             db_path=db_path)
+        if recovery.state not in (IDENTITY_RECOVERED, IDENTITY_NO_EVIDENCE):
+            raise CampaignBillingRefusal(
+                CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED,
+                f"{recovery.state}: {recovery.detail}"
+                + (f" (the record itself: {corrupt.detail})"
+                   if corrupt is not None else ""))
+        if recovery.state == IDENTITY_NO_EVIDENCE and corrupt is not None:
+            raise CampaignBillingRefusal(
+                CAMPAIGN_REFUSAL_RECORD_UNREADABLE,
+                f"{corrupt.detail}; the billing record establishes no campaign "
+                f"to recover ({recovery.detail or 'no candidate'})")
+    if recovery is not None and recovery.state == IDENTITY_RECOVERED:
+        if corrupt is not None:
+            # KEPT, NOT OVERWRITTEN BLIND: the unreadable file is the evidence
+            # somebody will want, and the rewrite below replaces it.
+            _kept, _err, _key = preserve_corrupt_file(
+                _campaign_record_path(), ".corrupt", keep_original=True)
+            if _err is not None:
+                CHECKPOINT_FAULTS[f"campaign_corrupt_copy:{_key}"] += 1
+        campaign_id, decision = (recovery.campaign_id,
+                                 CAMPAIGN_DECISION_RECOVERED)
+        console.out(f"[Campaign] The identity record was "
+                    f"{'unreadable' if corrupt is not None else 'missing'}; "
+                    f"the billing record establishes campaign {campaign_id}, "
+                    f"which this run continues.")
+    elif record is not None:
+        outcome, detail = run_fingerprint.compare(record.get("fingerprint"),
+                                                  fingerprint)
+        same = (outcome == run_fingerprint.FP_MATCH
+                and record.get("cohort_digest") == cohort_digest)
+        if same:
+            campaign_id, decision = (record["campaign_id"],
+                                     CAMPAIGN_DECISION_CONTINUED)
+        elif resumed:
+            raise CampaignBillingRefusal(
+                CAMPAIGN_REFUSAL_RECORD_DISAGREES,
+                f"the checkpoint matches this run and the campaign record does "
+                f"not ({outcome}: {detail}; cohort digest "
+                f"{record.get('cohort_digest')!r} vs {cohort_digest!r})")
+        else:
+            campaign_id, decision = (uuid.uuid4().hex,
+                                     CAMPAIGN_DECISION_RECONFIGURED)
+            console.out(f"[Campaign] The previous campaign "
+                        f"{record['campaign_id']} was recorded under a "
+                        f"different configuration ({outcome}) and no "
+                        f"checkpoint continues it; this run starts a new "
+                        f"campaign, as the stitch rule and --fresh would.")
+    elif resumed:
+        evidence = historical_campaign_evidence(run_id, cohort_digest,
+                                                db_path=db_path)
+        if not evidence.covered:
+            raise CampaignBillingRefusal(
+                CAMPAIGN_REFUSAL_HISTORICAL_UNCOVERED,
+                f"reason(s): {', '.join(evidence.reasons)}"
+                + (f" -- {evidence.detail}" if evidence.detail else ""))
+        campaign_id, decision = uuid.uuid4().hex, CAMPAIGN_DECISION_HISTORICAL
+        try:
+            record_historical_evidence(db_path, campaign_id=campaign_id,
+                                       run_id=run_id, evidence=evidence)
+        except BillingRecordWriteError as exc:
+            raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
+                                         str(exc)) from exc
+    else:
+        campaign_id, decision = uuid.uuid4().hex, CAMPAIGN_DECISION_NEW
+
+    if decision not in CAMPAIGN_DECISIONS:
+        # A RuntimeError and not an `assert`, which `python -O` deletes: a
+        # decision outside the vocabulary is a branch above that nobody named,
+        # and it is about to decide whether the identity record is written.
+        raise RuntimeError(f"establish_billing_campaign reached an unnamed "
+                           f"decision {decision!r}")
+    if decision != CAMPAIGN_DECISION_CONTINUED:
+        write_campaign_record(campaign_id, fingerprint, cohort_digest)
+    # THE RUN ROW CARRIES THE CAMPAIGN, DURABLY, BEFORE THE FIRST BILLED CALL,
+    # so `campaign_summary` and the budget name one campaign (P3).
+    try:
+        set_run_billing_campaign_id(run_id, campaign_id, db_path=db_path)
+    except BillingRecordWriteError as exc:
+        raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
+                                     str(exc)) from exc
+
+    try:
+        billing = campaign_billing_total(campaign_id, db_path=db_path)
+    except BillingRecordUnreadable as exc:
+        raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNREADABLE,
+                                     str(exc)) from exc
+    prior_runs = set(r for r in billing.run_ids if r != run_id)
+    if evidence is not None:
+        prior_runs |= set(evidence.run_ids)
+    seed = spend.LedgerSeed(usd=billing.usd, rows=billing.attempts,
+                            runs=len(prior_runs),
+                            source=spend.SEED_SOURCE_BILLING_RECORD,
+                            unresolved=billing.unresolved)
+    return CampaignBudget(campaign_id, decision, seed, evidence, recovery)
 
 
 def retire_superseded_results(completed_ids) -> "str | None":
@@ -1855,7 +2259,12 @@ def flush_health(run_id, snapshot=None, db_path=None) -> bool:
     try:
         snap = degradation.snapshot() if snapshot is None else snapshot
         totals = degradation.totals(snap)
-        registered = len(degradation.registered_names())
+        # THE NAMES AS WELL AS THE COUNT (the billing closure pass): the
+        # registry record is what lets a later reader treat a counter's absent
+        # row as a measured zero. Read once, so the count and the names cannot
+        # describe two different registries.
+        registered_names = degradation.registered_names()
+        registered = len(registered_names)
     except Exception as exc:                                   # noqa: BLE001
         RUN_METRICS_FLUSH_FAILURES[f"flush:registry_read:{type(exc).__name__}"] += 1
         log.error("the degradation registry could not be read, so this run's "
@@ -1865,7 +2274,8 @@ def flush_health(run_id, snapshot=None, db_path=None) -> bool:
                   error_type=type(exc).__name__, error_message=str(exc))
         return False
 
-    return flush_run_metrics(run_id, totals, registered, db_path=db_path)
+    return flush_run_metrics(run_id, totals, registered, db_path=db_path,
+                             registered_names=registered_names)
 
 
 # ===========================================================================
@@ -3680,6 +4090,13 @@ def main():
     # cohort at its first completed patient.
     spend.SPEND_LEDGER.reset()
     spend.SPEND_STOP.reset()
+    # THE SEVENTH: a billing sink left installed by an earlier main() in this
+    # process would write this run's attempts under that run's campaign. Its
+    # live liability tally goes with the ledger it mirrors (the billing closure
+    # pass), or this run's reconciliation would include an earlier run's
+    # attempts.
+    spend.BILLING_RECORD.clear()
+    spend.BILLING_RECORD.reset_liability()
 
     with CaffeinateSession("Batch Runner"):
 
@@ -3988,30 +4405,45 @@ def main():
         )
 
         # ------------------------------------------------------------------
-        # 3b-ii. Seed the spend ledger from the campaign this run resumes
+        # 3b-ii. Establish the billing campaign and seed the spend ledger
         # ------------------------------------------------------------------
-        # AFTER THE RUN ROW AND BEFORE THE FIRST BILLED CALL. The row is what
-        # carries this run's fingerprint and its `resumed` flag, which is what
-        # `campaign_spend_before` walks the chain on -- so it cannot be asked
-        # earlier -- and the answer has to be installed before anything can be
-        # gated against it.
+        # AFTER THE RUN ROW AND BEFORE THE FIRST BILLED CALL. The campaign is
+        # decided by its identity record beside the checkpoint (see THE
+        # CAMPAIGN'S BILLING IDENTITY), and its budget is read from the
+        # CUMULATIVE billing record -- every billed attempt of every invocation
+        # of this campaign, reserved before dispatch and settled after -- and
+        # never from `inferences.estimated_cost_usd`, which describes final
+        # attempts only.
         #
-        # WITHOUT THIS THE CAP IS PER INVOCATION AND NOT PER CAMPAIGN, which is
-        # not a smaller promise but a broken one: a run that tripped the cap and
-        # was restarted by a supervisor would get a fresh budget every time. The
-        # run lock forbids CONCURRENT runs and says nothing about sequential
-        # ones.
+        # IT REFUSES, WHERE THE READ IT REPLACES DEGRADED TO ZERO. An unreadable
+        # record, an unreadable identity file, or a historical campaign whose
+        # prior spend no durable evidence demonstrably covers all stop the run
+        # here, with the run row finalized KILLED: starting the budget from a
+        # number nobody could establish is the overspending direction. Nothing
+        # has been billed at this line.
         #
-        # IT NEVER RAISES and an unreadable answer is an EMPTY seed, which
-        # starts this run's budget at zero. That direction is argued at the
-        # function: a read-only bookkeeping query must not be able to stop a
-        # campaign, and the failure is counted and printed rather than silent.
-        _prior = campaign_spend_before(_run_record_id, db_path=_reconcile_db)
-        spend.SPEND_LEDGER.seed(spend.LedgerSeed(
-            usd=_prior.usd, rows=_prior.rows, unpriced=_prior.unpriced,
-            runs=_prior.runs, source=(spend.SEED_SOURCE_CAMPAIGN
-                                      if _prior.runs
-                                      else spend.SEED_SOURCE_NONE)))
+        # THE REASON IS NOT WRITTEN TO `runs.note`, which is documented as the
+        # OPERATOR'S own words; it is printed in the refusal block. And the
+        # finalize is OUTSIDE the `except`, deliberately: the handlers in this
+        # function that finalize are the CRASH paths, and a refusal is a
+        # decision, not a crash.
+        _campaign_refusal = None
+        try:
+            _campaign = establish_billing_campaign(
+                _resumed, _fingerprint, _cohort.digest, _run_record_id,
+                _reconcile_db)
+        except CampaignBillingRefusal as exc:
+            _campaign_refusal = exc
+        if _campaign_refusal is not None:
+            console.out()
+            for _line in _campaign_refusal.lines():
+                console.out(_line)
+            finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
+                                db_path=_reconcile_db)
+            raise SystemExit(1)
+        spend.SPEND_LEDGER.seed(_campaign.seed)
+        console.out(f"[Campaign] {_campaign.campaign_id} "
+                    f"({_campaign.decision})")
         console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
         console.out()
 
@@ -4103,6 +4535,14 @@ def main():
             finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
                                 db_path=_reconcile_db)
             raise
+
+        # THE DURABLE BILLING SINK, INSTALLED LAST BEFORE THE FIRST BILLED
+        # CALL. Every billed wire attempt from here on -- Stage 2's dense
+        # embedding and every Stage 5 attempt, warmups and retries included --
+        # is reserved in `inferences.billing_attempts` before it is sent. It is
+        # cleared on both exits of the try below.
+        spend.BILLING_RECORD.install(BillingRecordSink(
+            _reconcile_db, _campaign.campaign_id, _run_record_id))
 
         # THE RUN IS CLOSED ON EVERY EXIT PATH, and this try exists only for
         # that. MEASURED, not assumed: a process that opens an MLflow run and
@@ -4252,6 +4692,8 @@ def main():
                 RUN_STOP_REASON_OPERATOR if STOP_SWITCH.requested
                 else RUN_STOP_REASON_CALL_CEILING
                 if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_CALL_CEILING
+                else RUN_STOP_REASON_BILLING_RECORD
+                if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_BILLING_RECORD
                 else RUN_STOP_REASON_SPEND_CAP if spend.SPEND_STOP.requested
                 else None)
 
@@ -4687,6 +5129,11 @@ def main():
             # one of them skipped its resample pass because the budget ran out.
             # A reader asking WHICH of the two happened reads `status`, which is
             # what says it.
+            # THE BILLING SINK IS CLEARED HERE, ABOVE THE FINALIZE, because
+            # every billed call of this run has returned by this line (the
+            # pool and the resample pass are joined) and the finalize must stay
+            # the LAST statement before the return. clear() cannot raise.
+            spend.BILLING_RECORD.clear()
             finalize_run_record(
                 _run_record_id,
                 _terminal_status,
@@ -4762,6 +5209,7 @@ def main():
             finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
                                 db_path=_reconcile_db)
             tracking.end_run(status="FAILED")
+            spend.BILLING_RECORD.clear()
             raise
 
 

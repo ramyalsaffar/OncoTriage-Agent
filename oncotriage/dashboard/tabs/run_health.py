@@ -173,6 +173,8 @@ def _build_run_table(summary):
             # column so it cannot be scrolled off a wide table.
             "": "" if finalized else "⚠️",
             "run": as_int(row.run_id),
+            "billing campaign": as_text(getattr(row, "billing_campaign_id",
+                                                None), "—"),
             "source": as_text(row.invocation_source),
             "status": as_text(row.status),
             "finalization": as_text(row.finalization),
@@ -300,6 +302,11 @@ def _build_campaign_table(campaigns):
             # column cannot be scrolled off a wide table.
             "": ("🔗" if stitched else "") + ("⚠️" if open_span else ""),
             "campaign": as_int(row.campaign_id),
+            # THE ID THE BUDGET IS KEYED BY (the billing closure pass). `campaign`
+            # is the root run id; this is `billing_attempts.campaign_id`, so a
+            # reader can match this row to the spend a resume inherits.
+            "billing campaign": as_text(getattr(row, "billing_campaign_id",
+                                                None), "—"),
             "runs": as_int(row.runs),
             "run ids": as_text(row.run_ids, "—"),
             "statuses": as_text(row.statuses, "—"),

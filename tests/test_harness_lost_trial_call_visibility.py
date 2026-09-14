@@ -818,7 +818,7 @@ _HARNESS_SRC = _read(_HARNESS_PATH)
 
 # --- P1: the node stops returning the census on the success path -----------
 _p1 = planted(_EVAL_PATH,
-              "        **_per_trial_call_census(),\n"
+              "        **_per_trial_call_census(wave_final=True),\n"
               "        \"llm_classifier_calls\": calls_made,",
               "        \"llm_classifier_calls\": calls_made,",
               "_p1_eval")

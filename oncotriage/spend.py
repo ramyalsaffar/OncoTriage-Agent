@@ -94,7 +94,7 @@ is already inside the overshoot bound ``config.SPEND_CAP_USD`` states.
 THIS MODULE IMPORTS NO STORAGE LAYER
 ------------------------------------
 The resume derivation -- what the interrupted run already spent, read out of
-``inferences`` -- lives in ``oncotriage/storage/database_logger.py``, which owns
+``inferences.billing_attempts`` -- lives in ``oncotriage/storage/database_logger.py``, which owns
 the ``runs`` table and the fingerprint columns the campaign chain is walked
 over. It is handed here as a ``LedgerSeed``. Two reasons: this module is
 imported by ``oncotriage/agent/evaluation.py``, so a storage import here would
@@ -106,11 +106,12 @@ imports.
 
 import threading
 import time
+import uuid
 from collections import Counter, deque
 from typing import NamedTuple, Optional
 
 from oncotriage import config
-from oncotriage.observability import console, get_logger
+from oncotriage.observability import console, current_correlation_id, get_logger
 from oncotriage.utils import UnknownModelPricingError, get_model_cost
 
 log = get_logger(__name__)
@@ -179,6 +180,31 @@ defect into a per-request transport failure inside a worker thread, which is a
 worse diagnosis of the same fact.
 """
 
+BILLING_RECORD_FAULTS = Counter()
+"""What the campaign's durable billing record could not do. See ``BILLING_RECORD``.
+
+Keyed ``{phase}:{detail}``:
+
+    ``reserve:{Type}``      a reservation could not be persisted, so the attempt
+                            was NOT dispatched and the run latched.
+    ``reserve:unpriced``    the reservation could not be priced -- the wire
+                            model is absent from ``PRICING_CONFIG`` -- so the
+                            attempt was not dispatched.
+    ``refused_latched``     a later attempt refused without trying the write,
+                            because the run is already latched.
+    ``settle:{result}``     a settlement did not land cleanly: ``failed`` (the
+                            row stays RESERVED at its upper bound, which is the
+                            conservative reading), ``missing`` (no reservation
+                            to settle) or ``conflict`` (already settled at a
+                            different amount; the first settlement stands).
+    ``settle:raised:{Type}`` the sink raised, which it is documented not to.
+
+A ``settle:`` key never under-records: an unsettled reservation is charged at
+its upper bound by every reader. A ``reserve:`` key never under-records either:
+nothing was sent. What a non-zero total says is that the run stopped, or that a
+resume will charge more than was billed.
+"""
+
 SPEND_CEILING_TRIPS = Counter()
 """Stage 5 invocations that hit the per-invocation billed-call ceiling.
 
@@ -195,16 +221,20 @@ in this pipeline rather than a campaign that ran long.
 
 SPEND_LIMIT_CAP = "spend_cap"
 SPEND_LIMIT_CALL_CEILING = "call_ceiling"
+SPEND_LIMIT_BILLING_RECORD = "billing_record"
 
-SPEND_LIMITS = (SPEND_LIMIT_CAP, SPEND_LIMIT_CALL_CEILING)
+SPEND_LIMITS = (SPEND_LIMIT_CAP, SPEND_LIMIT_CALL_CEILING,
+                SPEND_LIMIT_BILLING_RECORD)
 """Which limit declined a request. CLOSED, and a caller may branch on it
 exhaustively.
 
-They are two findings with two remediations and must not be one key. The cap
+They are three findings with three remediations and must not be one key. The cap
 means "this campaign has spent its budget" and is answered by raising the budget
 or accepting the stop; the ceiling means "one Stage 5 invocation tried to issue
 more calls than it can legitimately need" and is answered by reading the
-traceback.
+traceback; ``billing_record`` means "the campaign's durable billing record could
+not be written, so no further billed request may be dispatched" and is answered
+by fixing the database the record lives in. See ``BILLING_RECORD``.
 """
 
 SPEND_SKIP_WARMUP_KEY_PREFIX = "warmup:"
@@ -265,9 +295,23 @@ all, which is the pre-journal behaviour and the under-enforcing direction, and
 the banner then says which of the two answered.
 """
 
+SEED_SOURCE_BILLING_RECORD = "billing_record"
+"""A batch campaign resuming, seeded from its CUMULATIVE billing record.
+
+``inferences.billing_attempts`` holds one row per billed wire attempt of the
+campaign -- warmups, retries, abandoned requests and Stage 2's dense embedding
+included -- each reserved before dispatch and settled against observed usage.
+It REPLACES ``campaign_rows`` for the batch runner: that one summed
+``inferences.estimated_cost_usd``, which describes a patient's FINAL Stage 5
+attempt only, so every earlier attempt's charge was missing from a resumed
+campaign's budget. ``campaign_rows`` stays a member because the ablation study
+still seeds from its own database's rows under that name.
+"""
+
 SEED_SOURCES = (SEED_SOURCE_NONE, SEED_SOURCE_CAMPAIGN,
                 SEED_SOURCE_RATER_STATE,
-                SEED_SOURCE_JOURNAL_RATER, SEED_SOURCE_JOURNAL_CAMPAIGN)
+                SEED_SOURCE_JOURNAL_RATER, SEED_SOURCE_JOURNAL_CAMPAIGN,
+                SEED_SOURCE_BILLING_RECORD)
 """Where a ledger's starting balance came from. CLOSED.
 
 ``fresh`` is a run that is resuming nothing, and it is a VALUE rather than an
@@ -393,6 +437,7 @@ BUDGET_FOR_SEED_SOURCE = {
     SEED_SOURCE_RATER_STATE: SPEND_BUDGET_RATER,
     SEED_SOURCE_JOURNAL_RATER: SPEND_BUDGET_RATER,
     SEED_SOURCE_JOURNAL_CAMPAIGN: SPEND_BUDGET_CAMPAIGN,
+    SEED_SOURCE_BILLING_RECORD: SPEND_BUDGET_CAMPAIGN,
 }
 """Which budget a resumed baseline belongs to. TOTAL over ``SEED_SOURCES``
 except ``fresh``, which belongs to none by construction -- it is a zero.
@@ -610,6 +655,11 @@ class LedgerSeed(NamedTuple):
                  money. The two are kept apart for that reason.
     ``unreadable_reasons``  the first few of those items, named, for the
                  refusal an operator reads. Bounded; ``unreadable`` is the count.
+    ``unresolved``  ``billing_record`` seeds only: how many of ``rows`` are
+                 reservations that were never settled -- an attempt interrupted
+                 between dispatch and settlement. Each is inside ``usd`` at its
+                 RESERVED upper bound, so a non-zero value makes ``usd`` a
+                 CEILING on those attempts rather than a floor: conservative.
     """
 
     usd: float = 0.0
@@ -619,6 +669,7 @@ class LedgerSeed(NamedTuple):
     source: str = SEED_SOURCE_NONE
     unreadable: int = 0
     unreadable_reasons: tuple = ()
+    unresolved: int = 0
 
     @property
     def is_floor(self) -> bool:
@@ -711,19 +762,9 @@ class SpendLedger:
         cap is enforced conservatively.** Over-enforcing is the safe direction
         and is the one this project already chose for that column.
         """
-        _in = _as_token_count(prompt_tokens)
-        _out = _as_token_count(completion_tokens)
-        if _in is None or _out is None:
-            SPEND_LEDGER_FAULTS[
-                f"bad_usage:{type(prompt_tokens).__name__}/"
-                f"{type(completion_tokens).__name__}"] += 1
-            self._commit(0.0, source)
-            return 0.0
-        try:
-            cost = get_model_cost(model or config.matching_wire_model(),
-                                  _in, _out)
-        except UnknownModelPricingError:
-            SPEND_LEDGER_FAULTS[f"unpriced_model:{model}"] += 1
+        cost, fault = price_usage(model, prompt_tokens, completion_tokens)
+        if cost is None:
+            SPEND_LEDGER_FAULTS[fault] += 1
             self._commit(0.0, source)
             return 0.0
         self._commit(cost, source)
@@ -996,6 +1037,32 @@ class SpendLedger:
 
 SPEND_LEDGER = SpendLedger()
 """The one instance. Reset by ``oncotriage/batch/runner.py:main()``."""
+
+
+def price_usage(model, prompt_tokens, completion_tokens):
+    """``(usd, None)`` for one response's usage, or ``(None, fault_key)``. PURE.
+
+    THE ONE PRICING OF A BILLED RESPONSE. ``SpendLedger.charge`` and the durable
+    billing record's settlement both call this, so the in-process ledger and the
+    cross-process record cannot price the same response differently -- two
+    copies of a pricing rule is how the resume figure and the cap it resumes
+    under would come to disagree with nothing raising.
+
+    ``model`` None falls back to ``config.matching_wire_model()``; see
+    ``SpendLedger.charge`` for why that is exact in the one case it is reached.
+    The fault key is ``SPEND_LEDGER_FAULTS``' vocabulary; counting is the
+    caller's, because the two callers count into different counters.
+    """
+    _in = _as_token_count(prompt_tokens)
+    _out = _as_token_count(completion_tokens)
+    if _in is None or _out is None:
+        return None, (f"bad_usage:{type(prompt_tokens).__name__}/"
+                      f"{type(completion_tokens).__name__}")
+    try:
+        return (get_model_cost(model or config.matching_wire_model(), _in, _out),
+                None)
+    except UnknownModelPricingError:
+        return None, f"unpriced_model:{model}"
 
 
 def _as_token_count(value):
@@ -1968,6 +2035,17 @@ class SpendStop:
             # reachable and a reader would go looking for how.
             console.out(f"[SPEND] THE {_budget.upper()} SPEND CAP HAS BEEN "
                         f"REACHED: ${_spent:.2f} of ${_cap:.2f}")
+        elif limit == SPEND_LIMIT_BILLING_RECORD:
+            # NOT A BUDGET EVENT AND NOT A DEFECT IN THE PIPELINE: the record
+            # that makes a resumed campaign's budget true could not be written,
+            # so dispatching further would spend money a later process cannot
+            # count. The remedy is the database, and the line names that.
+            console.out("[SPEND] THE CAMPAIGN'S DURABLE BILLING RECORD COULD "
+                        "NOT BE WRITTEN; no further billed request may be "
+                        "dispatched.")
+            console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "
+                        f"${_spent:.2f}. Fix the database the record lives in "
+                        f"(inferences.billing_attempts) and run again.")
         else:
             console.out("[SPEND] A STAGE 5 INVOCATION HIT ITS BILLED-CALL "
                         "CEILING.")
@@ -2004,6 +2082,426 @@ class SpendStop:
 
 SPEND_STOP = SpendStop()
 """The one instance. Reset by ``oncotriage/batch/runner.py:main()``."""
+
+
+# ===========================================================================
+# THE DURABLE BILLING RECORD (the cumulative-spend pass)
+# ===========================================================================
+#
+# WHY THE LEDGER ABOVE IS NOT ENOUGH FOR A CAMPAIGN. ``SPEND_LEDGER`` is exact
+# and dies with the process. A resumed campaign used to rebuild its baseline
+# from ``inferences.estimated_cost_usd``, and that column describes a patient's
+# FINAL Stage 5 attempt only -- so every earlier billed attempt (a parse failure
+# answered at full price, a warmup whose cache write could not be confirmed, a
+# timeout the provider may well have billed) was absent from the budget of the
+# next process, which could therefore spend it again.
+#
+# THE MECHANISM IS RESERVE, DISPATCH, SETTLE. Immediately before a billed wire
+# attempt a conservative RESERVATION -- the request's own estimated input plus
+# its full output ceiling, priced at the wire model: the same upper bound
+# ``provider_resilience`` already charges for a possibly-billed failure -- is
+# COMMITTED to ``inferences.billing_attempts``. Only then is the request sent.
+# When the attempt resolves, the row is SETTLED: a response at its priced usage,
+# a not-billed failure at zero, anything whose billing cannot be observed
+# (possibly billed, abandoned, unpriceable usage) at the reservation.
+#
+# WHAT A KILL COSTS IS THEREFORE BOUNDED IN THE SAFE DIRECTION. A process killed
+# after the reservation commit and before the settlement leaves a RESERVED row,
+# and every reader charges a reserved row at its reservation -- an upper bound
+# on what that attempt could have cost. A process killed before the commit sent
+# nothing. There is no window in which money leaves without a row.
+#
+# A RESERVATION THAT CANNOT BE PERSISTED REFUSES THE DISPATCH AND LATCHES THE
+# RUN. Continuing would send requests whose charges a later process cannot
+# count, which is the defect this exists to remove; the latch is ``SPEND_STOP``
+# under ``SPEND_LIMIT_BILLING_RECORD``, so the batch runner stops starting
+# patients and records ``runs.stop_reason = 'billing_record'``.
+#
+# ONLY A PROCESS THAT INSTALLS A SINK WRITES A RECORD. The batch runner installs
+# one per invocation, keyed to its campaign and its run row. The API, the MCP
+# server, the ablation study and every test that installs nothing keep exactly
+# the behaviour they had: ``reserve`` returns None and ``settle(None, ...)`` is
+# a no-op. That is a statement about who has a campaign, not an oversight.
+
+BILLING_OUTCOME_RESPONSE = "response"
+BILLING_OUTCOME_RESPONSE_UNPRICED = "response_unpriced"
+BILLING_OUTCOME_POSSIBLY_BILLED = "possibly_billed"
+BILLING_OUTCOME_NOT_BILLED = "not_billed"
+BILLING_OUTCOME_ABANDONED = "abandoned"
+
+BILLING_OUTCOMES = (BILLING_OUTCOME_RESPONSE, BILLING_OUTCOME_RESPONSE_UNPRICED,
+                    BILLING_OUTCOME_POSSIBLY_BILLED, BILLING_OUTCOME_NOT_BILLED,
+                    BILLING_OUTCOME_ABANDONED)
+"""How a reserved attempt resolved. CLOSED; ``database_logger`` restates it and
+a test pins the two equal.
+
+  ``response``           a response arrived; settled at its PRICED usage.
+  ``response_unpriced``  a response arrived and its usage could not be priced;
+                         settled at the reservation, because nothing smaller is
+                         known to be true.
+  ``possibly_billed``    the attempt failed after dispatch in a way the provider
+                         may have billed; settled at the reservation.
+  ``not_billed``         the attempt failed in a way the provider provably did
+                         not bill (refused before inference); settled at zero.
+  ``abandoned``          a Ctrl-C, SystemExit or cancellation arrived while the
+                         request was on the wire; settled at the reservation.
+"""
+
+BILLING_OUTCOMES_AT_RESERVATION = (BILLING_OUTCOME_RESPONSE_UNPRICED,
+                                   BILLING_OUTCOME_POSSIBLY_BILLED,
+                                   BILLING_OUTCOME_ABANDONED)
+"""The outcomes whose settled amount IS the reservation -- every outcome that
+observed no priceable usage and is not provably unbilled."""
+
+
+def attempt_liability(outcome, reserved_usd, model=None, prompt_tokens=None,
+                      completion_tokens=None):
+    """What one billed wire attempt costs a budget. PURE; never raises.
+
+    Returns ``(outcome, usd, settled_input, settled_output, fault)``.
+
+    THE ONE LIABILITY RULE (the billing closure pass). The in-process ledger
+    and the durable billing record used to price an attempt at two different
+    call sites, and they disagreed on every possibly-billed failure that one
+    of them did not see: a failed Stage 2 embedding was charged its
+    reservation in ``inferences.billing_attempts`` and NOTHING in
+    ``SPEND_LEDGER``, and a response whose usage could not be priced was
+    charged its reservation durably and $0 in the ledger. So a live process
+    could admit spending that a resumed process, reading the durable record,
+    would refuse. Both halves now read THIS function through
+    ``AttemptLiability.resolve``, so there is no second rule to drift.
+
+    ``response``            priced usage; an unpriceable response becomes
+                            ``response_unpriced`` at the reservation.
+    ``response_unpriced``,
+    ``possibly_billed``,
+    ``abandoned``           the reservation.
+    ``not_billed``          zero.
+    anything else           ``possibly_billed`` at the reservation, with a
+                            fault key -- an unknown outcome must not be free.
+
+    ``usd`` is None only when the reservation itself was unpriceable AND the
+    outcome is charged at it -- a state reachable only with no durable sink
+    installed, because ``BillingRecord.reserve`` refuses an unpriceable
+    reservation when one is. The caller counts it; it is never read as zero
+    silently.
+    """
+    fault = None
+    if outcome not in BILLING_OUTCOMES:
+        fault = f"bad_outcome:{outcome}"
+        outcome = BILLING_OUTCOME_POSSIBLY_BILLED
+    if outcome == BILLING_OUTCOME_RESPONSE:
+        usd, price_fault = price_usage(model, prompt_tokens, completion_tokens)
+        if usd is not None:
+            return (outcome, usd, _as_token_count(prompt_tokens),
+                    _as_token_count(completion_tokens), fault)
+        fault = price_fault
+        outcome = BILLING_OUTCOME_RESPONSE_UNPRICED
+    if outcome in BILLING_OUTCOMES_AT_RESERVATION:
+        return outcome, reserved_usd, None, None, fault
+    # `not_billed`, the one outcome left: provably refused before inference.
+    return outcome, 0.0, None, None, fault
+
+
+class BillingRecordUnavailable(RuntimeError):
+    """A billed attempt was NOT dispatched because its reservation could not be
+    persisted. A ``RuntimeError`` and not a ``ValueError``, on
+    ``UnknownModelPricingError``'s footing. Stage 5 converts it into a
+    ``Stage5SpendStopped`` so the patient fails rather than completing with a
+    hole; Stage 2's dense channel degrades exactly as for any other failure."""
+
+
+class BillingHandle(NamedTuple):
+    """One reserved attempt. Carries its SINK, so a settlement lands in the
+    record the reservation was written to even if the slot is cleared between
+    the two -- a request still on the wire when a run ends."""
+
+    attempt_id: str
+    sink: object
+    source: str
+    model: str
+    input_tokens: int
+    output_tokens: int
+    reserved_usd: float
+
+
+class BillingRecord:
+    """The process's installable durable billing sink. Thread-safe.
+
+    INSTALLED BY ``oncotriage/batch/runner.py:main()`` AND CLEARED BY IT, beside
+    ``SPEND_LEDGER.reset()``. Module-level for the ledger's reason: the question
+    spans patients and threads and Stage 2 as well as Stage 5, and
+    ``TrialMatchState`` reaches neither the embedding call nor the retry
+    policy's attempt loop.
+
+    THE SINK IS DUCK-TYPED -- ``reserve(**fields)`` and ``settle(attempt_id,
+    **fields) -> str`` -- so this module imports no storage layer (see the
+    module docstring); ``database_logger.BillingRecordSink`` is the one shipped
+    implementation.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._sink = None
+        # THE LIVE LIABILITY TALLY (the billing closure pass): per outcome,
+        # ``[count, usd]``, plus the attempts created and not yet resolved under
+        # ``LIABILITY_OPEN``. A plain dict and not a Counter, so it is not a
+        # module-level degradation counter; it is what lets a reconciliation
+        # compare SETTLED spend and UNRESOLVED reservations separately against
+        # the durable record's own split.
+        self._tally = {}
+        self._tally_lock = threading.Lock()
+
+    def _note_open(self, reserved_usd) -> None:
+        with self._tally_lock:
+            slot = self._tally.setdefault(LIABILITY_OPEN, [0, 0.0])
+            slot[0] += 1
+            slot[1] += float(reserved_usd or 0.0)
+
+    def _note_resolved(self, reserved_usd, outcome, usd) -> None:
+        with self._tally_lock:
+            slot = self._tally.setdefault(LIABILITY_OPEN, [0, 0.0])
+            slot[0] -= 1
+            slot[1] -= float(reserved_usd or 0.0)
+            done = self._tally.setdefault(outcome, [0, 0.0])
+            done[0] += 1
+            done[1] += float(usd or 0.0)
+
+    def liability_snapshot(self) -> dict:
+        """``{outcome or LIABILITY_OPEN: (count, usd)}``, a copy."""
+        with self._tally_lock:
+            return {k: (v[0], v[1]) for k, v in self._tally.items()}
+
+    def reset_liability(self) -> None:
+        """Forget an earlier run's tally. Called beside ``SPEND_LEDGER.reset()``."""
+        with self._tally_lock:
+            self._tally.clear()
+
+    def install(self, sink) -> None:
+        with self._lock:
+            self._sink = sink
+
+    def clear(self) -> None:
+        with self._lock:
+            self._sink = None
+
+    def installed_sink(self):
+        """The installed sink, or None. A method, not a property -- the decorator
+        inventory pins every property in the package."""
+        with self._lock:
+            return self._sink
+
+    def reserve(self, source, model, input_tokens, output_tokens, *, where):
+        """Persist a reservation before a billed dispatch. Returns a handle, or
+        None when no sink is installed. RAISES ``BillingRecordUnavailable`` when
+        a sink is installed and the reservation could not be made durable -- the
+        caller must then NOT dispatch.
+
+        ``where`` names the call site for the latch banner, on ``SpendStop``'s
+        own convention.
+        """
+        sink = self.installed_sink()
+        if sink is None:
+            return None
+        if SPEND_STOP.limit == SPEND_LIMIT_BILLING_RECORD:
+            # ALREADY LATCHED: the run is stopping because an earlier write
+            # failed. Trying again would make whether a request goes out depend
+            # on whether a flapping database happened to answer this time.
+            BILLING_RECORD_FAULTS["refused_latched"] += 1
+            raise BillingRecordUnavailable(
+                "the campaign's durable billing record failed earlier in this "
+                "run, so no further billed request is dispatched")
+        usd, fault = price_usage(model, input_tokens, output_tokens)
+        if usd is None:
+            BILLING_RECORD_FAULTS["reserve:unpriced"] += 1
+            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source)
+            raise BillingRecordUnavailable(
+                f"the reservation for this attempt could not be priced "
+                f"({fault}), so it was not dispatched")
+        attempt_id = uuid.uuid4().hex
+        try:
+            sink.reserve(attempt_id=attempt_id, source=source, model=model,
+                         input_tokens=int(input_tokens),
+                         output_tokens=int(output_tokens), reserved_usd=usd,
+                         correlation_id=current_correlation_id())
+        except Exception as exc:                                # noqa: BLE001
+            BILLING_RECORD_FAULTS[f"reserve:{type(exc).__name__}"] += 1
+            log.error("a billed attempt's reservation could not be persisted; "
+                      "the attempt was not dispatched and the run is latched",
+                      event="billing_reservation_failed", status="stopped",
+                      phase=source, mode=where, error_type=type(exc).__name__,
+                      error_message=str(exc), degraded=True)
+            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source)
+            raise BillingRecordUnavailable(
+                f"the reservation could not be persisted "
+                f"({type(exc).__name__}: {exc}), so the attempt was not "
+                f"dispatched") from exc
+        return BillingHandle(attempt_id, sink, source, model,
+                             int(input_tokens), int(output_tokens), usd)
+
+    def settle(self, handle, outcome, *, model=None, prompt_tokens=None,
+               completion_tokens=None):
+        """Resolve a reservation. NEVER RAISES. Returns the sink's result, or
+        None for a None handle.
+
+        It runs after the money is spent, frequently while an exception is
+        propagating, so a raise here would replace the caller's diagnosis with
+        a bookkeeping one. A settlement that did not land leaves the row
+        RESERVED, which every reader charges at its upper bound.
+        """
+        if handle is None:
+            return None
+        if outcome not in BILLING_OUTCOMES:
+            BILLING_RECORD_FAULTS[f"settle:bad_outcome:{outcome}"] += 1
+        # THE ONE RULE. See `attempt_liability`: the ledger's half of the same
+        # attempt reads the same function through `AttemptLiability.resolve`.
+        outcome, usd, settled_in, settled_out, _fault = attempt_liability(
+            outcome, handle.reserved_usd, model or handle.model, prompt_tokens,
+            completion_tokens)
+        return self._write_settlement(handle, outcome, usd, settled_in,
+                                      settled_out)
+
+    def _write_settlement(self, handle, outcome, usd, settled_in, settled_out):
+        """The durable half of a settlement whose amount is ALREADY decided.
+        NEVER RAISES. Shared by ``settle`` and ``AttemptLiability.resolve`` so
+        the write and its fault accounting have one owner."""
+        try:
+            result = handle.sink.settle(handle.attempt_id, outcome=outcome,
+                                        settled_usd=usd,
+                                        input_tokens=settled_in,
+                                        output_tokens=settled_out)
+        except Exception as exc:                                # noqa: BLE001
+            BILLING_RECORD_FAULTS[f"settle:raised:{type(exc).__name__}"] += 1
+            return "failed"
+        if result not in ("settled", "duplicate"):
+            BILLING_RECORD_FAULTS[f"settle:{result}"] += 1
+        return result
+
+
+BILLING_RECORD = BillingRecord()
+"""The one instance. Installed and cleared by ``oncotriage/batch/runner.py:main()``."""
+
+
+# ===========================================================================
+# ONE LIABILITY, BOTH LEDGERS (the billing closure pass)
+# ===========================================================================
+#
+# WHAT THIS CLOSES. The in-process ledger was charged at the Stage 5 call
+# sites (a response) and in the retry policy's `on_possibly_billed` callback
+# (a possibly-billed failure); the durable record was settled in the retry
+# policy's attempt hook; Stage 2's embedding charged the ledger for a response
+# and nothing for a failure. Three writers, two prices, and every attempt the
+# two did not both see was a live-versus-resumed disagreement in the direction
+# that lets a live process spend what a resume would refuse.
+#
+# THE MECHANISM: one object per billed wire attempt, created before dispatch
+# (it persists the durable reservation when a sink is installed), resolved
+# EXACTLY ONCE after. Resolution computes the liability through
+# `attempt_liability`, charges `SPEND_LEDGER` that amount, and settles the
+# durable row at the SAME amount. When the durable settlement does not land,
+# the row stays RESERVED -- every reader charges it at the reservation -- so
+# the ledger is topped up to the reservation too, and the two agree again.
+#
+# WHAT IT DOES NOT COVER, STATED: billed paths that do not create one of these
+# -- the rater's Batch API, the ragas harness -- keep their own ledger charges
+# and have no durable record to agree with.
+
+LIABILITY_OPEN = "open"
+"""The live tally's key for attempts created and not yet resolved -- the
+in-process mirror of a durable row still ``reserved``."""
+
+
+class AttemptLiability:
+    """One billed wire attempt's liability. Resolve it EXACTLY ONCE.
+
+    ``begin_billed_attempt`` is the constructor to use. It RAISES
+    ``BillingRecordUnavailable`` when a durable sink is installed and the
+    reservation could not be made durable -- the caller must then not
+    dispatch. With no sink it never raises.
+    """
+
+    def __init__(self, source, model, input_tokens, output_tokens, *, where):
+        self.source = source
+        self.model = model
+        self.where = where
+        # PRICED ONCE, HERE, whether or not a sink is installed: the ledger's
+        # possibly-billed charge needs it on every process, and the durable
+        # reservation (below) is priced by the same function, so the two cannot
+        # hold different upper bounds for one attempt.
+        self.reserved_usd, self.reservation_fault = price_usage(
+            model, input_tokens, output_tokens)
+        self.handle = BILLING_RECORD.reserve(source, model, input_tokens,
+                                             output_tokens, where=where)
+        self.resolved_outcome = None
+        self.resolved_usd = None
+        BILLING_RECORD._note_open(self.reserved_usd)
+
+    def upper_bound_usd(self) -> float:
+        """The reservation, for reporting. Charges nothing. Zero when it could
+        not be priced (a no-sink process only; the fault is counted at
+        resolution)."""
+        return float(self.reserved_usd or 0.0)
+
+    def resolve(self, outcome, *, model=None, prompt_tokens=None,
+                completion_tokens=None) -> float:
+        """Charge the ledger and settle the durable row at ONE amount.
+
+        NEVER RAISES; idempotent -- a second call returns the first call's
+        amount and charges nothing, because an attempt is billed once whatever
+        path reports it.
+
+        ORDER: the LEDGER first, then the durable write. ``charge_usd`` cannot
+        raise, so the in-process budget moves even if everything after it
+        fails; and a durable write that does not land tops the ledger up to the
+        reservation the unsettled row is read at.
+        """
+        if self.resolved_outcome is not None:
+            return self.resolved_usd
+        try:
+            out, usd, s_in, s_out, fault = attempt_liability(
+                outcome, self.reserved_usd, model or self.model, prompt_tokens,
+                completion_tokens)
+        except Exception as exc:                                # noqa: BLE001
+            # Unreachable by construction; conservative if reached.
+            BILLING_RECORD_FAULTS[f"liability:raised:{type(exc).__name__}"] += 1
+            out, usd, s_in, s_out, fault = (BILLING_OUTCOME_POSSIBLY_BILLED,
+                                            self.reserved_usd, None, None, None)
+        if fault is not None:
+            SPEND_LEDGER_FAULTS[fault] += 1
+        if usd is None:
+            # AN UNPRICEABLE RESERVATION CHARGED AT ITSELF. Only reachable with
+            # no sink (see `attempt_liability`); counted, never silent.
+            SPEND_LEDGER_FAULTS[f"unpriced_reservation:{self.model}"] += 1
+            usd = 0.0
+        self.resolved_outcome, self.resolved_usd = out, float(usd)
+        if out != BILLING_OUTCOME_NOT_BILLED:
+            SPEND_LEDGER.charge_usd(float(usd), self.source)
+        result = None
+        if self.handle is not None:
+            result = BILLING_RECORD._write_settlement(self.handle, out,
+                                                      float(usd), s_in, s_out)
+            if result not in ("settled", "duplicate"):
+                # THE DURABLE ROW STAYS RESERVED (failed) or holds something
+                # this attempt did not write (conflict, missing); every reader
+                # charges the conservative reading. Top the ledger up to the
+                # reservation so live and resumed agree in the safe direction.
+                top_up = float(self.reserved_usd or 0.0) - float(usd)
+                if top_up > 0:
+                    SPEND_LEDGER.charge_usd(top_up, self.source)
+                    self.resolved_usd = float(self.reserved_usd)
+                BILLING_RECORD_FAULTS[f"ledger_topped_up:{result}"] += 1
+        BILLING_RECORD._note_resolved(self.reserved_usd, out,
+                                      self.resolved_usd)
+        return self.resolved_usd
+
+
+def begin_billed_attempt(source, model, input_tokens, output_tokens, *,
+                         where) -> AttemptLiability:
+    """Create one billed attempt's liability, BEFORE dispatch. RAISES
+    ``BillingRecordUnavailable`` when a durable sink is installed and the
+    reservation could not be persisted; the caller must then not dispatch."""
+    return AttemptLiability(source, model, input_tokens, output_tokens,
+                            where=where)
 
 
 # ===========================================================================
@@ -2107,6 +2605,21 @@ def describe_seed(seed: LedgerSeed) -> str:
                   f"OVERSTATED"
                   if isinstance(seed, LedgerSeed) and seed.has_unreadable()
                   else "")
+    if seed.source == SEED_SOURCE_BILLING_RECORD:
+        # THE CUMULATIVE RECORD SAYS WHAT IT HOLDS IN ITS OWN UNITS -- billed
+        # attempts, not inference rows -- and it can hold spend from a prior
+        # invocation that checkpointed nothing, so "no prior run" is decided by
+        # the attempt count rather than by `runs`.
+        if seed.rows == 0 and not unverified:
+            return ("[Spend] Fresh campaign: its durable billing record holds "
+                    "no billed attempt yet.")
+        _open = (f"; {seed.unresolved} of them were interrupted before "
+                 f"settlement and are charged at their RESERVED upper bound"
+                 if seed.unresolved else "")
+        return (f"[Spend] Resumed {seed_budget(seed)} budget from the durable "
+                f"billing record: ${seed.usd:.2f} across {seed.rows} billed "
+                f"attempt(s) in {seed.runs} prior invocation(s){_open}"
+                f"{unverified}.")
     if (seed.source == SEED_SOURCE_NONE or seed.runs == 0) and not unverified:
         return ("[Spend] Fresh run: no prior run contributes to any budget "
                 "here.")

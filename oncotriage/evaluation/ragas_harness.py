@@ -3612,8 +3612,8 @@ def main(argv=None):
         # nothing said so, which is the rater's defect one program over.
         #
         # WHAT IT STILL DOES NOT DO: it does not net against Stage 5's spend.
-        # A campaign seeds the same budget from the `runs` table
-        # (`database_logger.campaign_spend_before`); ragas seeds it from the
+        # A campaign seeds the same budget from its billing record
+        # (`database_logger.campaign_billing_total`); ragas seeds it from the
         # journal. The two populations are DISJOINT -- Stage 5 writes no
         # journal entry and ragas writes no `inferences` row -- so neither
         # double-counts the other, and neither sees it either. That was true

@@ -83,11 +83,12 @@ recovery path.
 import json
 import os
 import sqlite3
+import sys
 import threading
 import time
 import urllib.parse
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Dict, NamedTuple
 
 from oncotriage import paths
@@ -234,6 +235,24 @@ def resolve_inference_db_path(db_path=None):
 # where they started. It answers one question -- which era is this file -- for
 # a human, a support script, or a future tool that must refuse a database it
 # does not understand.
+# ERA 18: `runs.billing_campaign_id` and the `run_counter_registry` TABLE (the
+#        billing closure pass). The column stamps the billing campaign on the
+#        run row before its first billed call, so a zero-success restart that
+#        continues a budget is one campaign in `campaign_summary` too. The
+#        table records WHICH degradation counters a run's health flush
+#        consulted, so the absence of a counter's row is positive evidence of
+#        zero only where that counter was registered -- which is what
+#        `historical_campaign_evidence` now requires rather than assumes.
+# ERA 17: the `billing_attempts` TABLE -- a campaign's CUMULATIVE billing
+#        record, one row per billed wire attempt, reserved before dispatch and
+#        settled against observed usage, keyed by attempt, invocation
+#        (`run_id`) and campaign. It is what a resumed batch campaign's budget
+#        is read from, replacing a sum over `inferences.estimated_cost_usd`
+#        that described final attempts only. See THE CAMPAIGN'S CUMULATIVE
+#        BILLING RECORD below. A new table rather than a column: the unit is
+#        the attempt, not the patient. Nothing existing moves and nothing is
+#        backfilled; a historical campaign's prior spend is admitted only
+#        through `historical_campaign_evidence`.
 # ERA 16: the `drift_reference` TABLE, and five additive `drift_metrics`
 #        columns -- `status`, `alert_policy`, `reference_id`, `stratum` and
 #        `comparison_selection` -- added with DRIFT_METRIC_COLUMN_ADDITIONS and
@@ -437,7 +456,7 @@ def resolve_inference_db_path(db_path=None):
 #        own once per-trial mode can bypass the packer.
 # ERA 2: `runs.resumed`, added with RUN_COLUMN_ADDITIONS and its migration loop.
 # ERA 1: the constant's own introduction -- the schema as it stood then.
-SCHEMA_USER_VERSION = 16
+SCHEMA_USER_VERSION = 18
 
 
 #------------------------------------------------------------------------------
@@ -2123,6 +2142,20 @@ RUN_COLUMN_ADDITIONS = {
     # JSON object naming the failure rather than dropped, so a reader never has
     # to distinguish "old row" from "new row whose serialization failed".
     "tunables": "TEXT",
+    # ── THE BILLING CAMPAIGN THIS RUN SPENT UNDER (era 18) ─────────────────
+    #
+    # `billing_attempts.campaign_id`, stamped on the run row BEFORE the run's
+    # first billed call, durably (see `set_run_billing_campaign_id`). A zero-
+    # success restart used to continue the SAME billing campaign while its run
+    # row read `resumed = 0`, so `campaign_summary`'s stitch rule reported two
+    # campaigns for one budget. The stitch now reads this column first; see
+    # `campaign_run_ids`.
+    #
+    # NULL MEANS "THIS RUN RAN UNDER NO BILLING CAMPAIGN": every row before era
+    # 18, every caller that installs no billing sink, and a batch run refused
+    # before its campaign was established. `runs.resumed` is UNCHANGED and still
+    # means "the checkpoint handed this run completed patients".
+    "billing_campaign_id": "TEXT",
 }
 
 
@@ -2748,8 +2781,8 @@ deciding that it should. Listing them makes that guard a real check and makes a
 new status a deliberate edit here.
 
 TWO CONSUMERS, ONE OWNER. ``queries.campaign_summary`` stitches every campaign
-in the table with a recursive CTE; ``campaign_spend_before`` below walks ONE
-chain backwards to seed a resumed run's spend gate. They must agree about what
+in the table with a recursive CTE; ``campaign_run_ids`` below walks ONE
+chain from a known run. They must agree about what
 a campaign IS or a budget would be computed over a different set of runs than
 the report that presents it -- so they read one tuple rather than two.
 
@@ -2780,9 +2813,16 @@ near its cap. It means a single invocation asked for more billed calls than the
 configuration can legitimately produce, which is a defect in this pipeline.
 """
 
+RUN_STOP_REASON_BILLING_RECORD = "billing_record"
+"""The campaign's durable billing record could not be written, so no further
+billed request could be dispatched. NOT a budget event and NOT a pipeline
+defect: the database the record lives in is the remedy. See
+``spend.BILLING_RECORD``."""
+
 RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR,
                     RUN_STOP_REASON_SPEND_CAP,
-                    RUN_STOP_REASON_CALL_CEILING)
+                    RUN_STOP_REASON_CALL_CEILING,
+                    RUN_STOP_REASON_BILLING_RECORD)
 """Every value ``runs.stop_reason`` may hold. CLOSED.
 
 WHY THIS IS A COLUMN AND NOT THREE MORE MEMBERS OF ``RUN_RECORD_STATUSES``, and
@@ -4386,6 +4426,57 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     _ensure_index(cursor, "idx_run_metrics_run_id", "run_metrics",
                   ("run_id",))
 
+    # THE CAMPAIGN'S CUMULATIVE BILLING RECORD (era 17). One row per billed
+    # wire attempt; see THE CAMPAIGN'S CUMULATIVE BILLING RECORD for the
+    # identities, the reserve/settle contract and why the primary key is the
+    # attempt id. `reserved_usd` is NOT NULL because a row exists only once a
+    # reservation has been priced; `settled_usd` is NULL exactly while the row
+    # is reserved.
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS billing_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    model TEXT,
+    correlation_id TEXT,
+    state TEXT NOT NULL,
+    reserved_usd REAL NOT NULL,
+    settled_usd REAL,
+    outcome TEXT,
+    reserved_input_tokens INTEGER,
+    reserved_output_tokens INTEGER,
+    settled_input_tokens INTEGER,
+    settled_output_tokens INTEGER,
+    reserved_at TEXT NOT NULL,
+    settled_at TEXT,
+    note TEXT
+)
+''')
+
+    _ensure_index(cursor, "idx_billing_attempts_campaign_id",
+                  "billing_attempts", ("campaign_id",))
+    _ensure_index(cursor, "idx_billing_attempts_run_id", "billing_attempts",
+                  ("run_id",))
+
+    # WHICH COUNTERS A RUN'S HEALTH FLUSH CONSULTED (era 18). One row per
+    # registered counter NAME, rewritten with the run's `run_metrics` rows in
+    # the same transaction. `run_metrics` stores only NON-ZERO totals, so without
+    # this a counter that the producing build never registered and a counter
+    # that stayed at zero leave the same absence. A separate table rather than a
+    # third `run_metrics` category, because RUN_METRIC_CATEGORIES is closed and
+    # the run-health consumers count that table's rows.
+    cursor.execute('''
+CREATE TABLE IF NOT EXISTS run_counter_registry (
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    name TEXT NOT NULL,
+    written_at TEXT NOT NULL
+)
+''')
+    _ensure_index(cursor, "idx_run_counter_registry_run_id",
+                  "run_counter_registry", ("run_id",))
+
 
     # ------------------------------------------------------------------
     # STAMP THE SCHEMA ERA -- LAST, AND THE POSITION IS THE POINT
@@ -4943,6 +5034,11 @@ def start_run_record(invocation_source, db_path=None, fingerprint=None,
     # every era rather than only on the ones written before era 7.
     values["stop_reason"] = None
 
+    # NULL AT OPEN: the billing campaign is decided AFTER the run row exists
+    # (historical evidence walks the stitch from it), and is stamped by
+    # `set_run_billing_campaign_id` before the first billed call.
+    values["billing_campaign_id"] = None
+
     # WHAT EVERY KNOB WAS SET TO AT THIS MOMENT. Resolved here rather than
     # taken as an argument -- see `_run_tunables_json` for why that is the
     # opposite call from `fingerprint`, `cohort` and `environment` above, and
@@ -5074,175 +5170,926 @@ def _coerce_run_note(note, run_id):
     return text
 
 
-class CampaignSpend(NamedTuple):
-    """What the runs this one is RESUMING already spent. See
-    ``campaign_spend_before``."""
+# ===========================================================================
+# THE CAMPAIGN'S CUMULATIVE BILLING RECORD (the cumulative-spend pass)
+# ===========================================================================
+#
+# WHAT THIS REPLACES, AND WHY IT HAD TO GO RATHER THAN BE PATCHED.
+# ``campaign_spend_before`` used to seed a resumed batch run's budget by summing
+# ``inferences.estimated_cost_usd`` over the ``runs`` chain. Since the
+# attempt-provenance pass that column describes a patient's FINAL Stage 5
+# attempt only, so the sum omitted every earlier billed attempt, every billed
+# attempt of a patient whose row was never written, and every Stage 2 dense
+# embedding -- and a restarted campaign could spend all of it again. A function
+# named "spend before" that sums final-attempt figures is a standing invitation
+# to that regression, so it is DELETED, not narrowed. The chain walk it carried
+# survives in ``campaign_run_ids``; the budget is now read from the record below.
+#
+# ONE ROW PER BILLED WIRE ATTEMPT, RESERVED BEFORE DISPATCH AND SETTLED AFTER.
+# See ``oncotriage/spend.py``'s DURABLE BILLING RECORD block for the mechanism
+# and ``BILLING_RECORD``'s docstring for who installs a sink. This module owns
+# the table, the three writes and the one read.
+#
+# THE IDENTITIES, EACH STABLE FOR WHAT IT NAMES:
+#   ``attempt_id``   one wire attempt; generated at reservation, the PRIMARY KEY,
+#                    and the only key a settlement is addressed by -- so a
+#                    repeated settlement cannot land twice and cannot land on a
+#                    different attempt.
+#   ``run_id``       the invocation (the ``runs`` row) that made the attempt.
+#   ``campaign_id``  the campaign, persisted beside the checkpoint before the
+#                    first billed call (``oncotriage/batch/runner.py``), and
+#                    inherited by every invocation that continues it. It is NOT
+#                    derived from the ``runs`` stitch: two concurrent campaigns
+#                    sharing one database and one configuration are
+#                    indistinguishable to that rule and distinct here.
+#   ``correlation_id``  the patient scope the attempt ran under, for diagnosis.
+#
+# NOT A FOREIGN KEY THAT IS ENFORCED, for ``runs``' own four reasons (argued at
+# its CREATE TABLE). THE PRIMARY KEY ON ``attempt_id`` IS THE ONE UNIQUENESS
+# CONSTRAINT, and it is reached only through ``INSERT OR IGNORE`` plus a read
+# back, on ``run_environment``'s precedent, so ``IntegrityError`` -- which
+# ``_is_retryable`` classes TERMINAL -- is never the way a duplicate is found.
 
-    usd: float = 0.0
-    rows: int = 0
-    unpriced: int = 0
-    run_ids: tuple = ()
+BILLING_ATTEMPT_KIND_ATTEMPT = "attempt"
+BILLING_ATTEMPT_KIND_HISTORICAL = "historical_evidence"
+BILLING_ATTEMPT_KINDS = (BILLING_ATTEMPT_KIND_ATTEMPT,
+                         BILLING_ATTEMPT_KIND_HISTORICAL)
+"""What a ``billing_attempts`` row is. CLOSED.
 
-    @property
-    def runs(self) -> int:
-        return len(self.run_ids)
+  ``attempt``              one billed wire attempt of this build.
+  ``historical_evidence``  the demonstrated-covered spend of a campaign's runs
+                           that predate this record, written ONCE when such a
+                           campaign is first resumed. See
+                           ``historical_campaign_evidence``.
+"""
+
+BILLING_ATTEMPT_STATE_RESERVED = "reserved"
+BILLING_ATTEMPT_STATE_SETTLED = "settled"
+BILLING_ATTEMPT_STATES = (BILLING_ATTEMPT_STATE_RESERVED,
+                          BILLING_ATTEMPT_STATE_SETTLED)
+"""A row is RESERVED until its attempt resolves and SETTLED after. CLOSED.
+Every reader charges a reserved row at ``reserved_usd`` and a settled row at
+``settled_usd``; there is no third reading."""
+
+BILLING_ATTEMPT_OUTCOMES = ("response", "response_unpriced", "possibly_billed",
+                            "not_billed", "abandoned", "historical_evidence")
+"""What a settled row's amount is based on. CLOSED.
+
+RESTATED FROM ``spend.BILLING_OUTCOMES`` PLUS ``historical_evidence``, which only
+this module writes. It is restated rather than imported for
+``RUN_FINGERPRINT_COLUMNS``' reason -- the storage layer carries no dependency
+on the module whose values it stores -- and
+``tests/test_campaign_billing_record.py`` pins the two equal, so a sixth outcome
+added to one side fails there rather than arriving as a settlement this module
+refuses.
+"""
+
+SETTLE_SETTLED = "settled"
+SETTLE_DUPLICATE = "duplicate"
+SETTLE_CONFLICT = "conflict"
+SETTLE_MISSING = "missing"
+SETTLE_FAILED = "failed"
+SETTLE_RESULTS = (SETTLE_SETTLED, SETTLE_DUPLICATE, SETTLE_CONFLICT,
+                  SETTLE_MISSING, SETTLE_FAILED)
+"""What ``settle_billing_attempt`` did. CLOSED.
+
+  ``settled``    the reservation was resolved by this call.
+  ``duplicate``  it was already settled at the SAME amount and outcome -- a
+                 repeat of a settlement that landed. Harmless and not a fault.
+  ``conflict``   it was already settled at a DIFFERENT amount or outcome. The
+                 first settlement stands; nothing is overwritten.
+  ``missing``    no row carries that attempt id.
+  ``failed``     the write could not be made; the row stays RESERVED, which
+                 every reader charges at its upper bound.
+"""
+
+_BILLING_AMOUNT_EPSILON = 1e-9
 
 
-def campaign_spend_before(run_id, db_path=None) -> CampaignSpend:
-    """The billed spend of the runs this run is resuming. NEVER RAISES.
+class BillingRecordWriteError(RuntimeError):
+    """A reservation could not be made durable. The caller must NOT dispatch."""
 
-    WHY A RESUME MUST ASK. ``config.SPEND_CAP_USD`` is a CAMPAIGN budget. A cap
-    that reset with each invocation is not a brake at all: a run that tripped
-    the cap and was restarted -- by a systemd ``Restart=``, a cron entry, an
-    operator who thought it had hung -- would get a fresh $300 every time, and
-    the run lock (which forbids CONCURRENT runs) does nothing about SEQUENTIAL
-    ones. This is what closes that.
 
-    THE ROWS ARE THE SOURCE OF TRUTH, and there is no second one. The checkpoint
-    could have carried a running total, and that was rejected: it is a control
-    file an operator may delete (``--fresh`` does), it is written by the very
-    process whose spend it would be claiming, and it would be a SECOND ledger to
-    keep in step with the one the database already holds. ``inferences`` rows are
-    what the money actually bought.
+class BillingRecordUnreadable(RuntimeError):
+    """The campaign's billing record could not be read, or holds a row whose
+    amount cannot be summed. A resume must refuse rather than start its budget
+    from a number nobody could read."""
 
-    WHICH RUNS COUNT -- ``campaign_summary``'s STITCH, WALKED FORWARD.
-    A run with ``resumed = 1`` continues the campaign of the nearest PRECEDING
-    run whose status is in ``CAMPAIGN_RESUMABLE_STATUSES`` and whose fingerprint
-    columns are all identical; chains stitch transitively. That rule is
-    ``oncotriage/storage/queries.py``'s and it is not re-decided here -- what is
-    different is only the direction: that query stitches every campaign in the
-    table at once with a recursive CTE, and this walks ONE chain backwards from
-    a known run in a few round trips.
 
-    THE TWO ARE PINNED AGAINST EACH OTHER by ``tests/test_spend_gate.py``, on
-    ``RUN_RECORD_TERMINAL_STATUSES``' precedent: a restated rule is a rule that
-    can drift, so it is checked rather than promised. A test may import both.
+class BillingDurabilityUnavailable(RuntimeError):
+    """A connection that writes the billing record could not be put into the
+    synchronous mode the record requires. A ``RuntimeError`` and not an
+    ``sqlite3.OperationalError``, so ``run_with_write_retry`` classes it
+    TERMINAL: retrying does not change what a connection reads back."""
 
-    WHY NOT SIMPLY REUSE ``campaign_summary``. It is a REPORTING query over the
-    whole table, keyed on a campaign's FIRST run; this needs the answer for a
-    run that has just been created and has no rows of its own yet, at the top of
-    ``main()``, before the first billed call. Running the whole recursive stitch
-    to read one chain would also make every batch run's startup cost a full-table
-    scan of ``runs`` joined to ``inferences``.
 
-    WHY THE FINGERPRINT MUST MATCH, and it is the same argument
-    ``campaign_summary`` makes: a prompt bump, a renderer edit, a re-index or a
-    model change between the crash and the resume breaks the chain, because
-    "which configuration produced this number" is the question a campaign total
-    is asked. A budget follows the campaign, and a re-configured run is a new
-    campaign.
+# ---------------------------------------------------------------------------
+# DURABILITY OF THE BILLING WRITES (the billing closure pass)
+# ---------------------------------------------------------------------------
+#
+# A process kill cannot lose a committed transaction; a HOST crash can lose the
+# last ones when SQLite is not syncing at commit. ``PRAGMA synchronous`` is a
+# PER-CONNECTION setting whose default is a COMPILE-TIME choice of whichever
+# SQLite the interpreter links -- measured FULL (2) on this machine's 3.45.3, and
+# NORMAL is a common build default, under which a WAL commit is not synced and
+# the most recent commits can roll back on power loss. So every connection that
+# writes a reservation, a settlement or a run's billing campaign id SETS FULL
+# and READS IT BACK before its transaction; one that reads back less is refused,
+# and a refused reservation is an attempt that is not dispatched.
+#
+# ON macOS, FULL IS NOT ENOUGH ON ITS OWN. fsync(2) there returns once the data
+# reaches the drive, not once the drive has flushed its cache; F_FULLFSYNC is
+# what Apple documents as the durable call, and SQLite issues it only under
+# ``PRAGMA fullfsync``. It is required and read back on darwin only; elsewhere
+# the pragma is ignored by SQLite, and requiring a value it ignores would be a
+# check that proves nothing.
+#
+# THE BOUND, STATED: this is durability to what the filesystem and the hardware
+# guarantee. A drive that acknowledges a flush it did not perform, a filesystem
+# mounted without barriers, or a virtualised disk with a volatile write cache can
+# still lose a synced commit, and nothing a process does can detect that.
 
-    NULLS: SQLite's ``IS`` is null-safe equality, so a field that degraded to
-    NULL on both sides compares equal -- correct -- and two runs with NO STAMP
-    AT ALL would also compare equal, which is not. Both sides are therefore
-    additionally required to carry a ``fingerprint_version``, which is
-    ``run_fingerprint``'s own key for "unknown configuration" and is
-    ``campaign_summary``'s guard restated.
+BILLING_SYNCHRONOUS_MINIMUM = 2
+"""``PRAGMA synchronous`` read-back floor: FULL (2) or EXTRA (3)."""
 
-    A ROW WITH A NULL COST IS COUNTED IN ``unpriced`` AND CONTRIBUTES NOTHING TO
-    ``usd``, which makes the sum a FLOOR. That is stated by every consumer --
-    ``spend.describe_seed`` prints "<- A FLOOR, NOT A TOTAL" -- rather than
-    hidden, because the direction of the error matters: a floor UNDER-counts,
-    so the gate lets the campaign spend more than it should. The alternative,
-    refusing to resume, would make one unpriceable historical row block a
-    campaign; ``print_cost_by_model`` faced the identical choice and made the
-    identical call.
+BILLING_FULLFSYNC_PLATFORMS = ("darwin",)
+"""Platforms on which ``PRAGMA fullfsync`` must read back ON."""
 
-    Args:
-        run_id: the row this run just opened. ``None`` returns an empty result
-            rather than raising -- a caller with no run row has no campaign.
-        db_path: the database the run row is in.
 
-    Returns:
-        ``CampaignSpend``. Empty on any failure, which is the direction argued
-        below.
+def _open_billing_connection(db_path):
+    """An ``_open_connection`` whose commits are synced, VERIFIED. RAISES
+    ``BillingDurabilityUnavailable``; the connection is closed on refusal.
 
-    IT NEVER RAISES, AND THE DIRECTION IS THE UNCOMFORTABLE HALF. A failure here
-    returns an EMPTY seed, so a resumed run starts its budget at zero and may
-    spend a second full cap. The alternative -- refusing to run -- turns a
-    read-only bookkeeping query into something that can stop a campaign, and
-    this is called at the top of ``main()`` where the honest failure is "this
-    database could not be read", which every write below would hit anyway. The
-    failure is COUNTED into ``RUN_RECORD_FAILURES`` under ``campaign_spend:``
-    and printed, so it is never silent.
+    The PRAGMAs run on a fresh connection, before any statement opens a
+    transaction -- SQLite refuses to change the safety level inside one
+    ("Safety level may not be changed inside a transaction", measured).
     """
+    conn = _open_connection(db_path)
     try:
-        if run_id is None:
-            return CampaignSpend()
+        conn.execute("PRAGMA synchronous = FULL")
+        row = conn.execute("PRAGMA synchronous").fetchone()
+        level = row[0] if row else None
+        if (isinstance(level, bool) or not isinstance(level, int)
+                or level < BILLING_SYNCHRONOUS_MINIMUM):
+            raise BillingDurabilityUnavailable(
+                f"PRAGMA synchronous reads back {level!r} on {db_path}, below "
+                f"FULL ({BILLING_SYNCHRONOUS_MINIMUM}); a billing commit would "
+                f"not be synced")
+        if sys.platform in BILLING_FULLFSYNC_PLATFORMS:
+            conn.execute("PRAGMA fullfsync = ON")
+            row = conn.execute("PRAGMA fullfsync").fetchone()
+            if not row or row[0] != 1:
+                raise BillingDurabilityUnavailable(
+                    f"PRAGMA fullfsync reads back {row!r} on {db_path}; on "
+                    f"{sys.platform} a commit synced without F_FULLFSYNC can "
+                    f"sit in the drive's cache")
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
-        db_path = resolve_inference_db_path(db_path)
-        conn = _open_connection(db_path)
+
+def _billing_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _valid_billing_usd(value) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and value == value and value not in (float("inf"), float("-inf"))
+            and value >= 0)
+
+
+def _optional_count(value):
+    return (value if isinstance(value, int) and not isinstance(value, bool)
+            and value >= 0 else None)
+
+
+def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
+                            model, input_tokens, output_tokens, reserved_usd,
+                            correlation_id=None,
+                            kind=BILLING_ATTEMPT_KIND_ATTEMPT, note=None):
+    """COMMIT a reservation row. RAISES ``BillingRecordWriteError`` on any
+    failure; returns the attempt id once the row is durable.
+
+    IT RAISES AND THAT IS THE CONTRACT. It runs immediately BEFORE a billed
+    dispatch, where a failure costs nothing and continuing would send a request
+    whose charge a later process cannot count.
+
+    IDEMPOTENT BY CONSTRUCTION: ``INSERT OR IGNORE`` on the primary key, then the
+    row is READ BACK and required to carry this call's campaign, run and amount.
+    A repeat of the same reservation succeeds; a colliding id that describes a
+    different charge raises rather than being mistaken for this one.
+
+    A ``historical_evidence`` row is written SETTLED at its amount in the same
+    statement -- it records spend that already happened, so there is nothing to
+    reserve ahead of.
+    """
+    problems = []
+    if not isinstance(attempt_id, str) or not attempt_id:
+        problems.append("attempt_id")
+    if not isinstance(campaign_id, str) or not campaign_id:
+        problems.append("campaign_id")
+    if isinstance(run_id, bool) or not isinstance(run_id, int):
+        problems.append("run_id")
+    if not isinstance(source, str) or not source:
+        problems.append("source")
+    if kind not in BILLING_ATTEMPT_KINDS:
+        problems.append("kind")
+    if not _valid_billing_usd(reserved_usd):
+        problems.append("reserved_usd")
+    if problems:
+        raise BillingRecordWriteError(
+            f"a billing reservation was refused before any write: invalid "
+            f"{', '.join(problems)}")
+
+    historical = kind == BILLING_ATTEMPT_KIND_HISTORICAL
+    now = _billing_now()
+    values = (attempt_id, campaign_id, run_id, kind, source, model,
+              correlation_id,
+              (BILLING_ATTEMPT_STATE_SETTLED if historical
+               else BILLING_ATTEMPT_STATE_RESERVED),
+              float(reserved_usd),
+              float(reserved_usd) if historical else None,
+              "historical_evidence" if historical else None,
+              _optional_count(input_tokens), _optional_count(output_tokens),
+              now, now if historical else None, note)
+
+    def _op():
+        # SYNCED AND VERIFIED BEFORE THE TRANSACTION. See DURABILITY OF THE
+        # BILLING WRITES: the commit below returns only once it is on disk to
+        # the filesystem's guarantee, and only then is the attempt dispatched.
+        conn = _open_billing_connection(db_path)
         try:
             cursor = conn.cursor()
-            _fp = ", ".join(RUN_FINGERPRINT_COLUMNS)
             cursor.execute(
-                f"SELECT id, resumed, {_fp} FROM runs WHERE id = ?", (run_id,))
-            row = cursor.fetchone()
-            if row is None:
-                RUN_RECORD_FAILURES["campaign_spend:row_not_found"] += 1
-                return CampaignSpend()
-
-            _stamp = list(row[2:])
-            # NO STAMP, NO CHAIN. `fingerprint_version` is RUN_FINGERPRINT_COLUMNS'
-            # first member and is `run_fingerprint`'s own key for "this
-            # configuration was never recorded". Stitching on an all-NULL stamp
-            # would make every unstamped run in the table one campaign.
-            if _stamp[0] is None:
-                return CampaignSpend()
-
-            _match = " AND ".join(f"{c} IS ?" for c in RUN_FINGERPRINT_COLUMNS)
-            _statuses = ", ".join("?" for _ in CAMPAIGN_RESUMABLE_STATUSES)
-
-            chain = []
-            cur_id, cur_resumed = row[0], row[1]
-            # THE WALK IS BOUNDED BY `id <` AND CANNOT LOOP: each step selects a
-            # STRICTLY smaller id, so the sequence is decreasing in a finite set.
-            # A `seen` guard would be defending against a database in which a
-            # row's id is not its own.
-            while cur_resumed == 1:
-                cursor.execute(
-                    f"SELECT id, resumed FROM runs "
-                    f"WHERE id < ? AND status IN ({_statuses}) "
-                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
-                    f"ORDER BY id DESC LIMIT 1",
-                    (cur_id, *CAMPAIGN_RESUMABLE_STATUSES, *_stamp))
-                prev = cursor.fetchone()
-                if prev is None:
-                    break
-                chain.append(prev[0])
-                cur_id, cur_resumed = prev[0], prev[1]
-
-            if not chain:
-                return CampaignSpend()
-
-            _ids = ", ".join("?" for _ in chain)
+                "INSERT OR IGNORE INTO billing_attempts (attempt_id, "
+                "campaign_id, run_id, kind, source, model, correlation_id, "
+                "state, reserved_usd, settled_usd, outcome, "
+                "reserved_input_tokens, reserved_output_tokens, reserved_at, "
+                "settled_at, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                "?, ?, ?, ?)", values)
             cursor.execute(
-                f"SELECT COALESCE(SUM(estimated_cost_usd), 0.0), "
-                f"       COUNT(*), "
-                f"       SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 "
-                f"                ELSE 0 END) "
-                f"FROM inferences WHERE run_id IN ({_ids})",
-                tuple(chain))
-            total, rows, unpriced = cursor.fetchone()
+                "SELECT campaign_id, run_id, kind, reserved_usd FROM "
+                "billing_attempts WHERE attempt_id = ?", (attempt_id,))
+            found = cursor.fetchone()
+            conn.commit()
+            return found
         finally:
             conn.close()
 
-        return CampaignSpend(usd=float(total or 0.0), rows=int(rows or 0),
-                             unpriced=int(unpriced or 0),
-                             run_ids=tuple(reversed(chain)))
-
+    try:
+        with _WRITE_LOCK:
+            found = run_with_write_retry(_op, "a billing reservation")
     except Exception as exc:                                   # noqa: BLE001
-        RUN_RECORD_FAILURES[f"campaign_spend:{type(exc).__name__}"] += 1
-        console.out(f"⚠ The campaign's prior spend could not be read "
-                    f"(non-critical): {type(exc).__name__}: {exc}")
-        log.error("the resumed campaign's prior spend could not be read, so "
-                  "this run's spend gate starts from zero",
-                  event="campaign_spend_unreadable",
-                  inference_run_id=run_id,
-                  error_type=type(exc).__name__, error_message=str(exc))
-        return CampaignSpend()
+        raise BillingRecordWriteError(
+            f"the billing reservation could not be committed to {db_path}: "
+            f"{type(exc).__name__}: {exc}") from exc
+    if (found is None or found[0] != campaign_id or found[1] != run_id
+            or found[2] != kind
+            or not _valid_billing_usd(found[3])
+            or abs(float(found[3]) - float(reserved_usd))
+            > _BILLING_AMOUNT_EPSILON):
+        raise BillingRecordWriteError(
+            f"billing attempt {attempt_id} reads back as {found!r}, which is "
+            f"not the reservation just written; it was not treated as durable")
+    return attempt_id
 
 
+def settle_billing_attempt(db_path, attempt_id, *, outcome, settled_usd,
+                           input_tokens=None, output_tokens=None) -> str:
+    """Resolve a reservation. NEVER RAISES. Returns a ``SETTLE_RESULTS`` member.
+
+    THE UPDATE IS GUARDED BY ``state = 'reserved'``, WHICH IS THE WHOLE OF THE
+    IDEMPOTENCY: a second settlement matches no row, and the row is then read to
+    say whether it was a harmless repeat or a disagreement. Nothing already
+    settled is ever overwritten, so a replayed or racing settlement cannot move
+    a charge a reader has already summed.
+
+    IT NEVER RAISES because it runs after the money is spent, often while an
+    exception is propagating. A settlement that could not be written leaves the
+    row RESERVED at its upper bound -- conservative -- and says ``failed``.
+    """
+    if (outcome not in BILLING_ATTEMPT_OUTCOMES
+            or outcome == "historical_evidence"
+            or not _valid_billing_usd(settled_usd)):
+        log.warning("a billing settlement with an invalid outcome or amount was "
+                    "refused; the reservation stands",
+                    event="billing_settlement_refused", reason=str(outcome))
+        return SETTLE_FAILED
+
+    def _op():
+        conn = _open_billing_connection(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE billing_attempts SET state = ?, settled_usd = ?, "
+                "outcome = ?, settled_input_tokens = ?, "
+                "settled_output_tokens = ?, settled_at = ? "
+                "WHERE attempt_id = ? AND state = ?",
+                (BILLING_ATTEMPT_STATE_SETTLED, float(settled_usd), outcome,
+                 _optional_count(input_tokens), _optional_count(output_tokens),
+                 _billing_now(), attempt_id, BILLING_ATTEMPT_STATE_RESERVED))
+            if cursor.rowcount == 1:
+                conn.commit()
+                return SETTLE_SETTLED, None
+            cursor.execute(
+                "SELECT state, settled_usd, outcome FROM billing_attempts "
+                "WHERE attempt_id = ?", (attempt_id,))
+            row = cursor.fetchone()
+            conn.commit()
+            return None, row
+        finally:
+            conn.close()
+
+    try:
+        with _WRITE_LOCK:
+            result, row = run_with_write_retry(_op, "a billing settlement")
+    except Exception as exc:                                   # noqa: BLE001
+        log.error("a billing settlement could not be written; the reservation "
+                  "stands at its upper bound", event="billing_settlement_failed",
+                  error_type=type(exc).__name__, error_message=str(exc),
+                  degraded=True)
+        return SETTLE_FAILED
+    if result == SETTLE_SETTLED:
+        return SETTLE_SETTLED
+    if row is None:
+        return SETTLE_MISSING
+    state, stored_usd, stored_outcome = row
+    if (state == BILLING_ATTEMPT_STATE_SETTLED
+            and _valid_billing_usd(stored_usd)
+            and abs(float(stored_usd) - float(settled_usd))
+            <= _BILLING_AMOUNT_EPSILON
+            and stored_outcome == outcome):
+        return SETTLE_DUPLICATE
+    log.warning("a billing settlement disagreed with the settlement already "
+                "stored; the stored one stands", event="billing_settlement_conflict",
+                reason=str(stored_outcome), degraded=True)
+    return SETTLE_CONFLICT
+
+
+class CampaignBilling(NamedTuple):
+    """What a campaign's cumulative billing record holds. See
+    ``campaign_billing_total``."""
+
+    usd: float = 0.0
+    attempts: int = 0
+    unresolved: int = 0
+    unresolved_usd: float = 0.0
+    historical_usd: float = 0.0
+    run_ids: tuple = ()
+
+
+def campaign_billing_total(campaign_id, db_path=None) -> CampaignBilling:
+    """Sum a campaign's billing record. RAISES ``BillingRecordUnreadable``.
+
+    THIS IS THE NUMBER A RESUMED CAMPAIGN'S BUDGET STARTS FROM, and it is the
+    one place that number is computed. A settled row contributes
+    ``settled_usd``; a RESERVED row -- an attempt whose process died between
+    dispatch and settlement -- contributes ``reserved_usd``, its upper bound,
+    for as long as it stays unresolved.
+
+    IT RAISES, AND THE DIRECTION IS THE POINT. The function it replaces returned
+    an empty result on any failure, which started the budget at zero -- the
+    overspending direction. An unreadable record, or a row whose amount cannot
+    be summed, is a refusal to resume paid work, and the caller names it.
+
+    THE SUM IS DONE IN PYTHON OVER VALIDATED ROWS rather than by ``SUM()``,
+    because SQLite's ``SUM`` coerces a text value to 0 -- a hand-edited or
+    corrupted amount would silently read as free.
+    """
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise BillingRecordUnreadable(
+            f"no campaign id to read the billing record for: {campaign_id!r}")
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        conn = _open_connection(db_path, read_only=True)
+        try:
+            rows = conn.execute(
+                "SELECT attempt_id, run_id, kind, state, reserved_usd, "
+                "settled_usd FROM billing_attempts WHERE campaign_id = ? "
+                "ORDER BY rowid", (campaign_id,)).fetchall()
+        finally:
+            conn.close()
+    except Exception as exc:                                   # noqa: BLE001
+        raise BillingRecordUnreadable(
+            f"the billing record for campaign {campaign_id} could not be read "
+            f"from {db_path}: {type(exc).__name__}: {exc}") from exc
+
+    usd = unresolved_usd = historical_usd = 0.0
+    unresolved = 0
+    bad = []
+    run_ids = set()
+    for attempt_id, run_id, kind, state, reserved, settled in rows:
+        if state not in BILLING_ATTEMPT_STATES:
+            bad.append(attempt_id)
+            continue
+        if state == BILLING_ATTEMPT_STATE_SETTLED and _valid_billing_usd(settled):
+            amount = float(settled)
+        elif (state == BILLING_ATTEMPT_STATE_RESERVED
+              and _valid_billing_usd(reserved)):
+            amount = float(reserved)
+            unresolved += 1
+            unresolved_usd += amount
+        else:
+            bad.append(attempt_id)
+            continue
+        if kind == BILLING_ATTEMPT_KIND_HISTORICAL:
+            historical_usd += amount
+        elif kind != BILLING_ATTEMPT_KIND_ATTEMPT:
+            bad.append(attempt_id)
+            continue
+        usd += amount
+        run_ids.add(run_id)
+    if bad:
+        raise BillingRecordUnreadable(
+            f"{len(bad)} billing row(s) of campaign {campaign_id} carry an "
+            f"amount, state or kind that cannot be summed (first: {bad[:3]}); "
+            f"a budget computed without them would be lower than the truth")
+    return CampaignBilling(usd=usd, attempts=len(rows), unresolved=unresolved,
+                           unresolved_usd=unresolved_usd,
+                           historical_usd=historical_usd,
+                           run_ids=tuple(sorted(r for r in run_ids
+                                                if r is not None)))
+
+
+class BillingRecordSink:
+    """The shipped ``spend.BILLING_RECORD`` sink: one campaign, one invocation.
+
+    Constructed by ``oncotriage/batch/runner.py:main()`` after the run row is
+    open and the campaign is established, installed before the first billed
+    call, and cleared when the run ends.
+    """
+
+    def __init__(self, db_path, campaign_id, run_id):
+        if not isinstance(campaign_id, str) or not campaign_id:
+            raise ValueError(f"campaign_id must be a non-empty string, not "
+                             f"{campaign_id!r}")
+        if isinstance(run_id, bool) or not isinstance(run_id, int):
+            raise ValueError(f"run_id must be an int, not {run_id!r}")
+        self.db_path = resolve_inference_db_path(db_path)
+        self.campaign_id = campaign_id
+        self.run_id = run_id
+
+    def reserve(self, **fields):
+        return reserve_billing_attempt(self.db_path,
+                                       campaign_id=self.campaign_id,
+                                       run_id=self.run_id, **fields)
+
+    def settle(self, attempt_id, **fields):
+        return settle_billing_attempt(self.db_path, attempt_id, **fields)
+
+
+# ---------------------------------------------------------------------------
+# HISTORICAL CAMPAIGNS: WHAT MAY BE REUSED, AND ONLY WITH DEMONSTRATED COVERAGE
+# ---------------------------------------------------------------------------
+#
+# A campaign checkpointed by a build that predates the billing record has no
+# rows in it. Its prior spend can be taken from other durable evidence ONLY if
+# that evidence provably identifies THIS campaign and provably covers EVERY
+# charge its runs made. Anything short of that is refused by name: a partial
+# figure is the defect this record exists to remove, and the whole-database
+# total or a final-attempt sum is never a substitute.
+#
+# WHAT THE EVIDENCE IS: the ``runs`` rows of the chain, their ``inferences``
+# rows, and their ``run_metrics`` health record. WHAT MAKES IT COMPLETE is every
+# one of the conditions below, and each has its own reason:
+#
+#   not_identified          no predecessor run stitches to this one, or the
+#                           stitch could not be read.
+#   cohort_mismatch         a predecessor's ``cohort_digest`` is absent or is not
+#                           this checkpoint's, so it is not demonstrably this
+#                           campaign even though its configuration matches.
+#   billed_run_without_campaign  a predecessor already has billing rows, so it
+#                           belongs to a campaign whose identity file is gone;
+#                           adding row evidence would count its spend twice.
+#   not_cleanly_finalized   a predecessor is not STOPPED or FAILED with a
+#                           ``finished_at`` -- a KILLED or RUNNING run can have
+#                           billed patients whose rows were never written.
+#   health_record_absent    a predecessor has no ``run_metrics`` meta row, so
+#                           the absence of a fault counter is not evidence.
+#   counter_registration_unproven  a predecessor's health record does not show
+#                           that each counter below was REGISTERED when it was
+#                           flushed (``run_counter_registry``, era 18), or its
+#                           registry disagrees with its own meta count. An
+#                           absent ``run_metrics`` row means zero only for a
+#                           counter the producing build registered; for any
+#                           other it means nothing, and is refused by name.
+#   unrecorded_billing_signal  a counter that marks billing absent from the rows
+#                           is non-zero: a lost row write, a possibly-billed
+#                           transport failure, a retried attempt, an unpriced
+#                           response, a failed per-trial call, a failed flush.
+#   unpriced_rows           a row carries no cost.
+#   attempt_history_not_on_rows  a row records Stage 5 retries, so its earlier
+#                           attempts' charges are not on it.
+#   embedding_spend_not_on_rows  a row's dense channel ran, or its channels were
+#                           never recorded; embedding charges are on no row.
+#   read_failure            the evidence could not be read.
+#
+# THE RESIDUAL THE CUMULATIVE-SPEND PASS STATED IS CLOSED (the billing closure
+# pass). It read: "a run_metrics counter that a historical build had not yet
+# REGISTERED is absent from its health record and reads as zero". Every such
+# run is now refused under ``counter_registration_unproven``. The consequence,
+# stated rather than discovered: NO database written before era 18 records a
+# counter registry, so no pre-era-18 campaign can be reused through this path.
+
+HISTORICAL_COVERAGE_REASONS = (
+    "not_identified", "cohort_mismatch", "billed_run_without_campaign",
+    "not_cleanly_finalized", "health_record_absent",
+    "counter_registration_unproven",
+    "unrecorded_billing_signal", "unpriced_rows",
+    "attempt_history_not_on_rows", "embedding_spend_not_on_rows",
+    "read_failure")
+"""Why a historical campaign's prior spend could not be demonstrated covered.
+CLOSED, and the refusal names every member that applied."""
+
+HISTORICAL_FINALIZED_STATUSES = ("STOPPED", "FAILED")
+"""The predecessor statuses under which every started patient ran to completion
+and was written. KILLED is resumable and is NOT here: a killed process can have
+billed patients whose rows never landed."""
+
+HISTORICAL_UNRECORDED_BILLING_COUNTERS = (
+    "INFERENCE_WRITE_FAILURES", "PROVIDER_UNCONFIRMED_BILLING",
+    "PROVIDER_RETRY_OUTCOMES", "SPEND_LEDGER_FAULTS", "PER_TRIAL_CALL_FAILURES",
+    "RUN_METRICS_FLUSH_FAILURES")
+"""Registered degradation counters whose non-zero total means billed spend that
+no inference row carries. Restated names -- this module cannot import the
+registry -- and ``tests/test_campaign_billing_record.py`` requires every one to
+be a registered counter, so a rename there fails here rather than silently
+passing every historical campaign."""
+
+
+class HistoricalEvidence(NamedTuple):
+    """The coverage decision for a historical campaign. See
+    ``historical_campaign_evidence``."""
+
+    covered: bool = False
+    reasons: tuple = ()
+    usd: float = 0.0
+    rows: int = 0
+    run_ids: tuple = ()
+    detail: str = ""
+
+
+def historical_campaign_evidence(run_id, cohort_digest, db_path=None
+                                 ) -> HistoricalEvidence:
+    """Decide whether a historical campaign's prior spend is demonstrably
+    covered by durable evidence. NEVER RAISES; an unreadable answer is NOT
+    covered.
+
+    ``run_id`` is the run row the resuming invocation has just opened (so
+    ``campaign_run_ids`` can walk the stitch from it); ``cohort_digest`` is the
+    checkpoint's. The figure is ``usd`` only when ``covered`` is True.
+    """
+    reasons, notes = [], []
+    try:
+        membership = campaign_run_ids(run_id, db_path=db_path)
+        prior = tuple(r for r in membership.run_ids
+                      if isinstance(run_id, int) and r < run_id)
+        if not membership.resolved or membership.reason or not prior:
+            return HistoricalEvidence(
+                reasons=("not_identified",),
+                detail=(f"no predecessor run stitches to run {run_id} "
+                        f"(membership reason: {membership.reason})"))
+        db_path = resolve_inference_db_path(db_path)
+        marks = ", ".join("?" for _ in prior)
+        conn = _open_connection(db_path, read_only=True)
+        try:
+            runs = conn.execute(
+                f"SELECT id, status, finished_at, cohort_digest FROM runs "
+                f"WHERE id IN ({marks})", prior).fetchall()
+            billed = conn.execute(
+                f"SELECT COUNT(*) FROM billing_attempts WHERE run_id IN "
+                f"({marks})", prior).fetchone()[0]
+            metrics = conn.execute(
+                f"SELECT run_id, category, name, value FROM run_metrics "
+                f"WHERE run_id IN ({marks})", prior).fetchall()
+            inference_rows = conn.execute(
+                f"SELECT estimated_cost_usd, llm_classifier_retries, "
+                f"retrieval_channels FROM inferences WHERE run_id IN ({marks})",
+                prior).fetchall()
+            # THE COUNTER REGISTRY, OR ITS ABSENCE -- which is a finding, not a
+            # read failure: a database written before era 18 has no table.
+            has_registry = conn.execute(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND "
+                "name = 'run_counter_registry'").fetchone()[0] > 0
+            registry = (conn.execute(
+                f"SELECT run_id, name FROM run_counter_registry WHERE run_id "
+                f"IN ({marks})", prior).fetchall() if has_registry else [])
+        finally:
+            conn.close()
+    except Exception as exc:                                   # noqa: BLE001
+        return HistoricalEvidence(
+            reasons=("read_failure",),
+            detail=f"{type(exc).__name__}: {exc}")
+
+    for rid, status, finished_at, digest in runs:
+        if digest is None or digest != cohort_digest:
+            reasons.append("cohort_mismatch")
+            notes.append(f"run {rid} cohort_digest={digest!r}")
+        if status not in HISTORICAL_FINALIZED_STATUSES or finished_at is None:
+            reasons.append("not_cleanly_finalized")
+            notes.append(f"run {rid} status={status} finished_at={finished_at}")
+    if len(runs) != len(prior):
+        reasons.append("not_identified")
+    if billed:
+        reasons.append("billed_run_without_campaign")
+        notes.append(f"{billed} billing row(s) already name a predecessor run")
+    measured = {r for r, cat, name, _v in metrics
+                if cat == RUN_METRIC_CATEGORY_META
+                and name == RUN_METRIC_META_COUNTERS_REGISTERED}
+    for rid in prior:
+        if rid not in measured:
+            reasons.append("health_record_absent")
+            notes.append(f"run {rid} has no health record")
+    # POSITIVE EVIDENCE THAT EACH REQUIRED COUNTER EXISTED AND WAS CONSULTED.
+    # Without it the `value` test below reads an unregistered counter's absent
+    # row as a zero it never measured.
+    meta_count = {r: v for r, cat, name, v in metrics
+                  if cat == RUN_METRIC_CATEGORY_META
+                  and name == RUN_METRIC_META_COUNTERS_REGISTERED}
+    names_by_run = {}
+    for rid, name in registry:
+        names_by_run.setdefault(rid, set()).add(name)
+    for rid in prior:
+        if rid not in measured:
+            continue
+        names = names_by_run.get(rid)
+        if names is None:
+            reasons.append("counter_registration_unproven")
+            notes.append(f"run {rid} recorded no counter registry, so an "
+                         f"absent counter row proves nothing")
+            continue
+        if len(names) != meta_count.get(rid):
+            reasons.append("counter_registration_unproven")
+            notes.append(f"run {rid} registry names {len(names)} counter(s) "
+                         f"and its health record says {meta_count.get(rid)}")
+        missing = [c for c in HISTORICAL_UNRECORDED_BILLING_COUNTERS
+                   if c not in names]
+        if missing:
+            reasons.append("counter_registration_unproven")
+            notes.append(f"run {rid} never registered {', '.join(missing)}")
+    for rid, cat, name, value in metrics:
+        if (cat == RUN_METRIC_CATEGORY_DEGRADATION
+                and name in HISTORICAL_UNRECORDED_BILLING_COUNTERS and value):
+            reasons.append("unrecorded_billing_signal")
+            notes.append(f"run {rid} {name}={value}")
+    usd = 0.0
+    for cost, retries, channels in inference_rows:
+        if not _valid_billing_usd(cost):
+            reasons.append("unpriced_rows")
+        else:
+            usd += float(cost)
+        if isinstance(retries, int) and not isinstance(retries, bool) \
+                and retries > 0:
+            reasons.append("attempt_history_not_on_rows")
+        dense = None
+        try:
+            dense = (json.loads(channels) or {}).get("dense", {}).get("status")
+            _recorded = True
+        except Exception:                                      # noqa: BLE001
+            _recorded = False
+        if not _recorded or dense not in (None, "ablated"):
+            reasons.append("embedding_spend_not_on_rows")
+
+    unique = tuple(r for r in HISTORICAL_COVERAGE_REASONS if r in reasons)
+    return HistoricalEvidence(covered=not unique, reasons=unique,
+                              usd=usd if not unique else 0.0,
+                              rows=len(inference_rows), run_ids=prior,
+                              detail="; ".join(notes[:10]))
+
+
+def record_historical_evidence(db_path, *, campaign_id, run_id,
+                               evidence: HistoricalEvidence) -> str:
+    """Write a covered historical campaign's evidence figure ONCE. RAISES
+    ``BillingRecordWriteError``.
+
+    Keyed ``historical:{campaign_id}``, so a repeat is idempotent and a second
+    figure for the same campaign is a refusal. It is written BEFORE the
+    campaign identity file, so a crash between the two leaves an orphaned row
+    under an id nothing will resume -- never a resumable campaign missing its
+    history.
+    """
+    if not isinstance(evidence, HistoricalEvidence) or not evidence.covered:
+        raise BillingRecordWriteError(
+            "only a covered historical campaign's evidence may be recorded")
+    return reserve_billing_attempt(
+        db_path, attempt_id=f"historical:{campaign_id}",
+        campaign_id=campaign_id, run_id=run_id, source="stage5",
+        model=None, input_tokens=None, output_tokens=None,
+        reserved_usd=evidence.usd, kind=BILLING_ATTEMPT_KIND_HISTORICAL,
+        note=json.dumps({"covered_run_ids": list(evidence.run_ids),
+                         "inference_rows": evidence.rows}))
+
+
+def set_run_billing_campaign_id(run_id, campaign_id, db_path=None) -> None:
+    """Stamp ``runs.billing_campaign_id``, DURABLY. RAISES
+    ``BillingRecordWriteError``.
+
+    Called by the batch runner after its campaign is established and BEFORE the
+    first billed call, so a zero-success restart that continues a budget reads
+    as ONE campaign in ``campaign_summary`` as well as in the billing record. It
+    raises for the reason ``reserve_billing_attempt`` does: nothing has been
+    billed yet, and a run whose rows would report a second campaign for one
+    budget is the display defect this column exists to remove.
+
+    It never OVERWRITES a different id: the UPDATE matches only a NULL column,
+    and the row is read back and required to carry this id.
+    """
+    if not isinstance(campaign_id, str) or not campaign_id:
+        raise BillingRecordWriteError(
+            f"billing campaign id must be a non-empty string, not "
+            f"{campaign_id!r}")
+    if isinstance(run_id, bool) or not isinstance(run_id, int):
+        raise BillingRecordWriteError(f"run_id must be an int, not {run_id!r}")
+
+    def _op():
+        conn = _open_billing_connection(db_path)
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                "UPDATE runs SET billing_campaign_id = ? WHERE id = ? AND "
+                "billing_campaign_id IS NULL", (campaign_id, run_id))
+            cursor.execute("SELECT billing_campaign_id FROM runs WHERE id = ?",
+                           (run_id,))
+            found = cursor.fetchone()
+            conn.commit()
+            return found
+        finally:
+            conn.close()
+
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        with _WRITE_LOCK:
+            _ensure_database(db_path)
+            found = run_with_write_retry(_op, "a run's billing campaign id")
+    except Exception as exc:                                   # noqa: BLE001
+        raise BillingRecordWriteError(
+            f"run {run_id}'s billing campaign id could not be committed to "
+            f"{db_path}: {type(exc).__name__}: {exc}") from exc
+    if found is None or found[0] != campaign_id:
+        raise BillingRecordWriteError(
+            f"run {run_id} reads back billing campaign {found!r}, not "
+            f"{campaign_id!r}")
+
+
+# ---------------------------------------------------------------------------
+# RECOVERING A CAMPAIGN'S IDENTITY FROM THE BILLING RECORD (the billing closure
+# pass)
+# ---------------------------------------------------------------------------
+#
+# The identity file beside the checkpoint is written durably before the first
+# billed call, so a host crash does not lose it to the filesystem's guarantee.
+# It can still be DELETED or CORRUPTED. A resume that met that used to be read
+# as a historical campaign and refused under ``billed_run_without_campaign`` --
+# correct, but it refused a campaign whose identity the database had.
+#
+# RECOVERY IS PERMITTED ONLY WHERE THE ROWS ESTABLISH IT: among the runs that
+# precede this one under the SAME configuration stamp and cohort digest, the
+# billing campaign ids their run rows carry and their billing rows name must
+# reduce to exactly ONE campaign that is not closed (its latest run is not
+# FINISHED), and every run that campaign's rows touch must be one of those
+# runs. Two campaigns is ``ambiguous``; a campaign whose rows reach a run under
+# another configuration is ``inconsistent``; neither is guessed at.
+
+IDENTITY_RECOVERED = "recovered"
+IDENTITY_NO_EVIDENCE = "no_evidence"
+IDENTITY_AMBIGUOUS = "ambiguous"
+IDENTITY_INCONSISTENT = "inconsistent"
+IDENTITY_UNREADABLE = "unreadable"
+IDENTITY_RECOVERY_STATES = (IDENTITY_RECOVERED, IDENTITY_NO_EVIDENCE,
+                            IDENTITY_AMBIGUOUS, IDENTITY_INCONSISTENT,
+                            IDENTITY_UNREADABLE)
+"""What ``recover_campaign_identity`` found. CLOSED. Only ``recovered`` carries
+an id; ``no_evidence`` lets the caller fall back to the historical path; the
+other three are refusals."""
+
+
+class CampaignIdentityRecovery(NamedTuple):
+    """See ``recover_campaign_identity``."""
+
+    state: str
+    campaign_id: str = None
+    candidates: tuple = ()
+    detail: str = ""
+
+
+def recover_campaign_identity(run_id, cohort_digest, db_path=None
+                              ) -> CampaignIdentityRecovery:
+    """Which billing campaign the rows say ``run_id`` continues. NEVER RAISES.
+
+    ``run_id`` is the run row the resuming invocation has just opened -- its
+    stamp is what candidates must match -- and ``cohort_digest`` is the
+    checkpoint's or the current cohort's.
+    """
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        conn = _open_connection(db_path, read_only=True)
+        try:
+            run_columns = {r[1] for r in conn.execute("PRAGMA table_info(runs)")}
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            _fp = ", ".join(RUN_FINGERPRINT_COLUMNS)
+            me = conn.execute(f"SELECT {_fp} FROM runs WHERE id = ?",
+                              (run_id,)).fetchone()
+            if me is None or me[0] is None:
+                return CampaignIdentityRecovery(
+                    IDENTITY_NO_EVIDENCE,
+                    detail=f"run {run_id} is absent or carries no stamp")
+            _bc = ("billing_campaign_id" if "billing_campaign_id" in run_columns
+                   else "NULL")
+            _match = " AND ".join(f"{c} IS ?" for c in RUN_FINGERPRINT_COLUMNS)
+            same = conn.execute(
+                f"SELECT id, status, {_bc} FROM runs WHERE id < ? AND "
+                f"fingerprint_version IS NOT NULL AND {_match} AND "
+                f"cohort_digest IS ? ORDER BY id",
+                (run_id, *me, cohort_digest)).fetchall()
+            same_ids = {r[0] for r in same}
+            status_of = {r[0]: r[1] for r in same}
+            members = {}
+            for rid, _status, bcid in same:
+                if bcid is not None:
+                    members.setdefault(bcid, set()).add(rid)
+            billed_runs = {}
+            if "billing_attempts" in tables:
+                if same_ids:
+                    marks = ", ".join("?" for _ in same_ids)
+                    for cid, in conn.execute(
+                            f"SELECT DISTINCT campaign_id FROM billing_attempts "
+                            f"WHERE run_id IN ({marks})", tuple(same_ids)):
+                        members.setdefault(cid, set())
+                for cid in list(members):
+                    billed_runs[cid] = {r[0] for r in conn.execute(
+                        "SELECT DISTINCT run_id FROM billing_attempts WHERE "
+                        "campaign_id = ?", (cid,))}
+            carried = {}
+            if _bc != "NULL":
+                for cid in list(members):
+                    carried[cid] = {r[0] for r in conn.execute(
+                        "SELECT id FROM runs WHERE billing_campaign_id = ?",
+                        (cid,))}
+            # A RUN THAT DID BILLED WORK AND HAS NO BILLING ROW. A run row is
+            # stamped with its campaign BEFORE its first billed call, so a stamped
+            # run with no billing row may legitimately have spent nothing -- but
+            # one whose inference rows record billed Stage 5 calls or a cost did
+            # spend, and its rows are GONE. Recovering that campaign would seed
+            # its budget without them: the under-count this record exists to
+            # remove. Refused as inconsistent.
+            unbilled_work = set()
+            if "inferences" in tables and "billing_attempts" in tables:
+                for cid in list(members):
+                    for rid in carried.get(cid, set()):
+                        if rid in billed_runs.get(cid, set()):
+                            continue
+                        worked = conn.execute(
+                            "SELECT COUNT(*) FROM inferences WHERE run_id = ? "
+                            "AND (COALESCE(llm_classifier_calls, 0) > 0 OR "
+                            "COALESCE(estimated_cost_usd, 0) > 0)",
+                            (rid,)).fetchone()[0]
+                        if worked:
+                            unbilled_work.add((cid, rid))
+        finally:
+            conn.close()
+    except Exception as exc:                                   # noqa: BLE001
+        return CampaignIdentityRecovery(
+            IDENTITY_UNREADABLE, detail=f"{type(exc).__name__}: {exc}")
+
+    inconsistent, open_ids, notes = [], [], []
+    for cid in sorted(members):
+        touched = (billed_runs.get(cid, set()) | carried.get(cid, set())
+                   | members[cid]) - {run_id}
+        foreign = sorted(touched - same_ids)
+        if foreign:
+            inconsistent.append(cid)
+            notes.append(f"campaign {cid} reaches run(s) {foreign} outside this "
+                         f"configuration and cohort")
+            continue
+        lost = sorted(rid for c, rid in unbilled_work if c == cid)
+        if lost:
+            inconsistent.append(cid)
+            notes.append(f"campaign {cid}: run(s) {lost} recorded billed work "
+                         f"and hold no billing row")
+            continue
+        latest = max(touched) if touched else None
+        if latest is not None and status_of.get(latest) == "FINISHED":
+            notes.append(f"campaign {cid} is closed: its latest run {latest} "
+                         f"is FINISHED")
+            continue
+        open_ids.append(cid)
+    if inconsistent:
+        return CampaignIdentityRecovery(IDENTITY_INCONSISTENT,
+                                        candidates=tuple(sorted(members)),
+                                        detail="; ".join(notes))
+    if len(open_ids) == 1:
+        return CampaignIdentityRecovery(IDENTITY_RECOVERED, open_ids[0],
+                                        candidates=tuple(open_ids),
+                                        detail="; ".join(notes))
+    if len(open_ids) > 1:
+        return CampaignIdentityRecovery(
+            IDENTITY_AMBIGUOUS, candidates=tuple(open_ids),
+            detail=(f"{len(open_ids)} open billing campaigns share this "
+                    f"configuration and cohort: {', '.join(open_ids)}"))
+    return CampaignIdentityRecovery(IDENTITY_NO_EVIDENCE,
+                                    detail="; ".join(notes))
 
 
 class CampaignMembership(NamedTuple):
@@ -5276,10 +6123,9 @@ and a read failure is about the file rather than about the campaign.
 def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
     """Every run row that belongs to ``run_id``'s campaign. NEVER RAISES.
 
-    THE STITCH RULE, WALKED IN BOTH DIRECTIONS. ``campaign_spend_before``
-    walks it BACKWARD only and that is right for its caller: it is asked at the
-    top of ``main()`` by a run that has just been created, so there is nothing
-    ahead of it to find. A caller that wants to name a campaign as a THING --
+    THE STITCH RULE, WALKED IN BOTH DIRECTIONS. The backward-only walker that
+    seeded a resumed run's budget (``campaign_spend_before``) is deleted; see
+    THE CAMPAIGN'S CUMULATIVE BILLING RECORD above. A caller that wants to name a campaign as a THING --
     to designate it, to select rows from it, to say which run_ids constitute it
     -- is usually holding a run in the middle of a finished chain, and the runs
     that resumed it are as much a part of the campaign as the ones it resumed.
@@ -5291,8 +6137,7 @@ def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
     ``fingerprint_version``, because SQLite's ``IS`` is null-safe equality and
     two runs with NO stamp would otherwise compare equal on every column and
     make every unstamped run in the table one campaign. That is
-    ``queries.campaign_summary``'s rule and ``campaign_spend_before``'s, and
-    all three are pinned against each other by a test rather than promised --
+    ``queries.campaign_summary``'s rule, and the two are pinned against each other by a test rather than promised --
     a restated rule is a rule that can drift.
 
     THE FORWARD STEP IS THE MIRROR OF THE BACKWARD ONE AND IT IS NOT SYMMETRIC
@@ -5310,8 +6155,7 @@ def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
     Args:
         run_id: any member of the campaign. ``None`` returns an unresolved
             membership rather than raising -- a caller with no run row has no
-            campaign, which is the same contract ``campaign_spend_before``
-            keeps for the same argument.
+            campaign.
         db_path: the database the run row is in.
 
     Returns:
@@ -5320,9 +6164,9 @@ def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
         on every failure and ``reason`` names which, from
         ``CAMPAIGN_MEMBERSHIP_REASONS``.
 
-    IT NEVER RAISES, on ``campaign_spend_before``'s precedent, and the
-    direction is the opposite of that one's: an empty membership here does not
-    let anything spend more, it makes a designation refuse. The failure is
+    IT NEVER RAISES: an empty membership here does not let anything spend
+    more, it makes a designation refuse -- and ``historical_campaign_evidence``
+    reads an unresolved membership as NOT covered. The failure is
     COUNTED into ``RUN_RECORD_FAILURES`` under ``campaign_membership:`` so it is
     never silent.
     """
@@ -5334,87 +6178,45 @@ def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
         conn = _open_connection(db_path)
         try:
             cursor = conn.cursor()
+            _columns = {r[1] for r in cursor.execute("PRAGMA table_info(runs)")}
+            _bc = ("billing_campaign_id" if "billing_campaign_id" in _columns
+                   else "NULL")
             _fp = ", ".join(RUN_FINGERPRINT_COLUMNS)
             cursor.execute(
-                f"SELECT id, resumed, status, {_fp} FROM runs WHERE id = ?",
-                (run_id,))
-            row = cursor.fetchone()
-            if row is None:
-                RUN_RECORD_FAILURES["campaign_membership:row_not_found"] += 1
-                return CampaignMembership(
-                    reason=CAMPAIGN_MEMBERSHIP_UNRESOLVED)
-
-            _stamp = list(row[3:])
-            if _stamp[0] is None:
-                # NO STAMP, NO CHAIN -- and, unlike `campaign_spend_before`,
-                # not "no campaign" either. The run is its own campaign of one,
-                # which is the honest reading: it exists, it produced rows, and
-                # nothing can be stitched to it. Resolved, with the reason
-                # recorded so a caller that needs a stamped campaign can refuse.
-                return CampaignMembership(run_ids=(row[0],), head_id=row[0],
-                                          resolved=True,
-                                          reason=CAMPAIGN_MEMBERSHIP_NO_STAMP)
-
-            _match = " AND ".join(f"{c} IS ?" for c in RUN_FINGERPRINT_COLUMNS)
-            _statuses = ", ".join("?" for _ in CAMPAIGN_RESUMABLE_STATUSES)
-
-            # ---- backward: to the head -----------------------------------
-            #
-            # BOUNDED BY `id <` AND CANNOT LOOP: each step selects a strictly
-            # smaller id, so the sequence decreases in a finite set. Identical
-            # to `campaign_spend_before`'s walk, which is the point.
-            before = []
-            cur_id, cur_resumed = row[0], row[1]
-            while cur_resumed == 1:
-                cursor.execute(
-                    f"SELECT id, resumed FROM runs "
-                    f"WHERE id < ? AND status IN ({_statuses}) "
-                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
-                    f"ORDER BY id DESC LIMIT 1",
-                    (cur_id, *CAMPAIGN_RESUMABLE_STATUSES, *_stamp))
-                prev = cursor.fetchone()
-                if prev is None:
-                    break
-                before.append(prev[0])
-                cur_id, cur_resumed = prev[0], prev[1]
-
-            # ---- forward: to the tail ------------------------------------
-            #
-            # BOUNDED BY `id >` for the mirror reason. The successor must be
-            # the NEAREST run that resumed a qualifying predecessor, and this
-            # row must itself be resumable for anything to have resumed it.
-            after = []
-            cur_id, cur_status = row[0], row[2]
-            while cur_status in CAMPAIGN_RESUMABLE_STATUSES:
-                cursor.execute(
-                    f"SELECT id, status FROM runs "
-                    f"WHERE id > ? AND resumed = 1 "
-                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
-                    f"ORDER BY id ASC LIMIT 1",
-                    (cur_id, *_stamp))
-                nxt = cursor.fetchone()
-                if nxt is None:
-                    break
-                # THE LINK IS ONLY REAL IF NOTHING QUALIFYING SITS BETWEEN
-                # THEM. `nxt` resumes the nearest PRECEDING resumable run with
-                # this stamp; if that is not `cur_id`, `nxt` belongs to a
-                # different link and this chain ends here. Asking the backward
-                # step is what checks it, rather than a second copy of the rule.
-                cursor.execute(
-                    f"SELECT id FROM runs "
-                    f"WHERE id < ? AND status IN ({_statuses}) "
-                    f"  AND fingerprint_version IS NOT NULL AND {_match} "
-                    f"ORDER BY id DESC LIMIT 1",
-                    (nxt[0], *CAMPAIGN_RESUMABLE_STATUSES, *_stamp))
-                back = cursor.fetchone()
-                if back is None or back[0] != cur_id:
-                    break
-                after.append(nxt[0])
-                cur_id, cur_status = nxt[0], nxt[1]
+                f"SELECT id, resumed, status, {_bc}, {_fp} FROM runs "
+                f"ORDER BY id")
+            _table = cursor.fetchall()
         finally:
             conn.close()
 
-        ids = tuple(sorted(set(before) | {row[0]} | set(after)))
+        _by_id = {r[0]: r for r in _table}
+        row = _by_id.get(run_id)
+        if row is None:
+            RUN_RECORD_FAILURES["campaign_membership:row_not_found"] += 1
+            return CampaignMembership(reason=CAMPAIGN_MEMBERSHIP_UNRESOLVED)
+        if row[4] is None:
+            # NO STAMP, NO CHAIN -- and not "no campaign" either. The run is its
+            # own campaign of one, which is the honest reading: it exists, it
+            # produced rows, and nothing can be stitched to it.
+            return CampaignMembership(run_ids=(row[0],), head_id=row[0],
+                                      resolved=True,
+                                      reason=CAMPAIGN_MEMBERSHIP_NO_STAMP)
+
+        _parent = campaign_parent_map(_table)
+        _roots = {}
+
+        def _root(rid):
+            path = []
+            while rid not in _roots and _parent.get(rid) is not None:
+                path.append(rid)
+                rid = _parent[rid]
+            top = _roots.get(rid, rid)
+            for p in path + [rid]:
+                _roots[p] = top
+            return top
+
+        _head = _root(run_id)
+        ids = tuple(sorted(r[0] for r in _table if _root(r[0]) == _head))
         return CampaignMembership(run_ids=ids, head_id=ids[0], resolved=True)
 
     except Exception as exc:                                   # noqa: BLE001
@@ -5425,6 +6227,43 @@ def campaign_run_ids(run_id, db_path=None) -> CampaignMembership:
                   error_type=type(exc).__name__, error_message=str(exc))
         return CampaignMembership(reason=CAMPAIGN_MEMBERSHIP_READ_FAILURE)
 
+
+def campaign_parent_map(table) -> dict:
+    """``{run id: the run it continues, or None}``. PURE.
+
+    ``table`` is every run row as ``(id, resumed, status, billing_campaign_id,
+    *RUN_FINGERPRINT_COLUMNS)``. THIS IS ``queries._CAMPAIGN_EDGE_SQL`` IN
+    PYTHON, and the two are pinned against each other by a test:
+
+      * an unstamped run continues nothing;
+      * a run carrying a billing campaign id continues the nearest preceding
+        stamped run carrying THE SAME id -- whatever its status and whether or
+        not this run was a checkpoint resume (the billing closure pass: a
+        zero-success restart continues the same budget, so it is the same
+        campaign);
+      * otherwise a run with ``resumed = 1`` continues the nearest preceding
+        stamped run whose status is resumable, whose stamp is identical, and
+        which carries NO billing campaign id -- the pre-era-18 rule, confined to
+        runs that never had a campaign id so it cannot attach a run to someone
+        else's billing campaign.
+    """
+    last_by_campaign, legacy_by_stamp, parent = {}, {}, {}
+    for rid, resumed, status, bcid, *stamp in sorted(table, key=lambda r: r[0]):
+        stamp = tuple(stamp)
+        stamped = stamp[0] is not None
+        prev = None
+        if stamped:
+            if bcid is not None:
+                prev = last_by_campaign.get(bcid)
+            if prev is None and resumed == 1:
+                prev = legacy_by_stamp.get(stamp)
+        parent[rid] = prev
+        if stamped:
+            if bcid is not None:
+                last_by_campaign[bcid] = rid
+            elif status in CAMPAIGN_RESUMABLE_STATUSES:
+                legacy_by_stamp[stamp] = rid
+    return parent
 
 
 def finalize_run_record(run_id, status, db_path=None, note=None,
@@ -5760,8 +6599,53 @@ def _run_metric_rows(totals, counters_registered):
     return rows
 
 
-def flush_run_metrics(run_id, totals, counters_registered, db_path=None):
+def _registered_name_rows(registered_names, counters_registered, totals):
+    """The validated registry names for one flush, ``()`` when none were given,
+    or ``None`` to refuse the whole flush.
+
+    REFUSED rather than trimmed, on ``_run_metric_rows``' own footing: a names
+    list that disagrees with the count it accompanies, repeats a name, holds a
+    non-identifier, or omits a counter that has a non-zero total did not come
+    from ``degradation.registered_names()`` -- and a registry record that is
+    wrong is worse than none, because it is what proves a zero.
+    """
+    if registered_names is None:
+        return ()
+    if not isinstance(registered_names, (list, tuple)):
+        _note_run_metric_shape("registered_names:not_a_sequence",
+                               type(registered_names).__name__)
+        return None
+    names = list(registered_names)
+    for name in names:
+        if not isinstance(name, str) or not name.isidentifier():
+            _note_run_metric_shape("registered_names:non_identifier", name)
+            return None
+    if len(set(names)) != len(names):
+        _note_run_metric_shape("registered_names:duplicate", len(names))
+        return None
+    if len(names) != counters_registered:
+        _note_run_metric_shape("registered_names:count_disagrees", len(names))
+        return None
+    missing = sorted(set(totals) - set(names)) if isinstance(totals, dict) else []
+    if missing:
+        _note_run_metric_shape("registered_names:total_not_registered",
+                               missing[0])
+        return None
+    return tuple(names)
+
+
+def flush_run_metrics(run_id, totals, counters_registered, db_path=None,
+                      registered_names=None):
     """Replace ``run_id``'s health rows with ``totals``. NEVER RAISES.
+
+    ``registered_names`` (the billing closure pass): the NAMES of the counters
+    consulted, ``degradation.registered_names()``. When given it must hold
+    exactly ``counters_registered`` identifiers including every name in
+    ``totals``, and is written to ``run_counter_registry`` in the same
+    transaction -- that record is what lets a later reader treat a counter's
+    missing ``run_metrics`` row as a measured zero. ``None`` writes no registry
+    rows, which a reader must treat as "which counters were consulted is not
+    recorded".
 
     Args:
         run_id: what ``start_run_record`` returned. ``None`` is tolerated and
@@ -5875,7 +6759,10 @@ def flush_run_metrics(run_id, totals, counters_registered, db_path=None):
             return False
 
         rows = _run_metric_rows(totals, counters_registered)
-        if rows is None:
+        names = (None if rows is None else
+                 _registered_name_rows(registered_names, counters_registered,
+                                       totals))
+        if rows is None or names is None:
             # Already counted and announced by _note_run_metric_shape. Logged
             # here with the COUNT only -- never a name, never a value.
             log.error("a health flush was refused because its totals were not "
@@ -5901,6 +6788,14 @@ def flush_run_metrics(run_id, totals, counters_registered, db_path=None):
                     "VALUES (?, ?, ?, ?, ?)",
                     [(run_id, category, name, value, written_at)
                      for category, name, value in rows])
+                if registered_names is not None:
+                    cursor.execute(
+                        "DELETE FROM run_counter_registry WHERE run_id = ?",
+                        (run_id,))
+                    cursor.executemany(
+                        "INSERT INTO run_counter_registry "
+                        "(run_id, name, written_at) VALUES (?, ?, ?)",
+                        [(run_id, name, written_at) for name in names])
                 conn.commit()
             finally:
                 conn.close()

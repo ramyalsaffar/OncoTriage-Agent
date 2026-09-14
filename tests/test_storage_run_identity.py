@@ -765,10 +765,15 @@ silence(_dl.initialize_database, _FRESH)
 # the reason the bedrock adapter's copy of this assertion states: exact is what
 # makes it fail when a table is introduced under any name, which is how this
 # line came to be edited.
-check("a fresh database carries all seven tables",
+# EIGHT AT THE CUMULATIVE-SPEND PASS, which added `billing_attempts`.
+# NINE AT THE BILLING CLOSURE PASS, which added `run_counter_registry` -- which
+# counters a run's health flush consulted, so an absent counter row is evidence
+# of zero only where the counter was registered.
+check("a fresh database carries all nine tables",
       tables_of(_FRESH),
-      ["drift_metrics", "drift_reference", "inferences", "run_environment",
-       "run_metrics", "runs", "trial_matches"])
+      ["billing_attempts", "drift_metrics", "drift_reference", "inferences",
+       "run_counter_registry", "run_environment", "run_metrics", "runs",
+       "trial_matches"])
 # `drift_reference` JOINED THEM AT SCHEMA ERA 16 and the exact pin is what
 # caught it -- which is the pin working. It is the drift redesign's designation
 # store: one active row naming the campaign, the run ids, the row ids and a

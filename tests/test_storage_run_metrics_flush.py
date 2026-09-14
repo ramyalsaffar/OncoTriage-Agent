@@ -373,10 +373,15 @@ _FRESH = fresh_db("fresh.db")
 # that saw that environment. EXACT rather than a subset test, deliberately:
 # exact is what makes this fail when a table is introduced under any name,
 # which is how this line came to be edited.
-check("a fresh database carries all seven tables",
+# `run_counter_registry` JOINED AT ERA 18 (the billing closure pass). It is a
+# SEPARATE table rather than a third `run_metrics` category precisely so this
+# file's row-count pins on `run_metrics` do not move; the exact table pin does,
+# which is the pin working. The label has said "seven" since before the eighth.
+check("a fresh database carries all nine tables",
       tables_of(_FRESH),
-      ["drift_metrics", "drift_reference", "inferences", "run_environment",
-       "run_metrics", "runs", "trial_matches"])
+      ["billing_attempts", "drift_metrics", "drift_reference", "inferences",
+       "run_counter_registry", "run_environment", "run_metrics", "runs",
+       "trial_matches"])
 # THE SEVENTH IS `drift_reference`, added at schema era 16 by the drift
 # redesign, and this EXACT pin is how it came to be declared rather than
 # arriving unremarked -- which is the reason the comment above gives for the
