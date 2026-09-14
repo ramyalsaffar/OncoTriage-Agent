@@ -6249,11 +6249,25 @@ PRICING_CONFIG = {
 #       So the Sonnet rows carry an ASSUMED CEILING of 2.0x input / 1.5x output
 #       -- the long-context class R1 recorded for GPT-5.6 Terra (not re-read in
 #       R1b). A Bedrock premium ABOVE that would break the bound. The RATES are
-#       verified (PRICING_CONFIG); the multipliers are not. What would settle
-#       it: an AWS statement, or a console bill line for a Sonnet 4.6 request
-#       above 200K input tokens (A6). If Bedrock applies no premium, both
-#       multipliers become 1.0; rows reserved at the higher bound still cover
-#       the lower recomputed one.
+#       verified (PRICING_CONFIG); the multipliers are not.
+#       THE AWS PRICE LIST DOES NOT SETTLE IT EITHER (the R1c recovery, offer
+#       files publication 2026-09-11T12:44Z, retrieved 2026-09-14; hashes in
+#       RECOVERY_R1C_REPORT.md). AmazonBedrockFoundationModels lists 620 Sonnet
+#       4.6 SKUs over 22 usage types, one price each, ranges 0-Inf, and no
+#       attribute, usage type or description that distinguishes input size;
+#       AmazonBedrock and AmazonBedrockService list no Sonnet 4.6 SKU. Absence
+#       there is NOT proof of no premium: the same offers omit commercial-region
+#       GPT-5.6 Terra entirely, whose long-context premium the AWS model card
+#       documents (only a GovCloud listing exists, with its long-ctx SKUs). The
+#       only Claude long-context tier the Price List does publish is Claude
+#       Sonnet 4's (AmazonBedrockService, global CRIS, 5 regions): exactly 2.0x
+#       input, cache read and cache write, and 1.5x output -- the structure
+#       assumed here, for a sibling model, not for Sonnet 4.6. What would settle
+#       it: a first-party AWS statement of how Sonnet 4.6 requests above any
+#       input size are priced on Bedrock (documentation, or a written AWS
+#       billing/support answer). One request's bill would verify that request
+#       only. If Bedrock applies no premium, both multipliers become 1.0; rows
+#       reserved at the higher bound still cover the lower recomputed one.
 #
 # A MODEL ABSENT FROM THIS TABLE HAS NO ESTABLISHED BOUND AND IS REFUSED BEFORE
 # DISPATCH (Stage5ReservationUnbounded). Priced is not bounded: gpt-4o has a
