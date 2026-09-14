@@ -1523,3 +1523,196 @@ gap does not apply to it.
 `test_ablation_stop_and_lock`, `test_runner_stop_switch`,
 `test_runner_sigterm_shutdown` and `test_package_invariants`. Nothing in B4
 blocks it.
+
+### 14.14 Batch B5 -- tripwire coverage for PYTHONPATH-manipulating children (2026-09-14)
+
+Written for: the operator and the session that runs B6. Brief's definition of
+B5 governs (14.7's B5, the simulation and premise probes, is retained as B6).
+No production source and no test file edited; no commit, stash, branch change,
+reset or cleanup; no paid call; no production database connected to.
+`git log -1` = `e469740` before and after; `git status --short` clean before
+this section. `$TMPDIR` still holds four `oncotriage-admission-e1b-*` dirs
+(counted before and after every run).
+
+Evidence root: `/private/tmp/claude-501/<project-slug>/647e295b-ad5a-4df6-97f0-7127446a3af3/scratchpad`
+-- `evidence/{validate1,validate2,baseline_b1harness,suite_ablation,suite_stop_switch,suite_sigterm,suite_package_invariants}/`
+(each: `test.log`, `tw.jsonl`, `launch.jsonl`, `kernel.log`, `fault/`,
+`preflight.txt`, `summary.json`; the baseline has no launch/kernel files).
+
+#### 14.14.1 The harness change (scratchpad only)
+
+- **Disposable interpreter.** `venv/` = `python -m venv --system-site-packages
+  --without-pip` from `/opt/anaconda3/bin/python3` (3.13.5). The shared
+  install is untouched: nothing `onc_b5` in its site-packages; its
+  `sitecustomize.py` still dated Jun 12 2025.
+- **Loader that PYTHONPATH cannot remove.** `venv/.../site-packages/zz_onc_b5_tripwire.pth`
+  (`import _onc_tripwire`), with the tripwire module beside it. A `.pth` in the
+  interpreter's own site-packages runs in every process of that interpreter
+  whatever `PYTHONPATH` holds; only `-S` stops it. It does not touch
+  `sitecustomize`/`usercustomize` resolution.
+- **Tripwire.** B1's `_onc_tripwire.py` plus marker fields only: `load_via`
+  (`pth`/`sitecustomize`), `pythonpath_env`, `prefix`, `tw_dir_on_sys_path`,
+  `user_site_enabled`. The last reads `None` at `.pth` time and is NOT used as
+  evidence (usercustomize execution is checked directly instead).
+- **Exec-level launch shim (the independent inventory).** `venv/bin/python3` is
+  a bash script that, before `exec /opt/anaconda3/bin/python3.13`, appends a
+  `shim-launch` JSON record (pid, ppid, first three args, PYTHONPATH set/unset
+  and value, tripwire-log env present, its own sandbox-only write probe) to
+  `ONC_LAUNCH_LOG`. It sets `__PYVENV_LAUNCHER__` so `sys.executable` stays the
+  venv path; CPython unsets that variable at startup (measured: absent from
+  `os.environ`). `exec` keeps the pid. The shim runs no external command.
+- **Kernel reports (second independent source).** Profile = B1's `nonet.sb`
+  re-pathed to this scratchpad's decoys, plus two lines:
+  `(allow process-exec* (with report))`, `(allow process-fork (with report))`.
+  The kernel logs every sandboxed exec as `Sandbox: name(pid) allow
+  process-exec* <path>`; read after each run with `log show` (sender Sandbox).
+  **Lossy under bursts, measured**: 150 `/usr/bin/true` + 80 Python spawns in a
+  tight loop logged 147 of 151 `true` execs, no duplicate notation for the four
+  lost. So it corroborates and inventories non-Python helpers; it is not
+  treated as complete. Fork reports aggregate as "N duplicate reports" and are
+  not reconcilable to children.
+- **Unchanged from B1.** `sx.sh` (re-pathed; launch record before exec),
+  isolated root = B1's `isoroot`, `ONC_STRIP=1`, `HF_HUB_OFFLINE=1`,
+  decoys denied by the profile, driver `subprocess.Popen` with a new session,
+  foreground, `python -u`, `default_int_handler`, one run at a time. `tw/sitecustomize.py`
+  = B1's, importing the tripwire from the venv and chaining the base
+  interpreter's sitecustomize via `sys.base_prefix` (B1 used `sys.prefix`,
+  which is the venv here; the base file's body is a no-op on this install --
+  neither of its two unconditional directories exists, and the third applies
+  only to free-threaded builds).
+- **Matching (`b5_inv.py`).** Expected Python processes = shim pids ∪ kernel
+  pids that exec a Python binary ∪ the sandbox-launch pid. Each must have a
+  `tripwire-loaded` marker. Also reported: markers with no shim record, kernel
+  Python pids with no shim record, shim pids absent from the kernel log,
+  duplicate markers, unattached markers (ppid not a marker pid), inventoried
+  pids still alive after the run.
+- sha256 (12): profile `bf4c6750042a`, `sx.sh` `2767b8312183`, shim
+  `f0eb0db88e9b`, tripwire `46eb646ea4c9`, `.pth` `1eaef0647db2`,
+  `tw/sitecustomize.py` `c8fbbbd56a40`, `b5_run.py` `0d7d64dea57d`,
+  `b5_inv.py` `b87c9298bb5e`, `probe_forms.py` `89dc903611ed`.
+
+#### 14.14.2 Validation per spawn form (before any suite)
+
+`probe_forms.py`, sandboxed parent via `sx.sh` + venv interpreter, one child per
+form. `validate1` had a defect in my probe (a blanket `__file__` substitution
+also rewrote the `-c` children's `getattr(..., "__file__")` reads, so their
+customize-module fields read `None`); fixed and re-run as `validate2`, which is
+the evidence below. Both runs gave the same marker and inventory outcome.
+
+| form (the suite that uses it) | shim record | marker (via) | sandbox write | sitecustomize / usercustomize / editable finders |
+|---|---|---|---|---|
+| parent | yes | yes (pth; tw on path) | denied | -- |
+| F1 PYTHONPATH REPLACED, script (ablation, stop switch, sigterm) | yes, set | yes (pth) | denied | conda / ran / 1 |
+| G grandchild of F1, PYTHONPATH POPPED | yes, unset | yes (pth), ppid = F1 | denied | conda / no / 1 |
+| F2 PREPENDED, `-c` (package_invariants) | yes, set | yes (pth; tw on path) | denied | tw / no / 0 |
+| F3 POPPED, `-c` (package_invariants) | yes, unset | yes (pth) | denied | conda / no / 1 |
+| F4 REPLACED, `-c` (completeness) | yes, set | yes (pth) | denied | conda / ran / 1 |
+| N1 `-S`, deliberately uninstrumented | **yes** | **no** | shim probe denied | none |
+| N2 `-I` | yes | yes (pth; site still runs) | denied | conda / no / 1 |
+| N3 base interpreter by path, bypassing venv | **no** | **no** | -- | conda / no / 1 |
+
+- **Negative controls fire.** N1 is a launch record with no marker (reported
+  as exempt only because its argv carries `-S`). N3 has neither, and the
+  matcher still reported it **UNMATCHED** from the kernel log alone
+  (`kernel_python_without_shim_record = [N3 pid]`). So an unarmed process is
+  detected, not inferred; and a process that escapes the shim is detected when
+  its kernel report is not lost.
+- **Tripwire still refuses** in the parent, F1, G and F3 (`getaddrinfo-REFUSED`,
+  4 records); every marker `sandbox_only_write: denied errno=1`; every shim
+  record `sandbox_write: denied`; decoys empty.
+- **Fork without exec** (K1): no shim record, no marker, no kernel exec report
+  -- invisible to both inventories. See residuals.
+- **Behaviour vs B3's harness.** The same probe under B1's `sx.sh` with the base
+  interpreter (`baseline_b1harness`) gives per form the SAME sitecustomize
+  file, usercustomize execution and editable-finder count as the table above.
+  What differs: children's `sys.prefix` is the venv (base: `/opt/anaconda3`),
+  `sys.executable` is the venv shim, and the tripwire is armed. Under the
+  baseline only 2 of 9 processes carried a marker (parent and F2) -- B3's gap,
+  reproduced. Nothing in the four suites, `_control_harness.py` or
+  `oncotriage/` reads `sys.prefix`/`base_prefix`/`VIRTUAL_ENV` (grep);
+  `test_package_invariants`' venv detection walks the repo tree, which the
+  scratchpad venv is outside.
+
+#### 14.14.3 The four suites
+
+Driver kill 540 s; independent outer `perl alarm` 580 s; neither fired. Pre-run
+scan: no other test process; load averages (1 min) 2.63-3.52 from other
+applications. Live tree digest `2fc195543bd2...` unchanged before and after
+every run (same as B3/B4).
+
+| suite | exit | time | result | expected | markers | shim | kernel Python pids | UNMATCHED | helpers (kernel) | other tripwire |
+|---|---|---|---|---|---|---|---|---|---|---|
+| test_ablation_stop_and_lock | 0 | 33.9 s | 161/0 | 161 | 21 (B3: 1) | 21 | 21 | none | caffeinate 27 | none |
+| test_runner_stop_switch | 0 | 26.5 s | 146/0 | 146 | 19 (B3: 2) | 19 | 19 | none | caffeinate 25, git 14 | none |
+| test_runner_sigterm_shutdown | 0 | 30.7 s | 95/0 | 95 | 13 (B3: 1) | 13 | 13 | none | caffeinate 19, git 10 | loopback 36 |
+| test_package_invariants | 0 | 134.9 s | 261/0/0 | 261/0/0 | 124 (B3: 6) | 124 | 124 | none | caffeinate 61 | none |
+
+Every run: launch pid = parent marker pid; markers without a shim record: none;
+kernel Python pids without a shim record: none; shim pids absent from the kernel
+log: 0; duplicate markers: none; unattached markers: none; every marker
+`sandbox_only_write: denied errno=1` and audit hook installed; every shim record
+`sandbox_write: denied` and tripwire log env present; external tripwire records:
+0; inventoried pids alive after the run: 0; no traceback; decoys empty.
+
+- **Load paths observed in the suites (from the markers).** ablation: 20
+  children `pth / PYTHONPATH set, no tw` (the replaced form) + parent;
+  stop switch 17 + 2 with tw on path; sigterm 12 + 1; package_invariants: 118
+  `pth / PYTHONPATH unset` (the popped form) + 6 with tw on path (parent + 5
+  prepended children). Every observed form is one validated in 14.14.2.
+- **sigterm's 36 loopback records** are six children each making six connects
+  to `127.0.0.1:1` (the suite's closed-port Qdrant URL). B3 showed none because
+  those children were unarmed; they are now recorded, not new behaviour.
+- **Non-Python helpers** (`/usr/bin/caffeinate`, `/usr/bin/git`): coverage is
+  the sandbox, evidenced by a kernel `allow process-exec*` report for each
+  helper pid under this profile -- the `with report` clause exists only in this
+  profile, so a report proves that exec ran sandboxed. Sandbox inheritance is
+  kernel-enforced for every descendant; the report is evidence of presence,
+  and a lost report would drop a helper from the count, not from the sandbox.
+- **Runtime.** package_invariants 134.9 s against B3's 60.6 s. Cause not
+  measured (candidates: the bash shim per process, the audit hook now in 118
+  more children, host load). The other three are within ~5 s of B3.
+
+#### 14.14.4 Verdicts, reported separately
+
+1. **Counts: PASSED.** 161/0, 146/0, 95/0, 261/0/0 -- each its expected count,
+   zero failures. No suite adjusted.
+2. **Coverage: PASSED for every inventoried Python process, with residuals.**
+   177 expected Python processes across the four runs (parent, children and
+   grandchildren), 177 markers, 177 shim records, 177 kernel Python pids, zero
+   unmatched, zero attached-marker gaps. The two inventories are independent of
+   the tripwire and of each other and agree exactly in all four runs.
+   Residuals, not closed by this batch:
+   - a Python process created by `fork()` without `exec` is invisible to both
+     inventories. The four suite files contain no `os.fork()` or
+     `multiprocessing` call (package_invariants patches `os.fork` to raise);
+     library code reached by their children was not audited for it.
+   - an interpreter launched by a path other than the venv shim is seen only
+     through the lossy kernel log (N3 shows detection works when the report is
+     present).
+   - B5's harness is not byte-equivalent to B3's: children run with the venv as
+     `sys.prefix`. Customize-module resolution is shown identical per form; no
+     code in scope reads the prefix.
+3. **Status.** B5 RECORDED: yes (validate1, validate2, baseline, four suite
+   runs). B5 PASSED: yes on (1); yes on (2) with the residuals above stated.
+
+- **B3's four-suite qualification (14.12.5) is resolved** for the processes the
+  suites actually spawned: every one now carries a marker, evidenced against an
+  independent inventory. The qualification now reads as the residuals above,
+  which apply to all 21 B3 suites alike, not to these four.
+
+#### 14.14.5 Still unrecorded
+
+- Carried, not acted on: (a) CLAUDE.md overclaims the E1b end state (14.9.5);
+  (b) the provider-resilience timing-check failure's cause remains unresolved
+  (14.13.3); (c) B3's two skipped checks mean the production byte comparison had
+  no data under containment (14.13.4).
+- The 17 non-B5 suites of B3 were not re-run under the B5 harness; their
+  per-process evidence is B1's standard (14.12.5), which was complete for them.
+- The package_invariants runtime difference above.
+
+#### 14.14.6 Next single batch
+
+**B6**: the stale pre-fix evidence -- re-run the 48-patient simulation and the
+replay premise probe, the static checks, and the end-state digest and
+production byte comparison, all of which predate the 12:12 fix. Then B7 (the
+pacing check's scheduled-start fix) and B8 (CLAUDE.md corrections).
