@@ -17301,3 +17301,47 @@ isolated copy: 17 opens (two `mode=ro` sites, which create WAL side files, one
 plain read-write through the unredirected cost-tab loader, and twelve
 `immutable=1`); after it, zero.
 
+
+### Budget admission is atomic (E1)
+
+**THE SPEND GATE'S OVERSHOOT STATEMENTS ABOVE ARE SUPERSEDED, NOT REWRITTEN.**
+The spend-gate pass stated the cap was honoured "to within the requests in
+flight" at their measured price. Under the liability rule a possibly-billed
+failure is charged its WHOLE reservation, so the real gap was the sum of the
+reservations in flight -- measured on the unchanged code, two $9 reservations
+both admitted against a $10 cap and $18 charged (`RECOVERY_E1_REPORT.md`).
+
+Every billed attempt created through `spend.AttemptLiability` is now ADMITTED
+only when committed spend plus every open reservation plus its own reservation
+fits under the cap, as ONE step: `SPEND_LEDGER.admit_hold` under the ledger's
+lock (the process authority), or one `BEGIN IMMEDIATE` transaction in
+`database_logger.reserve_billing_attempt` that reads
+`campaign_liabilities` and inserts only when it fits (the durable authority, used
+for the campaign budget when the shipped sink is installed; shared by every
+process on the database). Equality is admitted. A decline is
+`spend.BudgetAdmissionDeclined` (a `SpendLimitReached`), counted in
+`SPEND_ADMISSION_DECLINES`; `budget_exhausted` latches the run under the
+campaign policy, `headroom_held` never latches. Settlement replaces the hold
+with the charge in one critical section; resolution is exactly once under a
+per-liability lock. The reservation amount is SUPPLIED; admission does not
+depend on the Stage 5 bound's multipliers.
+
+**THE COST IS THROUGHPUT AND IT IS NOT SOLVED.** At the assumed Stage 5 bound
+($9.042) full parallelism needs $217 of headroom, so throttling begins at $83
+committed ($188 at the no-premium $4.653), and a held decline FAILS the patient
+rather than waiting -- near the cap a campaign churns through its cohort without
+latching. The durable authority's SQL aggregate is linear in the campaign's
+rows (~23 ms at 20k) and runs under the write lock per reservation. Both are in
+the report as open items.
+
+```bash
+python tests/test_budget_admission.py                               #  67
+```
+
+Counts that moved, each re-derived in place: `tests/test_spend_gate.py` 164 ->
+**167** (sections 4-9 now supply one call's price as the reservation; section 5
+measures ZERO overshoot; 9e-9h are caught by their accounting, since a bypassed
+call-site gate no longer reaches the wire). `test_billing_closure.py` **388**,
+`test_campaign_billing_record.py` **128** and
+`test_agent_stage5_attempt_provenance.py` **55** did not move; their caps were
+re-derived (1v needs two reservations; 6A and scenario A need 4.5 responses).

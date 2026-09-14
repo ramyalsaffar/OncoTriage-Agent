@@ -214,6 +214,65 @@ billed calls than its configuration can legitimately produce, which is a defect
 in this pipeline rather than a campaign that ran long.
 """
 
+SPEND_ADMISSION_DECLINES = Counter()
+"""Billed attempts NOT dispatched because budget ADMISSION declined them (E1).
+
+Keyed ``{source}:{reason}``, the reason from ``ADMISSION_DECLINE_REASONS``.
+Admission runs when a billed attempt's liability is created -- after the
+call-site gate and the pacer's wait, immediately before the durable reservation
+and the dispatch -- and it compares ``committed + held + this reservation`` with
+the budget's cap AS ONE STEP. A declined attempt was never sent, is never
+charged and is never counted as abandoned.
+"""
+
+ADMISSION_DECLINE_EXHAUSTED = "budget_exhausted"
+ADMISSION_DECLINE_HELD = "headroom_held"
+ADMISSION_DECLINE_UNPRICED = "reservation_unpriced"
+ADMISSION_DECLINE_REASONS = (ADMISSION_DECLINE_EXHAUSTED, ADMISSION_DECLINE_HELD,
+                             ADMISSION_DECLINE_UNPRICED)
+"""Why admission declined a billed attempt. CLOSED; ``database_logger``
+restates the first two and a test pins them equal.
+
+  ``budget_exhausted``      committed spend plus this reservation exceeds the cap
+                            even if every open reservation held by THIS process
+                            settled at nothing. Under the campaign policy it
+                            latches the run (``SPEND_LIMIT_CAP``): committed
+                            spend only grows.
+  ``headroom_held``         it fits against committed spend, and this process's
+                            own open reservations hold the rest. It never
+                            latches: that headroom returns as those attempts
+                            settle below their reservations.
+  ``reservation_unpriced``  a cap is in force and the reservation could not be
+                            priced. An amount nobody knows cannot be admitted
+                            against a cap.
+
+WHAT COUNTS AS "COMMITTED". In-process: what ``budget_spend`` reads (the seeded
+baseline and every charge, or the rolling window). Durably: every settled row
+of the campaign plus every row still RESERVED by another run -- a sibling
+process or a dead one, which this process cannot tell apart and so never
+assumes will release.
+"""
+
+ADMISSION_EPSILON_USD = 1e-9
+"""EQUALITY IS ADMITTED: an attempt fits when ``committed + held + usd <= cap +
+this``. Float noise only, equal to ``DISCREPANCY_EPSILON_USD``; a real excess is
+at least one priced token."""
+
+ADMISSION_AUTHORITY_PROCESS = "process"
+ADMISSION_AUTHORITY_DURABLE = "durable"
+ADMISSION_AUTHORITIES = (ADMISSION_AUTHORITY_PROCESS, ADMISSION_AUTHORITY_DURABLE)
+"""WHO DECIDES AN ADMISSION. CLOSED.
+
+  ``durable``  the campaign budget, under the campaign policy, with a sink that
+               declares ``supports_admission``: one SQLite ``BEGIN IMMEDIATE``
+               transaction reads the campaign's liabilities and inserts the
+               reservation only when it fits. Every process sharing the campaign
+               and the database is serialised by the database's write lock.
+  ``process``  everything else: one acquisition of ``SPEND_LEDGER``'s lock reads
+               the budget's committed spend and this process's open holds and
+               records the hold only when it fits.
+"""
+
 
 # ===========================================================================
 # THE CLOSED VOCABULARIES
@@ -757,6 +816,13 @@ class SpendLedger:
         # spent). The window is a DURATION, and monotonic is the clock that
         # measures durations.
         self._events = deque()
+        # THE OPEN HOLDS (E1). ``{token: (source, usd)}`` -- one per billed
+        # attempt admitted and not yet resolved, in THIS process. Guarded by
+        # ``self._lock``, the same lock every charge takes, so an admission's
+        # read of committed spend and of the holds and its write of a new hold
+        # are one critical section, and a resolution's charge and its release
+        # are another.
+        self._holds = {}
 
     # -- accumulation ------------------------------------------------------
 
@@ -803,8 +869,14 @@ class SpendLedger:
         self._commit(cost, source)
         return cost
 
-    def charge_usd(self, usd, source: str) -> float:
+    def charge_usd(self, usd, source: str, release=None) -> float:
         """Add one ALREADY-PRICED amount. Returns what was added. NEVER RAISES.
+
+        ``release`` (E1) is an admission hold token. When given, the hold is
+        removed IN THE SAME critical section that adds the charge, so the held
+        amount is REPLACED by the actual charge atomically: no reader can see
+        the attempt counted twice or not at all. It is released even when the
+        amount is a fault and charged as zero.
 
         THE SEAM FOR A VENDOR THIS MODULE CANNOT PRICE. ``charge()`` values a
         response against ``config.PRICING_CONFIG``, which is the OpenAI /
@@ -832,7 +904,7 @@ class SpendLedger:
         """
         if isinstance(usd, bool) or not isinstance(usd, (int, float)):
             SPEND_LEDGER_FAULTS[f"bad_amount:{type(usd).__name__}"] += 1
-            self._commit(0.0, source)
+            self._commit(0.0, source, release)
             return 0.0
         if usd != usd or usd in (float("inf"), float("-inf")):
             # NaN AND THE INFINITIES, EXPLICITLY. `float('nan') < 0` is False,
@@ -842,16 +914,16 @@ class SpendLedger:
             # off. `inf` fails the other way and would decline every request
             # for ever.
             SPEND_LEDGER_FAULTS[f"bad_amount:{usd!r}"] += 1
-            self._commit(0.0, source)
+            self._commit(0.0, source, release)
             return 0.0
         if usd < 0:
             SPEND_LEDGER_FAULTS[f"bad_amount:negative"] += 1
-            self._commit(0.0, source)
+            self._commit(0.0, source, release)
             return 0.0
-        self._commit(float(usd), source)
+        self._commit(float(usd), source, release)
         return float(usd)
 
-    def _commit(self, cost: float, source: str) -> None:
+    def _commit(self, cost: float, source: str, release=None) -> None:
         """The ONE write. Every charge lands here; nothing else touches state.
 
         ONE OWNER SO THE TOTAL, THE WINDOW AND THE PER-SOURCE BREAKDOWN CANNOT
@@ -879,6 +951,8 @@ class SpendLedger:
             # breakdown removes for the total.
             self._events.append((now, cost, source))
             self._prune(now)
+            if release is not None:
+                self._holds.pop(release, None)
 
     def _prune(self, now: float) -> None:
         """Drop events older than the widest window anyone can ask about.
@@ -962,6 +1036,84 @@ class SpendLedger:
             return [(stamp, cost) for stamp, cost, src in self._events
                     if stamp >= cut and (keep is None or src in keep)]
 
+    # -- admission (E1) ----------------------------------------------------
+
+    def _committed_locked(self, keep, windowed, window_seconds, seed_usd,
+                          now) -> float:
+        """``budget_spend``'s quantity, read with ``self._lock`` HELD.
+
+        THE SAME RULE, RESTATED BECAUSE IT MUST RUN INSIDE THE LOCK: the
+        campaign policy reads the attributed seed plus every charge on the
+        budget's sources; the window policy reads the rolling window, falling
+        back to the unwindowed charges (no seed) when the window cannot be read
+        and to zero for a non-positive window -- exactly ``window_spend``'s
+        branches. A test pins this equal to ``budget_spend`` for every policy.
+        """
+        if not windowed:
+            return seed_usd + sum(v for k, v in self._by_source.items()
+                                  if k in keep)
+        if (isinstance(window_seconds, bool)
+                or not isinstance(window_seconds, (int, float))):
+            return sum(v for k, v in self._by_source.items() if k in keep)
+        if window_seconds <= 0:
+            return 0.0
+        self._prune(now)
+        cut = now - float(window_seconds)
+        return sum(cost for stamp, cost, src in self._events
+                   if stamp >= cut and src in keep)
+
+    def admit_hold(self, token, source, usd, *, sources, cap, windowed,
+                   window_seconds=None, seed_usd=0.0):
+        """THE PROCESS AUTHORITY'S ONE STEP (E1). ``(admitted, committed, held)``.
+
+        Under ONE acquisition of this ledger's lock: read what the budget has
+        committed, sum this process's open holds on the budget's sources,
+        compare ``committed + held + usd`` with ``cap``, and record the hold
+        ONLY when it fits. Two threads cannot both admit against the same free
+        headroom, because the second one's read happens after the first one's
+        hold is recorded. ``cap`` None records the hold without comparing.
+        NEVER RAISES for a well-formed call.
+        """
+        keep = set(sources)
+        now = time.monotonic()
+        with self._lock:
+            committed = self._committed_locked(keep, windowed, window_seconds,
+                                               seed_usd, now)
+            held = sum(amount for src, amount in self._holds.values()
+                       if src in keep)
+            if (cap is not None
+                    and committed + held + float(usd)
+                    > float(cap) + ADMISSION_EPSILON_USD):
+                return False, committed, held
+            self._holds[token] = (source, float(usd))
+            return True, committed, held
+
+    def record_hold(self, token, source, usd) -> None:
+        """Record a hold ANOTHER authority already admitted (the durable one).
+        It is released by the attempt's resolution like any other hold."""
+        with self._lock:
+            self._holds[token] = (source, float(usd))
+
+    def release_hold(self, token) -> bool:
+        """Drop a hold WITHOUT charging -- a provably unbilled attempt, or a
+        reservation that failed after admission. True when it was held."""
+        if token is None:
+            return False
+        with self._lock:
+            return self._holds.pop(token, None) is not None
+
+    def held_usd(self, sources=None) -> float:
+        """What this process's open holds sum to, optionally for ``sources``."""
+        keep = None if sources is None else set(sources)
+        with self._lock:
+            return sum(amount for src, amount in self._holds.values()
+                       if keep is None or src in keep)
+
+    def held_count(self) -> int:
+        """How many holds are open in this process."""
+        with self._lock:
+            return len(self._holds)
+
     def by_source(self) -> dict:
         """``{source: usd}``, a copy. The reader for "where did it go".
 
@@ -1034,6 +1186,7 @@ class SpendLedger:
             self._events.clear()
             self._unverified.clear()
             self._unverified_counts.clear()
+            self._holds.clear()
 
     # -- reading -----------------------------------------------------------
 
@@ -1580,6 +1733,167 @@ def require_budget(source: str, where: str, *, latch=None) -> None:
         f"{'no cap' if cap is None else f'${cap:.2f}'} "
         f"({BUDGET_CAP_CONSTANTS[budget]})",
         limit=SPEND_LIMIT_CAP, source=source)
+
+
+# ===========================================================================
+# ATOMIC BUDGET ADMISSION (E1)
+# ===========================================================================
+#
+# WHAT WAS WRONG, MEASURED ON THE UNCHANGED CODE. The gates above compare
+# MEASURED spend -- the seed plus every charge -- and a charge lands only when
+# an attempt resolves. Nothing counted the liabilities in flight, so two workers
+# each reserving $9.00 against a $10.00 cap both passed every check, both were
+# dispatched, and the budget ended at $18.00 (RECOVERY_E1_REPORT.md, section 3).
+# Under the liability rule a possibly-billed failure is charged its whole
+# reservation, so the gap was not "a few requests at their measured price" but
+# the sum of the reservations in flight.
+#
+# THE RULE. A billed attempt is admitted only when committed spend, plus every
+# reservation still open, plus its own reservation, fits under the cap -- and
+# the read and the reservation happen as ONE step, so no two attempts can both
+# take the same free headroom. See ``ADMISSION_AUTHORITIES`` for who decides.
+#
+# THE AMOUNT IS SUPPLIED. Admission compares whatever the reservation is; it
+# does not re-derive, re-price or depend on the Stage 5 bound's multipliers.
+#
+# WHAT IT DOES NOT CHANGE. The call-site gates above still run first, with
+# their own counters and latches; the unverified-record refusal still refuses
+# first where it applies; a reservation that cannot be persisted still latches
+# ``billing_record``. Paths that create no ``AttemptLiability`` -- the rater's
+# Batch API and the ragas harness -- are not admitted here.
+
+
+class BudgetAdmissionDeclined(SpendLimitReached):
+    """A billed attempt was NOT dispatched because admission declined it (E1).
+
+    A ``SpendLimitReached`` subclass with ``limit`` ``SPEND_LIMIT_CAP``, so every
+    caller that already handles a cap refusal handles this one: the API and the
+    MCP server answer it as a budget refusal, Stage 2's channel degrades, and
+    Stage 5 converts it into ``Stage5SpendStopped``. ``reason`` separates an
+    exhausted budget from headroom held by open reservations; ``authority`` says
+    which authority decided.
+    """
+
+    def __init__(self, message, *, reason, budget, source, committed_usd,
+                 held_usd, reservation_usd, cap_usd, authority):
+        super().__init__(message, limit=SPEND_LIMIT_CAP, source=source)
+        self.reason = reason
+        self.budget = budget
+        self.committed_usd = committed_usd
+        self.held_usd = held_usd
+        self.reservation_usd = reservation_usd
+        self.cap_usd = cap_usd
+        self.authority = authority
+
+
+def admission_terms(source: str):
+    """``(budget, cap)`` an attempt on ``source`` is admitted against. ``cap``
+    None means admission compares nothing: enforcement is off, the budget has no
+    cap, or the cap cannot be read -- ``cap_exceeded``'s hot-path rule, for its
+    reason (a configuration defect surfacing per request is a worse diagnosis of
+    a fact the banner already reports)."""
+    budget = budget_for(source)
+    if not config.SPEND_CAP_ENFORCED:
+        return budget, None
+    try:
+        return budget, budget_cap(budget)
+    except SpendCapConfigurationError:
+        return budget, None
+
+
+def durable_admission_applies(budget: str) -> bool:
+    """Does the DURABLE authority decide admissions on ``budget`` right now?
+
+    Only the campaign budget under the campaign policy, and only with an
+    installed sink that declares ``supports_admission``. A duck-typed sink that
+    does not (a test stand-in) keeps the process authority rather than being
+    handed an argument it cannot take -- which would latch the run on a
+    ``TypeError``.
+    """
+    if budget != SPEND_BUDGET_CAMPAIGN or policy() != SPEND_POLICY_CAMPAIGN:
+        return False
+    sink = BILLING_RECORD.installed_sink()
+    return sink is not None and getattr(sink, "supports_admission", False) is True
+
+
+def admission_declined(reason, *, where, source, budget, committed, held, usd,
+                       cap, authority, detail=None) -> BudgetAdmissionDeclined:
+    """Count, latch when the budget is exhausted, log, and RETURN the refusal.
+
+    THE LATCH IS ASKED FOR ONLY ON ``budget_exhausted``, and through
+    ``latch_on_limit()``: committed spend only grows under the campaign policy,
+    so no later attempt of this size can fit and the run should stop starting
+    patients. ``headroom_held`` never latches -- that headroom is released as
+    this process's own attempts settle -- and neither does an unpriced
+    reservation, which is a defect in one attempt rather than a spent budget.
+    """
+    if reason not in ADMISSION_DECLINE_REASONS:
+        SPEND_LEDGER_FAULTS[f"admission:bad_reason:{reason}"] += 1
+        reason = ADMISSION_DECLINE_EXHAUSTED
+    if authority not in ADMISSION_AUTHORITIES:
+        SPEND_LEDGER_FAULTS[f"admission:bad_authority:{authority}"] += 1
+    SPEND_ADMISSION_DECLINES[f"{source}:{reason}"] += 1
+    if reason == ADMISSION_DECLINE_EXHAUSTED and latch_on_limit():
+        SPEND_STOP.trip(SPEND_LIMIT_CAP, where, source)
+    log.warning("a billed attempt was not dispatched because budget admission "
+                "declined it", status="stopped", event="spend_admission_declined",
+                phase=source, reason=reason, mode=where,
+                cost_usd=(round(committed, 6) if committed is not None else None),
+                threshold=(round(cap, 6) if cap is not None else None),
+                degraded=True)
+    if reason == ADMISSION_DECLINE_UNPRICED:
+        why = (f"its reservation could not be priced ({detail}) and the "
+               f"{budget} budget has a cap in force, so it cannot be admitted")
+    elif reason == ADMISSION_DECLINE_HELD:
+        why = (f"${committed:.6f} committed plus ${held:.6f} held by this "
+               f"process's open reservations plus its own ${usd:.6f} would "
+               f"exceed the {budget} budget's {policy()} limit of ${cap:.2f} "
+               f"({BUDGET_CAP_CONSTANTS[budget]}); the held headroom returns as "
+               f"those attempts settle, so a later attempt may be admitted")
+    else:
+        why = (f"${committed:.6f} committed plus its own ${usd:.6f} exceeds the "
+               f"{budget} budget's {policy()} limit of ${cap:.2f} "
+               f"({BUDGET_CAP_CONSTANTS[budget]}) even if every open reservation "
+               f"of this process settled at nothing")
+    return BudgetAdmissionDeclined(
+        f"the request was not issued ({where}): budget admission declined it "
+        f"[{reason}, {authority} authority]: {why}",
+        reason=reason, budget=budget, source=source, committed_usd=committed,
+        held_usd=held, reservation_usd=usd, cap_usd=cap, authority=authority)
+
+
+def _admit_in_process(source, budget, cap, usd, where, fault):
+    """Admit one attempt under the PROCESS authority. Returns its hold token.
+    RAISES ``BudgetAdmissionDeclined``."""
+    if usd is None:
+        if cap is not None:
+            raise admission_declined(ADMISSION_DECLINE_UNPRICED, where=where,
+                                     source=source, budget=budget,
+                                     committed=None, held=None, usd=None,
+                                     cap=cap,
+                                     authority=ADMISSION_AUTHORITY_PROCESS,
+                                     detail=fault)
+        usd = 0.0
+    windowed = (budget != SPEND_BUDGET_RATER
+                and policy() == SPEND_POLICY_WINDOW)
+    seed = SPEND_LEDGER.seeded
+    seed_usd = (seed.usd if (not windowed and seed_budget(seed) == budget)
+                else 0.0)
+    token = uuid.uuid4().hex
+    admitted, committed, held = SPEND_LEDGER.admit_hold(
+        token, source, float(usd), sources=BUDGET_SOURCES[budget], cap=cap,
+        windowed=windowed,
+        window_seconds=getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None),
+        seed_usd=seed_usd)
+    if admitted:
+        return token
+    reason = (ADMISSION_DECLINE_EXHAUSTED
+              if committed + float(usd) > float(cap) + ADMISSION_EPSILON_USD
+              else ADMISSION_DECLINE_HELD)
+    raise admission_declined(reason, where=where, source=source, budget=budget,
+                             committed=committed, held=held, usd=float(usd),
+                             cap=float(cap),
+                             authority=ADMISSION_AUTHORITY_PROCESS)
 
 
 # ===========================================================================
@@ -2399,7 +2713,7 @@ class BillingRecord:
             return self._sink
 
     def reserve(self, source, model, input_tokens, output_tokens, *, where,
-                reserved_usd=None, note=None):
+                reserved_usd=None, note=None, admission_cap=None):
         """Persist a reservation before a billed dispatch. Returns a handle, or
         None when no sink is installed. RAISES ``BillingRecordUnavailable`` when
         a sink is installed and the reservation could not be made durable -- the
@@ -2445,8 +2759,25 @@ class BillingRecord:
                           correlation_id=current_correlation_id())
             if note is not None:
                 fields["note"] = note
+            if admission_cap is not None:
+                # THE DURABLE AUTHORITY (E1): the sink admits and reserves in
+                # one transaction. Passed only when not None, so a sink that
+                # predates it is never handed an argument it cannot take.
+                fields["admission_cap"] = admission_cap
             sink.reserve(**fields)
         except Exception as exc:                                # noqa: BLE001
+            if getattr(exc, "admission_declined", False) is True:
+                # DECLINED, NOT FAILED. Nothing was written and nothing is
+                # dispatched; the billing record is healthy, so it is not
+                # latched -- ``admission_declined`` latches the CAP only when
+                # the budget is exhausted.
+                raise admission_declined(
+                    getattr(exc, "reason", ADMISSION_DECLINE_EXHAUSTED),
+                    where=where, source=source, budget=budget_for(source),
+                    committed=getattr(exc, "committed_usd", None),
+                    held=getattr(exc, "held_usd", None), usd=usd,
+                    cap=admission_cap,
+                    authority=ADMISSION_AUTHORITY_DURABLE) from exc
             BILLING_RECORD_FAULTS[f"reserve:{type(exc).__name__}"] += 1
             log.error("a billed attempt's reservation could not be persisted; "
                       "the attempt was not dispatched and the run is latched",
@@ -2684,12 +3015,41 @@ class AttemptLiability:
         # A BOUNDED attempt is one whose reservation claims to be a proven
         # upper bound; a response priced above it breaks that claim (R1).
         self.bounded = reserved_usd is not None
-        self.handle = BILLING_RECORD.reserve(source, model, input_tokens,
-                                             output_tokens, where=where,
-                                             reserved_usd=reserved_usd,
-                                             note=note)
         self.resolved_outcome = None
         self.resolved_usd = None
+        # RESOLVED EXACTLY ONCE UNDER THIS LOCK (E1). A duplicate or
+        # out-of-order completion from another thread waits and then reads the
+        # first resolution, so the hold is released once and charged once.
+        self._resolve_lock = threading.Lock()
+        # ── ADMISSION, BEFORE THE RESERVATION AND THE DISPATCH (E1) ─────────
+        budget, cap = admission_terms(source)
+        self.admission_authority = (ADMISSION_AUTHORITY_DURABLE
+                                    if durable_admission_applies(budget)
+                                    else ADMISSION_AUTHORITY_PROCESS)
+        if self.admission_authority == ADMISSION_AUTHORITY_PROCESS:
+            self._hold = _admit_in_process(source, budget, cap,
+                                           self.reserved_usd, where,
+                                           self.reservation_fault)
+        else:
+            self._hold = None
+        try:
+            self.handle = BILLING_RECORD.reserve(
+                source, model, input_tokens, output_tokens, where=where,
+                reserved_usd=reserved_usd, note=note,
+                admission_cap=(cap if self.admission_authority
+                               == ADMISSION_AUTHORITY_DURABLE else None))
+        except BaseException:
+            # ADMITTED BUT NOT RESERVED: nothing is dispatched, so the hold is
+            # released rather than left to block headroom for the process's
+            # life.
+            SPEND_LEDGER.release_hold(self._hold)
+            raise
+        if self._hold is None:
+            # The durable authority admitted it; mirror the hold in process so
+            # the attempt's resolution releases it like any other.
+            self._hold = uuid.uuid4().hex
+            SPEND_LEDGER.record_hold(self._hold, source,
+                                     float(self.reserved_usd or 0.0))
         BILLING_RECORD._note_open(self.reserved_usd)
 
     def upper_bound_usd(self) -> float:
@@ -2712,8 +3072,14 @@ class AttemptLiability:
         ``_settlement_did_not_land``, which keeps a resumed reading at or above
         this process's charge (P1b).
         """
-        if self.resolved_outcome is not None:
-            return self.resolved_usd
+        with self._resolve_lock:
+            if self.resolved_outcome is not None:
+                return self.resolved_usd
+            return self._resolve_locked(outcome, model, prompt_tokens,
+                                        completion_tokens)
+
+    def _resolve_locked(self, outcome, model, prompt_tokens,
+                        completion_tokens) -> float:
         try:
             out, usd, s_in, s_out, fault = attempt_liability(
                 outcome, self.reserved_usd, model or self.model, prompt_tokens,
@@ -2727,7 +3093,8 @@ class AttemptLiability:
             SPEND_LEDGER_FAULTS[fault] += 1
         if usd is None:
             # AN UNPRICEABLE RESERVATION CHARGED AT ITSELF. Only reachable with
-            # no sink (see `attempt_liability`); counted, never silent.
+            # no sink and no cap in force (see `attempt_liability` and
+            # `_admit_in_process`); counted, never silent.
             SPEND_LEDGER_FAULTS[f"unpriced_reservation:{self.model}"] += 1
             usd = 0.0
         if (self.bounded and out == BILLING_OUTCOME_RESPONSE
@@ -2747,8 +3114,13 @@ class AttemptLiability:
                       event="billing_bound_exceeded", status="error",
                       phase=self.source, mode=self.where, degraded=True)
         self.resolved_outcome, self.resolved_usd = out, float(usd)
+        # THE HOLD IS REPLACED BY THE CHARGE IN ONE STEP (E1): released inside
+        # the ledger's critical section that adds the charge. A provably
+        # unbilled attempt charges nothing and releases its whole hold.
         if out != BILLING_OUTCOME_NOT_BILLED:
-            SPEND_LEDGER.charge_usd(float(usd), self.source)
+            SPEND_LEDGER.charge_usd(float(usd), self.source, release=self._hold)
+        else:
+            SPEND_LEDGER.release_hold(self._hold)
         result = None
         if self.handle is not None:
             result = BILLING_RECORD._write_settlement(self.handle, out,

@@ -6948,30 +6948,30 @@ before its first billed call, which is a legitimate thing to ask for (a dry
 rehearsal of the whole pipeline's non-billed path). `spend.spend_cap()` refuses
 a negative value at import rather than reading it as unlimited.
 
-THE WORST-CASE OVERSHOOT IS BOUNDED AND IS STATED HERE, because a cap with an
-unstated edge is a promise nobody can rely on.
+THE OVERSHOOT, AND WHAT CHANGED IT (E1). The paragraph that stood here said the
+cap was honoured "to within about a dollar and a half": the gate compared
+MEASURED spend before a request and the ledger was charged after the response,
+so the requests in flight -- up to MAX_WORKERS x per_trial_parallel_bound() --
+could overshoot at their measured price. That was false under the liability
+rule: a possibly-billed failure is charged its WHOLE reservation, so the gap was
+the sum of the reservations in flight (measured on the unchanged code: two $9
+reservations admitted against a $10 cap, $18 charged; RECOVERY_E1_REPORT.md).
 
-    Every billed call is bracketed: the gate is checked immediately BEFORE the
-    request and the ledger is charged immediately AFTER the response. So the
-    only spend a trip cannot prevent is what is already past the gate and not
-    yet charged, which is exactly the set of requests in flight:
+Billed attempts are now ADMITTED atomically (``spend.ADMISSION_AUTHORITIES``):
+committed spend plus every open reservation plus this attempt's reservation
+must fit under the cap, and the check and the reservation are one step. So for
+every attempt created through ``spend.AttemptLiability`` the budget's
+liabilities never exceed the cap at admission. What can still exceed it, stated:
+a response priced ABOVE its reservation (the bound broken, counted under
+``BILLING_RECORD_FAULTS['bound_exceeded:...']``); a settlement whose durable
+reading is unverified (live is topped up and the run latches); and billed paths
+that create no liability -- the rater's Batch API and the ragas harness.
 
-        overshoot_requests  <=  MAX_WORKERS x per_trial_parallel_bound()
-                            =   12 x 4  =  48                (per-trial mode)
-        overshoot_requests  <=  MAX_WORKERS x 1  =  12       (grouped mode:
-                                the send loop is sequential per patient)
-
-    At the per-request costs derived above:
-
-        per-trial, cache working   48 x $0.010811 = $0.52
-        per-trial, cache absent    48 x $0.026246 = $1.26
-        grouped                    12 x one packed chunk
-
-    So the cap is honoured to within about a dollar and a half, on a $300 cap.
-    THIS IS THE BOUND THE DESIGN BUYS BY CHARGING AT THE RESPONSE RATHER THAN
-    AT THE PATIENT. Charging only where the node folds its accumulators would
-    make the bound MAX_WORKERS whole patients (~$5), because per-trial mode
-    dispatches a patient's entire wave before the node reads any of it.
+THE PRICE OF ADMISSION IS THROUGHPUT, AND IT IS RECORDED RATHER THAN HIDDEN.
+Each Stage 5 attempt reserves its documented-limit bound, so with N attempts in
+flight the cap must hold N reservations before the next is admitted. See
+RECOVERY_E1_REPORT.md for the measured range at the assumed and the no-premium
+bound.
 """
 
 RATER_SPEND_CAP_USD = 50.00

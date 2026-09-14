@@ -2074,6 +2074,15 @@ class _Stage5AttemptRecord:
             raise Stage5SpendStopped(f"the request was not issued: {exc}",
                                      limit=spend.SPEND_LIMIT_BILLING_RECORD
                                      ) from exc
+        except spend.BudgetAdmissionDeclined as exc:
+            # ADMISSION DECLINED IT (E1): nothing was reserved or sent. A
+            # `Stage5SpendStopped`, so the node fails the patient rather than
+            # completing it with a hole, and `_account_unconsumed` does not
+            # count it as abandoned. The admission reason rides along because
+            # the warmup floor's sentence depends on it.
+            stopped = Stage5SpendStopped(str(exc), limit=spend.SPEND_LIMIT_CAP)
+            stopped.admission_reason = exc.reason
+            raise stopped from exc
 
     def response(self, token, result):
         usage = getattr(result, "usage", None)
@@ -8508,6 +8517,15 @@ CLINICAL TRIALS:
                           "patient")
                          if getattr(_warmup_error, "limit", None)
                          == spend.SPEND_LIMIT_BILLING_RECORD
+                         # A HELD-HEADROOM DECLINE IS NOT A LIMIT REACHED (E1):
+                         # the budget is not spent, this process's own open
+                         # reservations held the rest of it.
+                         else ("this process's open reservations held the "
+                               "campaign budget's remaining headroom when this "
+                               "patient's warmup sought admission, so no "
+                               "request was issued at all")
+                         if getattr(_warmup_error, "admission_reason", None)
+                         == spend.ADMISSION_DECLINE_HELD
                          else ("a spend limit was reached before this "
                                "patient's wave was dispatched, so no request "
                                "was issued at all"))

@@ -511,6 +511,16 @@ _REGISTRY_SPEC = (
      "deliberately and is NOT checkpointed, so a resume runs it. The total is "
      "a FLOOR -- incremented from worker threads without a lock; the LEDGER, "
      "which decisions are made on, is locked"),
+    ("SPEND_ADMISSION_DECLINES", _spend.SPEND_ADMISSION_DECLINES,
+     "billed attempts NOT dispatched because budget ADMISSION declined them "
+     "after the call-site gate passed (E1). Keyed {source}:{reason}: "
+     "`budget_exhausted` (committed spend plus the reservation exceeds the cap; "
+     "latches the run under the campaign policy), `headroom_held` (it fits "
+     "against committed spend but this process's own open reservations hold "
+     "the rest; never latches, and those patients fail and are NOT "
+     "checkpointed, so a resume runs them), `reservation_unpriced`. IT NAMES "
+     "MONEY NOT SPENT. A large `headroom_held` total is the throughput cost of "
+     "reserving each attempt at its upper bound"),
     ("SPEND_LEDGER_FAULTS", _spend.SPEND_LEDGER_FAULTS,
      "a billed response could not be priced, so its cost is MISSING from the "
      "spend ledger. EVERY KEY HERE IS SPEND THE GATE CANNOT SEE, which means "

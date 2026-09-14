@@ -5388,10 +5388,116 @@ def _optional_count(value):
             and value >= 0 else None)
 
 
+BILLING_ADMISSION_EXHAUSTED = "budget_exhausted"
+BILLING_ADMISSION_HELD = "headroom_held"
+BILLING_ADMISSION_DECLINE_REASONS = (BILLING_ADMISSION_EXHAUSTED,
+                                     BILLING_ADMISSION_HELD)
+"""``spend.ADMISSION_DECLINE_EXHAUSTED`` / ``_HELD``, restated: this module does
+not import ``spend``, and a test pins them equal."""
+
+
+class BillingAdmissionDeclined(RuntimeError):
+    """The DURABLE admission authority declined a reservation (E1). Nothing was
+    written. ``admission_declined`` is the duck-typed marker ``spend`` reads;
+    ``reason`` is a ``BILLING_ADMISSION_DECLINE_REASONS`` member."""
+
+    admission_declined = True
+
+    def __init__(self, message, *, reason, committed_usd, held_usd,
+                 reservation_usd, cap_usd):
+        super().__init__(message)
+        if reason not in BILLING_ADMISSION_DECLINE_REASONS:
+            reason = BILLING_ADMISSION_EXHAUSTED
+        self.reason = reason
+        self.committed_usd = committed_usd
+        self.held_usd = held_usd
+        self.reservation_usd = reservation_usd
+        self.cap_usd = cap_usd
+
+
+class CampaignLiabilities(NamedTuple):
+    """One read of a campaign's liabilities for admission. See
+    ``campaign_liabilities``."""
+
+    rows: int = 0
+    bad: int = 0
+    incomplete: int = 0
+    committed_usd: float = 0.0
+    held_usd: float = 0.0
+
+
+_CAMPAIGN_LIABILITIES_SQL = """
+SELECT COUNT(*),
+       COALESCE(SUM(CASE WHEN ok THEN 0 ELSE 1 END), 0),
+       COALESCE(SUM(CASE WHEN ok AND kind = ? AND COALESCE(
+                    (CASE WHEN json_valid(note) THEN json_extract(note, '$.result')
+                     END) IN (?, ?), 0) = 0 THEN 1 ELSE 0 END), 0),
+       COALESCE(SUM(CASE WHEN ok AND NOT (state = ? AND run_id IS ?)
+                    THEN amount ELSE 0 END), 0.0),
+       COALESCE(SUM(CASE WHEN ok AND state = ? AND run_id IS ?
+                    THEN amount ELSE 0 END), 0.0)
+FROM (SELECT kind, state, note, run_id, amount,
+             (state IN (?, ?) AND kind IN (?, ?, ?)
+              AND NOT (kind = ? AND state <> ?)
+              AND typeof(amount) IN ('integer', 'real')
+              AND amount >= 0 AND amount <= 1.7976931348623157e308) AS ok
+      FROM (SELECT kind, state, note, run_id,
+                   CASE WHEN state = ? THEN settled_usd ELSE reserved_usd END
+                       AS amount
+            FROM billing_attempts WHERE campaign_id = ?))
+"""
+
+
+def campaign_liabilities(cursor, campaign_id, run_id) -> CampaignLiabilities:
+    """The campaign's liabilities, split for admission. RAISES on SQL failure.
+
+    ``committed_usd`` is every settled row plus every row still RESERVED by a run
+    other than ``run_id``; ``held_usd`` is what ``run_id`` itself still holds.
+
+    THE SAME SUMMATION RULE AS ``campaign_billing_total``, IN SQL, because it
+    runs inside the admission transaction under the write lock for every billed
+    attempt, and a Python loop over a growing campaign would make that lock's
+    hold time grow with it. A settled row counts its settled amount and a
+    reserved row its reservation; a row whose state, kind or amount cannot be
+    summed is ``bad``; a settlement discrepancy whose note does not record a
+    conflict or a failure is ``incomplete``. A text or blob amount must be
+    ``bad``, because ``SUM`` would coerce it to 0. THE UPPER BOUND IS THE
+    LOAD-BEARING PREDICATE, measured by planting each out (E1): SQLite orders
+    TEXT and BLOB above every number, so ``amount <= 1.797e308`` is false for
+    them, and it is the only predicate that excludes an INFINITE real. ``typeof``
+    is redundant with it -- removing ``typeof`` alone is not caught, removing
+    the bound alone is -- and is kept only because it states the rule. A NULL
+    amount fails both. A test pins this equal to ``campaign_billing_total`` over
+    every row shape it distinguishes.
+    """
+    row = cursor.execute(_CAMPAIGN_LIABILITIES_SQL, (
+        BILLING_ATTEMPT_KIND_DISCREPANCY, SETTLE_CONFLICT, SETTLE_FAILED,
+        BILLING_ATTEMPT_STATE_RESERVED, run_id,
+        BILLING_ATTEMPT_STATE_RESERVED, run_id,
+        BILLING_ATTEMPT_STATE_RESERVED, BILLING_ATTEMPT_STATE_SETTLED,
+        *BILLING_ATTEMPT_KINDS,
+        BILLING_ATTEMPT_KIND_DISCREPANCY, BILLING_ATTEMPT_STATE_SETTLED,
+        BILLING_ATTEMPT_STATE_SETTLED, campaign_id)).fetchone()
+    return CampaignLiabilities(int(row[0]), int(row[1]), int(row[2]),
+                               float(row[3]), float(row[4]))
+
+
+def admission_decision(liabilities, reservation_usd, cap_usd):
+    """None to admit, or the decline reason. PURE. Equality is admitted."""
+    usd = float(reservation_usd)
+    limit = float(cap_usd) + _BILLING_AMOUNT_EPSILON
+    if liabilities.committed_usd + usd > limit:
+        return BILLING_ADMISSION_EXHAUSTED
+    if liabilities.committed_usd + liabilities.held_usd + usd > limit:
+        return BILLING_ADMISSION_HELD
+    return None
+
+
 def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
                             model, input_tokens, output_tokens, reserved_usd,
                             correlation_id=None,
-                            kind=BILLING_ATTEMPT_KIND_ATTEMPT, note=None):
+                            kind=BILLING_ATTEMPT_KIND_ATTEMPT, note=None,
+                            admission_cap=None):
     """COMMIT a reservation row. RAISES ``BillingRecordWriteError`` on any
     failure; returns the attempt id once the row is durable.
 
@@ -5421,6 +5527,11 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
         problems.append("kind")
     if not _valid_billing_usd(reserved_usd):
         problems.append("reserved_usd")
+    if admission_cap is not None and (not _valid_billing_usd(admission_cap)
+                                      or kind != BILLING_ATTEMPT_KIND_ATTEMPT):
+        # An admission cap applies to a billed ATTEMPT only: historical and
+        # discrepancy rows record spend that already happened.
+        problems.append("admission_cap")
     if problems:
         raise BillingRecordWriteError(
             f"a billing reservation was refused before any write: invalid "
@@ -5451,6 +5562,26 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
         conn = _open_billing_connection(db_path)
         try:
             cursor = conn.cursor()
+            if admission_cap is not None:
+                # ATOMIC ADMISSION (E1). BEGIN IMMEDIATE takes the database's
+                # write lock BEFORE the read, so the liabilities read below and
+                # the insert that follows are one step for every connection to
+                # this file -- threads here (already serialised by
+                # `_WRITE_LOCK`) and every other process sharing the campaign.
+                # A declined reservation rolls back having written nothing.
+                cursor.execute("BEGIN IMMEDIATE")
+                liabilities = campaign_liabilities(cursor, campaign_id, run_id)
+                if liabilities.bad or liabilities.incomplete:
+                    raise BillingRecordUnreadable(
+                        f"campaign {campaign_id}'s billing record holds "
+                        f"{liabilities.bad} row(s) that cannot be summed and "
+                        f"{liabilities.incomplete} incomplete discrepancy "
+                        f"row(s); nothing is admitted against it")
+                reason = admission_decision(liabilities, reserved_usd,
+                                            admission_cap)
+                if reason is not None:
+                    conn.rollback()
+                    return "declined", reason, liabilities
             cursor.execute(
                 "INSERT OR IGNORE INTO billing_attempts (attempt_id, "
                 "campaign_id, run_id, kind, source, model, correlation_id, "
@@ -5463,17 +5594,29 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
                 "billing_attempts WHERE attempt_id = ?", (attempt_id,))
             found = cursor.fetchone()
             conn.commit()
-            return found
+            return "written", found, None
         finally:
             conn.close()
 
     try:
         with _WRITE_LOCK:
-            found = run_with_write_retry(_op, "a billing reservation")
+            status, found, liabilities = run_with_write_retry(
+                _op, "a billing reservation")
     except Exception as exc:                                   # noqa: BLE001
         raise BillingRecordWriteError(
             f"the billing reservation could not be committed to {db_path}: "
             f"{type(exc).__name__}: {exc}") from exc
+    if status == "declined":
+        raise BillingAdmissionDeclined(
+            f"campaign {campaign_id}'s budget admission declined a "
+            f"${float(reserved_usd):.6f} reservation [{found}]: "
+            f"${liabilities.committed_usd:.6f} committed, "
+            f"${liabilities.held_usd:.6f} held by run {run_id}, cap "
+            f"${float(admission_cap):.2f}",
+            reason=found, committed_usd=liabilities.committed_usd,
+            held_usd=liabilities.held_usd,
+            reservation_usd=float(reserved_usd),
+            cap_usd=float(admission_cap))
     if (found is None or found[0] != campaign_id or found[1] != run_id
             or found[2] != kind
             or not _valid_billing_usd(found[3])
@@ -6095,6 +6238,10 @@ class BillingRecordSink:
     open and the campaign is established, installed before the first billed
     call, and cleared when the run ends.
     """
+
+    supports_admission = True
+    """It takes ``admission_cap`` and admits in the reservation's own
+    transaction (E1), so ``spend`` makes it the campaign budget's authority."""
 
     def __init__(self, db_path, campaign_id, run_id, discrepancy_dir=None):
         if not isinstance(campaign_id, str) or not campaign_id:

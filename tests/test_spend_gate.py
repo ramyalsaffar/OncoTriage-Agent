@@ -299,13 +299,20 @@ class _Stub:
     serialize them.
     """
 
-    def __init__(self, *, barrier_size=None, barrier_timeout=15.0):
+    def __init__(self, *, barrier_size=None, barrier_timeout=15.0,
+                 hold_until_declines=None):
         self.requests = []
         self._lock = threading.Lock()
         self._barrier = (threading.Barrier(barrier_size)
                          if barrier_size else None)
         self._barrier_timeout = barrier_timeout
         self.barrier_broken = False
+        # E1: hold every TRIAL call open until this many admission declines
+        # have been counted, so a check can prove a request was IN FLIGHT while
+        # its peers sought admission. `held_by_declines` records whether the
+        # condition was met or the wait timed out.
+        self._hold_until = hold_until_declines
+        self.held_by_declines = None
 
     @property
     def chat(self):
@@ -323,6 +330,14 @@ class _Stub:
             # request 0 a trial call, and a stub that DEFINED request 0 as the
             # warmup could not see that.
             return _Response("{}", *CALL_TOKENS)
+        if self._hold_until is not None:
+            import time as _time
+            deadline = _time.monotonic() + self._barrier_timeout
+            while (sum(spend.SPEND_ADMISSION_DECLINES.values())
+                   < self._hold_until and _time.monotonic() < deadline):
+                _time.sleep(0.002)
+            self.held_by_declines = (sum(spend.SPEND_ADMISSION_DECLINES
+                                         .values()) >= self._hold_until)
         if self._barrier is not None:
             try:
                 self._barrier.wait(timeout=self._barrier_timeout)
@@ -370,10 +385,24 @@ def trial(index):
 _SIX = [trial(i) for i in range(6)]
 
 
+_REAL_STAGE5_BOUND = config.stage5_attempt_bound
+
+
 def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
              parallel=1, per_trial=True, seed_usd=0.0, node=None, stub=None,
-             **stub_kw):
+             reservation_usd=CALL_COST, **stub_kw):
     """Drive Stage 5 once under a chosen budget. Returns ``(result, stub)``.
+
+    E1: THE SUPPLIED RESERVATION IS ONE CALL'S PRICE BY DEFAULT. Admission now
+    requires ``committed + held + reservation <= cap`` before every billed
+    attempt, and this file's budgets are written in whole CALLS
+    (``cap=3 * CALL_COST``). With the documented-limit bound as the reservation
+    (~$5.83 per attempt on the pinned arm) no attempt would fit any of them and
+    every scenario would measure a decline at admission instead of the gate it
+    is about. So ``reservation_usd`` supplies the amount -- admission takes the
+    amount as an input and its design does not depend on it -- and a response
+    priced at exactly that amount keeps the arithmetic in whole calls. ``None``
+    uses the real bound; ``tests/test_budget_admission.py`` drives that.
 
     THE LEDGER IS RESET PER DRIVE, deliberately, because it is process-global
     state and a scenario that inherited the previous one's spend would be
@@ -391,12 +420,17 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
     spend.SPEND_GATE_SKIPS.clear()
     spend.SPEND_CEILING_TRIPS.clear()
     spend.SPEND_LEDGER_FAULTS.clear()
+    spend.SPEND_ADMISSION_DECLINES.clear()
     if seed_usd:
         spend.SPEND_LEDGER.seed(spend.LedgerSeed(
             usd=seed_usd, rows=1, runs=1,
             source=spend.SEED_SOURCE_CAMPAIGN))
     deps.set_override(deps.OPENAI_CLIENT, stub)
     try:
+        if reservation_usd is not None:
+            config.stage5_attempt_bound = (
+                lambda *a, **k: dict(_REAL_STAGE5_BOUND(*a, **k),
+                                     usd=reservation_usd))
         config.SPEND_CAP_USD = cap
         config.SPEND_CAP_ENFORCED = enforced
         config.SPEND_CALL_CEILING_ENFORCED = ceiling_enforced
@@ -411,6 +445,7 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
          config.SPEND_CALL_CEILING_ENFORCED,
          config.MATCHING_PER_TRIAL_CALLS_ENABLED,
          config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) = saved
+        config.stage5_attempt_bound = _REAL_STAGE5_BOUND
         deps.clear_override(deps.OPENAI_CLIENT)
 
 
@@ -565,11 +600,14 @@ check("1k-i ...and the two spend members are named by the SAME strings the "
 # THE THREE COUNTERS REACH THE RUN-END REPORT. A counter with no reader is the
 # shape oncotriage/degradation.py exists to remove.
 from oncotriage import degradation as _degradation              # noqa: E402
-check("1l  all three spend counters are in the degradation registry, so a "
+# E1 ADDED A FOURTH: SPEND_ADMISSION_DECLINES, the attempts atomic budget
+# admission declined after the call-site gate passed. The pin stays EXACT.
+check("1l  all four spend counters are in the degradation registry, so a "
       "gated run says so on its own report",
       sorted(n for n in _degradation.registered_names()
              if n.startswith("SPEND_")),
-      ["SPEND_CEILING_TRIPS", "SPEND_GATE_SKIPS", "SPEND_LEDGER_FAULTS"])
+      ["SPEND_ADMISSION_DECLINES", "SPEND_CEILING_TRIPS", "SPEND_GATE_SKIPS",
+       "SPEND_LEDGER_FAULTS"])
 
 
 # ===========================================================================
@@ -970,33 +1008,45 @@ check("4f-ii ...while an ordinary grouped patient is untouched: one packed "
 # SECTION 5 -- THE OVERSHOOT BOUND
 # ===========================================================================
 
-section("SECTION 5 -- the cap is honoured to within the requests in flight")
+section("SECTION 5 -- no overshoot: requests in flight hold their headroom (E1)")
 
-# EVERY REQUEST ALREADY PAST THE GATE IS ISSUED AND NO MORE. Driven with a
-# BARRIER of `parallel` on the trial calls, so the workers are provably past the
-# gate together rather than having been serialized by a scheduler that happened
-# to be idle -- which is the difference between measuring the bound and
-# measuring this machine.
+# THIS SECTION USED TO MEASURE AN OVERSHOOT, AND E1 REMOVED IT. Before atomic
+# admission every worker past the call-site gate was issued, so the ledger
+# ended at the warmup plus `parallel` trial calls against a two-call cap -- the
+# "requests in flight" bound config.SPEND_CAP_USD stated. Admission now counts
+# each in-flight request's reservation, so a request in flight HOLDS its
+# headroom and its peers are declined before dispatch.
+#
+# THE EXPECTATION, RE-DERIVED: cap 2C, reservation C (one call's price). The
+# warmup is admitted (C <= 2C) and settles at C. The first trial call is
+# admitted (C committed + C = 2C, equality) and is held open by the stub; each
+# peer then finds C committed + C held + C = 3C > 2C and is declined
+# `headroom_held`. When the held call settles the budget reads 2C, so every
+# later trial meets the call-site gate. Issued: the warmup and ONE trial call.
+# The stub holds the trial call open until PARALLEL - 1 declines are counted,
+# which is what proves the declines happened with a request in flight rather
+# than after it had settled.
 _PARALLEL = 4
 _boundary, _b_stub = run_node(
-    _SIX, cap=2 * CALL_COST, parallel=_PARALLEL, barrier_size=_PARALLEL)
-check("5a  the barrier was reached, so the requests really were in flight "
-      "together (non-degeneracy: a broken barrier means the run was "
-      "serialized and 5b would be measuring nothing)",
-      _b_stub.barrier_broken, False)
-check("5b  *** the overshoot is EXACTLY the in-flight bound: the warmup plus "
-      "`parallel` trial calls, and not one more ***",
-      (len(_b_stub.warmups), len(_b_stub.trial_requests)), (1, _PARALLEL))
-check("5b-i ...which is what config.SPEND_CAP_USD's overshoot block states, "
-      "per patient: MAX_WORKERS x per_trial_parallel_bound() requests, of "
-      "which this is the per_trial_parallel_bound() half",
-      len(_b_stub.trial_requests) <= config.per_trial_parallel_bound(), True)
-check("5c  the remaining trials were declined rather than issued",
-      sum(spend.SPEND_GATE_SKIPS.values()), len(_SIX) - _PARALLEL)
-check("5d  and the ledger's own total exceeds the cap by exactly what those "
-      "in-flight requests cost -- the overshoot is measured, not asserted",
-      round(spend.SPEND_LEDGER.total - 2 * CALL_COST, 10),
-      round((1 + _PARALLEL - 2) * CALL_COST, 10))
+    _SIX, cap=2 * CALL_COST, parallel=_PARALLEL,
+    hold_until_declines=_PARALLEL - 1)
+_b_declines = dict(spend.SPEND_ADMISSION_DECLINES)
+check("5a  non-degeneracy: the admitted trial call was still IN FLIGHT when "
+      "its peers sought admission -- the stub held it open until three "
+      "admission declines had been counted",
+      _b_stub.held_by_declines, True)
+check("5b  *** NO OVERSHOOT: exactly what the budget allows is issued -- the "
+      "warmup plus ONE trial call, not `parallel` of them ***",
+      (len(_b_stub.warmups), len(_b_stub.trial_requests)), (1, 1))
+check("5b-i ...the peers were declined headroom_held: the in-flight call's "
+      "reservation is what blocked them",
+      _b_declines.get(f"{spend.SPEND_SOURCE_STAGE5}:"
+                      f"{spend.ADMISSION_DECLINE_HELD}", 0) >= _PARALLEL - 1,
+      True)
+check("5c  and the patient fails rather than completing with holes",
+      bool(at(_boundary, "error")), True)
+check("5d  *** the ledger ends EXACTLY at the cap: overshoot $0 ***",
+      round(spend.SPEND_LEDGER.total - 2 * CALL_COST, 10), 0.0)
 
 
 # ===========================================================================
@@ -1696,19 +1746,17 @@ plant("9d  CLEAN CONTROL: the UNPLANTED module sends nothing when the budget "
 # one -- the plant would be masked by the gate one site over and reported as
 # caught while measuring nothing. The first version of this control did exactly
 # that.
-# THE OBSERVABLE IS THE RESERVATION COUNT, NOT THE REQUEST COUNT, AND THAT IS A
-# MEASURED CORRECTION RATHER THAN A WEAKENING. This control used to count
-# `stub.requests` and expect 7. It got 3 -- the same number the CLEAN module
-# sends -- so the plant was reported as uncaught while the safeguard's removal
-# was in fact perfectly visible. The cause is the pacer, not the gate: see the
-# `_pr` import above. `reserve` counts an attempt BEFORE it waits, so every
-# queued call that reached the wire path is counted whether the pacer then
-# cancelled it or the provider answered it -- which is exactly "the queued trial
-# calls go out after the budget has been crossed", and it is invariant to how
-# fast this machine happens to be. The WAVE-PHASE DECLINE COUNT is asserted
-# beside it, because that is the accounting the removed lines own: a gate that
-# is gone declines nothing and records nothing, and 9f/9g would still pass on a
-# module whose wave phase had silently stopped being counted.
+# THE OBSERVABLE CHANGED AT E1, AND THE OLD ONE IS RECORDED. This control used
+# to count the pacer's reservations and expect 7, because each queued call
+# acquired a pacer slot before being cancelled. With the supplied reservation
+# now one call's price, the requests issued are the SAME for the plant and the
+# clean module: each queued call is stopped by the policy's cancellation
+# predicate or by atomic admission, depending on whether the pacer made it wait
+# (timing; both were measured). What the plant deterministically removes is the
+# accounting the deleted lines own -- the wave phase declines nothing and
+# records nothing -- and that is what is asserted beside the requests. A probe
+# that read requests alone would now report the plant as uncaught while its
+# removal is perfectly visible.
 #
 # DRIVEN ON A BUDGET THAT CROSSES **MID-WAVE**, NOT ONE ALREADY SPENT, AND THAT
 # IS THE MEASUREMENT RATHER THAN A CONVENIENCE: with the budget spent before
@@ -1727,40 +1775,66 @@ declines the remaining trials at the `wave:` phase."""
 
 
 def _mid_wave_reach(module):
-    """``(wire attempts RESERVED, wave-phase declines)`` under a mid-wave cap.
+    """``(requests issued, wave-phase gate declines)`` under a mid-wave cap.
 
-    The reservation count is read as a DELTA around the drive: the pacer's
-    counters are process-global and this file drives the node dozens of times,
-    so an absolute reading would be every earlier scenario's total as well.
+    WHICH LATER CHECK STOPS A QUEUED CALL IN THIS PLANT IS A TIMING FACT, AND
+    TWO RUNS MEASURED BOTH. With the wave gate removed, a queued trial call
+    reaches the retry policy. If the pacer makes it wait, the policy's
+    cancellation predicate (``_stage5_cancellation``) reads ``cap_exceeded`` --
+    three calls committed against a three-call cap -- and cancels it before its
+    liability exists; if no wait happens, the call reaches atomic admission,
+    which declines it (committed plus its reservation exceeds the cap). Either
+    way it never reaches the wire, so the requests issued are the SAME for the
+    plant and the clean module. What the plant deterministically removes is the
+    wave phase's own accounting -- it declines nothing and records nothing --
+    and that is the observable. (Two earlier drafts asserted which check fired,
+    once each way; consecutive suite runs contradicted both.)
     """
-    _scope = config.matching_quota_scope()
-    _before = _pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"]
-    run_node(_SIX, cap=_MID_WAVE_ALLOWED * CALL_COST, parallel=1,
-             node=module.node_llm_classifier_evaluation)
-    return (_pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"] - _before,
+    _res, _stub = run_node(_SIX, cap=_MID_WAVE_ALLOWED * CALL_COST, parallel=1,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests),
             sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
                 if k.startswith(spend.SPEND_SKIP_WAVE_KEY_PREFIX)))
 
 
-plant("9e  *** a BYPASS at the wave's call site is CAUGHT [9b/4c]: the queued "
-      "trial calls reach the wire after the budget has been crossed, and the "
-      "wave phase stops counting the declines it no longer makes ***",
+plant("9e  *** a BYPASS at the wave's call site is CAUGHT [9b/4c]: the wave "
+      "phase stops counting the declines it no longer makes (a later check -- "
+      "the policy's cancellation or admission -- still keeps the queued calls "
+      "off the wire) ***",
       [("            _refusal = _spend_gate(spend.SPEND_SKIP_WAVE_KEY_PREFIX,\n"
         "                                   _call_counter, where=\"a Stage 5 wave\",\n"
         "                                   count=len(chunk_))\n"
         "            if _refusal is not None:\n"
         "                return (\"error\", _refusal)\n",
         "")],
-      _mid_wave_reach, (1 + len(_SIX), 0))
-check("9e-i CLEAN CONTROL for 9e: the unplanted module reserves only what the "
+      _mid_wave_reach, (_MID_WAVE_ALLOWED, 0))
+check("9e-i CLEAN CONTROL for 9e: the unplanted module issues only what the "
       "budget allows and declines the rest at the wave phase, so the plant is "
       "measured against a probe that can tell the difference",
       _mid_wave_reach(_evaluation),
       (_MID_WAVE_ALLOWED, len(_SIX) - (_MID_WAVE_ALLOWED - 1)))
 
 # --- 9f: the warmup's gate is removed --------------------------------------
-plant("9f  *** a BYPASS at the WARMUP is CAUGHT: the patient sends the one "
-      "request that costs the most input tokens of any in the wave ***",
+def _warmup_reach(module):
+    """``(requests, warmup-phase gate declines, admission declined any)`` with
+    the budget already spent. E1: the bypassed warmup is now declined at
+    admission (committed $1 plus its reservation exceeds the $1 cap), so the
+    plant sends nothing either -- it is caught by the warmup phase's missing
+    decline and the admission decline that replaced it."""
+    _res, _stub = run_node(_SIX, cap=1.0, seed_usd=1.0, parallel=1,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests),
+            sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
+                if k.startswith(spend.SPEND_SKIP_WARMUP_KEY_PREFIX)),
+            sum(spend.SPEND_ADMISSION_DECLINES.values()) > 0)
+
+
+check("9f-i CLEAN CONTROL for 9f: the unplanted module declines at the warmup "
+      "phase and admission is never asked", _warmup_reach(_evaluation),
+      (0, 1, False))
+plant("9f  *** a BYPASS at the WARMUP is CAUGHT: the warmup phase stops "
+      "counting its decline -- and, since E1, admission still keeps the "
+      "warmup off the wire ***",
       # RE-ANCHORED AT THE CUMULATIVE-SPEND PASS, which binds the gate's
       # refusal so the floor can name WHICH limit declined the warmup. The
       # defect planted is unchanged: the warmup's gate is not asked at all.
@@ -1768,17 +1842,26 @@ plant("9f  *** a BYPASS at the WARMUP is CAUGHT: the patient sends the one "
         "                    spend.SPEND_SKIP_WARMUP_KEY_PREFIX, _call_counter,\n"
         "                    where=\"a Stage 5 cache warmup\")) is not None:",
         "            elif False:")],
-      _requests_under_cap, 1)
+      _warmup_reach, (0, 0, True))
 
 # --- 9g: the send loop's gate is removed (the GROUPED arm's only gate) ------
 def _grouped_requests_under_cap(module):
-    return len(run_node(_SIX, cap=1.0, seed_usd=1.0, per_trial=False,
-                        node=module.node_llm_classifier_evaluation)[1].requests)
+    """``(requests, send-phase gate declines, admission declined any)``. E1:
+    the bypassed send loop is declined at admission, as 9f's warmup is."""
+    _res, _stub = run_node(_SIX, cap=1.0, seed_usd=1.0, per_trial=False,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests),
+            sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
+                if k.startswith(spend.SPEND_SKIP_SEND_KEY_PREFIX)),
+            sum(spend.SPEND_ADMISSION_DECLINES.values()) > 0)
 
 
+check("9g-i CLEAN CONTROL for 9g: the unplanted grouped module declines at the "
+      "send phase and admission is never asked",
+      _grouped_requests_under_cap(_evaluation), (0, 1, False))
 plant("9g  *** a BYPASS at the SEND LOOP is CAUGHT, which is the RETAINED "
-      "GROUPED arm's only gate -- the one a per-trial-only fix would have left "
-      "open ***",
+      "GROUPED arm's only call-site gate: the send phase stops counting -- and, "
+      "since E1, admission still keeps the request off the wire ***",
       [("        _refusal = _spend_gate(spend.SPEND_SKIP_SEND_KEY_PREFIX, "
         "_call_counter,\n"
         "                               where=\"a Stage 5 send loop\", "
@@ -1786,14 +1869,23 @@ plant("9g  *** a BYPASS at the SEND LOOP is CAUGHT, which is the RETAINED "
         "        if _refusal is not None:\n"
         "            raise _refusal\n",
         "")],
-      _grouped_requests_under_cap, 1)
+      _grouped_requests_under_cap, (0, 0, True))
 
 # --- 9h: the LEDGER stops being charged ------------------------------------
 # A gate reading a ledger nothing charges never fires, which is the silent half
 # of a bypass: every request passes because the total never moves.
 def _requests_crossing_mid_wave(module):
-    return len(run_node(_SIX, cap=3 * CALL_COST, parallel=1,
-                        node=module.node_llm_classifier_evaluation)[1].requests)
+    """``(requests, the ledger moved, holds left open)`` under a three-call cap.
+
+    E1: an attempt issued and never resolved still HOLDS its reservation, so
+    three leaked holds fill the three-call cap and the fourth attempt is
+    declined `headroom_held` -- the patient no longer goes out whole. The plant
+    is now caught by what it leaves behind: a ledger that never moved and three
+    holds that were never released."""
+    _res, _stub = run_node(_SIX, cap=3 * CALL_COST, parallel=1,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests), spend.SPEND_LEDGER.measured > 0,
+            spend.SPEND_LEDGER.held_count())
 
 
 # RE-ANCHORED (the billing closure pass): the charge now lives in the attempt
@@ -1801,15 +1893,16 @@ def _requests_crossing_mid_wave(module):
 # The call is replaced by a no-op of the same arity, so the copy still parses
 # and every other line of the record is untouched.
 plant("9h  *** a wave call that is ISSUED and never CHARGED is CAUGHT: the "
-      "ledger stops moving, so the gate never fires and the whole patient goes "
-      "out under a three-call budget ***",
+      "ledger stops moving and three holds are never released -- and, since "
+      "E1, those holds still stop the patient at three requests ***",
       [("        usage = getattr(result, \"usage\", None)\n"
         "        token.resolve(spend.BILLING_OUTCOME_RESPONSE,",
         "        usage = getattr(result, \"usage\", None)\n"
         "        (lambda *_a, **_k: None)(spend.BILLING_OUTCOME_RESPONSE,")],
-      _requests_crossing_mid_wave, 7)
-check("9h-i CLEAN CONTROL for 9h: the unplanted module stops at three",
-      _requests_crossing_mid_wave(_evaluation), 3)
+      _requests_crossing_mid_wave, (3, False, 3))
+check("9h-i CLEAN CONTROL for 9h: the unplanted module stops at three, "
+      "charges them and releases every hold",
+      _requests_crossing_mid_wave(_evaluation), (3, True, 0))
 
 # --- 9i: the exception stops being a shutdown ------------------------------
 # `Stage5SpendStopped` subclasses `Stage5ShutdownRequested` precisely so the

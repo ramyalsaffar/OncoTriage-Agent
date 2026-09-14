@@ -403,7 +403,7 @@ def _open_s5(db, attempt_id, campaign_id, run_id):
         note=config.stage5_reservation_note(_S5_BOUND))
 
 
-def parity(name, client, call, classify=None):
+def parity(name, client, call, classify=None, cap=_CAP):
     """Drive one attempt with a sink installed; return what both ledgers say.
 
     LIVE is this process: its ledger measure and ``spend.remaining``. RESUMED is
@@ -418,7 +418,7 @@ def parity(name, client, call, classify=None):
     if classify is not None:
         _ev._classify_matching_failure = classify
     try:
-        with settings(SPEND_CAP_USD=_CAP, SPEND_CAP_ENFORCED=True), \
+        with settings(SPEND_CAP_USD=cap, SPEND_CAP_ENFORCED=True), \
                 sink_installed(db, camp, run):
             exc = raised(call)
             live = {"measured": _spend.SPEND_LEDGER.measured,
@@ -683,12 +683,18 @@ finally:
 check("1o-restore the pacer settle stand-in was removed from the instance",
       "settle" in vars(_pr.PACER), False)
 
+# E1: A RETRY IS TWO RESERVATIONS. The dropped attempt is charged its whole
+# reservation, so the retry is admitted only when the cap holds both; at the
+# file's $10 cap two $5.826 reservations do not fit and admission declines the
+# retry. The cap for this case is therefore exactly 2 x the independently derived
+# bound -- equality is admitted -- so it still measures two liabilities.
 _with_counters("s5_retry_then_response", lambda: parity(
     "s5_retry_then_response",
     _Client(chat=_Steps(lambda: _throw(RuntimeError("dropped mid-response")),
                         lambda: _chat_response((321, 45)))),
     _s5_call,
-    classify=lambda exc: _pr.verdict_for(_pr.CATEGORY_CONNECTION_LOST)))
+    classify=lambda exc: _pr.verdict_for(_pr.CATEGORY_CONNECTION_LOST),
+    cap=2 * _RESERVE_S5))
 
 _with_counters("s5_warmup_possibly_billed", lambda: parity(
     "s5_warmup_possibly_billed",

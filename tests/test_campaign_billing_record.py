@@ -998,6 +998,11 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
             db_path=None):
     name = os.path.basename(str(fhir_path))
     if mode == "billed_then_zero":
+        # E1: the SUPPLIED reservation is one response's price, so the budget
+        # arithmetic below is in whole responses. See the parent's 6A comment.
+        _real_bound = config.stage5_attempt_bound
+        config.stage5_attempt_bound = lambda *a, **k: dict(
+            _real_bound(*a, **k), usd=spend.price_usage(WIRE, 1000, 100)[0])
         attempts, ref = [], [0]
         def fn(kw):
             user = kw["messages"][1]["content"]
@@ -1134,8 +1139,13 @@ _COST_SMALL = _spend.price_usage(_WIRE, 1000, 100)[0]
 _CORP_A = make_corpus(os.path.join(_TMP, "corpus_a"), 1)
 _DB_A = os.path.join(_TMP, "p1.db")
 _CP_A = os.path.join(_TMP, "cp_a")
+# E1 RE-DERIVED THE CAP. It was 3.5 responses, which relied on the overshoot
+# atomic admission removed. The child supplies one response's price as each
+# attempt's reservation; attempt 1's peak liability is the settled warmup plus
+# three trial holds (4 x cost), which fits 4.5, and after it settles another
+# reservation (5 x cost) does not, so the later attempts issue nothing.
 _p1, _p1d = child("billed_then_zero", db=_DB_A, cp=_CP_A, corpus=_CORP_A,
-                  cap=_COST_SMALL * 3.5)
+                  cap=_COST_SMALL * 4.5)
 if _p1d is None:
     print(tail(_p1, 60))
 check("6a process 1 ran main() to its end", _p1.returncode, 0)

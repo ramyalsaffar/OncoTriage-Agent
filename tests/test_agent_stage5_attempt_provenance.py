@@ -407,7 +407,7 @@ def read_row(db, patient_id):
 
 def run_scenario(name, plan, *, node=None, policy=_spend.SPEND_POLICY_CAMPAIGN,
                  cap=None, serving_cap=None, seed_window_usd=None,
-                 lift_serving_cap_before=None):
+                 lift_serving_cap_before=None, reservation_usd=None):
     """Drive one patient through the real graph and the real writer.
 
     ``lift_serving_cap_before=k`` raises ``config.SERVING_SPEND_CAP_USD`` inside
@@ -435,9 +435,16 @@ def run_scenario(name, plan, *, node=None, policy=_spend.SPEND_POLICY_CAMPAIGN,
     _spend.SPEND_LEDGER.reset()
     _spend.SPEND_STOP.reset()
     _spend.SPEND_GATE_SKIPS.clear()
+    _spend.SPEND_ADMISSION_DECLINES.clear()
     deps.set_override(deps.OPENAI_CLIENT, stub)
     _pr.full_jitter_delay = _no_backoff
+    _real_bound = config.stage5_attempt_bound
     try:
+        if reservation_usd is not None:
+            # E1: the SUPPLIED reservation. See scenario A.
+            config.stage5_attempt_bound = (
+                lambda *a, **k: dict(_real_bound(*a, **k),
+                                     usd=reservation_usd))
         config.MATCHING_PER_TRIAL_CALLS_ENABLED = True
         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = 3
         config.SPEND_CAP_ENFORCED = True
@@ -458,6 +465,7 @@ def run_scenario(name, plan, *, node=None, policy=_spend.SPEND_POLICY_CAMPAIGN,
         out["ledger_calls"] = _spend.SPEND_LEDGER.calls
         out["cap_exceeded"] = _spend.cap_exceeded(_spend.SPEND_SOURCE_STAGE5)
         out["gate_skips"] = dict(_spend.SPEND_GATE_SKIPS)
+        out["admission_declines"] = dict(_spend.SPEND_ADMISSION_DECLINES)
         if isinstance(result, dict):
             result["qdrant_collection"] = "stub-collection"
             result["patient_data_hash"] = compute_patient_hash(PATIENT)
@@ -467,6 +475,7 @@ def run_scenario(name, plan, *, node=None, policy=_spend.SPEND_POLICY_CAMPAIGN,
             out["write"] = result
             out["rows"] = [{"__missing__": "no result"}]
     finally:
+        config.stage5_attempt_bound = _real_bound
         _pr.full_jitter_delay = _JITTER_START
         deps.clear_override(deps.OPENAI_CLIENT)
         for _k, _v in _CONFIG_START.items():
@@ -527,10 +536,19 @@ check("0b the two attempt shapes price differently (non-degenerate)",
 section("SECTION A -- a billed attempt, then final attempts that issue nothing")
 
 # Attempt 1 answers the warmup and the wave and then fails to parse trial 0, so
-# it is billed four responses. The cap sits between three and four of them, so
-# no request of attempt 1 is declined and every later warmup is.
+# it is billed four responses.
+#
+# E1 RE-DERIVED THE CAP. It was 3.5 responses, which relied on the overshoot
+# admission removed: the fourth response only went out because nothing counted
+# the three in flight. Each attempt now reserves a SUPPLIED amount -- one small
+# response's price here -- and is admitted only when committed + held + that
+# fits. Attempt 1's peak liability is the settled warmup plus three trial holds,
+# 4 x COST_SMALL, so a 4.5-response cap admits all four; after they settle,
+# 4 x COST_SMALL committed plus one more reservation is 5 x COST_SMALL > 4.5, so
+# every later warmup is declined -- at ADMISSION (`budget_exhausted`), because
+# committed spend is still below the cap and the call-site gate passes it.
 _A = run_scenario("scenario_a", {1: {"bad_json": [T0], "tokens": SMALL}},
-                  cap=COST_SMALL * 3.5)
+                  cap=COST_SMALL * 4.5, reservation_usd=COST_SMALL)
 _A1, _Afinal, _Arow = at(_A["attempts"], 0), at(_A["attempts"], -1), _A["row"]
 
 check("A0 three attempts ran (non-degenerate: the leak needs a re-entry)",
@@ -576,12 +594,17 @@ check("A9 the spend ledger still holds attempt 1's four billed responses",
       (round(_A["measured"] - _A["measured_before"], 12),
        _A["ledger_calls"] - _A["calls_before"]),
       (round(COST_SMALL * 4, 12), 4))
-check("A10 ...and it is that earlier charge the cap enforced: the campaign is "
-      "over its cap and both later warmups were declined by it",
+check("A10 ...and it is that earlier charge admission enforced (E1): committed "
+      "spend is below the cap, yet another attempt's reservation does not fit, "
+      "so both later warmups were declined budget_exhausted at admission and "
+      "none at the call-site gate",
       (_A["cap_exceeded"],
-       at(_A["gate_skips"],
-          f"{_spend.SPEND_SKIP_WARMUP_KEY_PREFIX}{_spend.SPEND_LIMIT_CAP}")),
-      (True, 2))
+       _A["admission_declines"].get(
+           f"{_spend.SPEND_SOURCE_STAGE5}:{_spend.ADMISSION_DECLINE_EXHAUSTED}",
+           0),
+       _A["gate_skips"].get(
+           f"{_spend.SPEND_SKIP_WARMUP_KEY_PREFIX}{_spend.SPEND_LIMIT_CAP}", 0)),
+      (False, 2, 0))
 
 
 #------------------------------------------------------------------------------
@@ -865,7 +888,7 @@ check("X1a the plant took", isinstance(_X1, types.ModuleType), True)
 if isinstance(_X1, types.ModuleType):
     _X1r = run_scenario("control_x1", {1: {"bad_json": [T0], "tokens": SMALL}},
                         node=_X1.node_llm_classifier_evaluation,
-                        cap=COST_SMALL * 3.5)
+                        cap=COST_SMALL * 4.5, reservation_usd=COST_SMALL)
     check("X1b CAUGHT: scenario A's stored row carries attempt 1's 4 / 4,000 / "
           "400 again beside an empty ledger -- check A3 would fail",
           (at(_X1r["row"], "llm_classifier_calls"),

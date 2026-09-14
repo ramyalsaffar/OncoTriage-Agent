@@ -1061,6 +1061,20 @@ BUCKETS = {
         "historical campaigns. Every provider client is a stand-in, every "
         "child gets a closed Qdrant port, every database is a temp file and "
         "the production digest is compared at the end"),
+    "test_budget_admission.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire (E1): "
+        "atomic budget admission. Real threads race for the last headroom "
+        "under the in-process and the durable (BEGIN IMMEDIATE) authority and "
+        "exactly one is admitted; child processes sharing one database race "
+        "the same way; a full wave is admitted and released; a resumed balance "
+        "plus live holds is counted once; the boundary is driven through Stage "
+        "5's public entry and through CHILD PROCESSES running the real main(); "
+        "settle and release happen once under duplicate and out-of-order "
+        "completion; a SIGKILL before the reservation commit leaves nothing "
+        "and one after it leaves the reservation counted. Every provider "
+        "client is a stand-in, every database is a temp file, and the "
+        "production database is never opened"),
     "test_agent_stage5_attempt_provenance.py": (
         _A, None,
         "ran green under an OS network sandbox and a socket tripwire that "
