@@ -202,6 +202,7 @@ from oncotriage.storage.database_logger import (
     BillingRecordWriteError,
     reconcile_discrepancy_markers,
     RUN_STOP_REASON_BILLING_RECORD,
+    RUN_STOP_REASON_ADMISSION_WAIT,
     IDENTITY_NO_EVIDENCE,
     IDENTITY_RECOVERED,
     campaign_billing_total,
@@ -4458,6 +4459,11 @@ def main():
     # cohort at its first completed patient.
     spend.SPEND_LEDGER.reset()
     spend.SPEND_STOP.reset()
+    # AND THE ADMISSION QUEUE (E1b), whose waiters hold no headroom but would
+    # hold the head of the queue: a waiter left by an earlier main() in this
+    # process would make this run's attempts wait behind an attempt nobody is
+    # running any more.
+    spend.ADMISSION_QUEUE.reset()
     # THE SEVENTH: a billing sink left installed by an earlier main() in this
     # process would write this run's attempts under that run's campaign. Its
     # live liability tally goes with the ledger it mirrors (the billing closure
@@ -5063,6 +5069,8 @@ def main():
                 if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_CALL_CEILING
                 else RUN_STOP_REASON_BILLING_RECORD
                 if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_BILLING_RECORD
+                else RUN_STOP_REASON_ADMISSION_WAIT
+                if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT
                 else RUN_STOP_REASON_SPEND_CAP if spend.SPEND_STOP.requested
                 else None)
 
@@ -5396,10 +5404,20 @@ def main():
                 # otherwise promise a resume that re-bills the whole cohort.
                 console.out("  checkpoint     " + describe_checkpoint_state(
                     "kept; the next run resumes from it"))
-                console.out("  TO RESUME      raise the cap and run again. The "
-                            "resumed run COUNTS WHAT THIS ONE SPENT, so a "
-                            "restart does not get a fresh budget:")
-                console.out("      # edit config.SPEND_CAP_USD")
+                if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT:
+                    # NOT THE CAP (E1b): nothing needs raising for the resume
+                    # to proceed, and telling the operator to raise it would
+                    # send them to a limit this stop did not reach.
+                    console.out("  TO RESUME      run again. A billed attempt "
+                                "waited its full admission wait for headroom "
+                                "this run's own open reservations held; the "
+                                "resumed run COUNTS WHAT THIS ONE SPENT and "
+                                "runs the unfinished patients:")
+                else:
+                    console.out("  TO RESUME      raise the cap and run again. "
+                                "The resumed run COUNTS WHAT THIS ONE SPENT, so "
+                                "a restart does not get a fresh budget:")
+                    console.out("      # edit config.SPEND_CAP_USD")
                 console.out("      python \"25- Batch Runner.py\"")
                 console.out("=" * 80)
 

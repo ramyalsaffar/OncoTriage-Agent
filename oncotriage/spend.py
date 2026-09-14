@@ -273,6 +273,50 @@ ADMISSION_AUTHORITIES = (ADMISSION_AUTHORITY_PROCESS, ADMISSION_AUTHORITY_DURABL
                records the hold only when it fits.
 """
 
+SPEND_ADMISSION_WAITS = Counter()
+"""Bounded waits for released headroom (E1b). Keyed ``{source}:{outcome}``, the
+outcome from ``ADMISSION_WAIT_OUTCOMES``.
+
+A billed attempt on a path that can wait -- Stage 5, through the one retry
+policy -- that is declined ``headroom_held`` waits for this process's own open
+reservations to settle instead of failing its patient. ``entered`` counts the
+waits; every wait ends in exactly one of the other five, so
+``entered == admitted + timed_out + cancelled + exhausted + failed`` once no
+wait is open. A non-zero ``timed_out`` means the run was stopped
+(``SPEND_LIMIT_ADMISSION_WAIT``) with its unfinished work left to a resume.
+"""
+
+ADMISSION_WAIT_ENTERED = "entered"
+ADMISSION_WAIT_ADMITTED = "admitted"
+ADMISSION_WAIT_TIMED_OUT = "timed_out"
+ADMISSION_WAIT_CANCELLED = "cancelled"
+ADMISSION_WAIT_EXHAUSTED = "exhausted"
+ADMISSION_WAIT_FAILED = "failed"
+ADMISSION_WAIT_OUTCOMES = (ADMISSION_WAIT_ENTERED, ADMISSION_WAIT_ADMITTED,
+                           ADMISSION_WAIT_TIMED_OUT, ADMISSION_WAIT_CANCELLED,
+                           ADMISSION_WAIT_EXHAUSTED, ADMISSION_WAIT_FAILED)
+"""How a wait for held headroom ended. CLOSED.
+
+  ``admitted``   a later admission check admitted the attempt.
+  ``timed_out``  the wait's one monotonic deadline passed first; the run is
+                 stopped under the campaign policy.
+  ``cancelled``  a shutdown, a spend stop or the operator's drain ended it.
+  ``exhausted``  a later check found the budget itself exhausted, which latches
+                 as it always did.
+  ``failed``     anything else ended it (a pacer refusal, a reservation that
+                 could not be persisted, an abandoned call).
+"""
+
+ADMISSION_WAIT_RECHECK = "recheck"
+ADMISSION_WAIT_NOT_WAITABLE = "not_waitable"
+ADMISSION_WAIT_VERDICTS = (ADMISSION_WAIT_RECHECK, ADMISSION_WAIT_CANCELLED,
+                           ADMISSION_WAIT_NOT_WAITABLE)
+"""What ``HeadroomWait.await_admission`` tells its caller. CLOSED; restated by
+``provider_resilience`` (which does not import this module) and a test pins the
+two equal. ``recheck`` means "take a paced slot and ask admission again";
+``cancelled`` means "stop, the run was told to"; ``not_waitable`` means "this
+decline is not one a wait can fix"."""
+
 
 # ===========================================================================
 # THE CLOSED VOCABULARIES
@@ -281,11 +325,19 @@ ADMISSION_AUTHORITIES = (ADMISSION_AUTHORITY_PROCESS, ADMISSION_AUTHORITY_DURABL
 SPEND_LIMIT_CAP = "spend_cap"
 SPEND_LIMIT_CALL_CEILING = "call_ceiling"
 SPEND_LIMIT_BILLING_RECORD = "billing_record"
+SPEND_LIMIT_ADMISSION_WAIT = "admission_wait"
 
 SPEND_LIMITS = (SPEND_LIMIT_CAP, SPEND_LIMIT_CALL_CEILING,
-                SPEND_LIMIT_BILLING_RECORD)
+                SPEND_LIMIT_BILLING_RECORD, SPEND_LIMIT_ADMISSION_WAIT)
 """Which limit declined a request. CLOSED, and a caller may branch on it
 exhaustively.
+
+``admission_wait`` (E1b) is a FOURTH finding with a fourth remedy: a billed
+attempt waited its full bounded wait for headroom held by this process's own
+open reservations and was not admitted. The budget is NOT spent -- reporting it
+as the cap would send an operator to raise a cap that may not need raising --
+and nothing is broken; the remedy is to resume (the unfinished work was left
+resumable) or to leave more headroom per attempt.
 
 They are three findings with three remediations and must not be one key. The cap
 means "this campaign has spent its budget" and is answered by raising the budget
@@ -1081,12 +1133,45 @@ class SpendLedger:
                                                seed_usd, now)
             held = sum(amount for src, amount in self._holds.values()
                        if src in keep)
+            # A HOLD THIS TOKEN ALREADY HAS IS RECOGNISED BEFORE ANY AMOUNT IS
+            # ADDED (E1b), the durable authority's replay rule applied here: the
+            # same token, source and amount is a replay and admits without
+            # asking for the amount twice; the same token for anything else is
+            # REFUSED rather than silently re-pointed at another attempt.
+            existing = self._holds.get(token)
+            if existing is not None:
+                if (existing[0] == source
+                        and abs(existing[1] - float(usd))
+                        <= ADMISSION_EPSILON_USD):
+                    return True, committed, held - existing[1]
+                raise ValueError(
+                    f"admission hold {token!r} is already held for a different "
+                    f"attempt ({existing[0]} ${existing[1]:.6f}); it was not "
+                    f"reused for {source} ${float(usd):.6f}")
             if (cap is not None
                     and committed + held + float(usd)
                     > float(cap) + ADMISSION_EPSILON_USD):
                 return False, committed, held
             self._holds[token] = (source, float(usd))
             return True, committed, held
+
+    def admission_preview(self, usd, *, sources, cap, windowed,
+                          window_seconds=None, seed_usd=0.0):
+        """``(reason, committed, held)`` for an attempt of ``usd``: ``reason`` is
+        None when it would fit. READ-ONLY (E1b): it records no hold, so it can
+        never admit anything -- ``admit_hold`` is the only decision. It exists
+        so an attempt waiting for held headroom can ask "would it fit" without
+        re-reserving a pacer slot every time it looks."""
+        keep = set(sources)
+        now = time.monotonic()
+        with self._lock:
+            committed = self._committed_locked(keep, windowed, window_seconds,
+                                               seed_usd, now)
+            held = sum(amount for src, amount in self._holds.values()
+                       if src in keep)
+        if cap is None:
+            return None, committed, held
+        return _decline_reason(committed, held, usd, cap), committed, held
 
     def record_hold(self, token, source, usd) -> None:
         """Record a hold ANOTHER authority already admitted (the durable one).
@@ -1706,6 +1791,20 @@ def require_budget(source: str, where: str, *, latch=None) -> None:
         raise SpendRecordUnverified(
             f"the request was not issued ({where}): {_unverified}",
             budget=budget, source=source, reasons=_reasons, count=_count)
+    # A RUN STOPPED BY AN ADMISSION-WAIT TIMEOUT ISSUES NOTHING FURTHER (E1b).
+    # The cap comparison below would not see it -- the budget is not spent --
+    # so without this a billed path outside Stage 5 would keep dispatching
+    # after the banner said no further request would be issued.
+    if SPEND_STOP.limit == SPEND_LIMIT_ADMISSION_WAIT:
+        SPEND_GATE_SKIPS[f"{source}:{SPEND_LIMIT_ADMISSION_WAIT}"] += 1
+        log.warning("a billed request was not issued because an admission wait "
+                    "timed out and stopped the run", status="stopped",
+                    event="spend_limit_declined", phase=source,
+                    reason=SPEND_LIMIT_ADMISSION_WAIT, mode=where, degraded=True)
+        raise SpendLimitReached(
+            f"the request was not issued ({where}): a billed attempt timed out "
+            f"waiting for held budget headroom and the run is stopping",
+            limit=SPEND_LIMIT_ADMISSION_WAIT, source=source)
     if not cap_exceeded(source):
         return
     SPEND_GATE_SKIPS[f"{source}:{SPEND_LIMIT_CAP}"] += 1
@@ -1844,6 +1943,12 @@ def admission_declined(reason, *, where, source, budget, committed, held, usd,
     if reason == ADMISSION_DECLINE_UNPRICED:
         why = (f"its reservation could not be priced ({detail}) and the "
                f"{budget} budget has a cap in force, so it cannot be admitted")
+    elif reason == ADMISSION_DECLINE_HELD and detail is not None:
+        why = (f"{detail}; admission for released headroom on the {budget} "
+               f"budget is first-in, first-out within this process, so this "
+               f"attempt waits its turn rather than taking headroom released "
+               f"for an earlier waiter (${committed:.6f} committed, "
+               f"${held:.6f} held, limit ${cap:.2f})")
     elif reason == ADMISSION_DECLINE_HELD:
         why = (f"${committed:.6f} committed plus ${held:.6f} held by this "
                f"process's open reservations plus its own ${usd:.6f} would "
@@ -1874,26 +1979,393 @@ def _admit_in_process(source, budget, cap, usd, where, fault):
                                      authority=ADMISSION_AUTHORITY_PROCESS,
                                      detail=fault)
         usd = 0.0
+    token = uuid.uuid4().hex
+    admitted, committed, held = SPEND_LEDGER.admit_hold(
+        token, source, float(usd), cap=cap,
+        **_process_admission_args(source, budget))
+    if admitted:
+        return token
+    reason = _decline_reason(committed, held, usd, cap) or ADMISSION_DECLINE_HELD
+    raise admission_declined(reason, where=where, source=source, budget=budget,
+                             committed=committed, held=held, usd=float(usd),
+                             cap=float(cap),
+                             authority=ADMISSION_AUTHORITY_PROCESS)
+
+
+def _process_admission_args(source, budget) -> dict:
+    """The keyword arguments the PROCESS authority reads a budget with. ONE
+    OWNER, so a decision (``admit_hold``) and a preview (``admission_preview``)
+    cannot read the budget two different ways."""
     windowed = (budget != SPEND_BUDGET_RATER
                 and policy() == SPEND_POLICY_WINDOW)
     seed = SPEND_LEDGER.seeded
     seed_usd = (seed.usd if (not windowed and seed_budget(seed) == budget)
                 else 0.0)
-    token = uuid.uuid4().hex
-    admitted, committed, held = SPEND_LEDGER.admit_hold(
-        token, source, float(usd), sources=BUDGET_SOURCES[budget], cap=cap,
-        windowed=windowed,
-        window_seconds=getattr(config, "SERVING_SPEND_WINDOW_SECONDS", None),
-        seed_usd=seed_usd)
-    if admitted:
-        return token
-    reason = (ADMISSION_DECLINE_EXHAUSTED
-              if committed + float(usd) > float(cap) + ADMISSION_EPSILON_USD
-              else ADMISSION_DECLINE_HELD)
-    raise admission_declined(reason, where=where, source=source, budget=budget,
-                             committed=committed, held=held, usd=float(usd),
-                             cap=float(cap),
-                             authority=ADMISSION_AUTHORITY_PROCESS)
+    return dict(sources=BUDGET_SOURCES[budget], windowed=windowed,
+                window_seconds=getattr(config, "SERVING_SPEND_WINDOW_SECONDS",
+                                       None),
+                seed_usd=seed_usd)
+
+
+def _decline_reason(committed, held, usd, cap):
+    """None to admit, or the decline reason. PURE. The process authority's twin
+    of ``database_logger.admission_decision``; equality is admitted."""
+    limit = float(cap) + ADMISSION_EPSILON_USD
+    if committed + float(usd) > limit:
+        return ADMISSION_DECLINE_EXHAUSTED
+    if committed + held + float(usd) > limit:
+        return ADMISSION_DECLINE_HELD
+    return None
+
+
+# ===========================================================================
+# A BOUNDED WAIT FOR RELEASED HEADROOM (E1b)
+# ===========================================================================
+#
+# WHY A HELD DECLINE WAITS INSTEAD OF FAILING ITS PATIENT. ``headroom_held``
+# means the attempt fits against committed spend and this process's own open
+# reservations hold the rest; that headroom comes back as those attempts settle.
+# E1 declined it and Stage 5 failed the patient, so near the cap a campaign
+# churned through its cohort failing patients it could have finished -- measured
+# at 8 of 48 from $83 committed and every one from $250 at the assumed bound.
+#
+# THE DESIGN, AND WHERE IT SITS RELATIVE TO EVERY LOCK.
+#
+#   * THE WAIT HOLDS NOTHING. It runs between two admission checks, after the
+#     declined check has returned and before the next one begins: the ledger's
+#     lock, the database's write transaction, ``_WRITE_LOCK`` and every
+#     liability's resolve lock are all released. Stage 5's caller
+#     (``provider_resilience.execute``) also REFUNDS its pacer permit before
+#     waiting and takes a new one when told to recheck, so a waiting attempt
+#     holds no rate-limit slot either. The only lock taken is this queue's own
+#     condition lock, and ``Condition.wait`` releases it while sleeping.
+#   * ONE MONOTONIC DEADLINE PER WAIT, set when the attempt first enters the
+#     queue and never moved: a recheck that is declined again keeps waiting
+#     against the SAME deadline. The timeout is
+#     ``config.admission_wait_timeout_seconds()``.
+#   * CANCELLABLE. The caller's ``cancelled`` predicate is asked at least every
+#     ``config.PROVIDER_WAIT_POLL_SECONDS`` -- for Stage 5 that is the shutdown
+#     flag (SIGTERM, Ctrl-C), the operator's drain and every spend stop -- so a
+#     shutdown is never delayed by a wait by more than one poll interval.
+#   * FIRST-IN, FIRST-OUT WITHIN THE PROCESS. While attempts are waiting on a
+#     budget, a waiting-capable attempt that is not at the head is declined
+#     before it can take headroom released for an earlier waiter, and joins
+#     the queue behind it. Without that a newly arriving attempt could take
+#     every release and starve a waiter until its deadline.
+#   * WOKEN BY A RELEASE, CHECKED BY A PREVIEW. A settling liability notifies
+#     the queue; the head waiter then asks a READ-ONLY preview whether it would
+#     fit, and only a positive preview sends it back to take a paced slot and
+#     be admitted for real. Across processes (the durable authority) nothing
+#     notifies, so the head also rechecks every
+#     ``config.ADMISSION_WAIT_RECHECK_SECONDS``.
+#   * ON TIMEOUT THE RUN STOPS CLEANLY. Under the campaign policy the wait trips
+#     ``SPEND_STOP`` with ``SPEND_LIMIT_ADMISSION_WAIT``: no further patient is
+#     started, no further billed request is issued, the attempt's patient is not
+#     checkpointed, and a resume runs it. Under the rolling-window policy (a
+#     server) nothing latches and only that request is refused.
+#
+# WHAT IT DOES NOT COVER. Paths that create their liability without a wait
+# (Stage 2's embedding, the rater, direct callers) keep E1's immediate decline
+# and are not queued. Fairness is within ONE process: a sibling process's
+# reservations are committed spend to this one and decline ``budget_exhausted``.
+
+
+class BudgetAdmissionWaitTimeout(SpendLimitReached):
+    """A billed attempt waited its full bounded wait for held headroom and was
+    NOT admitted (E1b). ``limit`` is ``SPEND_LIMIT_ADMISSION_WAIT``; nothing was
+    reserved or sent. ``latched`` says whether the run was stopped."""
+
+    def __init__(self, message, *, budget, source, waited_s, timeout_s,
+                 reservation_usd, cap_usd, authority, latched):
+        super().__init__(message, limit=SPEND_LIMIT_ADMISSION_WAIT,
+                         source=source)
+        self.budget = budget
+        self.waited_s = waited_s
+        self.timeout_s = timeout_s
+        self.reservation_usd = reservation_usd
+        self.cap_usd = cap_usd
+        self.authority = authority
+        self.latched = latched
+
+
+class AdmissionQueue:
+    """The process's first-in, first-out queue of attempts waiting for held
+    headroom, one queue per budget. Thread-safe. See the section above.
+
+    ITS CONDITION LOCK IS THE ONLY LOCK A WAIT TAKES, it is never held while
+    anything else is called, and ``wait_for_change`` releases it while sleeping.
+    An entry carries an expiry well past its owner's deadline, so an entry whose
+    owner thread died without finishing is dropped rather than blocking the
+    queue forever; that drop is counted.
+    """
+
+    def __init__(self, clock=None):
+        self._cond = threading.Condition(threading.Lock())
+        self._queues = {}
+        self._generation = 0
+        self._next_ticket = 0
+        self._clock = time.monotonic if clock is None else clock
+
+    def reset(self) -> None:
+        """Forget every waiter. Called at a run's start beside ``SPEND_STOP``."""
+        with self._cond:
+            self._queues.clear()
+            self._generation += 1
+            self._cond.notify_all()
+
+    def enqueue(self, budget, expires_at) -> int:
+        with self._cond:
+            self._next_ticket += 1
+            ticket = self._next_ticket
+            self._queues.setdefault(budget, []).append(
+                (ticket, float(expires_at)))
+            self._generation += 1
+            self._cond.notify_all()
+            return ticket
+
+    def _purge_locked(self, budget) -> None:
+        entries = self._queues.get(budget)
+        if not entries:
+            return
+        now = self._clock()
+        kept = [entry for entry in entries if entry[1] >= now]
+        if len(kept) != len(entries):
+            SPEND_LEDGER_FAULTS["admission:stale_waiter_dropped"] += (
+                len(entries) - len(kept))
+            self._queues[budget] = kept
+            self._generation += 1
+            self._cond.notify_all()
+
+    def ahead_of(self, budget, ticket):
+        """How many waiters are ahead of ``ticket``: 0 at the head; every waiter
+        for a new arrival (``ticket`` None); None when ``ticket`` is no longer
+        queued."""
+        with self._cond:
+            self._purge_locked(budget)
+            entries = self._queues.get(budget, [])
+            if ticket is None:
+                return len(entries)
+            for index, entry in enumerate(entries):
+                if entry[0] == ticket:
+                    return index
+            return None
+
+    def depth(self, budget) -> int:
+        with self._cond:
+            return len(self._queues.get(budget, []))
+
+    def remove(self, budget, ticket) -> bool:
+        with self._cond:
+            entries = self._queues.get(budget, [])
+            kept = [entry for entry in entries if entry[0] != ticket]
+            self._queues[budget] = kept
+            self._generation += 1
+            self._cond.notify_all()
+            return len(kept) != len(entries)
+
+    def notify(self) -> None:
+        """Something that may release headroom happened. Wakes every waiter."""
+        with self._cond:
+            self._generation += 1
+            self._cond.notify_all()
+
+    def generation(self) -> int:
+        with self._cond:
+            return self._generation
+
+    def wait_for_change(self, since, timeout) -> int:
+        """Sleep until the generation moves past ``since`` or ``timeout``
+        elapses; return the generation. Releases the lock while sleeping."""
+        with self._cond:
+            if self._generation == since and timeout > 0:
+                self._cond.wait(timeout)
+            return self._generation
+
+
+ADMISSION_QUEUE = AdmissionQueue()
+"""The one process-wide admission queue. PROCESS-LOCAL, like the ledger."""
+
+
+def _admission_preview(source, budget, cap, usd, authority):
+    """Would an attempt of ``usd`` be admitted now? The decline reason, or None
+    when it would fit OR when the answer cannot be read -- the real admission
+    then decides. NEVER RAISES. READ-ONLY under both authorities."""
+    if authority == ADMISSION_AUTHORITY_DURABLE:
+        sink = BILLING_RECORD.installed_sink()
+        preview = getattr(sink, "admission_preview", None)
+        if preview is None:
+            return None
+        try:
+            return preview(reserved_usd=float(usd), admission_cap=float(cap))
+        except Exception as exc:                                # noqa: BLE001
+            SPEND_LEDGER_FAULTS[
+                f"admission:preview_failed:{type(exc).__name__}"] += 1
+            return None
+    try:
+        reason, _committed, _held = SPEND_LEDGER.admission_preview(
+            float(usd), cap=cap, **_process_admission_args(source, budget))
+    except Exception as exc:                                    # noqa: BLE001
+        SPEND_LEDGER_FAULTS[f"admission:preview_failed:{type(exc).__name__}"] += 1
+        return None
+    return reason
+
+
+def _queued_decline(source, budget, cap, usd, where, ahead, authority):
+    """The ``headroom_held`` decline for an attempt that is behind earlier
+    waiters. Nothing is read under a write lock and nothing is held."""
+    try:
+        _reason, committed, held = SPEND_LEDGER.admission_preview(
+            float(usd), cap=cap, **_process_admission_args(source, budget))
+    except Exception:                                           # noqa: BLE001
+        committed, held = 0.0, 0.0
+        SPEND_LEDGER_FAULTS["admission:queued_decline_unread"] += 1
+    return admission_declined(
+        ADMISSION_DECLINE_HELD, where=where, source=source, budget=budget,
+        committed=committed, held=held, usd=float(usd), cap=float(cap),
+        authority=authority,
+        detail=f"{ahead} earlier attempt(s) in this process are waiting")
+
+
+class HeadroomWait:
+    """ONE billed attempt's bounded wait for released headroom (E1b).
+
+    Created by the caller before the attempt's first admission check and handed
+    to every check of that attempt (``begin_billed_attempt(admission_wait=)``);
+    SINGLE-USE -- once it has ended, a new wire attempt needs a new one.
+    """
+
+    def __init__(self, source, *, queue=None, clock=None):
+        self.source = source
+        self.budget = budget_for(source)
+        self._queue = ADMISSION_QUEUE if queue is None else queue
+        self._clock = time.monotonic if clock is None else clock
+        self._lock = threading.Lock()
+        self.ticket = None
+        self.started = None
+        self.deadline = None
+        self.timeout_s = None
+        self.outcome = None
+        self.rechecks = 0
+
+    def ahead(self) -> int:
+        """Waiters ahead of this attempt on its budget (0 = may be admitted)."""
+        ahead = self._queue.ahead_of(self.budget, self.ticket)
+        if ahead is None:
+            # Dropped as stale while its owner was still alive (a paced slot
+            # outlived the expiry): it takes its turn behind whoever is queued.
+            return self._queue.ahead_of(self.budget, None)
+        return ahead
+
+    def finish(self, outcome) -> bool:
+        """End the wait with ``outcome``, once. True when a wait had been
+        entered (and was therefore counted). Idempotent; NEVER RAISES."""
+        with self._lock:
+            if self.ticket is None or self.outcome is not None:
+                return False
+            if outcome not in ADMISSION_WAIT_OUTCOMES or \
+                    outcome == ADMISSION_WAIT_ENTERED:
+                SPEND_LEDGER_FAULTS[f"admission:bad_wait_outcome:{outcome}"] += 1
+                outcome = ADMISSION_WAIT_FAILED
+            self.outcome = outcome
+            ticket, self.ticket = self.ticket, None
+        try:
+            self._queue.remove(self.budget, ticket)
+        except Exception as exc:                                # noqa: BLE001
+            SPEND_LEDGER_FAULTS[
+                f"admission:wait_remove_failed:{type(exc).__name__}"] += 1
+        SPEND_ADMISSION_WAITS[f"{self.source}:{outcome}"] += 1
+        log.info("a wait for held budget headroom ended", event="admission_wait",
+                 status=outcome, phase=self.source,
+                 delay_s=round(max(0.0, self._clock() - self.started), 3),
+                 count=self.rechecks)
+        return True
+
+    def await_admission(self, decline, cancelled=None) -> str:
+        """Wait after ``decline``; return an ``ADMISSION_WAIT_VERDICTS`` member.
+
+        RAISES ``BudgetAdmissionWaitTimeout`` when the deadline passes. Must be
+        called with NO lock held (see the section above). ``cancelled`` is a
+        zero-argument predicate asked at least every
+        ``config.PROVIDER_WAIT_POLL_SECONDS``.
+        """
+        reason = getattr(decline, "reason", None)
+        usd = getattr(decline, "reservation_usd", None)
+        cap = getattr(decline, "cap_usd", None)
+        if (reason != ADMISSION_DECLINE_HELD or self.outcome is not None
+                or isinstance(usd, bool) or isinstance(cap, bool)
+                or not isinstance(usd, (int, float))
+                or not isinstance(cap, (int, float))):
+            self.finish(ADMISSION_WAIT_EXHAUSTED
+                        if reason == ADMISSION_DECLINE_EXHAUSTED
+                        else ADMISSION_WAIT_FAILED)
+            return ADMISSION_WAIT_NOT_WAITABLE
+        authority = getattr(decline, "authority", ADMISSION_AUTHORITY_PROCESS)
+        poll_s = float(config.PROVIDER_WAIT_POLL_SECONDS)
+        recheck_s = float(config.ADMISSION_WAIT_RECHECK_SECONDS)
+        now = self._clock()
+        if self.ticket is None:
+            # THE ONE DEADLINE, SET HERE ONCE AND NEVER MOVED BY A RECHECK.
+            self.timeout_s = float(config.admission_wait_timeout_seconds())
+            self.started = now
+            self.deadline = now + self.timeout_s
+            self.ticket = self._queue.enqueue(self.budget,
+                                              self.deadline + self.timeout_s)
+            SPEND_ADMISSION_WAITS[f"{self.source}:{ADMISSION_WAIT_ENTERED}"] += 1
+            log.info("a billed attempt is waiting for held budget headroom",
+                     event="admission_wait", status=ADMISSION_WAIT_ENTERED,
+                     phase=self.source, threshold=round(float(cap), 6),
+                     delay_s=round(self.timeout_s, 3))
+        seen = self._queue.generation()
+        last_check = now
+        while True:
+            if cancelled is not None and cancelled():
+                self.finish(ADMISSION_WAIT_CANCELLED)
+                return ADMISSION_WAIT_CANCELLED
+            now = self._clock()
+            remaining = self.deadline - now
+            if remaining <= 0:
+                self._time_out(usd, cap, authority, decline)
+            generation = self._queue.wait_for_change(seen,
+                                                     min(poll_s, remaining))
+            changed = generation != seen
+            seen = generation
+            if cancelled is not None and cancelled():
+                continue
+            now = self._clock()
+            if now >= self.deadline or self.ahead() != 0:
+                continue
+            if not changed and now - last_check < recheck_s:
+                continue
+            last_check = now
+            self.rechecks += 1
+            if (_admission_preview(self.source, self.budget, cap, usd, authority)
+                    == ADMISSION_DECLINE_HELD):
+                continue
+            return ADMISSION_WAIT_RECHECK
+
+    def _time_out(self, usd, cap, authority, decline):
+        waited = max(0.0, self._clock() - self.started)
+        self.finish(ADMISSION_WAIT_TIMED_OUT)
+        latched = False
+        if latch_on_limit():
+            latched = SPEND_STOP.trip(SPEND_LIMIT_ADMISSION_WAIT,
+                                      "a budget admission wait", self.source)
+        log.error("a billed attempt waited its full bounded wait for held budget "
+                  "headroom and was not admitted", event="admission_wait",
+                  status=ADMISSION_WAIT_TIMED_OUT, phase=self.source,
+                  delay_s=round(waited, 3), threshold=round(float(cap), 6),
+                  reason=SPEND_LIMIT_ADMISSION_WAIT, degraded=True)
+        raise BudgetAdmissionWaitTimeout(
+            f"a ${float(usd):.6f} billed attempt on the {self.budget} budget "
+            f"waited {waited:.1f}s of its {self.timeout_s:.1f}s admission wait "
+            f"for headroom held by this process's open reservations and was not "
+            f"admitted; "
+            + ("the run is stopping and its unfinished work is left to a resume"
+               if latched else "only this request was refused"),
+            budget=self.budget, source=self.source, waited_s=waited,
+            timeout_s=self.timeout_s, reservation_usd=float(usd),
+            cap_usd=float(cap), authority=authority,
+            latched=latched) from decline
 
 
 # ===========================================================================
@@ -2407,6 +2879,23 @@ class SpendStop:
                         f"dispatched.")
             console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "
                         f"${_spent:.2f}. {_remedy}")
+        elif limit == SPEND_LIMIT_ADMISSION_WAIT:
+            # NOT THE CAP (E1b): the budget is not spent. A billed attempt
+            # waited its full bounded wait for headroom this process's own open
+            # reservations held, and was not admitted.
+            console.out(f"[SPEND] A BILLED ATTEMPT WAITED ITS FULL ADMISSION "
+                        f"WAIT FOR HELD HEADROOM ON THE "
+                        f"{(_budget or 'campaign').upper()} BUDGET AND WAS NOT "
+                        f"ADMITTED; no further billed request may be "
+                        f"dispatched.")
+            console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "
+                        f"${_spent:.2f}"
+                        + (f" of ${_cap:.2f}" if _cap is not None else "")
+                        + ". The unfinished work is left to a resume; a "
+                          "resumed run counts what this one spent. Fewer "
+                          "attempts in flight (MAX_WORKERS, the per-trial "
+                          "parallel bound) or a larger cap leaves more "
+                          "headroom per attempt.")
         else:
             console.out("[SPEND] A STAGE 5 INVOCATION HIT ITS BILLED-CALL "
                         "CEILING.")
@@ -2428,9 +2917,10 @@ class SpendStop:
         console.out(f"[SPEND] Noticed during {where}. No further billed request "
                     f"will be ISSUED; work already in flight completes and is "
                     f"written.")
-        if limit != SPEND_LIMIT_BILLING_RECORD:
+        if limit not in (SPEND_LIMIT_BILLING_RECORD, SPEND_LIMIT_ADMISSION_WAIT):
             # NOT FOR A BILLING-RECORD STOP, which no cap change fixes (P1c): its
-            # remedy is printed above, per cause.
+            # remedy is printed above, per cause. NOT FOR AN ADMISSION-WAIT STOP
+            # either (E1b), whose remedy is printed in its own branch.
             console.out(f"[SPEND] To continue, raise "
                         f"{BUDGET_CAP_CONSTANTS.get(_budget, 'config.SPEND_CAP_USD')} "
                         f"and run again -- a resumed run counts what this one "
@@ -3001,7 +3491,7 @@ class AttemptLiability:
     """
 
     def __init__(self, source, model, input_tokens, output_tokens, *, where,
-                 reserved_usd=None, note=None):
+                 reserved_usd=None, note=None, admission_wait=None):
         self.source = source
         self.model = model
         self.where = where
@@ -3026,24 +3516,50 @@ class AttemptLiability:
         self.admission_authority = (ADMISSION_AUTHORITY_DURABLE
                                     if durable_admission_applies(budget)
                                     else ADMISSION_AUTHORITY_PROCESS)
-        if self.admission_authority == ADMISSION_AUTHORITY_PROCESS:
-            self._hold = _admit_in_process(source, budget, cap,
-                                           self.reserved_usd, where,
-                                           self.reservation_fault)
-        else:
-            self._hold = None
+        if (admission_wait is not None and cap is not None
+                and self.reserved_usd is not None):
+            # FIRST-IN, FIRST-OUT (E1b): an attempt behind earlier waiters is
+            # declined before it can take headroom released for them.
+            _ahead = admission_wait.ahead()
+            if _ahead:
+                raise _queued_decline(source, budget, cap, self.reserved_usd,
+                                      where, _ahead, self.admission_authority)
         try:
-            self.handle = BILLING_RECORD.reserve(
-                source, model, input_tokens, output_tokens, where=where,
-                reserved_usd=reserved_usd, note=note,
-                admission_cap=(cap if self.admission_authority
-                               == ADMISSION_AUTHORITY_DURABLE else None))
-        except BaseException:
-            # ADMITTED BUT NOT RESERVED: nothing is dispatched, so the hold is
-            # released rather than left to block headroom for the process's
-            # life.
-            SPEND_LEDGER.release_hold(self._hold)
+            if self.admission_authority == ADMISSION_AUTHORITY_PROCESS:
+                self._hold = _admit_in_process(source, budget, cap,
+                                               self.reserved_usd, where,
+                                               self.reservation_fault)
+            else:
+                self._hold = None
+            try:
+                self.handle = BILLING_RECORD.reserve(
+                    source, model, input_tokens, output_tokens, where=where,
+                    reserved_usd=reserved_usd, note=note,
+                    admission_cap=(cap if self.admission_authority
+                                   == ADMISSION_AUTHORITY_DURABLE else None))
+            except BaseException:
+                # ADMITTED BUT NOT RESERVED: nothing is dispatched, so the hold
+                # is released rather than left to block headroom for the
+                # process's life -- and a waiter is told it may fit now.
+                if SPEND_LEDGER.release_hold(self._hold):
+                    ADMISSION_QUEUE.notify()
+                raise
+        except BudgetAdmissionDeclined as exc:
+            # A HELD DECLINE LEAVES THE WAIT OPEN for the caller to wait on;
+            # anything else ends it.
+            if admission_wait is not None and \
+                    exc.reason != ADMISSION_DECLINE_HELD:
+                admission_wait.finish(
+                    ADMISSION_WAIT_EXHAUSTED
+                    if exc.reason == ADMISSION_DECLINE_EXHAUSTED
+                    else ADMISSION_WAIT_FAILED)
             raise
+        except BaseException:
+            if admission_wait is not None:
+                admission_wait.finish(ADMISSION_WAIT_FAILED)
+            raise
+        if admission_wait is not None:
+            admission_wait.finish(ADMISSION_WAIT_ADMITTED)
         if self._hold is None:
             # The durable authority admitted it; mirror the hold in process so
             # the attempt's resolution releases it like any other.
@@ -3121,6 +3637,10 @@ class AttemptLiability:
             SPEND_LEDGER.charge_usd(float(usd), self.source, release=self._hold)
         else:
             SPEND_LEDGER.release_hold(self._hold)
+        # THE HOLD IS GONE: a waiter for held headroom may fit now (E1b). Called
+        # with no ledger lock held; the durable half notifies again below, once
+        # its row has settled.
+        ADMISSION_QUEUE.notify()
         result = None
         if self.handle is not None:
             result = BILLING_RECORD._write_settlement(self.handle, out,
@@ -3129,6 +3649,8 @@ class AttemptLiability:
                 self._settlement_did_not_land(result)
         BILLING_RECORD._note_resolved(self.reserved_usd, out,
                                       self.resolved_usd)
+        if self.handle is not None:
+            ADMISSION_QUEUE.notify()
         return self.resolved_usd
 
     def _settlement_did_not_land(self, result) -> None:
@@ -3287,14 +3809,17 @@ def _reservation_price(model, input_tokens, output_tokens, reserved_usd):
 
 def begin_billed_attempt(source, model, input_tokens, output_tokens, *,
                          where, reserved_usd=None,
-                         note=None) -> AttemptLiability:
+                         note=None, admission_wait=None) -> AttemptLiability:
     """Create one billed attempt's liability, BEFORE dispatch. RAISES
     ``BillingRecordUnavailable`` when a durable sink is installed and the
     reservation could not be persisted; the caller must then not dispatch.
 
-    ``reserved_usd`` and ``note`` (R1): see ``BillingRecord.reserve``."""
+    ``reserved_usd`` and ``note`` (R1): see ``BillingRecord.reserve``.
+    ``admission_wait`` (E1b): the attempt's ``HeadroomWait``, for a caller that
+    waits on a ``headroom_held`` decline; None keeps E1's immediate decline."""
     return AttemptLiability(source, model, input_tokens, output_tokens,
-                            where=where, reserved_usd=reserved_usd, note=note)
+                            where=where, reserved_usd=reserved_usd, note=note,
+                            admission_wait=admission_wait)
 
 
 # ===========================================================================

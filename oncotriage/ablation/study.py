@@ -1269,6 +1269,11 @@ def _stop_reason_now():
     # event -- which sends an operator to raise a cap over a pipeline defect.
     if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_CALL_CEILING:
         return RUN_STOP_REASON_CALL_CEILING
+    # AN ADMISSION-WAIT TIMEOUT (E1b) IS NOT THE CAP, for the ceiling's reason:
+    # recording it as `spend_cap` would send an operator to raise a cap the
+    # study never reached.
+    if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT:
+        return RUN_STOP_REASON_ADMISSION_WAIT
     return RUN_STOP_REASON_SPEND_CAP
 
 
@@ -1700,9 +1705,11 @@ treated as complete.
 RUN_STOP_REASON_OPERATOR = "operator"
 RUN_STOP_REASON_SPEND_CAP = "spend_cap"
 RUN_STOP_REASON_CALL_CEILING = "call_ceiling"
+RUN_STOP_REASON_ADMISSION_WAIT = "admission_wait"
 
 RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR, RUN_STOP_REASON_SPEND_CAP,
-                    RUN_STOP_REASON_CALL_CEILING)
+                    RUN_STOP_REASON_CALL_CEILING,
+                    RUN_STOP_REASON_ADMISSION_WAIT)
 """Why a configuration was cut short, stored in `ablation_runs.stop_reason`.
 CLOSED, and NULL is the fourth reading rather than a fourth member.
 
@@ -3062,6 +3069,13 @@ def print_study_close(status, study_elapsed, run_success, run_error,
                  "than its")
             emit("                   configuration can produce. Raising the "
                  "cap will not help.")
+        elif spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT:
+            emit("                   NOT THE CAP: a billed attempt waited its "
+                 "full admission")
+            emit("                   wait for headroom this study's own open "
+                 "reservations held.")
+            emit("                   To continue: run again -- this database's "
+                 "rows are counted.")
         else:
             emit("                   To continue: raise config.SPEND_CAP_USD "
                  "and run again --")

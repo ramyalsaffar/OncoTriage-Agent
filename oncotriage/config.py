@@ -2584,7 +2584,59 @@ PROVIDER_WAIT_POLL_SECONDS = 0.25
 """How promptly a pacing or backoff wait notices a shutdown, a spend stop or
 the operator's STOP. The waits are POLLED rather than event-driven because the
 Stage 5 shutdown flag is a plain module boolean set from a signal handler, and
-`threading.Event.set()` takes a lock a handler must not take."""
+`threading.Event.set()` takes a lock a handler must not take.
+
+IT IS ALSO THE CANCELLATION-CHECK INTERVAL OF AN ADMISSION WAIT (E1b): a billed
+attempt waiting for held budget headroom asks its cancellation predicate at
+least this often, so a shutdown is not delayed by that wait either."""
+
+ADMISSION_WAIT_TIMEOUT_SECONDS = None
+"""How long ONE billed attempt may wait for headroom held by this process's own
+open reservations before the run is stopped (E1b). None derives it; see
+`admission_wait_timeout_seconds()`. A number overrides the derivation (tests set
+a few seconds); it must be positive and finite.
+
+WHAT THE DERIVATION BOUNDS. Held headroom belongs to attempts already on the
+wire, and one Stage 5 wire attempt lives at most its read budget,
+`MATCHING_REQUEST_TIMEOUT_SECONDS`, per SDK attempt. So every hold that existed
+when a waiter entered the queue is released within ONE such lifetime, and the
+attempts admitted ahead of it in that first release round finish within a
+SECOND. `ADMISSION_WAIT_RELEASE_ROUNDS` is that two. A waiter still not admitted
+after both rounds is behind more work than two rounds release, and the run
+STOPS with its unfinished patients left to a resume rather than crawling at a
+concurrency the cap no longer supports. As shipped: 2 x 300 s x 1 = 600 s.
+UNCALIBRATED beyond that argument: no real campaign has measured how long held
+headroom takes to release near the cap."""
+
+ADMISSION_WAIT_RELEASE_ROUNDS = 2
+"""Release rounds an admission wait covers. See `ADMISSION_WAIT_TIMEOUT_SECONDS`."""
+
+ADMISSION_WAIT_RECHECK_SECONDS = 1.0
+"""How often the attempt at the head of the admission queue re-asks, READ-ONLY,
+whether it would fit when no in-process release has woken it (E1b). A release
+inside this process wakes waiters at once; releases by ANOTHER process sharing
+a durable campaign notify nothing, and this is how they are noticed. One
+read-only query per second per waiting budget, not per waiter: only the head
+asks."""
+
+
+def admission_wait_timeout_seconds() -> float:
+    """The admission wait's timeout, in seconds (E1b). RAISES ``ValueError`` for
+    an override that is not a positive finite number -- a configuration defect,
+    surfaced by name rather than read as zero (no wait) or as infinity (an
+    unbounded one)."""
+    override = ADMISSION_WAIT_TIMEOUT_SECONDS
+    if override is not None:
+        if (isinstance(override, bool) or not isinstance(override, (int, float))
+                or override != override or override <= 0
+                or override == float("inf")):
+            raise ValueError(
+                f"config.ADMISSION_WAIT_TIMEOUT_SECONDS must be None or a "
+                f"positive finite number of seconds, not {override!r}")
+        return float(override)
+    return float(ADMISSION_WAIT_RELEASE_ROUNDS
+                 * MATCHING_REQUEST_TIMEOUT_SECONDS
+                 * matching_sdk_attempts_per_call())
 
 PROVIDER_QUOTA_LOOKUP_CODES = {
     MATCHING_PROVIDER_OPENAI: None,

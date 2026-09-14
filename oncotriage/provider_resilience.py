@@ -1546,6 +1546,48 @@ def _settle_unclassifiable(pacer, permit, scope: str, on_possibly_billed,
         _UNCONFIRMED_USD[scope] = _UNCONFIRMED_USD.get(scope, 0.0) + usd
 
 
+ADMISSION_WAIT_RECHECK = "recheck"
+ADMISSION_WAIT_CANCELLED = "cancelled"
+ADMISSION_WAIT_NOT_WAITABLE = "not_waitable"
+ADMISSION_WAIT_VERDICTS = (ADMISSION_WAIT_RECHECK, ADMISSION_WAIT_CANCELLED,
+                           ADMISSION_WAIT_NOT_WAITABLE)
+"""An attempt record's answer to ``await_admission`` (E1b). CLOSED. Restated from
+``spend.ADMISSION_WAIT_VERDICTS`` -- this module imports nothing that imports
+``spend`` -- and a test pins the two equal."""
+
+
+def _await_admission(attempt_record, exc, cancelled) -> str:
+    """Ask ``attempt_record`` to wait after its ``begin`` raised ``exc``. A record
+    without ``await_admission`` cannot wait. Raises what the record raises (a
+    timeout). An answer outside the vocabulary is not waited on."""
+    await_admission = getattr(attempt_record, "await_admission", None)
+    if await_admission is None:
+        return ADMISSION_WAIT_NOT_WAITABLE
+    verdict = await_admission(exc, cancelled)
+    return (verdict if verdict in ADMISSION_WAIT_VERDICTS
+            else ADMISSION_WAIT_NOT_WAITABLE)
+
+
+def _end_admission_wait(attempt_record, scope: str, *,
+                        cancelled=False) -> None:
+    """End a record's open admission wait on an exit that is not a wait verdict.
+    ``cancelled`` says the exit is a cancellation (a shutdown, a spend stop,
+    the drain), so the wait is counted ``cancelled`` rather than ``failed``.
+    NEVER RAISES; a failure is counted."""
+    end = getattr(attempt_record, "end_admission_wait", None)
+    if end is None:
+        return
+    try:
+        if cancelled:
+            end(cancelled=True)
+        else:
+            end()
+    except Exception as exc:                                    # noqa: BLE001
+        _bump(PROVIDER_RETRY_OUTCOMES,
+              f"attempt_record_unresolved:{scope}:end_admission_wait:"
+              f"{type(exc).__name__}")
+
+
 def _record_resolve(attempt_record, how: str, token, value, scope: str) -> None:
     """Resolve one durable attempt record. NEVER RAISES.
 
@@ -1741,28 +1783,41 @@ def execute(send: Callable[[], object], *, scope: str,
         # front of it -- this IS its gate.
         if attempt > 1 and _is_cancelled():
             _cancel_now(last_exc)
-        try:
-            permit = pacer.reserve(scope, reservation_tokens, slots=sdk_attempts)
-            waited_total += permit.waited_s
-            pacer.wait(permit, _is_cancelled)
-        except WaitCancelled:
-            _cancel_now(last_exc)
-        except BaseException as _reserve_exc:
-            # `reserve` IS WHERE `QuotaUnknown` AND `ReservationExceedsQuota`
-            # COME FROM, and on the first attempt nothing has been sent. The
-            # guard is `dispatch_begun` rather than `attempt == 1` because they
-            # are different facts: a retry whose reserve refuses follows a send
-            # that DID happen, and marking it pre-send would tell the rater that
-            # a request which may well have been accepted never left.
-            if not dispatch_begun:
-                mark_pre_send_refusal(_reserve_exc)
-            raise
-        if permit.waited_s > 0:
-            log.debug("a provider attempt waited for its paced slot", stage=5,
-                      provider=scope, phase="pacing", attempts=attempt,
-                      delay_s=round(permit.waited_s, 3))
-        _record_token = None
-        if attempt_record is not None:
+        # ONE WIRE ATTEMPT'S PACED SLOT AND ADMISSION, LOOPED ONLY BY A WAIT FOR
+        # HELD HEADROOM (E1b). An attempt record whose `begin` is declined for
+        # headroom its own process holds may wait (`await_admission`) and then
+        # ask again; that re-entry takes a NEW paced slot and spends NO policy
+        # attempt, because nothing was sent. The permit is refunded BEFORE the
+        # wait, so a waiting attempt holds no rate-limit slot, and no lock of
+        # this module or of the ledger is held across it.
+        while True:
+            try:
+                permit = pacer.reserve(scope, reservation_tokens,
+                                       slots=sdk_attempts)
+                waited_total += permit.waited_s
+                pacer.wait(permit, _is_cancelled)
+            except WaitCancelled:
+                _end_admission_wait(attempt_record, scope, cancelled=True)
+                _cancel_now(last_exc)
+            except BaseException as _reserve_exc:
+                _end_admission_wait(attempt_record, scope)
+                # `reserve` IS WHERE `QuotaUnknown` AND `ReservationExceedsQuota`
+                # COME FROM, and on the first attempt nothing has been sent. The
+                # guard is `dispatch_begun` rather than `attempt == 1` because
+                # they are different facts: a retry whose reserve refuses follows
+                # a send that DID happen, and marking it pre-send would tell the
+                # rater that a request which may well have been accepted never
+                # left.
+                if not dispatch_begun:
+                    mark_pre_send_refusal(_reserve_exc)
+                raise
+            if permit.waited_s > 0:
+                log.debug("a provider attempt waited for its paced slot",
+                          stage=5, provider=scope, phase="pacing",
+                          attempts=attempt, delay_s=round(permit.waited_s, 3))
+            _record_token = None
+            if attempt_record is None:
+                break
             # THE DURABLE RESERVATION, AFTER THE WAIT AND BEFORE THE DISPATCH.
             # A refusal here is a refusal to SEND: nothing is on the wire, so
             # the permit is refunded as not billed and the exception is not
@@ -1771,12 +1826,34 @@ def execute(send: Callable[[], object], *, scope: str,
             # retry into the same refusal.
             try:
                 _record_token = attempt_record.begin()
+                break
             except BaseException as _record_exc:
                 try:
                     pacer.settle(permit, billing=BILLING_NOT_BILLED)
                 except Exception as _settle_exc:          # noqa: BLE001
                     _bump(PROVIDER_RETRY_OUTCOMES,
                           f"settle_failed:{scope}:{type(_settle_exc).__name__}")
+                try:
+                    _wait_verdict = _await_admission(attempt_record,
+                                                     _record_exc, _is_cancelled)
+                except BaseException as _wait_exc:
+                    _bump(PROVIDER_RETRY_OUTCOMES,
+                          f"attempt_record_refused:{scope}:"
+                          f"{type(_wait_exc).__name__}")
+                    if not dispatch_begun:
+                        mark_pre_send_refusal(_wait_exc)
+                    raise
+                if _wait_verdict == ADMISSION_WAIT_RECHECK:
+                    # RE-ASKED BEFORE RE-ENTERING: a stop that landed between
+                    # the wait's last poll and here must not reach a dispatch,
+                    # because the call site's gate does not run again.
+                    if _is_cancelled():
+                        _end_admission_wait(attempt_record, scope,
+                                            cancelled=True)
+                        _cancel_now(_record_exc)
+                    continue
+                if _wait_verdict == ADMISSION_WAIT_CANCELLED:
+                    _cancel_now(_record_exc)
                 _bump(PROVIDER_RETRY_OUTCOMES,
                       f"attempt_record_refused:{scope}:"
                       f"{type(_record_exc).__name__}")

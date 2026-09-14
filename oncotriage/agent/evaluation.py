@@ -1959,6 +1959,21 @@ def _spend_gate(phase, counter, *, where, count=None):
             "latched earlier in this run ("
             + (spend.SPEND_STOP.cause or "cause not recorded") + ")",
             limit=spend.SPEND_LIMIT_BILLING_RECORD)
+    # A RUN STOPPED BY AN ADMISSION-WAIT TIMEOUT DISPATCHES NOTHING FURTHER
+    # EITHER (E1b). The cap below would not see it -- the budget is not spent --
+    # so without this an in-flight patient would go on issuing requests after
+    # the run was stopped and the banner said none would be.
+    if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT:
+        spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_ADMISSION_WAIT}"] += 1
+        log.warning("a Stage 5 request was not issued because an admission wait "
+                    "timed out and stopped the run", stage=5, status="stopped",
+                    event="stage5_admission_wait_declined", phase=phase,
+                    reason=spend.SPEND_LIMIT_ADMISSION_WAIT, count=count,
+                    degraded=True)
+        return Stage5SpendStopped(
+            "the request was not issued: a billed attempt timed out waiting for "
+            "held budget headroom and the run is stopping",
+            limit=spend.SPEND_LIMIT_ADMISSION_WAIT)
     if spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5):
         spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_CAP}"] += 1
         # THE LATCH IS ASKED FOR RATHER THAN TAKEN, and that one condition is
@@ -2063,14 +2078,24 @@ class _Stage5AttemptRecord:
         self._output = output_tokens
         self._reserved_usd = reserved_usd
         self._note = note
+        # THE CURRENT WIRE ATTEMPT'S ADMISSION WAIT (E1b), or None. Created at
+        # the attempt's first admission check and kept across its rechecks, so
+        # its ONE deadline is never reset by a recheck; dropped once the attempt
+        # is admitted or its wait ends, so a LATER wire attempt of this logical
+        # call gets a wait of its own.
+        self._wait = None
 
     def begin(self):
+        if self._wait is None:
+            self._wait = spend.HeadroomWait(spend.SPEND_SOURCE_STAGE5)
         try:
-            return spend.begin_billed_attempt(
+            token = spend.begin_billed_attempt(
                 spend.SPEND_SOURCE_STAGE5, self._model, self._input,
                 self._output, where="a Stage 5 billed attempt",
-                reserved_usd=self._reserved_usd, note=self._note)
+                reserved_usd=self._reserved_usd, note=self._note,
+                admission_wait=self._wait)
         except spend.BillingRecordUnavailable as exc:
+            self._wait = None
             raise Stage5SpendStopped(f"the request was not issued: {exc}",
                                      limit=spend.SPEND_LIMIT_BILLING_RECORD
                                      ) from exc
@@ -2079,10 +2104,54 @@ class _Stage5AttemptRecord:
             # `Stage5SpendStopped`, so the node fails the patient rather than
             # completing it with a hole, and `_account_unconsumed` does not
             # count it as abandoned. The admission reason rides along because
-            # the warmup floor's sentence depends on it.
+            # the warmup floor's sentence depends on it. A HELD decline keeps
+            # its wait: the retry policy asks `await_admission` next (E1b).
+            if exc.reason != spend.ADMISSION_DECLINE_HELD:
+                self._wait = None
             stopped = Stage5SpendStopped(str(exc), limit=spend.SPEND_LIMIT_CAP)
             stopped.admission_reason = exc.reason
             raise stopped from exc
+        except BaseException:
+            self._wait = None
+            raise
+        self._wait = None
+        return token
+
+    def await_admission(self, exc, cancelled):
+        """Wait for held headroom after ``begin`` raised ``exc`` (E1b). Returns a
+        ``provider_resilience.ADMISSION_WAIT_VERDICTS`` member; RAISES
+        ``Stage5SpendStopped`` (limit ``admission_wait``) when the wait times
+        out. Called by ``provider_resilience.execute`` with no lock held and its
+        pacer permit already refunded."""
+        wait = self._wait
+        decline = exc.__cause__ if isinstance(exc, Stage5SpendStopped) else exc
+        if wait is None or not isinstance(decline, spend.BudgetAdmissionDeclined):
+            return provider_resilience.ADMISSION_WAIT_NOT_WAITABLE
+        try:
+            verdict = wait.await_admission(decline, cancelled)
+        except spend.BudgetAdmissionWaitTimeout as timeout:
+            self._wait = None
+            stopped = Stage5SpendStopped(f"the request was not issued: {timeout}",
+                                         limit=spend.SPEND_LIMIT_ADMISSION_WAIT)
+            stopped.admission_reason = spend.ADMISSION_DECLINE_HELD
+            raise stopped from timeout
+        except BaseException:
+            self._wait = None
+            wait.finish(spend.ADMISSION_WAIT_FAILED)
+            raise
+        if verdict != spend.ADMISSION_WAIT_RECHECK:
+            self._wait = None
+        return verdict
+
+    def end_admission_wait(self, cancelled=False):
+        """End an open admission wait because its attempt left the retry policy
+        some other way: ``cancelled`` (a shutdown, a spend stop or the drain
+        seen by the policy itself) or anything else (a pacer refusal), which
+        is ``failed``. NEVER RAISES."""
+        wait, self._wait = self._wait, None
+        if wait is not None:
+            wait.finish(spend.ADMISSION_WAIT_CANCELLED if cancelled
+                        else spend.ADMISSION_WAIT_FAILED)
 
     def response(self, token, result):
         usage = getattr(result, "usage", None)
@@ -8512,7 +8581,13 @@ CLINICAL TRIALS:
                 # THE BILLING-RECORD LATCH SHARES THIS SOURCE AND NOT THIS
                 # SENTENCE: "a spend limit was reached" would send an operator
                 # to the cap for a stop whose remedy is the database.
-                _what = (("the campaign's durable billing record could not be "
+                _what = (("a billed attempt waited its full admission wait for "
+                          "budget headroom held by this process's open "
+                          "reservations and was not admitted, so the run was "
+                          "stopped and no request was issued for this patient")
+                         if getattr(_warmup_error, "limit", None)
+                         == spend.SPEND_LIMIT_ADMISSION_WAIT
+                         else ("the campaign's durable billing record could not be "
                           "written, so no request was dispatched for this "
                           "patient")
                          if getattr(_warmup_error, "limit", None)

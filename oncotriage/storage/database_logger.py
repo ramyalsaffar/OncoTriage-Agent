@@ -2821,10 +2821,17 @@ outcome could not be read back (``spend.BILLING_RECORD_CAUSES``) -- so no furthe
 billed request could be dispatched. NOT a budget event and NOT a pipeline defect.
 See ``spend.BILLING_RECORD``."""
 
+RUN_STOP_REASON_ADMISSION_WAIT = "admission_wait"
+"""A billed attempt waited its full bounded wait for budget headroom held by the
+run's own open reservations and was not admitted (E1b), so the run stopped with
+its unfinished work left to a resume. NOT the cap -- the budget was not spent --
+and NOT a defect. See ``spend.SPEND_LIMIT_ADMISSION_WAIT``."""
+
 RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR,
                     RUN_STOP_REASON_SPEND_CAP,
                     RUN_STOP_REASON_CALL_CEILING,
-                    RUN_STOP_REASON_BILLING_RECORD)
+                    RUN_STOP_REASON_BILLING_RECORD,
+                    RUN_STOP_REASON_ADMISSION_WAIT)
 """Every value ``runs.stop_reason`` may hold. CLOSED.
 
 WHY THIS IS A COLUMN AND NOT THREE MORE MEMBERS OF ``RUN_RECORD_STATUSES``, and
@@ -5493,22 +5500,139 @@ def admission_decision(liabilities, reservation_usd, cap_usd):
     return None
 
 
+RESERVATION_WRITTEN = "written"
+RESERVATION_REPLAYED = "replayed"
+RESERVATION_OUTCOMES = (RESERVATION_WRITTEN, RESERVATION_REPLAYED)
+"""What ``reserve_billing_attempt_outcome`` did. CLOSED.
+
+  ``written``   this call inserted the row.
+  ``replayed``  the row was ALREADY there, identical in every immutable identity
+                and accounting field, so nothing was inserted, no liability was
+                added and nothing was admitted a second time (E1b).
+
+A REPLAY IS AN ACCOUNTING OPERATION, NOT PERMISSION TO SEND. The row cannot say
+whether the attempt it describes was ever dispatched: a caller that replays an
+attempt id after its request went out, and then dispatches again, sends a
+possibly billed request under a reservation already covering the first one.
+Every production dispatch creates a NEW attempt id (``spend.BillingRecord.
+reserve``), so the only production replay is this module's own write retry of a
+transaction whose commit landed and whose acknowledgement was lost -- a
+reservation nothing was dispatched against yet."""
+
+
+class BillingReservationConflict(BillingRecordWriteError):
+    """An attempt id is already in the billing record describing a DIFFERENT
+    reservation, or a reservation that is no longer open (E1b). Nothing was
+    written or reused. A ``BillingRecordWriteError`` subclass, so every caller
+    that refuses a failed reservation refuses this one too; ``fields`` names the
+    fields that disagree."""
+
+    def __init__(self, message, *, attempt_id, fields):
+        super().__init__(message)
+        self.attempt_id = attempt_id
+        self.fields = tuple(fields)
+
+
+class ReservationResult(NamedTuple):
+    """``reserve_billing_attempt_outcome``'s answer."""
+
+    attempt_id: str
+    outcome: str
+
+
+_EXISTING_RESERVATION_SQL = (
+    "SELECT campaign_id, run_id, kind, source, model, state, reserved_usd, "
+    "settled_usd, outcome, reserved_input_tokens, reserved_output_tokens, note "
+    "FROM billing_attempts WHERE attempt_id = ?")
+_EXISTING_RESERVATION_COLUMNS = (
+    "campaign_id", "run_id", "kind", "source", "model", "state", "reserved_usd",
+    "settled_usd", "outcome", "reserved_input_tokens", "reserved_output_tokens",
+    "note")
+
+
+def _reservation_replay_mismatches(existing, expected) -> list:
+    """The immutable fields on which a stored row and a requested reservation
+    disagree. PURE. Empty means the request is a replay of that row.
+
+    WHICH FIELDS, AND WHY. An ATTEMPT row is compared on everything that says
+    which charge it is and how much it may cost -- campaign, run, kind, source,
+    model, both reserved token counts, the reserved amount and the reservation
+    note (the bound's provenance) -- and on its STATE, which must still be
+    ``reserved``: a replay of a SETTLED attempt would hand a caller a reservation
+    whose liability is already resolved. ``correlation_id`` and the timestamps
+    are NOT compared: they say when and under which patient scope the row was
+    written, not what it charges, and a retry necessarily carries a new time.
+
+    A ``historical_evidence`` or ``settlement_discrepancy`` row keeps the check it
+    always had (campaign, run, kind, amount) plus its settled state and settled
+    amount, and the historical row its outcome: those rows are written by their
+    own idempotent writers, whose repeats must keep succeeding.
+    """
+    kind = expected["kind"]
+    exact = ["campaign_id", "run_id", "kind", "state"]
+    amounts = ["reserved_usd"]
+    if kind == BILLING_ATTEMPT_KIND_ATTEMPT:
+        exact += ["source", "model", "reserved_input_tokens",
+                  "reserved_output_tokens", "note"]
+    else:
+        amounts.append("settled_usd")
+        if kind == BILLING_ATTEMPT_KIND_HISTORICAL:
+            exact.append("outcome")
+    bad = [name for name in exact if existing.get(name) != expected.get(name)]
+    for name in amounts:
+        stored, wanted = existing.get(name), expected.get(name)
+        if (not _valid_billing_usd(stored) or not _valid_billing_usd(wanted)
+                or abs(float(stored) - float(wanted)) > _BILLING_AMOUNT_EPSILON):
+            bad.append(name)
+    return bad
+
+
 def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
                             model, input_tokens, output_tokens, reserved_usd,
                             correlation_id=None,
                             kind=BILLING_ATTEMPT_KIND_ATTEMPT, note=None,
                             admission_cap=None):
     """COMMIT a reservation row. RAISES ``BillingRecordWriteError`` on any
-    failure; returns the attempt id once the row is durable.
+    failure; returns the attempt id once the row is durable. See
+    ``reserve_billing_attempt_outcome``, which this wraps."""
+    return reserve_billing_attempt_outcome(
+        db_path, attempt_id=attempt_id, campaign_id=campaign_id, run_id=run_id,
+        source=source, model=model, input_tokens=input_tokens,
+        output_tokens=output_tokens, reserved_usd=reserved_usd,
+        correlation_id=correlation_id, kind=kind, note=note,
+        admission_cap=admission_cap).attempt_id
+
+
+def reserve_billing_attempt_outcome(db_path, *, attempt_id, campaign_id, run_id,
+                                    source, model, input_tokens, output_tokens,
+                                    reserved_usd, correlation_id=None,
+                                    kind=BILLING_ATTEMPT_KIND_ATTEMPT,
+                                    note=None, admission_cap=None
+                                    ) -> ReservationResult:
+    """COMMIT a reservation row, or recognise it as already committed. RAISES
+    ``BillingRecordWriteError`` on any failure; returns a ``ReservationResult``
+    once the row is durable.
 
     IT RAISES AND THAT IS THE CONTRACT. It runs immediately BEFORE a billed
     dispatch, where a failure costs nothing and continuing would send a request
     whose charge a later process cannot count.
 
-    IDEMPOTENT BY CONSTRUCTION: ``INSERT OR IGNORE`` on the primary key, then the
-    row is READ BACK and required to carry this call's campaign, run and amount.
-    A repeat of the same reservation succeeds; a colliding id that describes a
-    different charge raises rather than being mistaken for this one.
+    AN EXISTING ROW IS RECOGNISED BEFORE ANY NEW LIABILITY IS CONSIDERED (E1b).
+    Inside ONE ``BEGIN IMMEDIATE`` transaction the attempt id is looked up
+    first: a row identical in every immutable field (see
+    ``_reservation_replay_mismatches``) is a REPLAY -- nothing is inserted, the
+    admission decision is not taken, and the outcome is ``replayed``; a row that
+    disagrees raises ``BillingReservationConflict`` naming the fields, and
+    nothing is written or reused. Only when no row carries the id is admission
+    decided and the row inserted.
+
+    WHY THE ORDER IS THE FIX. Admission used to add the requested amount before
+    asking whether that attempt's row already existed, so this function's own
+    write retry -- re-running a transaction whose commit landed and whose
+    acknowledgement was lost -- counted the committed row as HELD and then asked
+    for its amount again. Measured before the change: a $9 reservation under a
+    $10 cap came back ``headroom_held``, zero provider calls were made, and the
+    row stayed RESERVED for every later reader to charge.
 
     A ``historical_evidence`` row is written SETTLED at its amount in the same
     statement -- it records spend that already happened, so there is nothing to
@@ -5562,14 +5686,25 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
         conn = _open_billing_connection(db_path)
         try:
             cursor = conn.cursor()
+            # ONE TRANSACTION FOR THE LOOKUP, THE ADMISSION AND THE INSERT. BEGIN
+            # IMMEDIATE takes the database's write lock BEFORE the first read, so
+            # "is this attempt already recorded", the liabilities read below and
+            # the insert are one step for every connection to this file --
+            # threads here (already serialised by `_WRITE_LOCK`) and every other
+            # process sharing the campaign. A declined, replayed or conflicting
+            # reservation rolls back having written nothing.
+            cursor.execute("BEGIN IMMEDIATE")
+            # THE ATTEMPT'S OWN ROW IS ASKED FOR FIRST (E1b). A committed
+            # reservation must be recognised before any liability is summed:
+            # summed first, it is counted as held and then its amount is asked
+            # for again. See `reserve_billing_attempt_outcome`.
+            cursor.execute(_EXISTING_RESERVATION_SQL, (attempt_id,))
+            existing = cursor.fetchone()
+            if existing is not None:
+                conn.rollback()
+                return "existing", existing, None
             if admission_cap is not None:
-                # ATOMIC ADMISSION (E1). BEGIN IMMEDIATE takes the database's
-                # write lock BEFORE the read, so the liabilities read below and
-                # the insert that follows are one step for every connection to
-                # this file -- threads here (already serialised by
-                # `_WRITE_LOCK`) and every other process sharing the campaign.
-                # A declined reservation rolls back having written nothing.
-                cursor.execute("BEGIN IMMEDIATE")
+                # ATOMIC ADMISSION (E1), inside the transaction opened above.
                 liabilities = campaign_liabilities(cursor, campaign_id, run_id)
                 if liabilities.bad or liabilities.incomplete:
                     raise BillingRecordUnreadable(
@@ -5617,6 +5752,33 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
             held_usd=liabilities.held_usd,
             reservation_usd=float(reserved_usd),
             cap_usd=float(admission_cap))
+    if status == "existing":
+        stored = dict(zip(_EXISTING_RESERVATION_COLUMNS, found))
+        expected = {
+            "campaign_id": campaign_id, "run_id": run_id, "kind": kind,
+            "source": source, "model": model,
+            "state": (BILLING_ATTEMPT_STATE_SETTLED if settled_at_write
+                      else BILLING_ATTEMPT_STATE_RESERVED),
+            "reserved_usd": float(reserved_usd),
+            "settled_usd": float(reserved_usd) if settled_at_write else None,
+            "outcome": "historical_evidence" if historical else None,
+            "reserved_input_tokens": _optional_count(input_tokens),
+            "reserved_output_tokens": _optional_count(output_tokens),
+            "note": note}
+        mismatched = _reservation_replay_mismatches(stored, expected)
+        if mismatched:
+            raise BillingReservationConflict(
+                f"billing attempt {attempt_id} is already recorded as a "
+                f"different or no-longer-open reservation (fields that disagree: "
+                f"{', '.join(mismatched)}); it was neither reused nor "
+                f"overwritten, and nothing may be dispatched against it",
+                attempt_id=attempt_id, fields=mismatched)
+        log.warning("a billing reservation was already committed; it was "
+                    "recognised as a replay and no new liability was added",
+                    event="billing_reservation_replayed",
+                    reason=RESERVATION_REPLAYED, phase=str(source),
+                    status="replayed", degraded=True)
+        return ReservationResult(attempt_id, RESERVATION_REPLAYED)
     if (found is None or found[0] != campaign_id or found[1] != run_id
             or found[2] != kind
             or not _valid_billing_usd(found[3])
@@ -5625,7 +5787,35 @@ def reserve_billing_attempt(db_path, *, attempt_id, campaign_id, run_id, source,
         raise BillingRecordWriteError(
             f"billing attempt {attempt_id} reads back as {found!r}, which is "
             f"not the reservation just written; it was not treated as durable")
-    return attempt_id
+    return ReservationResult(attempt_id, RESERVATION_WRITTEN)
+
+
+def preview_billing_admission(db_path, *, campaign_id, run_id, reserved_usd,
+                              admission_cap):
+    """Would a reservation of ``reserved_usd`` be admitted right now? READ-ONLY.
+
+    Returns ``(reason, liabilities)``: ``reason`` is None when it would fit, or a
+    ``BILLING_ADMISSION_DECLINE_REASONS`` member; ``liabilities`` is the read.
+    RAISES on any read failure -- the caller treats that as "not known" and lets
+    the real admission decide.
+
+    A PREVIEW, NEVER A DECISION (E1b). It opens a read-only connection, takes no
+    write lock and records nothing, so it cannot admit, hold or reserve anything;
+    the answer may be stale by the time it is used. It exists so an attempt
+    waiting for held headroom asks "would it fit" without re-reserving a pacer
+    slot or taking the database's write lock every time it looks. Rows that
+    cannot be summed read as "would fit" (None) so that the real admission
+    refuses them by name.
+    """
+    conn = _open_connection(db_path, read_only=True)
+    try:
+        liabilities = campaign_liabilities(conn.cursor(), campaign_id, run_id)
+    finally:
+        conn.close()
+    if liabilities.bad or liabilities.incomplete:
+        return None, liabilities
+    return (admission_decision(liabilities, reserved_usd, admission_cap),
+            liabilities)
 
 
 def settle_billing_attempt(db_path, attempt_id, *, outcome, settled_usd,
@@ -6261,6 +6451,15 @@ class BillingRecordSink:
         return reserve_billing_attempt(self.db_path,
                                        campaign_id=self.campaign_id,
                                        run_id=self.run_id, **fields)
+
+    def admission_preview(self, *, reserved_usd, admission_cap):
+        """``preview_billing_admission`` for this sink's campaign and run: the
+        decline reason, or None when it would fit. RAISES on a read failure
+        (E1b)."""
+        reason, _liabilities = preview_billing_admission(
+            self.db_path, campaign_id=self.campaign_id, run_id=self.run_id,
+            reserved_usd=reserved_usd, admission_cap=admission_cap)
+        return reason
 
     def settle(self, attempt_id, **fields):
         return settle_billing_attempt(self.db_path, attempt_id, **fields)

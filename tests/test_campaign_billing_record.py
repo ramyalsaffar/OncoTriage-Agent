@@ -436,9 +436,14 @@ check("2g a settlement of an attempt nobody reserved is MISSING",
 check("2h a repeated reservation of the same attempt is idempotent",
       (drive(_reserve, "a2", 0.30), drive(_reserve, "a2", 0.30),
        len(billing_rows(_DB2, "attempt_id='a2'"))), ("a2", "a2", 1))
+# E1b: the refusal is `BillingReservationConflict`, a `BillingRecordWriteError`
+# SUBCLASS that names the disagreeing fields, so every caller refusing the parent
+# still refuses it. The pin asks for the parent by isinstance and the field.
+_collide = raised(_reserve, "a2", 0.31)
 check("2i ...and a colliding id describing a DIFFERENT charge raises rather "
       "than being mistaken for it",
-      type(raised(_reserve, "a2", 0.31)).__name__, "BillingRecordWriteError")
+      (isinstance(_collide, _dl.BillingRecordWriteError),
+       "reserved_usd" in getattr(_collide, "fields", ())), (True, True))
 check("2j an invalid reservation is refused before any write",
       type(raised(_reserve, "a3", -1.0)).__name__, "BillingRecordWriteError")
 

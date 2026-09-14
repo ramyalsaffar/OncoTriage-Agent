@@ -1075,6 +1075,19 @@ BUCKETS = {
         "and one after it leaves the reservation counted. Every provider "
         "client is a stand-in, every database is a temp file, and the "
         "production database is never opened"),
+    "test_admission_replay_and_wait.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire (E1b): a "
+        "replayed reservation is recognised inside its transaction and a "
+        "mismatch is refused by name, in process and in FRESH PROCESSES after "
+        "a commit whose acknowledgement was lost; a headroom_held decline "
+        "waits with real workers -- released by another worker's settlement "
+        "under both authorities with no lock or pacer permit held, one "
+        "deadline across rechecks, prompt cancellation by the shutdown flag, "
+        "a spend stop and the drain, first-in first-out -- and a timeout stops "
+        "the REAL main() STOPPED with its unfinished patients resumed by a "
+        "fresh process. Every provider client is a stand-in, every database is "
+        "a temp file, and the production database is never opened"),
     "test_agent_stage5_attempt_provenance.py": (
         _A, None,
         "ran green under an OS network sandbox and a socket tripwire that "

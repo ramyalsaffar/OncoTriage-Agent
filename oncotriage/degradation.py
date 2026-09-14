@@ -517,10 +517,19 @@ _REGISTRY_SPEC = (
      "`budget_exhausted` (committed spend plus the reservation exceeds the cap; "
      "latches the run under the campaign policy), `headroom_held` (it fits "
      "against committed spend but this process's own open reservations hold "
-     "the rest; never latches, and those patients fail and are NOT "
-     "checkpointed, so a resume runs them), `reservation_unpriced`. IT NAMES "
-     "MONEY NOT SPENT. A large `headroom_held` total is the throughput cost of "
-     "reserving each attempt at its upper bound"),
+     "the rest; never latches -- on Stage 5 the attempt then WAITS for the "
+     "headroom, see SPEND_ADMISSION_WAITS, and on other paths it is refused "
+     "as before), `reservation_unpriced`. IT NAMES MONEY NOT SPENT. A large "
+     "`headroom_held` total is the throughput cost of reserving each attempt "
+     "at its upper bound"),
+    ("SPEND_ADMISSION_WAITS", _spend.SPEND_ADMISSION_WAITS,
+     "bounded waits for released budget headroom (E1b). Keyed "
+     "{source}:{outcome}: `entered` counts waits and each ends `admitted`, "
+     "`timed_out` (the run was STOPPED, stop_reason admission_wait, with its "
+     "unfinished patients left to a resume), `cancelled` (a shutdown, a spend "
+     "stop or the operator's drain), `exhausted` or `failed`. A non-zero "
+     "`timed_out` means held headroom did not release within "
+     "config.admission_wait_timeout_seconds()"),
     ("SPEND_LEDGER_FAULTS", _spend.SPEND_LEDGER_FAULTS,
      "a billed response could not be priced, so its cost is MISSING from the "
      "spend ledger. EVERY KEY HERE IS SPEND THE GATE CANNOT SEE, which means "

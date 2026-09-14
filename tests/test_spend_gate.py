@@ -411,16 +411,25 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
     """
     node = node or _evaluation.node_llm_classifier_evaluation
     stub = stub if stub is not None else _Stub(**stub_kw)
+    # E1b: A HELD DECLINE NOW WAITS, bounded by the admission-wait timeout
+    # (600 s as shipped). Every scenario here either releases its holds within
+    # milliseconds or -- control 9h, which plants a hold that is never released
+    # -- would otherwise sit out the whole shipped timeout before timing out. A
+    # short timeout keeps the same outcome (the patient stops at the requests
+    # the leaked holds allow) and costs this file seconds instead of minutes.
     saved = (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
              config.SPEND_CALL_CEILING_ENFORCED,
              config.MATCHING_PER_TRIAL_CALLS_ENABLED,
-             config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+             config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
+             config.ADMISSION_WAIT_TIMEOUT_SECONDS)
     spend.SPEND_LEDGER.reset()
     spend.SPEND_STOP.reset()
+    spend.ADMISSION_QUEUE.reset()
     spend.SPEND_GATE_SKIPS.clear()
     spend.SPEND_CEILING_TRIPS.clear()
     spend.SPEND_LEDGER_FAULTS.clear()
     spend.SPEND_ADMISSION_DECLINES.clear()
+    spend.SPEND_ADMISSION_WAITS.clear()
     if seed_usd:
         spend.SPEND_LEDGER.seed(spend.LedgerSeed(
             usd=seed_usd, rows=1, runs=1,
@@ -436,6 +445,7 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
         config.SPEND_CALL_CEILING_ENFORCED = ceiling_enforced
         config.MATCHING_PER_TRIAL_CALLS_ENABLED = per_trial
         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = parallel
+        config.ADMISSION_WAIT_TIMEOUT_SECONDS = 2.0
         state = {"patient_data": PATIENT, "filtered_trials": trials,
                  "llm_classifier_retries": 0, "mesh_filter_applied": True,
                  "mesh_filter_skip_reason": "applied", "stage_timings": {}}
@@ -444,7 +454,8 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
         (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
          config.SPEND_CALL_CEILING_ENFORCED,
          config.MATCHING_PER_TRIAL_CALLS_ENABLED,
-         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) = saved
+         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
+         config.ADMISSION_WAIT_TIMEOUT_SECONDS) = saved
         config.stage5_attempt_bound = _REAL_STAGE5_BOUND
         deps.clear_override(deps.OPENAI_CLIENT)
 
@@ -518,11 +529,14 @@ check("1f  ...and the cap was restored", config.SPEND_CAP_USD, _START_CONFIG[0])
 # THREE MEMBERS SINCE THE CUMULATIVE-SPEND PASS, AND THE PIN MOVING IS THE CHECK
 # WORKING: `billing_record` is a third finding with a third remedy (the database
 # the durable record lives in), not a spelling of the cap or the ceiling.
-check("1g  SPEND_LIMITS is closed and its three members are distinct findings "
+# FOUR SINCE E1b, AND THE PIN MOVING IS THE CHECK WORKING AGAIN:
+# `admission_wait` is a fourth finding with a fourth remedy (resume; the budget
+# is not spent), not a spelling of the cap.
+check("1g  SPEND_LIMITS is closed and its four members are distinct findings "
       "with distinct remedies",
       spend.SPEND_LIMITS,
       (spend.SPEND_LIMIT_CAP, spend.SPEND_LIMIT_CALL_CEILING,
-       spend.SPEND_LIMIT_BILLING_RECORD))
+       spend.SPEND_LIMIT_BILLING_RECORD, spend.SPEND_LIMIT_ADMISSION_WAIT))
 check("1h  SPEND_SKIP_KEY_PREFIXES is closed",
       spend.SPEND_SKIP_KEY_PREFIXES,
       (spend.SPEND_SKIP_WARMUP_KEY_PREFIX, spend.SPEND_SKIP_WAVE_KEY_PREFIX,
@@ -590,7 +604,8 @@ check("1k  RUN_STOP_REASONS is closed and has no duplicate -- a duplicated "
       "mechanisms as one",
       (_dl.RUN_STOP_REASONS,
        len(set(_dl.RUN_STOP_REASONS)) == len(_dl.RUN_STOP_REASONS)),
-      (("operator", "spend_cap", "call_ceiling", "billing_record"), True))
+      (("operator", "spend_cap", "call_ceiling", "billing_record",
+        "admission_wait"), True))
 check("1k-i ...and the two spend members are named by the SAME strings the "
       "gate's own limit vocabulary uses, so a row and a counter key can be "
       "joined without a translation table",
@@ -602,12 +617,14 @@ check("1k-i ...and the two spend members are named by the SAME strings the "
 from oncotriage import degradation as _degradation              # noqa: E402
 # E1 ADDED A FOURTH: SPEND_ADMISSION_DECLINES, the attempts atomic budget
 # admission declined after the call-site gate passed. The pin stays EXACT.
-check("1l  all four spend counters are in the degradation registry, so a "
+# E1b ADDED A FIFTH: SPEND_ADMISSION_WAITS, how each bounded wait for held
+# headroom ended. The pin stays EXACT.
+check("1l  all five spend counters are in the degradation registry, so a "
       "gated run says so on its own report",
       sorted(n for n in _degradation.registered_names()
              if n.startswith("SPEND_")),
-      ["SPEND_ADMISSION_DECLINES", "SPEND_CEILING_TRIPS", "SPEND_GATE_SKIPS",
-       "SPEND_LEDGER_FAULTS"])
+      ["SPEND_ADMISSION_DECLINES", "SPEND_ADMISSION_WAITS",
+       "SPEND_CEILING_TRIPS", "SPEND_GATE_SKIPS", "SPEND_LEDGER_FAULTS"])
 
 
 # ===========================================================================
@@ -1548,7 +1565,10 @@ _reason_names = sorted({n.id for a in _reason_assigns for n in ast.walk(a)
 check("8d-i ...from the named constants rather than from literals: "
       "finalize_run_record REFUSES a value outside the vocabulary, so a typo "
       "would lose the reason silently at the one line whose job is to record it",
-      _reason_names, ["RUN_STOP_REASON_BILLING_RECORD",
+      # E1b: the admission-wait timeout is a FIFTH reason. It stays EXACT, so a
+      # sixth reason written as a literal (or not written at all) still fails.
+      _reason_names, ["RUN_STOP_REASON_ADMISSION_WAIT",
+                      "RUN_STOP_REASON_BILLING_RECORD",
                       "RUN_STOP_REASON_CALL_CEILING",
                       "RUN_STOP_REASON_OPERATOR", "RUN_STOP_REASON_SPEND_CAP"])
 _finalize_calls = [] if _MAIN is None else [

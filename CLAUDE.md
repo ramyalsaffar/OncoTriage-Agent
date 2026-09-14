@@ -17334,6 +17334,13 @@ latching. The durable authority's SQL aggregate is linear in the campaign's
 rows (~23 ms at 20k) and runs under the write lock per reservation. Both are in
 the report as open items.
 
+> **SUPERSEDED BY E1b -- the sentence above about a held decline is kept as
+> written.** On the Stage 5 path a `headroom_held` decline now WAITS, bounded
+> and cancellable, and a timeout stops the run cleanly (`stop_reason =
+> admission_wait`) with its unfinished patients left to a resume. See "A held
+> decline waits, and a replayed reservation is recognised (E1b)" at the end of
+> this file. The durable aggregate's linear cost is unchanged and still open.
+
 ```bash
 python tests/test_budget_admission.py                               #  67
 ```
@@ -17345,3 +17352,87 @@ call-site gate no longer reaches the wire). `test_billing_closure.py` **388**,
 `test_campaign_billing_record.py` **128** and
 `test_agent_stage5_attempt_provenance.py` **55** did not move; their caps were
 re-derived (1v needs two reservations; 6A and scenario A need 4.5 responses).
+
+
+### A held decline waits, and a replayed reservation is recognised (E1b)
+
+**TWO FOLLOW-UPS TO E1, BOTH CONFIRMED ON THE UNCHANGED CODE BEFORE ANYTHING WAS
+EDITED.** No paid call, no commit. Every run was under the OS network sandbox
+and the audit-hook tripwire against an isolated project root. The production
+files were compared by bytes at session end. `PROMPT_VERSION`,
+`FINGERPRINT_VERSION` and `llm_classifier_renderer_digest` are unchanged. The
+full account is `RECOVERY_E1B_REPORT.md`.
+
+**1. A REPLAYED RESERVATION WAS COUNTED AS ITS OWN HOLD.**
+`reserve_billing_attempt` decided admission before it asked whether the attempt's
+row already existed. Its own write retry re-runs a transaction whose commit
+landed and whose acknowledgement was lost, so the retry found its committed row,
+counted it as held, and declined `headroom_held`. Measured on the unchanged code:
+a $9 reservation under a $10 cap was declined, zero provider calls were made, and
+a RESERVED $9 row was left for every later reader to charge.
+
+The fix is `reserve_billing_attempt_outcome`. Inside ONE `BEGIN IMMEDIATE` it
+looks the attempt id up first:
+- **no row**: admission, then the insert (`written`);
+- **an identical row**: nothing inserted, no admission (`replayed`);
+- **a row that disagrees**: `BillingReservationConflict`, naming the fields that
+  disagree. A settled attempt cannot be replayed.
+
+**A REPLAY IS ACCOUNTING, NOT PERMISSION TO SEND.** Every dispatch creates a new
+attempt id, so a new wire attempt always reserves anew.
+
+`SpendLedger.admit_hold` applies the same rule to a hold token. The same token
+with the same source and amount is admitted without doubling; anything else
+raises.
+
+**2. A HELD DECLINE NOW WAITS, BOUNDED AND CANCELLABLE.** On the Stage 5 path,
+`provider_resilience.execute` handles a `headroom_held` decline in four steps:
+1. It refunds the pacer permit.
+2. It asks the attempt record to wait (`spend.HeadroomWait`).
+3. The wait ends in one of three verdicts:
+   - `recheck`: take a new paced slot and run the whole atomic admission again;
+   - `cancelled`: stop;
+   - timeout: `Stage5SpendStopped` with `limit = admission_wait`.
+4. Nothing is held while waiting: not the database transaction, not
+   `_WRITE_LOCK`, not the ledger lock, not the pacer permit.
+
+| | |
+|---|---|
+| timeout | `config.admission_wait_timeout_seconds()` = `ADMISSION_WAIT_RELEASE_ROUNDS (2) x MATCHING_REQUEST_TIMEOUT_SECONDS (300) x SDK attempts (1)` = **600 s**, overridable. Uncalibrated |
+| deadline | ONE monotonic deadline per wait, set on entry, never reset by a recheck |
+| cancellation interval | `PROVIDER_WAIT_POLL_SECONDS` = **0.25 s**, through Stage 5's existing predicate (shutdown flag, drain, spend stop, cap exceeded) |
+| wake-ups | a settling liability notifies the queue; the head waiter asks a READ-ONLY preview, and also rechecks every `ADMISSION_WAIT_RECHECK_SECONDS` (1.0 s) because releases by another process notify nothing |
+| fairness | first-in, first-out within the process; queue entries expire, so a dead waiter cannot block the queue |
+| timeout outcome | campaign policy: `SPEND_STOP` latches `admission_wait`, the run is STOPPED with `stop_reason = admission_wait`, unfinished patients are not checkpointed and a fresh process resumes them. Serving window: that request only |
+| exhaustion | `budget_exhausted` does not wait and still latches `spend_cap` |
+
+`SPEND_ADMISSION_WAITS` is registered and keyed `{source}:{outcome}`. Once no
+wait is open, `entered` equals admitted + timed_out + cancelled + exhausted +
+failed.
+A stop the retry policy sees itself -- after a positive preview, or while
+waiting for the paced slot -- also ends the wait `cancelled`, never `failed`
+(`end_admission_wait(cancelled=True)`; the self-review fix, check 4n-i).
+
+**THE 48-PATIENT SIMULATION, RE-RUN.** At the assumed and the no-premium
+reservations, with the cache working and absent:
+- **held failures: 0 at every baseline**;
+- 48/48 complete from $0 to $250;
+- at $285 the run latches `spend_cap` with work stopped or not started, and
+  nothing is held or queued afterwards.
+
+**NOT COVERED:** Stage 2's embedding, the rater, and any direct
+`begin_billed_attempt` caller keep E1's immediate decline and are not queued.
+`execute_async` does not wait.
+
+```bash
+# E1b. No network, no keys, NO SPEND, no model load, no corpus. Real threads,
+# fresh child processes and a real runner main(); every database is a temp
+# file. NOT in the collision matrix. It EXECS NOTHING. Bucket A.
+python tests/test_admission_replay_and_wait.py                      #  71
+```
+
+Counts that moved, each argued in place: `tests/test_spend_gate.py` **167**
+(`SPEND_LIMITS` 4 members, the `SPEND_` counter set, and the stop-reason
+vocabulary pin 8d-i); `tests/test_spend_coverage.py` **169**;
+`tests/test_campaign_billing_record.py` 2i checks the conflict class by
+`isinstance`, still **128**.
