@@ -268,19 +268,26 @@ CAMPAIGN_CAPTION = (
     "leaves a KILLED row and the next invocation opens a SECOND row, so one "
     "campaign that crashed twice is three rows above — each reporting a "
     "FRAGMENT of the patient count and a `started_at` that is when the LAST "
-    "process started. This table stitches them back together: a run whose "
-    "`resumed` flag is set continues the nearest preceding crashed run whose "
-    "**configuration fingerprint is identical**, transitively. A configuration "
-    "change breaks the chain and starts a new campaign, because fragments "
-    "produced under different configurations must not sum."
+    "process started. This table stitches them back together, transitively, "
+    "by two rules. A run that carries a **billing campaign** continues the "
+    "nearest preceding run carrying the same one, whatever that run's status "
+    "and whether or not it resumed a checkpoint, so a restart that completed "
+    "no patient (`resumed` = 0) is one campaign here as it is one budget. A "
+    "run with no billing campaign (written before era 18, or refused before "
+    "paid work) falls back to the older rule: a run whose `resumed` flag is "
+    "set continues the nearest preceding crashed run that also has no billing "
+    "campaign and whose **configuration fingerprint is identical**. A billing "
+    "campaign is only ever continued under an identical configuration, so "
+    "fragments produced under different configurations never sum. `resumed` "
+    "still means only that a checkpoint handed the run completed patients."
 )
 
 CAMPAIGN_SINGLE_STATEMENT = (
-    "Every campaign here is a campaign of ONE run — nothing in this database "
-    "was resumed, or nothing that was resumed matched a preceding crashed run "
-    "on all {fields} fingerprint columns. The table above and this one "
-    "therefore carry the same rows, which is the ordinary state of a database "
-    "in which no campaign has crashed."
+    "Every campaign here is a campaign of ONE run — no run in this database "
+    "continued another run's billing campaign, and nothing that was resumed "
+    "matched a preceding crashed run on all {fields} fingerprint columns. The "
+    "table above and this one therefore carry the same rows, which is the "
+    "ordinary state of a database in which no campaign has been restarted."
 )
 
 CAMPAIGN_OPEN_HELP = (
@@ -577,7 +584,9 @@ def _render_campaigns(summary):
     with col1:
         st.metric("Campaigns", total,
                   help="One row per campaign. Fewer than the run count above "
-                       "exactly when something was resumed.")
+                       "exactly when a run continued an earlier one: a "
+                       "billing campaign carried across a restart, or a "
+                       "checkpoint resume.")
     with col2:
         st.metric("Stitched from >1 run", stitched,
                   help="Campaigns whose patient count and wall span span more "

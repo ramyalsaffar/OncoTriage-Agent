@@ -851,7 +851,14 @@ section("SECTION 6 -- cross-process proofs through the REAL main()")
 _CHILD = os.path.join(_TMP, "billing_child.py")
 Path(_CHILD).write_text(r'''
 import json, os, re, signal, sqlite3, sys, types
-cfg = json.loads(sys.argv[1])
+# THE SAME STAND-INS SERVE TWO LAUNCHES (the P3 recovery). Run as a script, the
+# config is argv[1] and this file calls runner.main() itself. Copied into a hook
+# directory as `usercustomize.py`, the config arrives in ONC_BILLING_HOOK_CFG,
+# this file only installs the stand-ins at interpreter startup, and the REAL
+# entry point `25- Batch Runner.py` parses its own flags (--fresh) and calls
+# main().
+_HOOKED = bool(os.environ.get("ONC_BILLING_HOOK_CFG"))
+cfg = json.loads(os.environ["ONC_BILLING_HOOK_CFG"] if _HOOKED else sys.argv[1])
 sys.path.insert(0, cfg["repo"]); sys.path.insert(0, cfg["tests"])
 os.environ["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
 from oncotriage import config, paths, spend, run_fingerprint
@@ -999,7 +1006,8 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
              ledger_calls=spend.SPEND_LEDGER.calls, requests=stub.calls,
              attempts=len(attempts),
              campaign_id=spend.BILLING_RECORD.installed_sink().campaign_id,
-             row_input_tokens=result.get("llm_classifier_input_tokens"))
+             row_input_tokens=result.get("llm_classifier_input_tokens"),
+             runner_file=os.path.realpath(runner.__file__))
         return entry(fhir_path, "error")
     if mode == "observe":
         seed = spend.SPEND_LEDGER.seeded
@@ -1046,7 +1054,8 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
     raise SystemExit(f"unknown mode {mode}")
 
 runner.process_patient = patient
-runner.main()
+if not _HOOKED:
+    runner.main()
 ''', encoding="utf-8")
 
 
@@ -1129,6 +1138,127 @@ check("6e *** and its budget INCLUDES every charge the first process made: "
       (True, "billing_record", 4))
 check("6f *** remaining = cap - every charge of process 1 ***",
       near(at(_p2d, "remaining"), 100.0 - _COST_SMALL * 4, 1e-7), True)
+
+
+# ---- 6A-ii: THE SUMMARY SURFACE (the P3 recovery). 6d-6f prove the BUDGET
+#          continues; these read what an operator reads -- campaign_summary,
+#          run_summary and the Run Health tables -- over the database the two
+#          REAL main() processes wrote, and require one campaign there too.
+from oncotriage.storage import queries as _queries                 # noqa: E402
+from oncotriage.dashboard.tabs import run_health as _run_health    # noqa: E402
+
+
+def surface(db):
+    """(runs, campaign_summary, run_summary), read through a mode=ro URI."""
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        runs = conn.execute(
+            "SELECT id, resumed, billing_campaign_id, status FROM runs "
+            "ORDER BY id").fetchall()
+        camps = drive(_queries.run, conn, "campaign_summary")
+        rsum = drive(_queries.run, conn, "run_summary")
+    finally:
+        conn.close()
+    return runs, camps, rsum
+
+
+def _nullable(value):
+    return None if value is None or value != value else value
+
+
+def campaign_rows(camps):
+    """Sorted ``[(run_ids, billing_campaign_id)]`` of campaign_summary."""
+    try:
+        return sorted((str(r.run_ids), _nullable(r.billing_campaign_id))
+                      for r in camps.itertuples())
+    except Exception as exc:                                  # noqa: BLE001
+        return _Absent(f"{type(exc).__name__}: {exc}")
+
+
+def grouping_faults(db, runs, camps):
+    """Everything the grouping duplicates or omits; ``[]`` when it is exact.
+
+    Every run in exactly one summary row; a row carries at most one billing
+    campaign and it is the one its runs carry; every billing row sits in the
+    summary row of its own campaign; each campaign's durable total equals its
+    rows; and the summary's cost column sums to the inference costs of the runs
+    it covers.
+    """
+    faults = []
+    try:
+        rows = list(camps.itertuples())
+    except Exception as exc:                                  # noqa: BLE001
+        return [f"campaign_summary unreadable: {exc}"]
+    member_of, bc_of_run = {}, {r[0]: r[2] for r in runs}
+    for row in rows:
+        ids = [int(x) for x in str(row.run_ids).split(" -> ")]
+        for rid in ids:
+            member_of.setdefault(rid, []).append(row.campaign_id)
+        carried = {bc_of_run.get(i) for i in ids} - {None}
+        if len(carried) > 1 or _nullable(row.billing_campaign_id) not in (
+                carried or {None}):
+            faults.append(("row billing id", row.run_ids, carried,
+                           row.billing_campaign_id))
+    if sorted((k, len(v)) for k, v in member_of.items()) != sorted(
+            (r[0], 1) for r in runs):
+        faults.append(("run membership", member_of))
+    conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        attempts = conn.execute(
+            "SELECT campaign_id, run_id FROM billing_attempts").fetchall()
+        costs = conn.execute(
+            "SELECT COALESCE(SUM(estimated_cost_usd), 0) FROM inferences "
+            "WHERE run_id IS NOT NULL").fetchone()[0]
+    finally:
+        conn.close()
+    row_of_campaign = {_nullable(r.billing_campaign_id):
+                       {int(x) for x in str(r.run_ids).split(" -> ")}
+                       for r in rows}
+    for cid, rid in attempts:
+        if rid not in row_of_campaign.get(cid, set()):
+            faults.append(("billing row outside its campaign's summary row",
+                           cid, rid))
+    for cid in {a[0] for a in attempts}:
+        total = drive(_dl.campaign_billing_total, cid, db_path=db)
+        if getattr(total, "attempts", None) != sum(1 for a in attempts
+                                                   if a[0] == cid):
+            faults.append(("durable total disagrees with its rows", cid))
+    if not near(float(sum(r.total_cost_usd for r in rows)), costs,
+                1e-4 * max(1, len(rows))):
+        faults.append(("cost column", float(sum(r.total_cost_usd
+                                                for r in rows)), costs))
+    return faults
+
+
+_runs_a, _camps_a, _rsum_a = surface(_DB_A)
+_C_A = at(_p1d, "campaign_id")
+check("6f-i the run rows: BOTH processes read resumed = 0 (no checkpoint was "
+      "handed over) and both carry process 1's billing campaign",
+      [(r[1], r[2]) for r in _runs_a], [(0, _C_A), (0, _C_A)])
+check("6f-ii *** the SUMMARY SURFACE shows ONE campaign for that one budget: "
+      "campaign_summary groups both runs under process 1's billing id ***",
+      campaign_rows(_camps_a),
+      [(f"{at(at(_runs_a, 0), 0)} -> {at(at(_runs_a, 1), 0)}", _C_A)])
+check("6f-iii ...and the grouping duplicates and omits no run, billing row or "
+      "charge", grouping_faults(_DB_A, _runs_a, _camps_a), [])
+def column(frame, name):
+    """``list(frame[name])``, or a named absence -- a missing column is the
+    defect 6f-iv exists to catch, so it must fail the check, not abort the run."""
+    try:
+        return list(frame[name])
+    except Exception as exc:                                  # noqa: BLE001
+        return _Absent(f"{type(exc).__name__}: {exc}")
+
+
+_ctab = drive(_run_health._build_campaign_table, _camps_a)
+_rtab = drive(_run_health._build_run_table, _rsum_a)
+check("6f-iv ...and the Run Health tables name that one billing campaign on "
+      "the campaign row and on both run rows",
+      (column(_ctab, "billing campaign"), column(_rtab, "billing campaign")),
+      ([_C_A], [_C_A, _C_A]))
+check("6f-v non-degeneracy: the campaign really billed (rows under process 1 "
+      "only; the observer bills nothing)",
+      sorted({r["run_id"] for r in _rows_a}), [at(at(_runs_a, 0), 0)])
 
 
 # ---- 6B: SIGKILL between reservation and settlement
@@ -1359,6 +1489,108 @@ for _tag, _sql, _names in (
           (_latest, _billed,
            os.path.exists(os.path.join(_cpu, _runner.CAMPAIGN_RECORD_FILENAME))),
           (("KILLED",), 0, False))
+
+
+# ---- 6G: --fresh THROUGH THE REAL ENTRY POINT (the P3 recovery). A
+#          zero-success run, then `25- Batch Runner.py --fresh`, then the entry
+#          point again with no flag. The stand-ins arrive through a
+#          `usercustomize` hook -- the child script copied, not exec'd -- so the
+#          flag parsing, clear_checkpoint() and main() are the shipped ones.
+_HOOK_DIR = os.path.join(_TMP, "entry_hook")
+os.makedirs(_HOOK_DIR, exist_ok=True)
+shutil.copyfile(_CHILD, os.path.join(_HOOK_DIR, "usercustomize.py"))
+_ENTRY = os.path.join(_REPO, "25- Batch Runner.py")
+
+
+def entry_point(mode, *flags, db, cp, corpus, cap=None, timeout=240):
+    os.makedirs(cp, exist_ok=True)
+    out = os.path.join(cp, f"entry_{mode}.json")
+    if os.path.exists(out):
+        os.remove(out)
+    cfg = {"mode": mode, "repo": _REPO, "tests": _TESTS, "db": db, "cp": cp,
+           "corpus": corpus, "cap": cap, "out": out, "fingerprint": FIXED_FP,
+           "patient": PATIENT, "trials": TRIALS}
+    env = dict(os.environ)
+    _control_harness.isolate_qdrant(env)
+    # The entry point takes the PROVIDER ALLOWANCE lock, which every harness
+    # that launches it shares; this file's own directory keeps a concurrent
+    # bucket-A file (or an operator's run) from refusing it with exit 3.
+    _control_harness.isolate_locks(env, os.path.join(_TMP, "entry_locks"))
+    env["ONC_BILLING_HOOK_CFG"] = json.dumps(cfg)
+    env["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    env["PYTHONPATH"] = os.pathsep.join(
+        [_HOOK_DIR, _TESTS, _REPO]
+        + ([env["PYTHONPATH"]] if env.get("PYTHONPATH") else []))
+    proc = subprocess.run([sys.executable, _ENTRY, *flags],
+                          capture_output=True, text=True, timeout=timeout,
+                          env=env, cwd=_TMP)
+    data = None
+    if os.path.exists(out):
+        with open(out) as fh:
+            data = json.load(fh)
+    return proc, data
+
+
+_CORP_F = make_corpus(os.path.join(_TMP, "corpus_f"), 1)
+_DB_F = os.path.join(_TMP, "fresh.db")
+_CP_F = os.path.join(_TMP, "cp_f")
+_REC_F = os.path.join(_CP_F, _runner.CAMPAIGN_RECORD_FILENAME)
+_f1, _f1d = child("billed_then_zero", db=_DB_F, cp=_CP_F, corpus=_CORP_F,
+                  cap=100.0)
+_C1 = at(_f1d, "campaign_id")
+check("6u non-degeneracy: process 1 billed, completed no patient, and left a "
+      "campaign record naming its campaign and no checkpoint",
+      (isinstance(_C1, str),
+       drive(lambda: json.loads(Path(_REC_F).read_text())["campaign_id"]),
+       os.path.exists(os.path.join(_CP_F, _runner.CHECKPOINT_FILENAME))),
+      (True, _C1, False))
+_f2, _f2d = entry_point("billed_then_zero", "--fresh", db=_DB_F, cp=_CP_F,
+                        corpus=_CORP_F, cap=100.0)
+if _f2d is None:
+    print(tail(_f2, 60))
+_f2text = _f2.stdout + _f2.stderr
+check("6u-i PREFLIGHT: the REAL entry point ran with the stand-ins against this "
+      "tree -- --fresh parsed, the patient stand-in dumped, the runner imported "
+      "from the repository under test",
+      ("[--fresh] Discarding the batch checkpoint" in _f2text, _f2d is not None,
+       str(at(_f2d, "runner_file")).startswith(os.path.realpath(_REPO))),
+      (True, True, True))
+_C2 = at(_f2d, "campaign_id")
+check("6v *** --fresh after a zero-success run starts a NEW billing campaign "
+      "***", (isinstance(_C2, str), _C2 != _C1), (True, True))
+_f3, _f3d = entry_point("observe", db=_DB_F, cp=_CP_F, corpus=_CORP_F,
+                        cap=100.0)
+if _f3d is None:
+    print(tail(_f3, 60))
+check("6w ...and the next run with no flag continues the FRESH campaign, not "
+      "the discarded one", at(_f3d, "campaign_id"), _C2)
+_runs_f, _camps_f, _rsum_f = surface(_DB_F)
+_ids_f = [r[0] for r in _runs_f]
+check("6x the run rows: resumed 0, 0, 0 (no checkpoint in any of them) and "
+      "billing campaigns C1, C2, C2; every run finalized",
+      ([(r[1], r[2]) for r in _runs_f],
+       sorted({r[3] for r in _runs_f} - {"FAILED", "FINISHED"})),
+      ([(0, _C1), (0, _C2), (0, _C2)], []))
+check("6y *** the SUMMARY SURFACE shows the two budgets as two campaigns: "
+      "run 1 alone, and the fresh run stitched to its no-flag restart ***",
+      campaign_rows(_camps_f),
+      sorted([(f"{at(_ids_f, 0)}", _C1),
+              (f"{at(_ids_f, 1)} -> {at(_ids_f, 2)}", _C2)]))
+check("6y-i ...and the grouping duplicates and omits no run, billing row or "
+      "charge", grouping_faults(_DB_F, _runs_f, _camps_f), [])
+check("6y-ii non-degeneracy: BOTH campaigns billed, so the grouping check "
+      "compared two sets of charges",
+      sorted({r["campaign_id"] for r in billing_rows(_DB_F)}),
+      sorted([_C1, _C2]))
+_c2_rows = billing_rows(_DB_F, "campaign_id = ?", (_C2,))
+check("6z *** the budget the no-flag run was seeded with is exactly the "
+      "campaign the summary groups it into: C2's rows, one prior run -- not "
+      "C1's, and not both ***",
+      (near(at(at(_f3d, "seed"), "usd"),
+            sum(r["settled_usd"] or r["reserved_usd"] for r in _c2_rows), 1e-9),
+       at(at(_f3d, "seed"), "rows"), at(at(_f3d, "seed"), "runs")),
+      (True, len(_c2_rows), 1))
 
 
 #------------------------------------------------------------------------------

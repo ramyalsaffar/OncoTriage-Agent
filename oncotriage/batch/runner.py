@@ -894,6 +894,14 @@ class CampaignBillingRefusal(RuntimeError):
             CAMPAIGN_REFUSAL_RECORD_DISAGREES:
                 f"The checkpoint and {_campaign_record_path()} describe "
                 f"different configurations. --fresh starts a new campaign.",
+            CAMPAIGN_REFUSAL_RECORD_UNWRITABLE:
+                f"The campaign identity record {_campaign_record_path()} could "
+                f"not be made durable on this filesystem. Nothing was billed "
+                f"under this run. Check that the checkpoint directory is "
+                f"writable and on a filesystem that supports fsync and (on "
+                f"macOS) F_FULLFSYNC on files and directories, then run again; "
+                f"a record left behind by a failed directory sync names a "
+                f"campaign with no spend and is safe to continue or remove.",
             CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED:
                 f"{_campaign_record_path()} is missing or unreadable, and the "
                 f"billing record does not establish ONE open campaign for this "
@@ -931,20 +939,23 @@ def _durable_sync(fd, *, directory=False) -> None:
 
     ``os.fsync`` first; then, on darwin, ``F_FULLFSYNC``, because fsync there
     returns once the data reaches the drive rather than once the drive has
-    flushed its write cache. A DIRECTORY that refuses ``F_FULLFSYNC`` keeps its
-    fsync -- the rename's metadata is then bounded by what fsync reaches --
-    and the refusal is counted rather than failing every campaign on a
-    filesystem that does not support the call on directories (measured: APFS
-    accepts it).
+    flushed its write cache (measured on this machine's APFS volume: fsync
+    returned in ~0.02 ms, F_FULLFSYNC in ~9 ms).
+
+    A DIRECTORY GETS NO EXCEPTION (the P4 recovery). The first version counted
+    an ``F_FULLFSYNC`` refusal on the directory and carried on, so a campaign
+    could start with its rename synced only to fsync's weaker bound and nothing
+    but a counter saying so. The directory's sync is what makes the rename
+    durable, and the rename is what makes the identity record exist, so a
+    refusal there is the same finding as a refusal on the file: it raises, and
+    the caller refuses the campaign by name before any billed call. On a
+    filesystem that does not support the call on directories that refusal is
+    permanent and names the file; moving the checkpoint directory to one that
+    does is the remedy. ``directory`` is kept for the caller's diagnosis only.
     """
     os.fsync(fd)
     if sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC"):
-        try:
-            fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-        except OSError as exc:
-            if not directory:
-                raise
-            CHECKPOINT_FAULTS[f"campaign_dir_fullfsync:{type(exc).__name__}"] += 1
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
 
 
 def clear_campaign_record() -> None:
@@ -1019,12 +1030,24 @@ def write_campaign_record(campaign_id, fingerprint, cohort_digest) -> None:
     payload = {"version": CAMPAIGN_RECORD_VERSION, "campaign_id": campaign_id,
                "created_at": datetime.now().isoformat(),
                "fingerprint": fingerprint, "cohort_digest": cohort_digest}
+    # THE STAGE IS NAMED IN THE REFUSAL, because the two halves leave different
+    # things on disk. A failure before the rename leaves no record (the temp
+    # file is removed below); a failure in the DIRECTORY sync after it leaves
+    # the record in place with its rename not known to be durable. Either way
+    # nothing has been billed under the id -- the caller refuses before the
+    # first billed call -- so a restart that finds the record continues a
+    # campaign with no spend, and one that does not starts a new one. Both are
+    # safe; the operator is told which happened.
+    stage = "writing the temp file"
     try:
         with open(tmp, "w", encoding="utf-8") as fh:
             json.dump(payload, fh, indent=2)
             fh.flush()
+            stage = "syncing the temp file"
             _durable_sync(fh.fileno())
+        stage = "renaming it into place"
         os.replace(tmp, cr)
+        stage = "syncing the directory after the rename"
         _dir = os.open(str(cr.parent), os.O_RDONLY)
         try:
             _durable_sync(_dir, directory=True)
@@ -1038,7 +1061,8 @@ def write_campaign_record(campaign_id, fingerprint, cohort_digest) -> None:
             pass
         raise CampaignBillingRefusal(
             CAMPAIGN_REFUSAL_RECORD_UNWRITABLE,
-            f"{cr} could not be written: {type(exc).__name__}: {exc}") from exc
+            f"{cr} could not be written durably (failed while {stage}): "
+            f"{type(exc).__name__}: {exc}") from exc
 
 
 def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,

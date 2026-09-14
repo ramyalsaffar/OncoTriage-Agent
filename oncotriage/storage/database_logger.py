@@ -5308,6 +5308,19 @@ class BillingDurabilityUnavailable(RuntimeError):
 # guarantee. A drive that acknowledges a flush it did not perform, a filesystem
 # mounted without barriers, or a virtualised disk with a volatile write cache can
 # still lose a synced commit, and nothing a process does can detect that.
+#
+# A READ-BACK IS NOT A SYNC, AND TWO LIMITS FOLLOW (the P4 recovery). The
+# pragmas prove what the connection was TOLD, not that a sync happened:
+#   - SQLite's unix VFS issues F_FULLFSYNC only when built with HAVE_FULLFSYNC,
+#     and when the call fails it FALLS BACK to fsync without reporting it. So on
+#     a filesystem that refuses F_FULLFSYNC the commit is bounded by fsync, and
+#     this module cannot see that. The evidence that the call is issued on this
+#     machine's build is MEASURED rather than read back: a reservation commit
+#     costs ~15 ms with fullfsync ON and ~0.5 ms with it OFF, which is the
+#     F_FULLFSYNC cost measured directly (RECOVERY_P4_REPORT.md).
+#   - Durability is to the COMMIT. A reservation whose commit raised is not
+#     durable and is not dispatched (``reserve_billing_attempt`` raises); one
+#     whose commit returned is on disk to the bound above before the dispatch.
 
 BILLING_SYNCHRONOUS_MINIMUM = 2
 """``PRAGMA synchronous`` read-back floor: FULL (2) or EXTRA (3)."""

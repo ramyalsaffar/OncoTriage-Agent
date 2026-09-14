@@ -16959,7 +16959,7 @@ registered reads as zero in its health record.
 # checkpoint directory is inside a tempfile.mkdtemp removed and asserted gone,
 # and the production inferences.db digest is compared at the end. It EXECS
 # NOTHING: children are scripts written into the temp tree. Bucket A.
-python tests/test_campaign_billing_record.py                        #  97 (MEASURED 2026-09-13 by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
+python tests/test_campaign_billing_record.py                        # 111 (MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 97. The +14 are 6f-i..6f-v, the summary surface over the zero-success restart's database, and 6u..6z, --fresh through the REAL entry point read back at the summary surface. Before that 97, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
 ```
 
 **SEVENTEEN PLANTED REVERTS, SEVENTEEN CAUGHT, NONE ABORTING** -- each on a
@@ -17128,6 +17128,26 @@ back to the resume rule, which now attaches only to runs without one either.
 Health tables show it. `runs.resumed` keeps its meaning (a zero-success restart
 still reads 0).
 
+**THE P3 RECOVERY FOUND THE CODE CORRECT AND THE SURFACE'S PROSE STALE.** A
+zero-success restart, a `--fresh` start, a checkpoint resume and two checkpoint
+directories sharing one database were driven through the REAL
+`25- Batch Runner.py` and read back from `campaign_summary`, `run_summary` and
+the Run Health tables. Each budget is exactly one summary row, and no run,
+billing row or charge is duplicated or omitted. What was wrong was the Run
+Health campaign caption, its one-run statement and the Campaigns metric help:
+all three still described the `resumed` flag as the only way runs are stitched.
+They now name the billing-campaign rule. `tests/test_campaign_billing_record.py`
+6f-i..6f-v and 6u..6z pin the surface through real processes, including `--fresh`
+through the entry point. `tests/test_billing_closure.py` 3h/3h-i pins the legacy
+rule's billing-id filter (a refused resume stands alone), and 3f-i pins the
+caption. The residual (a legacy root continued by TWO billing campaigns shows
+one id) is unreachable through the runner, because the historical path refuses a
+billed predecessor. A revert matrix of nine plants caught all nine. Three were
+uncaught before this recovery: the resume rule's filter in SQL, the same filter
+in Python, and `--fresh` keeping the campaign record. One more aborted the file
+instead of failing: 3f's bare subscript, now guarded. See
+`RECOVERY_P3_REPORT.md`.
+
 **THE FIRST VERSION OF P3 HID THE RUN HEALTH TAB ON EVERY OLDER DATABASE, AND
 BUCKET A FOUND IT.** Declaring `runs.billing_campaign_id` in both queries'
 `requires_columns` made them SKIP on a pre-era-18 database, and
@@ -17152,7 +17172,26 @@ reservation is an attempt not dispatched). MEASURED on this APFS volume:
 `fsync` returned in 0.018 ms and `F_FULLFSYNC` in 9.4 ms -- plain fsync does not
 reach the drive here, which is why darwin needs the second pragma. The identity
 file is synced (and `F_FULLFSYNC`'d) before its rename and through its directory
-after; a cleared record's removal is synced too. **A missing record on resume,
+after; a cleared record's removal is synced too. **A DIRECTORY whose
+`F_FULLFSYNC` is refused now REFUSES the campaign** (`campaign_record_unwritable`,
+naming the failed stage) -- the first version counted it and carried on, so a
+campaign could start with its rename only fsync-durable (the P4 recovery).
+**A READ-BACK IS NOT A SYNC**: SQLite's unix VFS falls back to fsync without
+reporting it when F_FULLFSYNC fails, so the evidence the call is issued on this
+machine is MEASURED, re-measured 2026-09-13 by the P4 recovery: a reservation
+commit is 14.5 ms p50 with fullfsync ON and 0.57 ms with it OFF (raw F_FULLFSYNC
+4.7 ms, plain fsync 0.13 ms, after a 4 KiB write). **FAILURE INJECTION THROUGH
+THE REAL `main()`** (`tests/test_billing_closure.py` 4s / 4t): a failed commit
+of the run's campaign stamp, a stamp connection reading back synchronous OFF, a
+failed fsync of the identity temp file, a failed fsync of its directory and a
+refused directory F_FULLFSYNC each exit 1 with ZERO provider calls, a printed
+refusal naming its reason, the run row KILLED with NO billing campaign id and no
+billing row -- and an ordinary restart then bills under one campaign with
+nothing reserved or counted twice. A reservation commit that raises mid-run
+dispatches nothing, latches `billing_record` and records it as the run's
+`stop_reason`. A genuinely FULL disk (a 4 MiB HFS+ image, scratch only) failed
+the reservation at connection open ("unable to open database file") rather than
+at commit: no dispatch, the latch set, `integrity_check` ok. **A missing record on resume,
 or any unreadable record, is RECOVERED** by `recover_campaign_identity` only when
 the rows establish exactly ONE open campaign for this configuration and cohort,
 and refused by name (`campaign_identity_unestablished`) when they are ambiguous,
@@ -17169,6 +17208,19 @@ path, 12 patients x 16 attempts at a per-patient bound of 4:
 | FULL, no fullfsync (this Mac's default) | 0.45 ms | 21 / 64 ms | 5 / 25 / 30 ms |
 | shipped (FULL + fullfsync) | 14.8 ms | 700 / 860-1,440 ms | 146 / 614 / 720 ms |
 
+RE-MEASURED 2026-09-13 by the P4 recovery (the table above is the closure
+pass's, kept as written; the script and JSON are in that session's report). Same
+shape, plus a patient-end inference write under the same lock:
+
+| setting | serial reserve p50 | burst lock wait p50 / p95 | 1-3 s latency, added per attempt p50 / p95 / max |
+|---|---|---|---|
+| NORMAL, no fullfsync | 0.55 ms | 31 / 96 ms | 5.0 / 23.8 / 27.7 ms |
+| FULL, no fullfsync | 0.57 ms | 28 / 105 ms | 4.5 / 25.6 / 31.9 ms |
+| shipped (FULL + fullfsync) | 14.5 ms | 724 / 817 ms | 243 / 642 / 761 ms |
+
+FULL costs nothing over NORMAL here because plain fsync is ~0.1 ms on this
+volume; the whole cost is F_FULLFSYNC, serialized by the lock.
+
 The commit is serialized under `_WRITE_LOCK`, which `log_inference` and the
 health flush share. Against real Stage 5 latencies (seconds to tens of seconds)
 the added delay is a few percent; it is recorded rather than tuned. Options, not
@@ -17181,7 +17233,7 @@ on darwin (which re-opens the drive-cache window). Linux containers ignore
 # SPEND, no model load, no corpus. Children run the real main() with stand-in
 # clients and a closed Qdrant port. NOT in the collision matrix; the production
 # digest is compared at the end. It EXECS NOTHING. Bucket A.
-python tests/test_billing_closure.py                                # 190 (MEASURED 2026-09-13 by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
+python tests/test_billing_closure.py                                # 231 (MEASURED 2026-09-13 by the P4 recovery session under the network sandbox, an audit-hook tripwire and an isolated project root; was 193. The +38 are 4f-i, 4f-ii, 4r..4r-ii and the section-4 continuation's failure injections through the REAL main(), 4s-* and 4t. Before that 193, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 190. The +3 are 3h, 3h-i and 3f-i. Before that 190, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
 ```
 
 **NINETEEN REVERTS, NINETEEN CAUGHT**, each in a copied tree with the editable

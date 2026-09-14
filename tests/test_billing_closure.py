@@ -1038,8 +1038,35 @@ check("3d a historical chain continued by a billing-era run is ONE campaign; a "
              for r in summary(_DB3E, "campaign_summary").itertuples()),
       sorted([(f"{_l1} -> {_l2} -> {_l3}", "camp-hist"), (f"{_l4}", None)]))
 
+# A RUN REFUSED BEFORE PAID WORK CARRIES NO BILLING CAMPAIGN (the P3 recovery).
+# `establish_billing_campaign` raises before `set_run_billing_campaign_id` for
+# every refusal it can decide without a campaign, so a resume it refused has
+# `resumed = 1`, no billing campaign and a KILLED status. The older resume rule
+# would stitch it onto the billing-era run before it and show a run that billed
+# nothing inside a budget it never ran under; the rule attaches only to runs
+# that carry no billing campaign either, so it stands alone.
+_DB3R = new_db("p3_refused_after_billing_era.db")
+_r1 = run_row(_DB3R, FIXED_FP, resumed=False, status="KILLED", bcid="camp-r")
+_r2 = run_row(_DB3R, FIXED_FP, resumed=True, status="KILLED", bcid=None)
+check("3h a refused resume (resumed = 1, no billing campaign) after a "
+      "billing-era run is its OWN campaign, in SQL and in Python",
+      (sorted((str(r.run_ids), r.billing_campaign_id if r.billing_campaign_id
+               == r.billing_campaign_id else None)
+              for r in summary(_DB3R, "campaign_summary").itertuples()),
+       _dl.campaign_run_ids(_r2, db_path=_DB3R).run_ids),
+      (sorted([(f"{_r1}", "camp-r"), (f"{_r2}", None)]), (_r2,)))
+_DB3RC = new_db("p3_refused_control.db")
+_rc1 = run_row(_DB3RC, FIXED_FP, resumed=False, status="KILLED", bcid=None)
+_rc2 = run_row(_DB3RC, FIXED_FP, resumed=True, status="KILLED", bcid=None)
+check("3h-i CONTROL: the same two rows with no billing campaign on the first "
+      "DO stitch, so 3h is the billing-campaign filter at work and not a "
+      "resume rule that never fires",
+      (list(summary(_DB3RC, "campaign_summary")["run_ids"]),
+       _dl.campaign_run_ids(_rc2, db_path=_DB3RC).run_ids),
+      ([f"{_rc1} -> {_rc2}"], (_rc1, _rc2)))
+
 _pin_mismatch = []
-for _db in (_DB3, _DB3C, _DB3D, _DB3E):
+for _db in (_DB3, _DB3C, _DB3D, _DB3E, _DB3R, _DB3RC):
     _by_run = {}
     for _row in summary(_db, "campaign_summary").itertuples():
         _members = tuple(int(x) for x in str(_row.run_ids).split(" -> "))
@@ -1091,11 +1118,28 @@ check("3g-ii non-degeneracy: on the era-18 database the column IS rendered",
       "billing_campaign_id" in drive(lambda: _queries.render_sql(
           sqlite3.connect(_DB3), "campaign_summary")), True)
 
-_table = _run_health._build_campaign_table(summary(_DB3, "campaign_summary"))
-_rtable = _run_health._build_run_table(summary(_DB3, "run_summary"))
+_table = drive(_run_health._build_campaign_table,
+               summary(_DB3, "campaign_summary"))
+_rtable = drive(_run_health._build_run_table, summary(_DB3, "run_summary"))
+# GUARDED READS (the P3 recovery): a dropped column is the defect 3f exists to
+# catch, and a bare subscript turned it into a KeyError that aborted the whole
+# file with no summary -- measured by removing the column in a copy.
 check("3f the dashboard's campaign and run tables show the billing campaign",
-      (list(_table["billing campaign"]), sorted(_rtable["billing campaign"])),
+      (drive(lambda: list(_table["billing campaign"])),
+       drive(lambda: sorted(_rtable["billing campaign"]))),
       (["camp-z"], ["camp-z", "camp-z"]))
+_caption = " ".join(str(getattr(_run_health, "CAMPAIGN_CAPTION", "")).split())
+check("3f-i the campaign caption STATES the billing-campaign rule (a run with a "
+      "billing campaign continues the nearest preceding run carrying the same "
+      "one, whatever its status or resume flag) and that a zero-success "
+      "restart is one campaign; the stale resume-only help is gone",
+      ("A run that carries a **billing campaign** continues the nearest "
+       "preceding run carrying the same one, whatever that run's status and "
+       "whether or not it resumed a checkpoint" in _caption,
+       "`resumed` = 0" in _caption,
+       "exactly when something was resumed" in Path(
+           _run_health.__file__).read_text(encoding="utf-8")),
+      (True, True, False))
 
 
 # ===========================================================================
@@ -1231,6 +1275,64 @@ check("4d MEASURED: sixteen Stage 5 attempts (one per-trial patient's warmup "
       (len(_COMMITS), len(ro_rows(_DB_OK, "SELECT 1 FROM billing_attempts"))),
       (32, 16))
 
+# 4r: THE RESERVATION IS COMMITTED BEFORE THE DISPATCH (the P4 recovery). The
+# stand-in provider reads the billing table through an INDEPENDENT read-only
+# connection at the instant it is called. Under WAL that connection sees only
+# committed transactions, so seeing the row there is seeing it on disk to the
+# durability bound -- a reservation still inside an open transaction, or held
+# only in memory, reads as nothing.
+_DB_R = new_db("p4_reserve_before_dispatch.db")
+_R_R = _dl.start_run_record("batch", db_path=_DB_R, fingerprint=FIXED_FP)
+_SEEN_AT_DISPATCH = []
+
+
+def _chat_reads_reservation(kw):
+    _SEEN_AT_DISPATCH.append(ro_rows(
+        _DB_R, "SELECT state, campaign_id, run_id FROM billing_attempts "
+               "WHERE state = 'reserved'"))
+    return _chat_response((100, 10))
+
+
+class _MemorySink:
+    """CONTROL: a sink that 'reserves' in memory and writes nothing."""
+
+    def __init__(self):
+        self.rows = {}
+
+    def reserve(self, **fields):
+        self.rows[fields["attempt_id"]] = fields
+        return fields["attempt_id"]
+
+    def settle(self, attempt_id, **fields):
+        return _dl.SETTLE_SETTLED
+
+
+_reserve_client = _Client(chat=_chat_reads_reservation)
+deps.set_override(deps.OPENAI_CLIENT, _reserve_client)
+try:
+    with sink_installed(_DB_R, "camp-r", _R_R):
+        _r_out = drive(_ev.call_matching_model, "system prompt", "user prompt")
+    _reset_spend_state()
+    _spend.BILLING_RECORD.install(_MemorySink())
+    try:
+        drive(_ev.call_matching_model, "system prompt", "user prompt")
+    finally:
+        _spend.BILLING_RECORD.clear()
+finally:
+    deps.clear_override(deps.OPENAI_CLIENT)
+    _reset_spend_state()
+check("4r *** at the instant the provider is called, an INDEPENDENT connection "
+      "already reads the attempt's reservation: it was COMMITTED before the "
+      "dispatch ***",
+      (_reserve_client.calls, at(_SEEN_AT_DISPATCH, 0)),
+      (2, [("reserved", "camp-r", _R_R)]))
+check("4r-i CONTROL: a sink that reserves without writing is caught by the same "
+      "read -- the independent connection sees NOTHING at dispatch",
+      at(_SEEN_AT_DISPATCH, 1), [])
+check("4r-ii ...and the real reservation is settled after the response",
+      ro_rows(_DB_R, "SELECT state, outcome FROM billing_attempts"),
+      [("settled", "response")])
+
 # THE IDENTITY FILE'S SYNC ORDER.
 _SYNC_LOG = []
 
@@ -1280,6 +1382,13 @@ try:
     _w_fail = raised(_runner.write_campaign_record, "camp-sync", FIXED_FP, "dig")
     _left = sorted(os.listdir(_CP4))
     _FAIL_FULLFSYNC_ON.clear()
+    # THE DIRECTORY'S F_FULLFSYNC REFUSED (the P4 recovery). The first version
+    # counted this and carried on; it is a refusal now, like the file's.
+    _FAIL_FULLFSYNC_ON.add("dir")
+    _w_dir_fail = raised(_runner.write_campaign_record, "camp-sync-dir",
+                         FIXED_FP, "dig")
+    _left_dir = sorted(os.listdir(_CP4))
+    _FAIL_FULLFSYNC_ON.clear()
     _SYNC_LOG.clear()
     _runner.write_campaign_record("camp-sync", FIXED_FP, "dig")
     _SYNC_LOG.clear()
@@ -1303,8 +1412,21 @@ if _darwin:
           "campaign by name and leaves no record or temp file ***",
           (getattr(_w_fail, "reason", None), _left),
           (_runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE, []))
+    check("4f-i ...and the refusal names the stage that failed",
+          "syncing the temp file" in str(_w_fail), True)
+    check("4f-ii *** a DIRECTORY F_FULLFSYNC refusal also REFUSES by name, "
+          "leaving the renamed record and no temp file (it used to be counted "
+          "and ignored) ***",
+          (getattr(_w_dir_fail, "reason", None),
+           "syncing the directory after the rename" in str(_w_dir_fail),
+           _left_dir),
+          (_runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE, True,
+           [_runner.CAMPAIGN_RECORD_FILENAME]))
 else:
     skip("4f F_FULLFSYNC refusal control", f"{sys.platform} has no F_FULLFSYNC")
+    skip("4f-i F_FULLFSYNC refusal stage", f"{sys.platform} has no F_FULLFSYNC")
+    skip("4f-ii directory F_FULLFSYNC refusal",
+         f"{sys.platform} has no F_FULLFSYNC")
 check("4g a cleared record's removal is synced through its directory",
       ("fsync", "dir") in _clear_order, True)
 
@@ -1610,25 +1732,127 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
     return entry(fhir_path)
 
 runner.process_patient = patient
-runner.main()
+
+# P4 FAILURE INJECTION (the P4 recovery). Each plant breaks ONE durable write at
+# the point it would really fail, below the code under test: a commit that
+# raises, a file or directory sync that raises. Nothing above the plant is
+# replaced, so what is measured is how main() reacts.
+def inject(kind):
+    if not kind:
+        return
+    import sqlite3, stat
+    from oncotriage.storage import database_logger as dl
+    if kind in ("commit_reserve", "commit_stamp"):
+        needle = ("INSERT OR IGNORE INTO BILLING_ATTEMPTS"
+                  if kind == "commit_reserve"
+                  else "UPDATE RUNS SET BILLING_CAMPAIGN_ID")
+        real = dl._open_billing_connection
+
+        class FailingCommit:
+            def __init__(self, conn):
+                self._conn, self._hit = conn, False
+                conn.set_trace_callback(self._trace)
+
+            def _trace(self, sql):
+                if sql.strip().upper().startswith(needle):
+                    self._hit = True
+
+            def cursor(self):
+                return self._conn.cursor()
+
+            def execute(self, *a):
+                return self._conn.execute(*a)
+
+            def commit(self):
+                if self._hit:
+                    raise sqlite3.OperationalError(
+                        "disk I/O error (planted at commit)")
+                return self._conn.commit()
+
+            def close(self):
+                return self._conn.close()
+
+        dl._open_billing_connection = lambda db_path: FailingCommit(real(db_path))
+    elif kind == "stamp_weak":
+        real_open, real_billing = dl._open_connection, dl._open_billing_connection
+
+        class Weak(sqlite3.Connection):
+            def execute(self, sql, *a):
+                if str(sql).strip().upper() == "PRAGMA SYNCHRONOUS = FULL":
+                    sql = "PRAGMA synchronous = OFF"
+                return super().execute(sql, *a)
+
+        def weak_billing(db_path):
+            dl._open_connection = lambda p, read_only=False: (
+                real_open(p, read_only=True) if read_only
+                else sqlite3.connect(p, timeout=30.0, factory=Weak))
+            try:
+                return real_billing(db_path)
+            finally:
+                dl._open_connection = real_open
+
+        dl._open_billing_connection = weak_billing
+    elif kind in ("file_sync", "dir_sync"):
+        real_os, want_dir = runner.os, kind == "dir_sync"
+
+        class OsProxy:
+            def __getattr__(self, name):
+                return getattr(real_os, name)
+
+            @staticmethod
+            def fsync(fd):
+                is_dir = stat.S_ISDIR(real_os.fstat(fd).st_mode)
+                if is_dir == want_dir:
+                    raise OSError(5, "planted EIO on "
+                                  + ("directory" if is_dir else "file")
+                                  + " fsync")
+                return real_os.fsync(fd)
+
+        runner.os = OsProxy()
+    elif kind == "dir_fullfsync":
+        real_fcntl = runner.fcntl
+
+        def fc(fd, cmd, *a):
+            if (cmd == real_fcntl.F_FULLFSYNC
+                    and stat.S_ISDIR(os.fstat(fd).st_mode)):
+                raise OSError(45, "planted F_FULLFSYNC refusal on the directory")
+            return real_fcntl.fcntl(fd, cmd, *a)
+
+        runner.fcntl = types.SimpleNamespace(fcntl=fc,
+                                             F_FULLFSYNC=real_fcntl.F_FULLFSYNC)
+    else:
+        raise SystemExit(f"unknown injection {kind!r}")
+
+inject(cfg.get("inject"))
+EXIT = 0
+try:
+    runner.main()
+except SystemExit as _stop:
+    EXIT = _stop.code
 snap = spend.BILLING_RECORD.liability_snapshot()
+EXTRA = dict(exit_code=EXIT, inject=cfg.get("inject"),
+             billing_faults=dict(spend.BILLING_RECORD_FAULTS),
+             latch=[spend.SPEND_STOP.requested, spend.SPEND_STOP.limit])
 if cfg["mode"] == "campaign":
     dump(measured=spend.SPEND_LEDGER.measured, total=spend.SPEND_LEDGER.total,
          remaining=spend.remaining(spend.SPEND_SOURCE_STAGE5),
          tally={k: list(v) for k, v in snap.items()},
          report=spend.report_lines(), calls=CLIENT.calls,
-         faults=dict(spend.SPEND_LEDGER_FAULTS))
+         faults=dict(spend.SPEND_LEDGER_FAULTS), **EXTRA)
 else:
-    dump(**OBSERVED)
+    dump(**OBSERVED, **EXTRA)
+if EXIT:
+    sys.exit(EXIT)
 ''', encoding="utf-8")
 
 
-def child(mode, *, db, cp, corpus, cap, timeout=240):
+def child(mode, *, db, cp, corpus, cap, timeout=240, inject=None):
     out = os.path.join(cp, f"{mode}.json")
     if os.path.exists(out):
         os.remove(out)
     cfg = {"mode": mode, "repo": _REPO, "tests": _TESTS, "db": db, "cp": cp,
-           "corpus": corpus, "cap": cap, "out": out, "fingerprint": FIXED_FP}
+           "corpus": corpus, "cap": cap, "out": out, "fingerprint": FIXED_FP,
+           "inject": inject}
     env = dict(os.environ)
     _control_harness.isolate_qdrant(env)
     env["ONCOTRIAGE_DEFER_LOCAL_MODELS"] = "1"
@@ -1715,6 +1939,149 @@ check("5i *** SUMMARY GROUPING: the two processes are ONE campaign in "
 check("5i-i ...while both run rows still read resumed = 0",
       [r[0] for r in ro_rows(_DB5, "SELECT resumed FROM runs ORDER BY id")],
       [0, 0])
+
+
+# ===========================================================================
+section("SECTION 4 (continued) -- P4 failure injection through the REAL main()")
+# ===========================================================================
+#
+# EACH DURABLE WRITE BROKEN ONCE, AT THE POINT IT WOULD REALLY FAIL, and each
+# followed by an ordinary restart against the same database and checkpoint
+# directory. What is asserted is the property the P4 brief names, per failure:
+# NO PAID DISPATCH (the stand-in provider was never called), A NAMED REFUSAL
+# (printed and, for the stamp, recorded on the run row as KILLED with no billing
+# campaign id -- the P3 interaction), and SAFE RESTART BEHAVIOUR (the next run
+# bills normally under one campaign, with no orphaned reservation and nothing
+# counted twice).
+
+_DARWIN_FULLFSYNC = sys.platform == "darwin" and hasattr(fcntl, "F_FULLFSYNC")
+_REFUSAL_INJECTIONS = (
+    # kind,            refusal reason,                                record left?, restart decision
+    ("commit_stamp", _runner.CAMPAIGN_REFUSAL_BILLING_UNWRITABLE, True,
+     _runner.CAMPAIGN_DECISION_CONTINUED),
+    ("stamp_weak", _runner.CAMPAIGN_REFUSAL_BILLING_UNWRITABLE, True,
+     _runner.CAMPAIGN_DECISION_CONTINUED),
+    ("file_sync", _runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE, False,
+     _runner.CAMPAIGN_DECISION_NEW),
+    ("dir_sync", _runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE, True,
+     _runner.CAMPAIGN_DECISION_CONTINUED),
+) + ((("dir_fullfsync", _runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE, True,
+       _runner.CAMPAIGN_DECISION_CONTINUED),) if _DARWIN_FULLFSYNC else ())
+if not _DARWIN_FULLFSYNC:
+    skip("4s-dir_fullfsync injection", f"{sys.platform} has no F_FULLFSYNC")
+
+
+def _decision_line(proc):
+    text = (getattr(proc, "stdout", "") or "") + (getattr(proc, "stderr", "") or "")
+    return next((l.strip() for l in text.splitlines()
+                 if l.strip().startswith("[Campaign] ") and l.strip().endswith(")")
+                 and " (" in l), None)
+
+
+def _restart_is_safe(label, db, cp, decision, first_statuses=("KILLED",),
+                     first_has_id=False):
+    """The ordinary restart after a refusal: it bills, under ONE campaign."""
+    proc, data = child("campaign", db=db, cp=cp, corpus=_CORPUS, cap=_E2E_CAP)
+    rec = drive(lambda: json.loads(Path(record_path(cp)).read_text()))
+    cid = at(rec, "campaign_id")
+    runs = drive(ro_rows, db, "SELECT id, status, billing_campaign_id FROM runs "
+                              "ORDER BY id")
+    rows = drive(ro_rows, db, "SELECT DISTINCT campaign_id, run_id, state FROM "
+                              "billing_attempts")
+    total = drive(_dl.campaign_billing_total, cid, db_path=db)
+    settled_sum = at(at(drive(ro_rows, db, "SELECT COALESCE(SUM(settled_usd), 0) "
+                                           "FROM billing_attempts"), 0), 0)
+    check(f"4s-{label}-restart *** SAFE RESTART: the next run exits 0, dispatches "
+          f"(12 wire attempts), decides {decision!r}, stamps ITS run row with "
+          f"the recorded campaign, and every billing row is that run's, "
+          f"settled ***",
+          (proc.returncode, at(data, "calls"),
+           str(_decision_line(proc) or "").endswith(f"({decision})"),
+           len(runs) if isinstance(runs, list) else runs,
+           at(at(runs, 0), 1) in first_statuses,
+           (at(at(runs, 0), 2) == cid) is first_has_id,
+           (at(at(runs, 1), 1), at(at(runs, 1), 2) == cid),
+           sorted({(r[0] == cid, r[1], r[2]) for r in rows})
+           if isinstance(rows, list) else rows),
+          (0, 12, True, 2, True, True, ("FAILED", True),
+           [(True, 2, "settled")]))
+    check(f"4s-{label}-restart-i ...and its budget is exactly its own billing "
+          f"rows: nothing from the refused run, nothing reserved, nothing twice",
+          (getattr(total, "attempts", None), getattr(total, "unresolved", None),
+           near(getattr(total, "usd", None), settled_sum)),
+          (12, 0, True))
+
+
+for _kind, _reason, _record_left, _decision in _REFUSAL_INJECTIONS:
+    _dbx = os.path.join(_TMP, f"inject_{_kind}.db")
+    _cpx = os.path.join(_TMP, f"cp_inject_{_kind}")
+    os.makedirs(_cpx)
+    _px, _dx = child("campaign", db=_dbx, cp=_cpx, corpus=_CORPUS, cap=_E2E_CAP,
+                     inject=_kind)
+    _outx = (_px.stdout or "") + (_px.stderr or "")
+    check(f"4s-{_kind} *** NO PAID DISPATCH and a NAMED REFUSAL: exit 1, the "
+          f"stand-in provider never called, the refusal block names "
+          f"{_reason!r} and says nothing was billed ***",
+          (_px.returncode, at(_dx, "exit_code"), at(_dx, "calls"),
+           f"REFUSING TO START PAID WORK: {_reason}" in _outx,
+           "NOTHING HAS BEEN BILLED" in _outx),
+          (1, 1, 0, True, True))
+    check(f"4s-{_kind}-i *** THE RUN ROW: KILLED, finished, and carrying NO "
+          f"billing campaign id; no billing row exists ***",
+          (drive(ro_rows, _dbx, "SELECT status, finished_at IS NOT NULL, "
+                                "billing_campaign_id FROM runs"),
+           at(at(drive(ro_rows, _dbx, "SELECT COUNT(*) FROM billing_attempts"),
+                 0), 0)),
+          ([("KILLED", 1, None)], 0))
+    check(f"4s-{_kind}-ii ...the identity record is "
+          f"{'left, naming a campaign with no spend' if _record_left else 'absent'}"
+          f", and no temp file is left behind",
+          (os.path.exists(record_path(_cpx)),
+           sorted(n for n in os.listdir(_cpx) if n.endswith(".tmp"))),
+          (_record_left, []))
+    if _kind == "file_sync":
+        check("4s-file_sync-iii ...and the refusal names the failed stage",
+              "failed while syncing the temp file" in _outx, True)
+    if _kind in ("dir_sync", "dir_fullfsync"):
+        check(f"4s-{_kind}-iii ...and the refusal names the failed stage",
+              "failed while syncing the directory after the rename" in _outx,
+              True)
+    if _kind == "stamp_weak":
+        check("4s-stamp_weak-iii ...and the refusal says the connection could "
+              "not be made synchronous", "synchronous" in _outx, True)
+    _restart_is_safe(_kind, _dbx, _cpx, _decision)
+
+# A FAILED COMMIT OF A RESERVATION, MID-RUN. The campaign is established and
+# stamped; the first billed attempt's reservation commit raises. Nothing may be
+# dispatched, the run must say why it stopped, and the restart must continue
+# the campaign with a budget that holds nothing from the refused attempt.
+_dbc = os.path.join(_TMP, "inject_commit_reserve.db")
+_cpc = os.path.join(_TMP, "cp_inject_commit_reserve")
+os.makedirs(_cpc)
+_pc, _dc = child("campaign", db=_dbc, cp=_cpc, corpus=_CORPUS, cap=_E2E_CAP,
+                 inject="commit_reserve")
+_cidc = at(drive(lambda: json.loads(Path(record_path(_cpc)).read_text())),
+           "campaign_id")
+check("4t *** A FAILED RESERVATION COMMIT: NO PAID DISPATCH, the run latches "
+      "under the billing-record limit, and no billing row exists ***",
+      (at(_dc, "calls"), at(_dc, "latch"),
+       at(at(drive(ro_rows, _dbc, "SELECT COUNT(*) FROM billing_attempts"), 0), 0),
+       any(str(k).startswith("reserve:") for k in (at(_dc, "billing_faults") or {}))),
+      (0, [True, "billing_record"], 0, True))
+check("4t-i *** NAMED: the run row records stop_reason 'billing_record' and "
+      "carries the campaign it was stamped with ***",
+      drive(ro_rows, _dbc, "SELECT stop_reason, billing_campaign_id = ? FROM runs",
+            (_cidc,)),
+      [(_dl.RUN_STOP_REASON_BILLING_RECORD, 1)])
+# THE REFUSED RUN HERE WAS STAMPED (its campaign was established before the
+# reservation failed), and its terminal status is a SCHEDULING fact rather than
+# a durability one: FAILED when both patients had started before the latch (the
+# cohort was covered, every patient failed), STOPPED when the latch kept the
+# second from starting (the run covers a prefix). Both are the runner's honest
+# statuses -- measured, the plant matrix saw each -- so either is accepted, and
+# 4t-i pins what must not vary: stop_reason 'billing_record'.
+_restart_is_safe("commit_reserve", _dbc, _cpc, _runner.CAMPAIGN_DECISION_CONTINUED,
+                 first_statuses=("FAILED", "STOPPED"), first_has_id=True)
 
 
 # ===========================================================================
