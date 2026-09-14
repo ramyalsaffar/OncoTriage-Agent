@@ -25,6 +25,10 @@ WHAT THIS FILE HOLDS
        campaign, then a fresh process resuming it; live and resumed figures
        reconciled per outcome, settled and unresolved separately, printed lines
        compared, summary grouping read.
+    8. P1c -- a settlement's STORED outcome decides, not its returned one: a
+       commit whose acknowledgement was lost is verified landed; an unreadable
+       row is handled conservatively and latches; the billing-record banner
+       prints a sentence true of each cause. In process and in fresh processes.
 
 NO NETWORK, NO KEYS, NO SPEND, NO LIVE QDRANT, NO MODEL LOAD, NO CORPUS. Every
 provider client is a stand-in installed through ``oncotriage/agent/deps.py``;
@@ -2293,6 +2297,25 @@ def inject(kind):
 
         runner.fcntl = types.SimpleNamespace(fcntl=fc,
                                              F_FULLFSYNC=real_fcntl.F_FULLFSYNC)
+    elif kind.startswith("ack_"):
+        # P1c: EVERY settlement really COMMITS and then loses its
+        # acknowledgement -- it reports `failed` (`ack_failed`), or raises after
+        # the commit (`ack_raised`). `ack_unverifiable` additionally makes the
+        # stored row unreadable to the verification, so the liability must be
+        # handled without knowing whether the commit landed.
+        real_settle = dl.settle_billing_attempt
+
+        def settle(db_path, attempt_id, **kw):
+            res = real_settle(db_path, attempt_id, **kw)
+            if res == "settled":
+                if kind == "ack_raised":
+                    raise OSError(5, "planted EIO after the commit")
+                return "failed"
+            return res
+
+        dl.settle_billing_attempt = settle
+        if kind == "ack_unverifiable":
+            dl.billing_attempt_stored_state = lambda *a, **k: None
     elif kind.startswith("settle_"):
         # P1b: the FIRST settlement of the run finds its row DELETED (missing)
         # or already SETTLED at $0 by somebody else (conflict). `_deferred`
@@ -2337,7 +2360,8 @@ except SystemExit as _stop:
 snap = spend.BILLING_RECORD.liability_snapshot()
 EXTRA = dict(exit_code=EXIT, inject=cfg.get("inject"),
              billing_faults=dict(spend.BILLING_RECORD_FAULTS),
-             latch=[spend.SPEND_STOP.requested, spend.SPEND_STOP.limit])
+             latch=[spend.SPEND_STOP.requested, spend.SPEND_STOP.limit],
+             latch_cause=spend.SPEND_STOP.cause)
 if cfg["mode"] == "campaign":
     dump(measured=spend.SPEND_LEDGER.measured, total=spend.SPEND_LEDGER.total,
          remaining=spend.remaining(spend.SPEND_SOURCE_STAGE5),
@@ -2774,7 +2798,8 @@ check("7e *** THE OLD ESTIMATE WAS NOT A BOUND: 5,000 four-byte characters "
       (True, True, True, True))
 
 _DL_PATCHABLE = ("settle_billing_attempt", "record_settlement_discrepancy",
-                 "write_discrepancy_marker", "billing_attempt_settled_usd")
+                 "write_discrepancy_marker", "billing_attempt_settled_usd",
+                 "billing_attempt_stored_state")
 _DL_START = {n: getattr(_dl, n) for n in _DL_PATCHABLE}
 _REAL_SETTLE = _DL_START["settle_billing_attempt"]
 
@@ -2809,7 +2834,8 @@ def p1b_case(name, client, call, *, patches=None, discrepancy_dir=None,
                         "tally": _spend.BILLING_RECORD.liability_snapshot(),
                         "record_faults": dict(_spend.BILLING_RECORD_FAULTS),
                         "latch": (_spend.SPEND_STOP.requested,
-                                  _spend.SPEND_STOP.limit)}
+                                  _spend.SPEND_STOP.limit),
+                        "cause": _spend.SPEND_STOP.cause}
             finally:
                 _spend.BILLING_RECORD.clear()
                 _restore_dl()
@@ -3341,6 +3367,453 @@ check("7z-iii *** THE STATED BOUND, THROUGH main(): with the database AND the "
        _e_unr["markers"], at(at(_d2, "seed"), "usd") is not None
        and at(at(_d2, "seed"), "usd") < at(_d1, "measured")),
       ([True, _spend.SPEND_LIMIT_BILLING_RECORD], True, 1, ([], []), True))
+
+
+# ===========================================================================
+section("SECTION 8 -- P1c: a settlement's STORED outcome, not its returned one")
+# ===========================================================================
+#
+# A SETTLEMENT CAN COMMIT AND THEN LOSE ITS ACKNOWLEDGEMENT. Measured before the
+# P1c change, in fresh processes through the real main(): the real settlement
+# committed $0.0032 and reported `failed`; the live run charged the $0.38484
+# reservation and a fresh process seeded at $0.0032, with no discrepancy row --
+# a resumed figure below the live conservative total. `AttemptLiability` now
+# reads the row back and decides from what is STORED.
+
+_P_LOW = _spend.price_usage(_WIRE, 321, 45)[0]
+_P_HIGH = _spend.price_usage(_WIRE, 10 ** 7, 45)[0]
+_CONSOLE_START = _spend.console
+
+
+def _commit_then(exc=None):
+    """The REAL settlement commits; then its acknowledgement is lost."""
+    def settle(db_path, attempt_id, **kw):
+        res = _REAL_SETTLE(db_path, attempt_id, **kw)
+        if res != _dl.SETTLE_SETTLED:
+            return res
+        if exc is not None:
+            raise exc
+        return _dl.SETTLE_FAILED
+    return settle
+
+
+def _foreign_settle_then_failed(amount, outcome):
+    """Something else settles the row; this process's settlement reports
+    `failed` without writing."""
+    def settle(db_path, attempt_id, **kw):
+        _REAL_SETTLE(db_path, attempt_id, outcome=outcome, settled_usd=amount)
+        return _dl.SETTLE_FAILED
+    return settle
+
+
+def _sql_then_failed(sql, params_of):
+    def settle(db_path, attempt_id, **kw):
+        conn = sqlite3.connect(db_path)
+        try:
+            conn.execute(sql, params_of(attempt_id))
+            conn.commit()
+        finally:
+            conn.close()
+        return _dl.SETTLE_FAILED
+    return settle
+
+
+def _s5_low():
+    return _Client(chat=lambda kw: _chat_response((321, 45)))
+
+
+def _fault(case, key):
+    faults = at(case["live"], "record_faults")
+    return faults.get(key) if isinstance(faults, dict) else faults
+
+
+def _meas(case):
+    return case["live"].get("measured")
+
+
+check("8a non-degeneracy: the priced response is BELOW its reservation and the "
+      "large one ABOVE it, so trusting `failed` and trusting the stored row "
+      "give different amounts",
+      (_P_LOW < _RESERVE_S5 - 1e-6, _P_HIGH > _RESERVE_S5 + 1e-6), (True, True))
+
+_c8a = p1b_case("p1c_landed_ack_failed", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _commit_then()})
+check("8a-i *** COMMITTED, THEN REPORTED `failed`: the row is read back and the "
+      "settlement recognised as LANDED -- live is the priced amount, no top-up, "
+      "no discrepancy row, no latch ***",
+      (_kinds(_c8a), near(_meas(_c8a), _P_LOW), at(_c8a["live"], "latch"),
+       _fault(_c8a, "settle:verified_landed:failed")),
+      ([("attempt", "settled")], True, (False, None), 1))
+check("8a-ii *** ...and a fresh reading EQUALS live: settled, unresolved, total "
+      "and remaining ***", parity_holds(_c8a), (True, True, True, True))
+
+_c8b = p1b_case("p1c_landed_ack_raised", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt":
+                         _commit_then(OSError(5, "planted EIO after commit"))})
+check("8b *** COMMITTED, THEN THE SINK RAISED: verified landed the same way, and "
+      "a fresh reading equals live ***",
+      (_kinds(_c8b), near(_meas(_c8b), _P_LOW), at(_c8b["live"], "latch"),
+       _fault(_c8b, "settle:raised:OSError"),
+       _fault(_c8b, "settle:verified_landed:failed"), parity_holds(_c8b)),
+      ([("attempt", "settled")], True, (False, None), 1, 1,
+       (True, True, True, True)))
+
+_c8c = p1b_case("p1c_over_landed_ack_failed",
+                _Client(chat=lambda kw: _chat_response((10 ** 7, 45))),
+                _s5_call, patches={"settle_billing_attempt": _commit_then()})
+check("8c a response priced ABOVE its reservation that LANDED and lost its "
+      "acknowledgement: verified at the priced amount, no discrepancy owed, "
+      "parity holds",
+      (_kinds(_c8c), near(_meas(_c8c), _P_HIGH), parity_holds(_c8c)),
+      ([("attempt", "settled")], True, (True, True, True, True)))
+
+_c8d = p1b_case("p1c_not_landed_verified", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _returns(_dl.SETTLE_FAILED)})
+check("8d a `failed` that really did NOT land is VERIFIED reserved: read at the "
+      "reservation as before, no discrepancy, no latch, parity holds",
+      (_kinds(_c8d), near(_meas(_c8d), _RESERVE_S5), at(_c8d["live"], "latch"),
+       _fault(_c8d, "settle:verified_reserved:failed"), parity_holds(_c8d)),
+      ([("attempt", "reserved")], True, (False, None), 1,
+       (True, True, True, True)))
+
+_c8e = p1b_case("p1c_unverified_landed", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _commit_then(),
+                         "billing_attempt_stored_state": _returns(None)})
+_disc8e = [r for r in _c8e["rows"] if r[1] == "settlement_discrepancy"]
+check("8e *** THE STORED OUTCOME CANNOT BE READ and the commit HAD landed: live "
+      "keeps the conservative reservation, the discrepancy row carries "
+      "reservation - priced, and a fresh reading EQUALS live ***",
+      (_kinds(_c8e), near(_meas(_c8e), _RESERVE_S5),
+       near(at(at(_disc8e, 0), 5), _RESERVE_S5 - _P_LOW),
+       near(getattr(_c8e["durable"], "usd", None), _meas(_c8e)),
+       near(_c8e["resumed_remaining"], _c8e["live"].get("remaining"))),
+      ([("attempt", "settled"), ("settlement_discrepancy", "settled")], True,
+       True, True, True))
+check("8e-i ...settled and unresolved separately: live settled == durable "
+      "settled; nothing open live, nothing reserved durably",
+      (near(_c8e["settled_live"], _c8e["settled_durable"]),
+       _c8e["open_live"][0], _c8e["reserved_durable"][0]), (True, 0, 0))
+check("8e-ii ...the run LATCHES with cause `unverified`, and the faults name the "
+      "path",
+      (at(_c8e["live"], "latch"), at(_c8e["live"], "cause"),
+       _fault(_c8e, "settle:unverified:failed"),
+       _fault(_c8e, "discrepancy:unverified:recorded")),
+      ((True, _spend.SPEND_LIMIT_BILLING_RECORD),
+       _spend.BILLING_RECORD_CAUSE_UNVERIFIED, 1, 1))
+
+_c8f = p1b_case("p1c_unverified_not_landed", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _returns(_dl.SETTLE_FAILED),
+                         "billing_attempt_stored_state": _returns(None)})
+check("8f *** THE STORED OUTCOME CANNOT BE READ and the commit had NOT landed: "
+      "the fresh reading is ABOVE live by exactly reservation - priced (the "
+      "safe direction, never below), and the run latches ***",
+      (_kinds(_c8f), near(_meas(_c8f), _RESERVE_S5),
+       near((getattr(_c8f["durable"], "usd", None) or 0) - (_meas(_c8f) or 0),
+            _RESERVE_S5 - _P_LOW),
+       isinstance(_c8f["resumed_remaining"], float)
+       and _c8f["resumed_remaining"] < _c8f["live"].get("remaining", 0),
+       at(_c8f["live"], "latch")),
+      ([("attempt", "reserved"), ("settlement_discrepancy", "settled")], True,
+       True, True, (True, _spend.SPEND_LIMIT_BILLING_RECORD)))
+
+_c8g = p1b_case("p1c_verified_conflict", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt":
+                         _foreign_settle_then_failed(0.0, "not_billed")})
+_disc8g = [r for r in _c8g["rows"] if r[1] == "settlement_discrepancy"]
+check("8g *** `failed` reported while the row holds a settlement this process "
+      "did not write: VERIFIED as a CONFLICT -- the stored row stands, the "
+      "shortfall is its own row, the run latches with cause `conflict`, and a "
+      "fresh reading EQUALS live ***",
+      (_kinds(_c8g), _note_result(at(_disc8g, 0) or [None] * 7),
+       at(_c8g["live"], "cause"), _fault(_c8g, "settle:verified_conflict:failed"),
+       parity_holds(_c8g)),
+      ([("attempt", "settled"), ("settlement_discrepancy", "settled")],
+       "conflict", _spend.BILLING_RECORD_CAUSE_CONFLICT, 1,
+       (True, True, True, True)))
+
+_c8h = p1b_case("p1c_verified_missing", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _sql_then_failed(
+                    "DELETE FROM billing_attempts WHERE attempt_id = ?",
+                    lambda aid: (aid,))})
+check("8h `failed` reported while the row is GONE: VERIFIED missing -- a "
+      "discrepancy row retains the live charge, the run latches with cause "
+      "`missing`, and a fresh reading refuses as incomplete",
+      (_kinds(_c8h), at(_c8h["live"], "cause"),
+       type(_c8h["durable_exc"]).__name__,
+       near(getattr(_c8h["durable_exc"], "retained_usd", None), _meas(_c8h))),
+      ([("settlement_discrepancy", "settled")],
+       _spend.BILLING_RECORD_CAUSE_MISSING, "BillingRecordIncomplete", True))
+
+_c8i = p1b_case("p1c_rereserved", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _sql_then_failed(
+                    "UPDATE billing_attempts SET reserved_usd = 5.0 WHERE "
+                    "attempt_id = ?", lambda aid: (aid,))})
+check("8i `failed` reported while the RESERVED row carries an amount this "
+      "process did not reserve: a CONFLICT at that amount -- live is raised to "
+      "it, the run latches, and a fresh reading EQUALS live",
+      (near(_meas(_c8i), 5.0), at(_c8i["live"], "cause"),
+       near(getattr(_c8i["durable"], "usd", None), _meas(_c8i)),
+       near(_c8i["resumed_remaining"], _c8i["live"].get("remaining"))),
+      (True, _spend.BILLING_RECORD_CAUSE_CONFLICT, True, True))
+
+
+class _NoStateSink(_dl.BillingRecordSink):
+    """A duck-typed sink of the P1b shape: it cannot read a row back."""
+    stored_state = None
+
+
+_db8j = new_db("p1c_nostate.db")
+_run8j = _dl.start_run_record("batch", db_path=_db8j, fingerprint=FIXED_FP)
+_live8j = {}
+deps.set_override(deps.OPENAI_CLIENT, _s5_low())
+try:
+    with settings(SPEND_CAP_USD=_CAP, SPEND_CAP_ENFORCED=True):
+        _reset_spend_state()
+        _dl.settle_billing_attempt = _returns(_dl.SETTLE_FAILED)
+        _spend.BILLING_RECORD.install(_NoStateSink(_db8j, "camp-nostate",
+                                                   _run8j))
+        try:
+            raised(_s5_call)
+            _live8j = {"measured": _spend.SPEND_LEDGER.measured,
+                       "faults": dict(_spend.BILLING_RECORD_FAULTS),
+                       "cause": _spend.SPEND_STOP.cause}
+        finally:
+            _spend.BILLING_RECORD.clear()
+            _restore_dl()
+finally:
+    _restore_dl()
+    deps.clear_override(deps.OPENAI_CLIENT)
+    _reset_spend_state()
+check("8j a sink that CANNOT read a row back never has a reported failure "
+      "trusted: handled as unverified -- conservative live, a discrepancy row, "
+      "latched -- and the missing reader is counted",
+      (near(_live8j.get("measured"), _RESERVE_S5),
+       (_live8j.get("faults") or {}).get("verify:no_state_reader"),
+       _live8j.get("cause"),
+       [(r[0], r[1]) for r in ro_rows(_db8j, "SELECT kind, state FROM "
+                                             "billing_attempts ORDER BY rowid")]),
+      (True, 1, _spend.BILLING_RECORD_CAUSE_UNVERIFIED,
+       [("attempt", "reserved"), ("settlement_discrepancy", "settled")]))
+
+_c8k = p1b_case("p1c_malformed_state", _s5_low(), _s5_call,
+                patches={"settle_billing_attempt": _returns(_dl.SETTLE_FAILED),
+                         "billing_attempt_stored_state": _returns(
+                             {"state": "settled", "reserved_usd": 1.0,
+                              "settled_usd": "x", "outcome": "response"})})
+check("8k a MALFORMED read-back is not a state: unverified, counted, latched",
+      (_fault(_c8k, "verify:malformed"), at(_c8k["live"], "cause"),
+       near(_meas(_c8k), _RESERVE_S5)),
+      (1, _spend.BILLING_RECORD_CAUSE_UNVERIFIED, True))
+
+_db8l = new_db("p1c_reader.db")
+_run8l = _dl.start_run_record("batch", db_path=_db8l, fingerprint=FIXED_FP)
+for _aid, _usd in (("r8-res", 0.5), ("r8-set", 0.7), ("r8-bad", 0.9)):
+    _dl.reserve_billing_attempt(_db8l, attempt_id=_aid, campaign_id="camp-r8",
+                                run_id=_run8l, source="stage5", model=_WIRE,
+                                input_tokens=1, output_tokens=1,
+                                reserved_usd=_usd)
+_dl.settle_billing_attempt(_db8l, "r8-set", outcome="response", settled_usd=0.25)
+_conn8l = sqlite3.connect(_db8l)
+_conn8l.execute("UPDATE billing_attempts SET reserved_usd = 'x' WHERE "
+                "attempt_id = 'r8-bad'")
+_conn8l.commit()
+_conn8l.close()
+check("8l the real stored-state reader: absent, reserved and settled are read "
+      "back with their amounts; an unopenable database and an unsummable "
+      "amount are NOT established (None), never a state",
+      (drive(_dl.billing_attempt_stored_state, _db8l, "r8-none"),
+       drive(_dl.billing_attempt_stored_state, _db8l, "r8-res"),
+       drive(_dl.billing_attempt_stored_state, _db8l, "r8-set"),
+       drive(_dl.billing_attempt_stored_state, _db8l, "r8-bad"),
+       drive(_dl.billing_attempt_stored_state,
+             os.path.join(_TMP, "no-such-dir", "x.db"), "r8-res")),
+      ({"state": "absent"},
+       {"state": "reserved", "reserved_usd": 0.5, "outcome": None},
+       {"state": "settled", "reserved_usd": 0.7, "settled_usd": 0.25,
+        "outcome": "response"}, None, None))
+check("8m the stored-state and banner vocabularies are restated equal across "
+      "the layers, the causes are distinct, and the settled-amount reader is a "
+      "projection of the stored-state reader",
+      ((_spend.STORED_STATE_ABSENT, _spend.STORED_STATE_RESERVED,
+        _spend.STORED_STATE_SETTLED)
+       == (_dl.STORED_STATE_ABSENT, _dl.BILLING_ATTEMPT_STATE_RESERVED,
+           _dl.BILLING_ATTEMPT_STATE_SETTLED),
+       set(_spend._BILLING_RECORD_BANNER) == set(_spend.BILLING_RECORD_CAUSES)
+       | {None},
+       len(set(_spend.BILLING_RECORD_CAUSES)) == len(_spend.BILLING_RECORD_CAUSES),
+       drive(_dl.billing_attempt_settled_usd, _db8l, "r8-set"),
+       drive(_dl.billing_attempt_settled_usd, _db8l, "r8-res")),
+      (True, True, True, 0.25, None))
+
+
+def _banner(limit, cause):
+    """The latch banner, captured at the console surface, and the recorded cause."""
+    lines = []
+    _spend.SPEND_STOP.reset()
+    _spend.console = types.SimpleNamespace(
+        out=lambda *a, **k: lines.append(" ".join(str(x) for x in a)))
+    try:
+        with settings(SPEND_CAP_USD=_CAP, SPEND_CAP_ENFORCED=True):
+            _spend.SPEND_STOP.trip(limit, "a P1c banner probe",
+                                   _spend.SPEND_SOURCE_STAGE5, cause)
+            recorded = _spend.SPEND_STOP.cause
+    finally:
+        _spend.console = _CONSOLE_START
+        _spend.SPEND_STOP.reset()
+    return "\n".join(lines), recorded
+
+
+# PHRASES WRITTEN HERE, NOT READ FROM THE TABLE, so a wrong table entry fails.
+_PHRASE = {
+    _spend.BILLING_RECORD_CAUSE_WRITE_FAILED: "RESERVATION COULD NOT BE WRITTEN",
+    _spend.BILLING_RECORD_CAUSE_UNPRICED: "RESERVATION COULD NOT BE PRICED",
+    _spend.BILLING_RECORD_CAUSE_DEFERRED: "DEFERRED TO A MARKER FILE",
+    _spend.BILLING_RECORD_CAUSE_DISCREPANCY_UNRECORDED:
+        "COULD NOT BE WRITTEN TO THE DATABASE OR TO A MARKER FILE",
+    _spend.BILLING_RECORD_CAUSE_MISSING: "THIS RUN COMMITTED IS GONE FROM",
+    _spend.BILLING_RECORD_CAUSE_CONFLICT:
+        "HOLDS A SETTLEMENT THIS RUN DID NOT WRITE",
+    _spend.BILLING_RECORD_CAUSE_UNVERIFIED: "COULD NOT BE READ BACK",
+    None: "CAN NO LONGER BE TRUSTED",
+    "not-a-cause": "CAN NO LONGER BE TRUSTED",
+}
+_B = {c: _banner(_spend.SPEND_LIMIT_BILLING_RECORD, c) for c in _PHRASE}
+_CEILING = _banner(_spend.SPEND_LIMIT_CALL_CEILING,
+                   _spend.BILLING_RECORD_CAUSE_MISSING)
+check("8n *** THE BANNER, AT THE CONSOLE: each billing-record cause prints its "
+      "own sentence ***",
+      {str(c): _PHRASE[c] in _B[c][0] for c in _PHRASE},
+      {str(c): True for c in _PHRASE})
+check("8n-i *** 'COULD NOT BE WRITTEN' is printed ONLY where a write failed -- "
+      "not for a missing row, a conflict, an unverified outcome, an unpriced "
+      "reservation, or an unknown cause ***",
+      {str(c): "COULD NOT BE WRITTEN" in _B[c][0] for c in _PHRASE},
+      {str(c): c in (_spend.BILLING_RECORD_CAUSE_WRITE_FAILED,
+                     _spend.BILLING_RECORD_CAUSE_DEFERRED,
+                     _spend.BILLING_RECORD_CAUSE_DISCREPANCY_UNRECORDED)
+       for c in _PHRASE})
+check("8n-ii no billing-record banner tells the operator to raise the spend cap; "
+      "CONTROL: the call-ceiling banner still does",
+      ({str(c): "raise config.SPEND_CAP_USD" in _B[c][0] for c in _PHRASE},
+       "raise config.SPEND_CAP_USD" in _CEILING[0]),
+      ({str(c): False for c in _PHRASE}, True))
+check("8n-iii non-degeneracy: every banner was printed and states the stop; the "
+      "latch records the billing-record cause, and records NONE for another "
+      "limit",
+      ({str(c): "no further billed request may be dispatched" in _B[c][0]
+        for c in _PHRASE}, _B[_spend.BILLING_RECORD_CAUSE_CONFLICT][1],
+       _CEILING[1], _spend.console is _CONSOLE_START),
+      ({str(c): True for c in _PHRASE}, _spend.BILLING_RECORD_CAUSE_CONFLICT,
+       None, True))
+
+_db8p = new_db("p1c_latched_message.db")
+_run8p = _dl.start_run_record("batch", db_path=_db8p, fingerprint=FIXED_FP)
+_reset_spend_state()
+_spend.console = types.SimpleNamespace(out=lambda *a, **k: None)
+try:
+    _spend.SPEND_STOP.trip(_spend.SPEND_LIMIT_BILLING_RECORD, "probe",
+                           _spend.SPEND_SOURCE_STAGE5,
+                           _spend.BILLING_RECORD_CAUSE_CONFLICT)
+    _spend.BILLING_RECORD.install(_dl.BillingRecordSink(_db8p, "camp-8p",
+                                                        _run8p))
+    _exc8p = raised(_spend.BILLING_RECORD.reserve, _spend.SPEND_SOURCE_STAGE5,
+                    _WIRE, 1, 1, where="probe")
+finally:
+    _spend.console = _CONSOLE_START
+    _reset_spend_state()
+check("8p a reservation refused because the run is latched names the CAUSE, and "
+      "no longer says the record 'failed'",
+      (type(_exc8p).__name__, "(conflict)" in str(_exc8p),
+       "failed earlier" in str(_exc8p)),
+      ("BillingRecordUnavailable", True, False))
+
+check("8o *** AT THE PRINTED SURFACE, THROUGH main() (section 7's runs): the "
+      "MISSING run prints the missing sentence and the CONFLICT run the "
+      "conflict sentence; neither prints 'COULD NOT BE WRITTEN' or tells the "
+      "operator to raise the cap; the child recorded each cause ***",
+      (_PHRASE[_spend.BILLING_RECORD_CAUSE_MISSING] in _e_miss["out"][0],
+       _PHRASE[_spend.BILLING_RECORD_CAUSE_CONFLICT] in _e_conf["out"][0],
+       "COULD NOT BE WRITTEN" in _e_miss["out"][0] + _e_conf["out"][0],
+       "raise config.SPEND_CAP_USD" in _e_miss["out"][0] + _e_conf["out"][0],
+       at(_e_miss["d"][0], "latch_cause"), at(_e_conf["d"][0], "latch_cause")),
+      (True, True, False, False, _spend.BILLING_RECORD_CAUSE_MISSING,
+       _spend.BILLING_RECORD_CAUSE_CONFLICT))
+
+
+def _live_settled(d):
+    tally = at(d, "tally")
+    return (sum(v[1] for k, v in tally.items() if k != _spend.LIABILITY_OPEN)
+            if isinstance(tally, dict) else tally)
+
+
+def _live_open(d):
+    tally = at(d, "tally")
+    return ((tally.get(_spend.LIABILITY_OPEN) or [0])[0]
+            if isinstance(tally, dict) else tally)
+
+
+def _faults_of(d):
+    faults = at(d, "billing_faults")
+    return faults if isinstance(faults, dict) else {}
+
+
+for _inject, _key in (("ack_failed", "settle:failed"),
+                      ("ack_raised", "settle:raised:OSError")):
+    _e = p1b_e2e(f"p1c_{_inject}", _inject)
+    _x1, _x2, _x3 = _e["d"]
+    check(f"8q-{_inject} non-degeneracy: process 1 made every wire attempt, EVERY "
+          f"settlement committed and then lost its acknowledgement, and at least "
+          f"one priced liability is below its reservation",
+          (at(_x1, "calls"), _faults_of(_x1).get(_key),
+           sum(1 for r in _e["rows"] if r[1] == "settled" and r[3] is not None
+               and r[3] < r[2] - 1e-6) > 0),
+          (12, 12, True))
+    check(f"8q-{_inject}-i *** FRESH PROCESSES: every settlement VERIFIED landed; "
+          f"process 2 continues with a seed EQUAL to process 1's live ledger and "
+          f"a remaining EQUAL to process 1's; process 3 reads the same seed ***",
+          (_faults_of(_x1).get("settle:verified_landed:failed"), at(_x1, "latch"),
+           _e["p"][1].returncode, near(at(at(_x2, "seed"), "usd"),
+                                       at(_x1, "measured")),
+           near(at(_x2, "remaining"), at(_x1, "remaining")),
+           near(at(at(_x3, "seed"), "usd"), at(at(_x2, "seed"), "usd"))),
+          (12, [False, None], 0, True, True, True))
+    check(f"8q-{_inject}-ii *** settled and unresolved SEPARATELY: live settled "
+          f"== durable settled; nothing open live, nothing reserved durably, "
+          f"zero unresolved in the resumed seed, no discrepancy row ***",
+          (near(_live_settled(_x1),
+                sum(r[3] for r in _e["rows"] if r[1] == "settled")),
+           [r for r in _e["rows"] if r[1] == "reserved"], _live_open(_x1),
+           at(at(_x2, "seed"), "unresolved"), len(_e["discrepancies"])),
+          (True, [], 0, 0, 0))
+
+_e_un = p1b_e2e("p1c_ack_unverifiable", "ack_unverifiable")
+_u1, _u2, _u3 = _e_un["d"]
+check("8s *** THE STORED OUTCOME UNREADABLE, FRESH PROCESSES: process 1 latches "
+      "with cause `unverified` and prints so, not 'COULD NOT BE WRITTEN'; "
+      "process 2 continues with a seed EQUAL to process 1's live ledger and an "
+      "equal remaining; process 3 reads the same seed ***",
+      (at(_u1, "latch"), at(_u1, "latch_cause"),
+       _PHRASE[_spend.BILLING_RECORD_CAUSE_UNVERIFIED] in _e_un["out"][0],
+       "COULD NOT BE WRITTEN" in _e_un["out"][0], _e_un["p"][1].returncode,
+       near(at(at(_u2, "seed"), "usd"), at(_u1, "measured")),
+       near(at(_u2, "remaining"), at(_u1, "remaining")),
+       near(at(at(_u3, "seed"), "usd"), at(at(_u2, "seed"), "usd"))),
+      ([True, _spend.SPEND_LIMIT_BILLING_RECORD],
+       _spend.BILLING_RECORD_CAUSE_UNVERIFIED, True, False, 0, True, True, True))
+check("8s-i settled and unresolved separately: live settled == durable settled "
+      "(attempt rows plus their discrepancy rows); nothing open or reserved; at "
+      "least one settlement was unverified and at least one discrepancy row "
+      "exists",
+      (near(_live_settled(_u1),
+            sum(r[3] for r in _e_un["rows"] if r[1] == "settled")),
+       [r for r in _e_un["rows"] if r[1] == "reserved"], _live_open(_u1),
+       (_faults_of(_u1).get("settle:unverified:failed") or 0) >= 1,
+       len(_e_un["discrepancies"]) >= 1),
+      (True, [], 0, True, True))
+check("8t the patched storage functions and the console are restored",
+      (_dl.billing_attempt_stored_state is _DL_START["billing_attempt_stored_state"],
+       _dl.settle_billing_attempt is _SETTLE_START,
+       _spend.console is _CONSOLE_START), (True, True, True))
 
 
 # ===========================================================================

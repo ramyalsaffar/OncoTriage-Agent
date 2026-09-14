@@ -1949,14 +1949,15 @@ def _spend_gate(phase, counter, *, where, count=None):
     if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_BILLING_RECORD:
         spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_BILLING_RECORD}"] += 1
         log.warning("a Stage 5 request was not issued because the campaign's "
-                    "durable billing record could not be written",
+                    "durable billing record latched earlier in this run",
                     stage=5, status="stopped",
                     event="stage5_billing_record_declined", phase=phase,
                     reason=spend.SPEND_LIMIT_BILLING_RECORD, count=count,
                     degraded=True)
         return Stage5SpendStopped(
             "the request was not issued: the campaign's durable billing record "
-            "could not be written earlier in this run",
+            "latched earlier in this run ("
+            + (spend.SPEND_STOP.cause or "cause not recorded") + ")",
             limit=spend.SPEND_LIMIT_BILLING_RECORD)
     if spend.cap_exceeded(spend.SPEND_SOURCE_STAGE5):
         spend.SPEND_GATE_SKIPS[f"{phase}{spend.SPEND_LIMIT_CAP}"] += 1

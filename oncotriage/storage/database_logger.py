@@ -2814,10 +2814,12 @@ configuration can legitimately produce, which is a defect in this pipeline.
 """
 
 RUN_STOP_REASON_BILLING_RECORD = "billing_record"
-"""The campaign's durable billing record could not be written, so no further
-billed request could be dispatched. NOT a budget event and NOT a pipeline
-defect: the database the record lives in is the remedy. See
-``spend.BILLING_RECORD``."""
+"""The campaign's durable billing record could no longer be trusted to count the
+run's charges -- a write failed, a reservation could not be priced, a committed
+row went missing or was settled by something else, or a settlement's stored
+outcome could not be read back (``spend.BILLING_RECORD_CAUSES``) -- so no further
+billed request could be dispatched. NOT a budget event and NOT a pipeline defect.
+See ``spend.BILLING_RECORD``."""
 
 RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR,
                     RUN_STOP_REASON_SPEND_CAP,
@@ -5600,24 +5602,60 @@ class BillingRecordIncomplete(BillingRecordUnreadable):
         self.retained_usd = float(retained_usd)
 
 
-def billing_attempt_settled_usd(db_path, attempt_id):
-    """The amount a SETTLED row holds for ``attempt_id``, or None. NEVER RAISES.
-    None when the row is absent, reserved, unreadable or unsummable."""
+STORED_STATE_ABSENT = "absent"
+"""``billing_attempt_stored_state``'s answer for an attempt id no row carries.
+The other two answers are ``BILLING_ATTEMPT_STATE_RESERVED`` and
+``BILLING_ATTEMPT_STATE_SETTLED``; a restated copy lives in ``spend``, and a test
+pins the three equal."""
+
+
+def billing_attempt_stored_state(db_path, attempt_id):
+    """What the billing record now holds for ``attempt_id``, READ BACK. NEVER
+    RAISES. Returns a dict, or None when the answer could not be established.
+
+      ``{"state": "absent"}``
+      ``{"state": "reserved", "reserved_usd": R, "outcome": None}``
+      ``{"state": "settled", "reserved_usd": R, "settled_usd": S, "outcome": O}``
+
+    None -- NOT ``absent`` -- when the read failed or the row cannot be trusted
+    (an unknown state, an unsummable amount). WHY IT EXISTS (P1c): a settlement
+    whose write COMMITTED can still report ``failed`` (its acknowledgement was
+    lost: a raise after the commit, a sink that raised), so the returned result
+    is not evidence of what the row holds. ``spend.AttemptLiability`` asks this
+    instead, and reads None as "not established", never as a state.
+    """
     try:
         conn = _open_connection(resolve_inference_db_path(db_path),
                                 read_only=True)
         try:
             row = conn.execute(
-                "SELECT state, settled_usd FROM billing_attempts WHERE "
-                "attempt_id = ?", (attempt_id,)).fetchone()
+                "SELECT state, reserved_usd, settled_usd, outcome FROM "
+                "billing_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
         finally:
             conn.close()
     except Exception:                                          # noqa: BLE001
         return None
-    if (row is None or row[0] != BILLING_ATTEMPT_STATE_SETTLED
-            or not _valid_billing_usd(row[1])):
+    if row is None:
+        return {"state": STORED_STATE_ABSENT}
+    state, reserved, settled, outcome = row
+    if not _valid_billing_usd(reserved):
         return None
-    return float(row[1])
+    if state == BILLING_ATTEMPT_STATE_RESERVED:
+        return {"state": state, "reserved_usd": float(reserved), "outcome": None}
+    if state == BILLING_ATTEMPT_STATE_SETTLED and _valid_billing_usd(settled):
+        return {"state": state, "reserved_usd": float(reserved),
+                "settled_usd": float(settled), "outcome": outcome}
+    return None
+
+
+def billing_attempt_settled_usd(db_path, attempt_id):
+    """The amount a SETTLED row holds for ``attempt_id``, or None. NEVER RAISES.
+    None when the row is absent, reserved, unreadable or unsummable. A projection
+    of ``billing_attempt_stored_state``, so the row has one reader."""
+    stored = billing_attempt_stored_state(db_path, attempt_id)
+    if not stored or stored.get("state") != BILLING_ATTEMPT_STATE_SETTLED:
+        return None
+    return stored["settled_usd"]
 
 
 def _discrepancy_note(result, live_usd, durable_usd, shortfall_usd,
@@ -5961,6 +5999,10 @@ class BillingRecordSink:
 
     def settled_usd(self, attempt_id):
         return billing_attempt_settled_usd(self.db_path, attempt_id)
+
+    def stored_state(self, attempt_id):
+        """The row as read back (P1c). NEVER RAISES; None when not established."""
+        return billing_attempt_stored_state(self.db_path, attempt_id)
 
     def record_discrepancy(self, **fields):
         """The database first; a synced marker beside the checkpoint second.

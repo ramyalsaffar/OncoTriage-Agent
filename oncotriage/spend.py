@@ -232,9 +232,42 @@ They are three findings with three remediations and must not be one key. The cap
 means "this campaign has spent its budget" and is answered by raising the budget
 or accepting the stop; the ceiling means "one Stage 5 invocation tried to issue
 more calls than it can legitimately need" and is answered by reading the
-traceback; ``billing_record`` means "the campaign's durable billing record could
-not be written, so no further billed request may be dispatched" and is answered
-by fixing the database the record lives in. See ``BILLING_RECORD``.
+traceback; ``billing_record`` means "the campaign's durable billing record can no
+longer be trusted to count this run's charges, so no further billed request may
+be dispatched" -- WHY is ``SpendStop.cause`` (``BILLING_RECORD_CAUSES``), and the
+remedy depends on it. See ``BILLING_RECORD``.
+"""
+
+BILLING_RECORD_CAUSE_WRITE_FAILED = "write_failed"
+BILLING_RECORD_CAUSE_UNPRICED = "unpriced"
+BILLING_RECORD_CAUSE_DEFERRED = "deferred"
+BILLING_RECORD_CAUSE_DISCREPANCY_UNRECORDED = "discrepancy_unrecorded"
+BILLING_RECORD_CAUSE_MISSING = "missing"
+BILLING_RECORD_CAUSE_CONFLICT = "conflict"
+BILLING_RECORD_CAUSE_UNVERIFIED = "unverified"
+BILLING_RECORD_CAUSES = (BILLING_RECORD_CAUSE_WRITE_FAILED,
+                         BILLING_RECORD_CAUSE_UNPRICED,
+                         BILLING_RECORD_CAUSE_DEFERRED,
+                         BILLING_RECORD_CAUSE_DISCREPANCY_UNRECORDED,
+                         BILLING_RECORD_CAUSE_MISSING,
+                         BILLING_RECORD_CAUSE_CONFLICT,
+                         BILLING_RECORD_CAUSE_UNVERIFIED)
+"""Why a ``billing_record`` latch fired. CLOSED (P1c).
+
+THE BANNER USED TO SAY "COULD NOT BE WRITTEN" FOR ALL OF THEM, which is false for
+four: a reservation that could not be PRICED was never written at all; a row
+that is MISSING or holds a CONFLICTING settlement was written and then changed by
+something else; an UNVERIFIED settlement may well have been written. Each prints
+its own sentence and its own remedy in ``SpendStop._latch``.
+
+  ``write_failed``            a reservation could not be committed.
+  ``unpriced``                a reservation could not be priced; not dispatched.
+  ``deferred``                a settlement shortfall went to a marker file, not
+                              the database.
+  ``discrepancy_unrecorded``  a settlement shortfall reached neither.
+  ``missing``                 a billing row this run committed is gone.
+  ``conflict``                a row this run committed holds another settlement.
+  ``unverified``              a settlement's stored outcome could not be read.
 """
 
 SPEND_SKIP_WARMUP_KEY_PREFIX = "warmup:"
@@ -1947,6 +1980,7 @@ class SpendStop:
         self.spent = None
         self.cap = None
         self.budget = None
+        self.cause = None
 
     def reset(self) -> None:
         """Forget a limit reached by an earlier run in this process."""
@@ -1957,8 +1991,10 @@ class SpendStop:
             self.spent = None
             self.cap = None
             self.budget = None
+            self.cause = None
 
-    def trip(self, limit: str, where: str, source: str) -> bool:
+    def trip(self, limit: str, where: str, source: str,
+             cause: "str | None" = None) -> bool:
         """Latch on a limit a CALL SITE has already decided. Announces once.
 
         Used by the Stage 5 call-ceiling gate, which reaches its verdict from a
@@ -1969,8 +2005,13 @@ class SpendStop:
         and that figure has to be about ONE budget. A ceiling trip announcing
         the campaign's total inside a judge session would be a true number
         about the wrong program.
+
+        ``cause`` (P1c) says WHY a ``billing_record`` latch fired, from
+        ``BILLING_RECORD_CAUSES``; the banner's sentence and remedy depend on it.
+        Ignored for the other limits. An unrecognised or absent cause prints a
+        sentence that claims no mechanism.
         """
-        return self._latch(limit, where, source)
+        return self._latch(limit, where, source, cause)
 
     def poll(self, where: str, source: str) -> bool:
         """Has a spend limit been reached? Reads the ledger.
@@ -1998,13 +2039,15 @@ class SpendStop:
             return False
         return self._latch(SPEND_LIMIT_CAP, where, source)
 
-    def _latch(self, limit: str, where: str, source: str) -> bool:
+    def _latch(self, limit: str, where: str, source: str,
+               cause: "str | None" = None) -> bool:
         with self._lock:
             if self.requested:
                 return True
             self.requested = True
             self.limit = limit
             self.detected_in = where
+            self.cause = cause if limit == SPEND_LIMIT_BILLING_RECORD else None
             try:
                 self.budget = budget_for(source)
             except SpendCapConfigurationError:
@@ -2019,6 +2062,7 @@ class SpendStop:
                     self.cap = None
             _spent, _cap = self.spent, self.cap
             _budget = self.budget
+            _cause = self.cause
 
         # OUTSIDE THE LOCK, for control.StopSwitch.poll's reason: the console
         # writer and the logger take locks of their own and this is reached
@@ -2037,15 +2081,18 @@ class SpendStop:
                         f"REACHED: ${_spent:.2f} of ${_cap:.2f}")
         elif limit == SPEND_LIMIT_BILLING_RECORD:
             # NOT A BUDGET EVENT AND NOT A DEFECT IN THE PIPELINE: the record
-            # that makes a resumed campaign's budget true could not be written,
-            # so dispatching further would spend money a later process cannot
-            # count. The remedy is the database, and the line names that.
-            console.out("[SPEND] THE CAMPAIGN'S DURABLE BILLING RECORD COULD "
-                        "NOT BE WRITTEN; no further billed request may be "
-                        "dispatched.")
+            # that makes a resumed campaign's budget true can no longer be
+            # trusted to count this run's charges, so dispatching further would
+            # spend money a later process cannot count. WHY varies, and so does
+            # the remedy (P1c): this block used to say "COULD NOT BE WRITTEN"
+            # for every cause, which is false for a missing row, a conflicting
+            # settlement, an unverified one and an unpriced reservation.
+            _what, _remedy = _BILLING_RECORD_BANNER.get(
+                _cause, _BILLING_RECORD_BANNER[None])
+            console.out(f"[SPEND] {_what}; no further billed request may be "
+                        f"dispatched.")
             console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "
-                        f"${_spent:.2f}. Fix the database the record lives in "
-                        f"(inferences.billing_attempts) and run again.")
+                        f"${_spent:.2f}. {_remedy}")
         else:
             console.out("[SPEND] A STAGE 5 INVOCATION HIT ITS BILLED-CALL "
                         "CEILING.")
@@ -2067,10 +2114,13 @@ class SpendStop:
         console.out(f"[SPEND] Noticed during {where}. No further billed request "
                     f"will be ISSUED; work already in flight completes and is "
                     f"written.")
-        console.out(f"[SPEND] To continue, raise "
-                    f"{BUDGET_CAP_CONSTANTS.get(_budget, 'config.SPEND_CAP_USD')} "
-                    f"and run again -- a resumed run counts what this one "
-                    f"spent.")
+        if limit != SPEND_LIMIT_BILLING_RECORD:
+            # NOT FOR A BILLING-RECORD STOP, which no cap change fixes (P1c): its
+            # remedy is printed above, per cause.
+            console.out(f"[SPEND] To continue, raise "
+                        f"{BUDGET_CAP_CONSTANTS.get(_budget, 'config.SPEND_CAP_USD')} "
+                        f"and run again -- a resumed run counts what this one "
+                        f"spent.")
         console.out(rule)
         log.warning("a spend limit stopped the run",
                     event="spend_limit_reached", status="stopped",
@@ -2078,6 +2128,57 @@ class SpendStop:
                     cost_usd=round(_spent, 6),
                     threshold=(round(_cap, 6) if _cap is not None else None))
         return True
+
+
+_BILLING_RECORD_BANNER = {
+    BILLING_RECORD_CAUSE_WRITE_FAILED: (
+        "A BILLED ATTEMPT'S RESERVATION COULD NOT BE WRITTEN TO THE CAMPAIGN'S "
+        "DURABLE BILLING RECORD",
+        "Fix the database the record lives in (inferences.billing_attempts) and "
+        "run again."),
+    BILLING_RECORD_CAUSE_UNPRICED: (
+        "A BILLED ATTEMPT'S RESERVATION COULD NOT BE PRICED, so it was not "
+        "dispatched",
+        "Add the model's rates to config.PRICING_CONFIG and run again."),
+    BILLING_RECORD_CAUSE_DEFERRED: (
+        "A SETTLEMENT SHORTFALL COULD NOT BE WRITTEN TO THE DATABASE AND WAS "
+        "DEFERRED TO A MARKER FILE beside the checkpoint",
+        "The next run commits the marker before any paid work; fix the database "
+        "and run again, and do not delete the marker."),
+    BILLING_RECORD_CAUSE_DISCREPANCY_UNRECORDED: (
+        "A SETTLEMENT SHORTFALL COULD NOT BE WRITTEN TO THE DATABASE OR TO A "
+        "MARKER FILE",
+        "A resumed campaign's budget may be lower than this run's charges by the "
+        "shortfall printed on the DISCREPANCY line above; fix the database and "
+        "the checkpoint directory before running again."),
+    BILLING_RECORD_CAUSE_MISSING: (
+        "A BILLING ROW THIS RUN COMMITTED IS GONE FROM THE CAMPAIGN'S DURABLE "
+        "BILLING RECORD",
+        "Its charge is retained as a discrepancy where that could be written "
+        "(see the DISCREPANCY line above); a resumed campaign refuses until the "
+        "database is restored or --fresh starts a new campaign."),
+    BILLING_RECORD_CAUSE_CONFLICT: (
+        "A BILLING ROW THIS RUN COMMITTED HOLDS A SETTLEMENT THIS RUN DID NOT "
+        "WRITE",
+        "The shortfall is retained as a discrepancy where that could be written "
+        "(see the DISCREPANCY line above); find what else writes "
+        "inferences.billing_attempts before running again."),
+    BILLING_RECORD_CAUSE_UNVERIFIED: (
+        "A SETTLEMENT'S STORED OUTCOME COULD NOT BE READ BACK FROM THE "
+        "CAMPAIGN'S DURABLE BILLING RECORD",
+        "This run charged the conservative amount and retained the difference "
+        "as a discrepancy where that could be written (see the DISCREPANCY line "
+        "above); fix the database and run again."),
+    None: (
+        "THE CAMPAIGN'S DURABLE BILLING RECORD CAN NO LONGER BE TRUSTED TO COUNT "
+        "THIS RUN'S CHARGES",
+        "Inspect inferences.billing_attempts and the errors above before running "
+        "again."),
+}
+"""``(what happened, remedy)`` per ``BILLING_RECORD_CAUSES`` member, for
+``SpendStop._latch``. ``None`` is the sentence for an absent or unrecognised
+cause, and it claims no mechanism. A test pins the keys equal to the vocabulary
+plus None."""
 
 
 SPEND_STOP = SpendStop()
@@ -2236,7 +2337,10 @@ class BillingRecord:
 
     THE SINK IS DUCK-TYPED (P1b adds two OPTIONAL methods,
     ``settled_usd(attempt_id)`` and ``record_discrepancy(**fields) -> str``; a
-    sink without them has every discrepancy counted FAILED and the run latched)
+    sink without them has every discrepancy counted FAILED and the run latched.
+    P1c adds a third, ``stored_state(attempt_id) -> dict | None``; a sink without
+    it cannot VERIFY a settlement that reported failure, so every such settlement
+    is handled as UNVERIFIED -- conservatively, and the run latched)
     -- ``reserve(**fields)`` and ``settle(attempt_id,
     **fields) -> str`` -- so this module imports no storage layer (see the
     module docstring); ``database_logger.BillingRecordSink`` is the one shipped
@@ -2312,12 +2416,14 @@ class BillingRecord:
             # on whether a flapping database happened to answer this time.
             BILLING_RECORD_FAULTS["refused_latched"] += 1
             raise BillingRecordUnavailable(
-                "the campaign's durable billing record failed earlier in this "
-                "run, so no further billed request is dispatched")
+                "the campaign's durable billing record latched earlier in this "
+                "run (" + (SPEND_STOP.cause or "cause not recorded") + "), so "
+                "no further billed request is dispatched")
         usd, fault = price_usage(model, input_tokens, output_tokens)
         if usd is None:
             BILLING_RECORD_FAULTS["reserve:unpriced"] += 1
-            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source)
+            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source,
+                            BILLING_RECORD_CAUSE_UNPRICED)
             raise BillingRecordUnavailable(
                 f"the reservation for this attempt could not be priced "
                 f"({fault}), so it was not dispatched")
@@ -2334,7 +2440,8 @@ class BillingRecord:
                       event="billing_reservation_failed", status="stopped",
                       phase=source, mode=where, error_type=type(exc).__name__,
                       error_message=str(exc), degraded=True)
-            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source)
+            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, where, source,
+                            BILLING_RECORD_CAUSE_WRITE_FAILED)
             raise BillingRecordUnavailable(
                 f"the reservation could not be persisted "
                 f"({type(exc).__name__}: {exc}), so the attempt was not "
@@ -2351,6 +2458,11 @@ class BillingRecord:
         propagating, so a raise here would replace the caller's diagnosis with
         a bookkeeping one. A settlement that did not land leaves the row
         RESERVED, which every reader charges at its upper bound.
+
+        THIS METHOD TRUSTS THE SINK'S RESULT AND READS NOTHING BACK. A ``failed``
+        here may have committed (P1c). Billed attempts go through
+        ``AttemptLiability.resolve``, which verifies the stored row; this entry
+        point has no production caller.
         """
         if handle is None:
             return None
@@ -2399,6 +2511,40 @@ class BillingRecord:
             return None
         return float(value)
 
+    def _stored_state(self, handle):
+        """What the durable row now holds for ``handle``, READ BACK (P1c). NEVER
+        RAISES. Returns ``(STORED_STATE_ABSENT,)``, ``(STORED_STATE_RESERVED,
+        reserved_usd)``, ``(STORED_STATE_SETTLED, reserved_usd, settled_usd,
+        outcome)``, or None when the answer could not be established -- a sink
+        with no reader, a reader that raised, or an answer that is malformed.
+        None is never a state: the caller reads it as "not established"."""
+        reader = getattr(handle.sink, "stored_state", None)
+        if reader is None:
+            BILLING_RECORD_FAULTS["verify:no_state_reader"] += 1
+            return None
+        try:
+            value = reader(handle.attempt_id)
+        except Exception as exc:                                # noqa: BLE001
+            BILLING_RECORD_FAULTS[
+                f"verify:read_raised:{type(exc).__name__}"] += 1
+            return None
+        state = value.get("state") if isinstance(value, dict) else None
+        if state == STORED_STATE_ABSENT:
+            return (STORED_STATE_ABSENT,)
+        reserved = value.get("reserved_usd") if isinstance(value, dict) else None
+        if state == STORED_STATE_RESERVED and _valid_usd(reserved):
+            return (STORED_STATE_RESERVED, float(reserved))
+        settled = value.get("settled_usd") if isinstance(value, dict) else None
+        outcome = value.get("outcome") if isinstance(value, dict) else None
+        if (state == STORED_STATE_SETTLED and _valid_usd(reserved)
+                and _valid_usd(settled)
+                and (outcome is None or isinstance(outcome, str))):
+            return (STORED_STATE_SETTLED, float(reserved), float(settled),
+                    outcome)
+        if value is not None:
+            BILLING_RECORD_FAULTS["verify:malformed"] += 1
+        return None
+
     def _record_discrepancy(self, handle, result, live_usd, durable_usd,
                             shortfall_usd) -> str:
         """Hand one attempt's settlement shortfall to the sink. NEVER RAISES;
@@ -2442,11 +2588,14 @@ BILLING_RECORD = BillingRecord()
 # (it persists the durable reservation when a sink is installed), resolved
 # EXACTLY ONCE after. Resolution computes the liability through
 # `attempt_liability`, charges `SPEND_LEDGER` that amount, and settles the
-# durable row at the SAME amount. When the durable settlement does not land
-# (failed, missing, conflict), `AttemptLiability._settlement_did_not_land`
-# charges live the most conservative reading and writes the shortfall as its
-# own durable row (or a marker the runner reconciles), so a resumed reading is
-# never below the live charge (P1b).
+# durable row at the SAME amount. When the durable settlement does not report
+# landing (failed, missing, conflict), `AttemptLiability._settlement_did_not_land`
+# first READS THE ROW BACK for a result that could be a lost acknowledgement
+# (P1c), then charges live the most conservative reading the stored row allows
+# and writes the shortfall as its own durable row (or a marker the runner
+# reconciles), so a resumed reading is never below the live charge (P1b). The
+# one residual -- every durable write after the response failing -- is in
+# RECOVERY_P1C_REPORT.md, item 2.
 #
 # WHAT IT DOES NOT COVER, STATED: billed paths that do not create one of these
 # -- the rater's Batch API, the ragas harness -- keep their own ledger charges
@@ -2484,6 +2633,18 @@ DISCREPANCY_WRITE_RESULTS = (DISCREPANCY_RECORDED, DISCREPANCY_DEFERRED,
 DISCREPANCY_EPSILON_USD = 1e-9
 """Below this a shortfall is float noise, not a liability. Equal to the storage
 layer's amount tolerance and to the closure tests' accounting precision."""
+
+# WHAT A STORED ROW IS, READ BACK (P1c). Restated from ``database_logger``
+# (``STORED_STATE_ABSENT`` and its two row states) for ``BILLING_OUTCOMES``'
+# reason; a test pins them equal.
+STORED_STATE_ABSENT = "absent"
+STORED_STATE_RESERVED = "reserved"
+STORED_STATE_SETTLED = "settled"
+
+
+def _valid_usd(value) -> bool:
+    return (not isinstance(value, bool) and isinstance(value, (int, float))
+            and value == value and value != float("inf") and value >= 0)
 
 
 class AttemptLiability:
@@ -2573,10 +2734,26 @@ class AttemptLiability:
           ``missing``   no row. The durable reading is 0.
           ``conflict``  a row settled by something else. The reading is its
                         stored amount (0 when that cannot be read).
-          ``failed``    and anything unrecognised: the row stays RESERVED, read
-                        at the reservation. (If the write did land and only its
-                        report failed, the reading is the priced amount; the
-                        conservative assumption over-counts by the shortfall.)
+          ``failed``    and anything unrecognised, including a sink that raised:
+                        THE RETURNED RESULT IS NOT EVIDENCE (P1c). A settlement
+                        can commit and then lose its acknowledgement, so the row
+                        is READ BACK (``BillingRecord._stored_state``):
+                          settled at this liability's amount and outcome -- it
+                            LANDED; nothing further is owed, and live is not
+                            topped up;
+                          reserved at this reservation -- ``failed``, read at
+                            the reservation;
+                          settled otherwise, or reserved at another amount --
+                            ``conflict`` with that stored amount;
+                          absent -- ``missing``;
+                          not established -- UNVERIFIED: the row holds either
+                            the reservation or the priced amount, so the
+                            durable reading taken is the SMALLER of the two,
+                            live is the larger, and the run latches.
+
+        (P1c, measured before the change: a settlement that committed $0.0032
+        and reported ``failed`` left live at the $0.38484 reservation and a
+        fresh process seeded at $0.0032, with no discrepancy row.)
 
         LIVE is charged the most conservative amount any reading supports --
         ``max(priced, reservation, stored)`` -- so live never under-states the
@@ -2595,44 +2772,91 @@ class AttemptLiability:
         least one row this campaign wrote, and no reader can know how many
         more. A discrepancy that could not be made durable at all latches too.
         """
-        result_class = (result if result in SETTLEMENT_INTEGRITY_RESULTS
-                        else SETTLEMENT_FAILED)
         reserved = float(self.reserved_usd or 0.0)
         priced = float(self.resolved_usd)
         stored = None
-        if result_class == SETTLEMENT_CONFLICT:
-            stored = BILLING_RECORD._stored_settlement(self.handle)
+        verified = True
+        if result in SETTLEMENT_INTEGRITY_RESULTS:
+            # Already established by the settlement's own read inside its
+            # transaction.
+            result_class = result
+            if result_class == SETTLEMENT_CONFLICT:
+                stored = BILLING_RECORD._stored_settlement(self.handle)
+        else:
+            row = BILLING_RECORD._stored_state(self.handle)
+            if row is None:
+                result_class, verified = SETTLEMENT_FAILED, False
+                BILLING_RECORD_FAULTS[f"settle:unverified:{result}"] += 1
+            elif row[0] == STORED_STATE_ABSENT:
+                result_class = SETTLEMENT_MISSING
+                BILLING_RECORD_FAULTS[f"settle:verified_missing:{result}"] += 1
+            elif row[0] == STORED_STATE_SETTLED:
+                if (abs(row[2] - priced) <= DISCREPANCY_EPSILON_USD
+                        and row[3] == self.resolved_outcome):
+                    # THE SETTLEMENT LANDED; ONLY ITS ACKNOWLEDGEMENT WAS LOST.
+                    # The row carries exactly this liability, so there is no
+                    # shortfall, no top-up and nothing to latch on.
+                    BILLING_RECORD_FAULTS[
+                        f"settle:verified_landed:{result}"] += 1
+                    return
+                result_class, stored = SETTLEMENT_CONFLICT, row[2]
+                BILLING_RECORD_FAULTS[f"settle:verified_conflict:{result}"] += 1
+            elif abs(row[1] - reserved) <= DISCREPANCY_EPSILON_USD:
+                result_class = SETTLEMENT_FAILED
+                BILLING_RECORD_FAULTS[f"settle:verified_reserved:{result}"] += 1
+            else:
+                # Reserved at an amount this process did not reserve: the
+                # committed row was changed.
+                result_class, stored = SETTLEMENT_CONFLICT, row[1]
+                BILLING_RECORD_FAULTS[f"settle:verified_conflict:{result}"] += 1
         if result_class == SETTLEMENT_MISSING:
             durable = 0.0
         elif result_class == SETTLEMENT_CONFLICT:
             durable = stored if stored is not None else 0.0
-        else:
+        elif verified:
             durable = reserved
+        else:
+            # NOT ESTABLISHED: the row holds the reservation (the write did not
+            # land) or the priced liability (it did). Taking the SMALLER as the
+            # durable reading and the larger as live keeps the durable total at
+            # or above live in both worlds, over-counting by at most
+            # |reserved - priced| (the safe direction).
+            durable = min(reserved, priced)
         live = max(priced, reserved, stored if stored is not None else 0.0)
         if live - priced > 0:
             SPEND_LEDGER.charge_usd(live - priced, self.source)
             self.resolved_usd = live
-        BILLING_RECORD_FAULTS[f"ledger_topped_up:{result}"] += 1
+        label = result_class if verified else "unverified"
+        BILLING_RECORD_FAULTS[f"ledger_topped_up:{label}"] += 1
         shortfall = max(live - durable, 0.0)
         integrity = result_class in SETTLEMENT_INTEGRITY_RESULTS
         written = None
         if integrity or shortfall > DISCREPANCY_EPSILON_USD:
             written = BILLING_RECORD._record_discrepancy(
                 self.handle, result_class, live, durable, shortfall)
-            BILLING_RECORD_FAULTS[f"discrepancy:{result_class}:{written}"] += 1
+            BILLING_RECORD_FAULTS[f"discrepancy:{label}:{written}"] += 1
             log.error("a billed attempt's settlement did not land; the "
                       "shortfall was written as its own billing row, deferred "
                       "to a marker, or could not be recorded",
                       event="billing_settlement_discrepancy", status=written,
-                      phase=self.source, mode=self.where, reason=result_class,
+                      phase=self.source, mode=self.where, reason=label,
                       degraded=True)
-            console.out(f"[SPEND] BILLING RECORD DISCREPANCY ({result_class}): "
+            console.out(f"[SPEND] BILLING RECORD DISCREPANCY ({label}): "
                         f"attempt {self.handle.attempt_id} charged "
                         f"${live:.6f} live, durable reading ${durable:.6f}, "
                         f"shortfall ${shortfall:.6f} {written}.")
-        if integrity or (written is not None
-                         and written != DISCREPANCY_RECORDED):
-            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, self.where, self.source)
+        if integrity or not verified or (written is not None
+                                         and written != DISCREPANCY_RECORDED):
+            cause = (BILLING_RECORD_CAUSE_MISSING
+                     if result_class == SETTLEMENT_MISSING
+                     else BILLING_RECORD_CAUSE_CONFLICT
+                     if result_class == SETTLEMENT_CONFLICT
+                     else BILLING_RECORD_CAUSE_UNVERIFIED if not verified
+                     else BILLING_RECORD_CAUSE_DEFERRED
+                     if written == DISCREPANCY_DEFERRED
+                     else BILLING_RECORD_CAUSE_DISCREPANCY_UNRECORDED)
+            SPEND_STOP.trip(SPEND_LIMIT_BILLING_RECORD, self.where, self.source,
+                            cause)
 
 
 def begin_billed_attempt(source, model, input_tokens, output_tokens, *,
