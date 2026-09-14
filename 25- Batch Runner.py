@@ -139,6 +139,7 @@ from oncotriage.provider_resilience import (
 )
 from oncotriage.batch.runner import (
     AlreadyRunning,
+    CampaignBillingRefusal,
     EXIT_LOCK_UNAVAILABLE,
     LockUnavailable,
     StaleStopSwitch,
@@ -150,6 +151,7 @@ from oncotriage.batch.runner import (
     lock_unavailable_lines,
     main,
     reconciliation_exit_code,
+    record_fresh_start,
     run_lock_refusal_lines,
     stop_switch_path,
 )
@@ -588,6 +590,21 @@ if __name__ == "__main__":
                 console.out("[--fresh] Discarding the batch checkpoint. Every "
                             "patient will run again, at one live Stage 5 call "
                             "each.")
+                # THE WATERMARK BEFORE THE DELETION (P4b). A missing identity
+                # record is recovered from the billing record, so removing it is
+                # no longer enough to start a new campaign; the marker is what
+                # closes the existing ones. Written first, so a refusal leaves
+                # the checkpoint and the record exactly as they were.
+                try:
+                    record_fresh_start()
+                except CampaignBillingRefusal as _fresh_refusal:
+                    console.out()
+                    for _line in _fresh_refusal.lines():
+                        console.out(_line)
+                    console.out("[--fresh] REFUSING: the --fresh marker could "
+                                "not be recorded, so the checkpoint and the "
+                                "campaign record were NOT discarded.")
+                    sys.exit(1)
                 clear_checkpoint()
 
             # Ctrl-C EXITS 130 WITH NO TRACEBACK, AND THAT IS THIS GUARD'S JOB RATHER

@@ -6053,14 +6053,66 @@ class CampaignIdentityRecovery(NamedTuple):
     detail: str = ""
 
 
-def recover_campaign_identity(run_id, cohort_digest, db_path=None
+def latest_run_id(db_path=None) -> int:
+    """The highest ``runs.id`` in the database, or 0. RAISES ``BillingRecordUnreadable``.
+
+    0 when the database file or its ``runs`` table does not exist yet -- a
+    database no run has opened holds no campaign to close. The file is never
+    CREATED here: a read-only open of an absent path is not attempted.
+
+    Read by the batch runner's ``--fresh`` gesture, which records this number as
+    the point through which every existing campaign is closed for that
+    checkpoint directory (see ``recover_campaign_identity``).
+    """
+    try:
+        db_path = resolve_inference_db_path(db_path)
+        if not os.path.exists(db_path):
+            return 0
+        conn = _open_connection(db_path, read_only=True)
+        try:
+            tables = {r[0] for r in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'")}
+            if "runs" not in tables:
+                return 0
+            found = conn.execute("SELECT MAX(id) FROM runs").fetchone()[0]
+        finally:
+            conn.close()
+    except Exception as exc:                                   # noqa: BLE001
+        raise BillingRecordUnreadable(
+            f"the latest run id in {db_path} could not be read: "
+            f"{type(exc).__name__}: {exc}") from exc
+    if found is None:
+        return 0
+    if isinstance(found, bool) or not isinstance(found, int) or found < 0:
+        raise BillingRecordUnreadable(
+            f"runs.id in {db_path} reads back as {found!r}, not a run id")
+    return found
+
+
+def recover_campaign_identity(run_id, cohort_digest, db_path=None,
+                              closed_through_run_id=0
                               ) -> CampaignIdentityRecovery:
     """Which billing campaign the rows say ``run_id`` continues. NEVER RAISES.
 
     ``run_id`` is the run row the resuming invocation has just opened -- its
     stamp is what candidates must match -- and ``cohort_digest`` is the
     checkpoint's or the current cohort's.
+
+    ``closed_through_run_id`` is the ``--fresh`` watermark recorded beside the
+    checkpoint (0 when none): a campaign every one of whose runs is at or below
+    it was deliberately closed by ``--fresh`` in this checkpoint directory and is
+    not a candidate, whatever its latest status. A campaign with ANY run above it
+    is judged as before, so a campaign started after ``--fresh`` is still found.
+    A value that is not a non-negative int is ``unreadable``: a watermark nobody
+    can read must not decide which charges are forgotten.
     """
+    if (isinstance(closed_through_run_id, bool)
+            or not isinstance(closed_through_run_id, int)
+            or closed_through_run_id < 0):
+        return CampaignIdentityRecovery(
+            IDENTITY_UNREADABLE,
+            detail=f"the --fresh watermark {closed_through_run_id!r} is not a "
+                   f"run id")
     try:
         db_path = resolve_inference_db_path(db_path)
         conn = _open_connection(db_path, read_only=True)
@@ -6137,6 +6189,14 @@ def recover_campaign_identity(run_id, cohort_digest, db_path=None
     for cid in sorted(members):
         touched = (billed_runs.get(cid, set()) | carried.get(cid, set())
                    | members[cid]) - {run_id}
+        # CLOSED BY --fresh, AND DECIDED BEFORE ANY OTHER TEST. A campaign the
+        # operator deliberately closed is not evidence about this run, so neither
+        # its foreign runs nor its lost rows may turn a fresh start into a refusal.
+        if (closed_through_run_id and touched
+                and max(touched) <= closed_through_run_id):
+            notes.append(f"campaign {cid} was closed by --fresh (every run at or "
+                         f"below run {closed_through_run_id})")
+            continue
         foreign = sorted(touched - same_ids)
         if foreign:
             inconsistent.append(cid)

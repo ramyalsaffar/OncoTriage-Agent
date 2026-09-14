@@ -1593,6 +1593,56 @@ check("6z *** the budget the no-flag run was seeded with is exactly the "
       (True, len(_c2_rows), 1))
 
 
+# ---- 6G-ii: A DELETED IDENTITY RECORD, WITH AND WITHOUT --fresh (P4b). A
+#          missing record is now RECOVERED whether or not a checkpoint exists,
+#          so through the REAL entry point: the no-flag run continues the billed
+#          campaign, --fresh starts a new one regardless of the deletion, and a
+#          later deletion recovers the campaign --fresh started, not the one it
+#          closed.
+_DB_G = os.path.join(_TMP, "fresh_deleted.db")
+_CP_G = os.path.join(_TMP, "cp_g")
+_REC_G = os.path.join(_CP_G, _runner.CAMPAIGN_RECORD_FILENAME)
+_MARK_G = os.path.join(_CP_G, _runner.FRESH_MARKER_FILENAME)
+_g1, _g1d = child("billed_then_zero", db=_DB_G, cp=_CP_G, corpus=_CORP_F,
+                  cap=100.0)
+_G1 = at(_g1d, "campaign_id")
+check("6za non-degeneracy: process 1 billed C1, completed nothing, and left no "
+      "checkpoint", (isinstance(_G1, str), os.path.exists(os.path.join(
+          _CP_G, _runner.CHECKPOINT_FILENAME)), len(billing_rows(
+              _DB_G, "campaign_id = ?", (_G1,))) > 0), (True, False, True))
+if os.path.exists(_REC_G):
+    os.remove(_REC_G)
+_g2, _g2d = entry_point("billed_then_zero", db=_DB_G, cp=_CP_G, corpus=_CORP_F,
+                        cap=100.0)
+if _g2d is None:
+    print(tail(_g2, 60))
+check("6za-i *** THE ENTRY POINT, no flag, record deleted, no checkpoint: the "
+      "billed campaign C1 is RECOVERED, not replaced ***",
+      (at(_g2d, "campaign_id"),
+       "(recovered_from_billing_record)" in (_g2.stdout + _g2.stderr)),
+      (_G1, True))
+if os.path.exists(_REC_G):
+    os.remove(_REC_G)
+_g3, _g3d = entry_point("billed_then_zero", "--fresh", db=_DB_G, cp=_CP_G,
+                        corpus=_CORP_F, cap=100.0)
+if _g3d is None:
+    print(tail(_g3, 60))
+_G3 = at(_g3d, "campaign_id")
+check("6za-ii *** --fresh with the record ALREADY deleted still starts a NEW "
+      "campaign: the watermark is recorded before the checkpoint is cleared ***",
+      (isinstance(_G3, str), _G3 != _G1,
+       "[--fresh] Every campaign through run" in (_g3.stdout + _g3.stderr),
+       os.path.exists(_MARK_G)), (True, True, True, True))
+if os.path.exists(_REC_G):
+    os.remove(_REC_G)
+_g4, _g4d = entry_point("billed_then_zero", db=_DB_G, cp=_CP_G, corpus=_CORP_F,
+                        cap=100.0)
+if _g4d is None:
+    print(tail(_g4, 60))
+check("6za-iii ...and a later deletion recovers the campaign --fresh STARTED, "
+      "not the one it closed", at(_g4d, "campaign_id"), _G3)
+
+
 #------------------------------------------------------------------------------
 
 section("SECTION 7 -- isolation held")

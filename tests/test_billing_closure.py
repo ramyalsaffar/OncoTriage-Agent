@@ -64,6 +64,7 @@ except ImportError:
 
 os.environ.setdefault("ONCOTRIAGE_DEFER_LOCAL_MODELS", "1")
 
+import ast
 import contextlib
 import fcntl
 import hashlib
@@ -1605,15 +1606,193 @@ check("4p every state recovery returned is a member of the closed vocabulary",
 check("4p-i non-degeneracy: four different states were exercised",
       len(set(_STATES_SEEN)) >= 4, True)
 
-# THE STATED RESIDUAL, MEASURED RATHER THAN IMPLIED.
-_dbr, _cpr, _campr = campaign_setup("residual")
+# ── 4q: A MISSING RECORD WITH NO CHECKPOINT (P4b) ─────────────────────────────
+#
+# THIS WAS PINNED AS A RESIDUAL AND IT WAS THE DEFECT. `resumed` means the
+# checkpoint handed the run a COMPLETED patient, and recovery ran only when the
+# record was corrupt or `resumed` was true -- so a campaign whose every patient
+# failed, with its record deleted, started a NEW campaign at $0 while its
+# settled charges and unresolved reservations sat in the billing record.
+# Measured in two fresh processes before the fix: $1.65 of liabilities, seed
+# $0.00. Recovery now runs whenever the record is missing, and `--fresh` stays
+# separate through the watermark it records beside the checkpoint.
+
+
+def billing_census(db):
+    return at(drive(ro_rows, db, "SELECT COUNT(*), ROUND(COALESCE(SUM("
+                                 "COALESCE(settled_usd, reserved_usd)), 0), 9) "
+                                 "FROM billing_attempts"), 0)
+
+
+_dbr, _cpr, _campr = campaign_setup("zero_success")
+_dl.reserve_billing_attempt(_dbr, attempt_id="zero_success-open",
+                            campaign_id=_campr, run_id=1, source="stage5",
+                            model=_WIRE, input_tokens=1, output_tokens=1,
+                            reserved_usd=0.40)
+_census_r = billing_census(_dbr)
 os.remove(record_path(_cpr))
 _rr = next_run(_dbr, resumed=False)
 _br = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rr, _dbr)
-check("4q RESIDUAL, PINNED: a MISSING record with NO checkpoint is a NEW "
-      "campaign -- indistinguishable here from the run after --fresh",
-      (getattr(_br, "decision", None), getattr(_br, "campaign_id", None) != _campr),
-      (_runner.CAMPAIGN_DECISION_NEW, True))
+check("4q *** a MISSING record with NO checkpoint (zero completed patients) is "
+      "RECOVERED: same campaign, and the budget carries its settled charge AND "
+      "its unresolved reservation ***",
+      (getattr(_br, "decision", None), getattr(_br, "campaign_id", None) == _campr,
+       near(getattr(getattr(_br, "seed", None), "usd", None), 1.65),
+       getattr(getattr(_br, "seed", None), "unresolved", None)),
+      (_runner.CAMPAIGN_DECISION_RECOVERED, True, True, 1))
+check("4q-i non-degeneracy: the billing record held two rows and $1.65 before "
+      "the recovery", _census_r, (2, 1.65))
+os.remove(record_path(_cpr))
+_rr2 = next_run(_dbr, resumed=False)
+_br2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rr2,
+             _dbr)
+check("4q-ii *** REPEATED recovery duplicates nothing: the same campaign, the "
+      "same seed, and the billing record unchanged row for row ***",
+      (getattr(_br2, "campaign_id", None) == _campr,
+       near(getattr(getattr(_br2, "seed", None), "usd", None), 1.65),
+       billing_census(_dbr)),
+      (True, True, _census_r))
+
+# --fresh CLOSES WHAT EXISTS, DURABLY, AND ONLY WHAT EXISTS.
+_fresh_wm = drive(_runner.record_fresh_start, db_path=_dbr)
+_fresh_marker = os.path.join(_cpr, _runner.FRESH_MARKER_FILENAME)
+check("4q-iii the --fresh watermark is the database's latest run id, written "
+      "durably beside the checkpoint",
+      (_fresh_wm, at(drive(lambda: json.loads(Path(_fresh_marker).read_text())),
+                     "closed_through_run_id")),
+      (_rr2, _rr2))
+os.remove(record_path(_cpr))
+_rf = next_run(_dbr, resumed=False)
+_bf = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rf, _dbr)
+check("4q-iv *** after --fresh, a missing record starts a NEW campaign: the "
+      "campaign it closed is not recovered ***",
+      (getattr(_bf, "decision", None), getattr(_bf, "campaign_id", None) != _campr,
+       near(getattr(getattr(_bf, "seed", None), "usd", None), 0.0)),
+      (_runner.CAMPAIGN_DECISION_NEW, True, True))
+_camp_after = getattr(_bf, "campaign_id", None)
+_dl.reserve_billing_attempt(_dbr, attempt_id="after-fresh-1",
+                            campaign_id=_camp_after, run_id=_rf, source="stage5",
+                            model=_WIRE, input_tokens=1, output_tokens=1,
+                            reserved_usd=0.75)
+_dl.settle_billing_attempt(_dbr, "after-fresh-1", outcome="response",
+                           settled_usd=0.75)
+_dl.finalize_run_record(_rf, "FAILED", db_path=_dbr)
+os.remove(record_path(_cpr))
+_ra = next_run(_dbr, resumed=False)
+_ba = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ra, _dbr)
+check("4q-v *** a campaign started AFTER --fresh is still recovered when its "
+      "record goes missing -- the watermark closes only what existed ***",
+      (getattr(_ba, "decision", None), getattr(_ba, "campaign_id", None),
+       near(getattr(getattr(_ba, "seed", None), "usd", None), 0.75)),
+      (_runner.CAMPAIGN_DECISION_RECOVERED, _camp_after, True))
+Path(_fresh_marker).write_text(json.dumps(
+    {"version": _runner.FRESH_MARKER_VERSION, "closed_through_run_id": 999}))
+check("4q-vi the watermark never goes DOWN: a marker already higher keeps its "
+      "number", drive(_runner.record_fresh_start, db_path=_dbr), 999)
+Path(_fresh_marker).write_text("{not json")
+os.remove(record_path(_cpr))
+_ru = next_run(_dbr, resumed=False)
+_eu = raised(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _ru, _dbr)
+check("4q-vii an UNREADABLE --fresh marker beside a missing record is REFUSED by "
+      "name, and nothing is written",
+      (getattr(_eu, "reason", None), _runner.FRESH_MARKER_FILENAME in str(_eu),
+       os.path.exists(record_path(_cpr))),
+      (_runner.CAMPAIGN_REFUSAL_RECORD_UNREADABLE, True, False))
+_abs_db = os.path.join(_TMP, "absent", "never.db")
+check("4q-viii latest_run_id on a database that does not exist is 0 and does "
+      "not create it", (drive(_dl.latest_run_id, _abs_db),
+                        os.path.exists(os.path.dirname(_abs_db))), (0, False))
+
+# AMBIGUITY STILL REFUSES WITHOUT A CHECKPOINT.
+_dbq, _cpq, _campq = campaign_setup("ambiguous_zero")
+_rq_other = _dl.start_run_record("batch", db_path=_dbq, fingerprint=FIXED_FP)
+_set_digest(_dbq, _rq_other)
+_dl.set_run_billing_campaign_id(_rq_other, "camp-other-zero", db_path=_dbq)
+_dl.reserve_billing_attempt(_dbq, attempt_id="oz-1", campaign_id="camp-other-zero",
+                            run_id=_rq_other, source="stage5", model=_WIRE,
+                            input_tokens=1, output_tokens=1, reserved_usd=2.0)
+_dl.finalize_run_record(_rq_other, "KILLED", db_path=_dbq)
+os.remove(record_path(_cpq))
+_rq = next_run(_dbq, resumed=False)
+_eq = raised(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rq, _dbq)
+check("4q-ix *** two open campaigns and NO checkpoint are REFUSED by name, not "
+      "guessed at and not replaced by a new campaign ***",
+      (getattr(_eq, "reason", None), _campq in str(_eq),
+       "camp-other-zero" in str(_eq), os.path.exists(record_path(_cpq))),
+      (_runner.CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED, True, True, False))
+
+# THE ENTRY POINT RECORDS THE WATERMARK BEFORE IT DISCARDS ANYTHING.
+_guard_tree = ast.parse(Path(os.path.join(_REPO, "25- Batch Runner.py"))
+                        .read_text(encoding="utf-8"))
+_fresh_calls = []
+for _node in ast.walk(_guard_tree):
+    if (isinstance(_node, ast.If) and isinstance(_node.test, ast.Attribute)
+            and _node.test.attr == "fresh"):
+        for _sub in ast.walk(_node):
+            if isinstance(_sub, ast.Call) and isinstance(_sub.func, ast.Name):
+                _fresh_calls.append((_sub.lineno, _sub.col_offset, _sub.func.id))
+_fresh_order = [n for _, _, n in sorted(_fresh_calls)
+                if n in ("record_fresh_start", "clear_checkpoint")]
+check("4q-x *** the entry point's --fresh records the watermark BEFORE "
+      "clear_checkpoint() removes the identity record ***",
+      _fresh_order, ["record_fresh_start", "clear_checkpoint"])
+
+# ── ITEM 3 (P4b): AN IDENTITY-WRITE FAILURE WHILE RECOVERING A BILLED CAMPAIGN ──
+#
+# The refusal used to say a record left behind "names a campaign with no spend
+# and is safe to continue or remove". A RECOVERED campaign already holds
+# charges; removing its record to "start over" was advice to forget them.
+_RETIRED_CLAIMS = ("no spend", "safe to continue or remove")
+_SYNC_START = _runner._durable_sync
+for _where in ("file", "dir"):
+    _dbw, _cpw, _campw = campaign_setup(f"unwritable_{_where}")
+    _census_w = billing_census(_dbw)
+    os.remove(record_path(_cpw))
+    _rw = next_run(_dbw, resumed=False)
+
+    def _failing_sync(fd, *, directory=False, _w=_where):
+        if directory == (_w == "dir"):
+            raise OSError(5, f"planted {_w} sync failure")
+        return _SYNC_START(fd, directory=directory)
+
+    _runner._durable_sync = _failing_sync
+    try:
+        _ew = raised(_runner.establish_billing_campaign, False, FIXED_FP, "dig",
+                     _rw, _dbw)
+    finally:
+        _runner._durable_sync = _SYNC_START
+    _lines_w = str(drive(lambda: "\n".join(_ew.lines())))
+    check(f"4w-{_where} *** recovering an ALREADY-BILLED campaign, a {_where} "
+          f"sync failure REFUSES by name; nothing is billed and the run row "
+          f"carries no campaign ***",
+          (getattr(_ew, "reason", None), billing_census(_dbw),
+           at(at(drive(ro_rows, _dbw, "SELECT billing_campaign_id FROM runs "
+                                      "WHERE id = ?", (_rw,)), 0), 0)),
+          (_runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE, _census_w, None))
+    check(f"4w-{_where}-i *** the printed refusal no longer calls the campaign "
+          f"spend-free or safe to remove: it says it may hold charges, that the "
+          f"next run carries them, and that --fresh is the deliberate new start ***",
+          ([c for c in _RETIRED_CLAIMS if c in _lines_w],
+           "ALREADY HOLD CHARGES" in _lines_w,
+           "Do not remove the record to start over" in _lines_w,
+           "--fresh starts a new campaign deliberately" in _lines_w,
+           "NOTHING HAS BEEN BILLED BY THIS RUN." in _lines_w),
+          ([], True, True, True, True))
+    _rw2 = next_run(_dbw, resumed=False)
+    _bw2 = drive(_runner.establish_billing_campaign, False, FIXED_FP, "dig", _rw2,
+                 _dbw)
+    check(f"4w-{_where}-ii *** the claim is true: the next run continues THAT "
+          f"campaign with its charge -- "
+          f"{'from the record left in place' if _where == 'dir' else 'recovered from the billing record'} "
+          f"-- and duplicates nothing ***",
+          (getattr(_bw2, "decision", None), getattr(_bw2, "campaign_id", None)
+           == _campw, near(getattr(getattr(_bw2, "seed", None), "usd", None),
+                           1.25), billing_census(_dbw)),
+          ((_runner.CAMPAIGN_DECISION_CONTINUED if _where == "dir"
+            else _runner.CAMPAIGN_DECISION_RECOVERED), True, True, _census_w))
+check("4w-restore the runner's durable sync was restored, by identity",
+      _runner._durable_sync is _SYNC_START, True)
+_paths._RESOLVED["checkpoint_path"] = _CP4 + os.sep
 
 
 # ===========================================================================
@@ -2082,6 +2261,113 @@ check("4t-i *** NAMED: the run row records stop_reason 'billing_record' and "
 # 4t-i pins what must not vary: stop_reason 'billing_record'.
 _restart_is_safe("commit_reserve", _dbc, _cpc, _runner.CAMPAIGN_DECISION_CONTINUED,
                  first_statuses=("FAILED", "STOPPED"), first_has_id=True)
+
+
+# ── 4u: THE P4b RECOVERY GAP, THROUGH THE REAL main(), IN FRESH PROCESSES ─────
+#
+# Process 1 runs a campaign to its end with every patient failing, so no
+# checkpoint exists; one reservation is then left UNRESOLVED under it, and the
+# identity record is deleted. Every later process is a new interpreter running
+# the shipped main().
+_dbu = os.path.join(_TMP, "p4b_zero_success.db")
+_cpu = os.path.join(_TMP, "cp_p4b_zero_success")
+os.makedirs(_cpu)
+_pu1, _du1 = child("campaign", db=_dbu, cp=_cpu, corpus=_CORPUS, cap=_E2E_CAP)
+_campu = at(drive(lambda: json.loads(Path(record_path(_cpu)).read_text())),
+            "campaign_id")
+_run1u = at(at(drive(ro_rows, _dbu, "SELECT MIN(id) FROM runs"), 0), 0)
+drive(_dl.reserve_billing_attempt, _dbu, attempt_id="p4b-open",
+      campaign_id=_campu, run_id=_run1u, source="stage5", model=_WIRE,
+      input_tokens=1, output_tokens=1, reserved_usd=0.40)
+_totu = drive(_dl.campaign_billing_total, _campu, db_path=_dbu)
+check("4u non-degeneracy: process 1 ran main() to its end with ZERO completed "
+      "patients (no checkpoint), twelve settled attempts, and one reservation "
+      "left UNRESOLVED",
+      (_pu1.returncode,
+       os.path.exists(os.path.join(_cpu, _runner.CHECKPOINT_FILENAME)),
+       getattr(_totu, "attempts", None), getattr(_totu, "unresolved", None),
+       getattr(_totu, "usd", 0) > 0.40),
+      (0, False, 13, 1, True))
+os.remove(record_path(_cpu))
+_pu2, _du2 = child("observe", db=_dbu, cp=_cpu, corpus=_CORPUS, cap=_E2E_CAP)
+check("4u-i *** a FRESH process with the identity record deleted and NO "
+      "checkpoint recovers the campaign through main(): exit 0, the decision "
+      "printed, the same campaign, and a seed carrying every settled charge AND "
+      "the unresolved reservation ***",
+      (_pu2.returncode,
+       str(_decision_line(_pu2) or "").endswith(
+           f"({_runner.CAMPAIGN_DECISION_RECOVERED})"),
+       at(_du2, "campaign_id") == _campu,
+       near(at(at(_du2, "seed"), "usd"), getattr(_totu, "usd", None)),
+       at(at(_du2, "seed"), "unresolved")),
+      (0, True, True, True, 1))
+_census_u = billing_census(_dbu)
+os.remove(record_path(_cpu))
+_pu3, _du3 = child("observe", db=_dbu, cp=_cpu, corpus=_CORPUS, cap=_E2E_CAP)
+check("4u-ii *** REPEATED recovery in a third process: the same campaign, the "
+      "same seed, and the billing record unchanged row for row ***",
+      (_pu3.returncode, at(_du3, "campaign_id") == _campu,
+       near(at(at(_du3, "seed"), "usd"), getattr(_totu, "usd", None)),
+       billing_census(_dbu)),
+      (0, True, True, _census_u))
+
+# ITEM 3 THROUGH main(): the identity rewrite of that ALREADY-BILLED campaign
+# fails, and the refusal must be true of it.
+for _kind in ("file_sync", "dir_sync"):
+    _census_before = billing_census(_dbu)
+    if os.path.exists(record_path(_cpu)):
+        os.remove(record_path(_cpu))
+    _pi, _di = child("campaign", db=_dbu, cp=_cpu, corpus=_CORPUS, cap=_E2E_CAP,
+                     inject=_kind)
+    _outi = (_pi.stdout or "") + (_pi.stderr or "")
+    check(f"4u-{_kind} *** recovering an ALREADY-BILLED campaign, the identity "
+          f"rewrite fails ({_kind}): exit 1, zero provider calls, refused by "
+          f"name, nothing billed, and the refusal says the campaign may hold "
+          f"charges rather than that it is spend-free and safe to remove ***",
+          (_pi.returncode, at(_di, "calls"),
+           f"REFUSING TO START PAID WORK: "
+           f"{_runner.CAMPAIGN_REFUSAL_RECORD_UNWRITABLE}" in _outi,
+           "ALREADY HOLD CHARGES" in _outi,
+           [c for c in _RETIRED_CLAIMS if c in _outi], billing_census(_dbu)),
+          (1, 0, True, True, [], _census_before))
+    _pr_i, _dr_i = child("observe", db=_dbu, cp=_cpu, corpus=_CORPUS,
+                         cap=_E2E_CAP)
+    check(f"4u-{_kind}-i ...and the next fresh process continues THAT campaign "
+          f"with the same seed and duplicates nothing",
+          (_pr_i.returncode, at(_dr_i, "campaign_id") == _campu,
+           near(at(at(_dr_i, "seed"), "usd"), getattr(_totu, "usd", None)),
+           billing_census(_dbu)),
+          (0, True, True, _census_before))
+
+# AMBIGUITY THROUGH main(): a second open campaign under the same configuration
+# and cohort, and the record deleted. Nothing may be dispatched.
+_run_other_u = drive(_dl.start_run_record, "batch", db_path=_dbu,
+                     fingerprint=FIXED_FP)
+_conn = sqlite3.connect(_dbu)
+_conn.execute("UPDATE runs SET cohort_digest = (SELECT cohort_digest FROM runs "
+              "WHERE id = ?) WHERE id = ?", (_run1u, _run_other_u))
+_conn.commit()
+_conn.close()
+drive(_dl.set_run_billing_campaign_id, _run_other_u, "camp-p4b-other",
+      db_path=_dbu)
+drive(_dl.reserve_billing_attempt, _dbu, attempt_id="p4b-other-1",
+      campaign_id="camp-p4b-other", run_id=_run_other_u, source="stage5",
+      model=_WIRE, input_tokens=1, output_tokens=1, reserved_usd=0.5)
+drive(_dl.finalize_run_record, _run_other_u, "KILLED", db_path=_dbu)
+if os.path.exists(record_path(_cpu)):
+    os.remove(record_path(_cpu))
+_census_amb = billing_census(_dbu)
+_pam, _dam = child("campaign", db=_dbu, cp=_cpu, corpus=_CORPUS, cap=_E2E_CAP)
+_outam = (_pam.stdout or "") + (_pam.stderr or "")
+check("4u-iii *** AMBIGUOUS through main(): exit 1, zero provider calls, "
+      "refused as campaign_identity_unestablished naming both campaigns, and "
+      "no identity record written ***",
+      (_pam.returncode, at(_dam, "calls"),
+       f"REFUSING TO START PAID WORK: "
+       f"{_runner.CAMPAIGN_REFUSAL_IDENTITY_UNESTABLISHED}" in _outam,
+       _campu in _outam and "camp-p4b-other" in _outam,
+       os.path.exists(record_path(_cpu)), billing_census(_dbu)),
+      (1, 0, True, True, False, _census_amb))
 
 
 # ===========================================================================

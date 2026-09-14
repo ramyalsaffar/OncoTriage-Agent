@@ -586,7 +586,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 261/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 498 (this line said 434 and was stale by 64 -- the reason-coverage pass recorded 487 -> 498 five hundred lines below and this line never moved; MEASURED 2026-09-03. Before that 434, was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 503 (MEASURED 2026-09-13 by the P4b recovery session; was 498 -- the production row counts are taken on verified byte snapshots, the production files compared by bytes, a guard refuses and records any production connect, and the cost-tab render is redirected to the seeded database. Before that 498 (this line said 434 and was stale by 64 -- the reason-coverage pass recorded 487 -> 498 five hundred lines below and this line never moved; MEASURED 2026-09-03. Before that 434, was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -674,7 +674,7 @@ python tests/test_dashboard_app_integration.py                     # 113 (MEASUR
 # st.download_button call, never rebuilt. It EXECS NOTHING: every plant is a
 # COPY imported by name from the temp directory. NOT in the collision matrix.
 # Bucket A.
-python tests/test_dashboard_truthfulness.py                        # 157 (MEASURED 2026-09-13 against the developer tree; 131 before the closing pass added the two population labels, the CSV export and the demographics chart checks)
+python tests/test_dashboard_truthfulness.py                        # 161 (MEASURED 2026-09-13 by the P4b recovery session; was 157 -- section 10 reads a verified FROZEN COPY, immutable=1 only there, and the production path is guarded for the whole file. Before that 157 (MEASURED 2026-09-13 against the developer tree; 131 before the closing pass added the two population labels, the CSV export and the demographics chart checks)
 
 # The call-mode-labelling pass. Same shape, same directory. No network, no
 # keys, NO SPEND -- the API sections install a stub Qdrant client and a stub
@@ -775,7 +775,7 @@ python tests/test_agent_emission_provenance.py                      # 186 (was 1
 # nothing -- every control is driven through the real shipped module by creating
 # the failing condition for real (an exclusive lock from a second connection, an
 # unwritable path, a deleted row). ~4 s, most of it deliberate lock contention.
-python tests/test_storage_write_durability.py                       # 111 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton, and 111/0/0 against the developer tree. BUCKET E -> BUCKET A (the signal-safe-restore pass): its single production-database non-degeneracy probe was keeping a hundred checks that need nothing at all out of CI, and that probe is GATED now on tests/test_dashboard_run_health.py's pattern -- nine controls, an AST pin on the gate's call site, and the 9c COMPARISON never gated, so a run that CREATED a production database still fails on a runner. THE SAME PASS FIXED 9c, WHICH COULD NOT FAIL: its BEFORE reading was captured on the line above the comparison, after every driver had run, so it was rows(db) == rows(db) microseconds apart -- measured, a planted mid-run write left it GREEN. The capture is at module scope now and the same plant makes it FAIL. (was 100; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
+python tests/test_storage_write_durability.py                       # 122 on the developer tree (MEASURED 2026-09-13 by the P4b recovery session; was 111 -- 9c compares verified snapshots plus byte digests, and 9e shows the snapshot, the frozen copy and the production guard each able to fail). Before that: 111 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton, and 111/0/0 against the developer tree. BUCKET E -> BUCKET A (the signal-safe-restore pass): its single production-database non-degeneracy probe was keeping a hundred checks that need nothing at all out of CI, and that probe is GATED now on tests/test_dashboard_run_health.py's pattern -- nine controls, an AST pin on the gate's call site, and the 9c COMPARISON never gated, so a run that CREATED a production database still fails on a runner. THE SAME PASS FIXED 9c, WHICH COULD NOT FAIL: its BEFORE reading was captured on the line above the comparison, after every driver had run, so it was rows(db) == rows(db) microseconds apart -- measured, a planted mid-run write left it GREEN. The capture is at module scope now and the same plant makes it FAIL. (was 100; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
 
 # The reproducibility-hash pass. Same shape, same directory. No network, no
 # keys, no spend, no git history, not in the collision matrix, and it execs
@@ -16656,7 +16656,7 @@ population disagrees. The patient CSV export is recorded from the tab's own
 columns compared with SQL on the synthetic and smoke databases.
 
 ```bash
-python tests/test_dashboard_truthfulness.py      # 157
+python tests/test_dashboard_truthfulness.py      # 161
 ```
 
 **PINS THAT MOVED, EACH THE CHECK WORKING.** `test_package_invariants.py`
@@ -16959,7 +16959,7 @@ registered reads as zero in its health record.
 # checkpoint directory is inside a tempfile.mkdtemp removed and asserted gone,
 # and the production inferences.db digest is compared at the end. It EXECS
 # NOTHING: children are scripts written into the temp tree. Bucket A.
-python tests/test_campaign_billing_record.py                        # 111 (MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 97. The +14 are 6f-i..6f-v, the summary surface over the zero-success restart's database, and 6u..6z, --fresh through the REAL entry point read back at the summary surface. Before that 97, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
+python tests/test_campaign_billing_record.py                        # 115 (MEASURED 2026-09-13 by the P4b recovery session under the same containment; was 111. The +4 are 6za..6za-iii: a deleted identity record through the REAL entry point, recovered without a flag, and a NEW campaign under --fresh. Before that 111, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 97. The +14 are 6f-i..6f-v, the summary surface over the zero-success restart's database, and 6u..6z, --fresh through the REAL entry point read back at the summary surface. Before that 97, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
 ```
 
 **SEVENTEEN PLANTED REVERTS, SEVENTEEN CAUGHT, NONE ABORTING** -- each on a
@@ -17233,7 +17233,7 @@ on darwin (which re-opens the drive-cache window). Linux containers ignore
 # SPEND, no model load, no corpus. Children run the real main() with stand-in
 # clients and a closed Qdrant port. NOT in the collision matrix; the production
 # digest is compared at the end. It EXECS NOTHING. Bucket A.
-python tests/test_billing_closure.py                                # 231 (MEASURED 2026-09-13 by the P4 recovery session under the network sandbox, an audit-hook tripwire and an isolated project root; was 193. The +38 are 4f-i, 4f-ii, 4r..4r-ii and the section-4 continuation's failure injections through the REAL main(), 4s-* and 4t. Before that 193, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 190. The +3 are 3h, 3h-i and 3f-i. Before that 190, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
+python tests/test_billing_closure.py                                # 256 (MEASURED 2026-09-13 by the P4b recovery session under the network sandbox with production reads denied, the audit-hook tripwire and an isolated root; was 231. The +25 are 4q..4q-x (a missing record with no checkpoint recovered, repeated recovery, the --fresh watermark, an unreadable marker, ambiguity, the entry-point ordering), 4w-* (an identity-write failure while recovering a billed campaign, and the corrected refusal) and 4u..4u-iii (the same through the REAL main() in fresh processes). Before that 231, MEASURED 2026-09-13 by the P4 recovery session under the network sandbox, an audit-hook tripwire and an isolated project root; was 193. The +38 are 4f-i, 4f-ii, 4r..4r-ii and the section-4 continuation's failure injections through the REAL main(), 4s-* and 4t. Before that 193, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 190. The +3 are 3h, 3h-i and 3f-i. Before that 190, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
 ```
 
 **NINETEEN REVERTS, NINETEEN CAUGHT**, each in a copied tree with the editable
@@ -17247,13 +17247,22 @@ files), the index pin (+1), `_WRITE_LOCK` sites 9 -> 10, `test_spend_gate.py`
 
 **WHAT IS NOT DONE.**
 
-1. **A MISSING identity record with NO checkpoint is a NEW campaign** -- pinned
-   as a residual (4q). It is indistinguishable here from the run after
-   `--fresh`; closing it needs a durable campaign-closed marker in the database.
+1. ~~**A MISSING identity record with NO checkpoint is a NEW campaign**~~ --
+   CLOSED by the P4b recovery. It was not a residual but the defect: a campaign
+   whose every patient failed, with its record deleted, restarted at $0 while its
+   settled charges and unresolved reservations sat in the billing record
+   (measured in two fresh processes: $1.65, seed $0.00). Recovery now runs
+   whenever the record is missing, and `--fresh` stays separate through a
+   durable per-directory watermark (`batch_runner_fresh_start.json`,
+   `runner.record_fresh_start`), written BEFORE the checkpoint is cleared:
+   campaigns whose runs all sit at or below it are not recovered.
 2. **Recovery can adopt ANOTHER checkpoint directory's campaign** when that is
    the only open campaign sharing the configuration and cohort in one database.
    The direction is over-counting, but the two campaigns would then share a
-   budget.
+   budget. **Since P4b this also reaches a new checkpoint directory's FIRST
+   run**, not only a resume: a second directory started on the identical
+   configuration and cohort continues the first directory's open campaign unless
+   it is started with `--fresh`.
 3. **No pre-era-18 database can use the historical path** (P2's consequence).
 4. **The durability cost above is accepted, not optimised.**
 5. **A response priced ABOVE its reservation whose settlement fails** leaves the
@@ -17261,4 +17270,23 @@ files), the index pin (+1), `_WRITE_LOCK` sites 9 -> 10, `test_spend_gate.py`
    amount -- resumed remaining is then higher than live. Reachable only when the
    input estimate under-counts tokens.
 6. **The ablation study, API and MCP server still install no sink**, unchanged.
+7. **A clean finish that dies between clearing its checkpoint and finalizing its
+   run FINISHED** leaves an unfinished campaign with no record; the next run
+   recovers and continues it (over-counting). Found by the P4b review; not
+   driven.
+
+**TESTS NEVER OPEN THE PRODUCTION DATABASE (the P4b recovery).**
+`tests/_db_snapshot.py` is the one owner: `snapshot()` copies the file and its
+`-wal` as BYTES and proves the copy consistent (source digests equal before and
+after, copy equal to both, else `SnapshotInconsistent`); `frozen_copy()`
+checkpoints that COPY into one file, which is the only thing `immutable=1` may
+be pointed at; `ProductionConnectGuard` refuses and records any
+`sqlite3.connect` resolving to the production path, before open.
+`test_storage_query_layer.py`, `test_storage_write_durability.py` and
+`test_dashboard_truthfulness.py` use it, and each says its "production
+untouched" row comparison measures snapshots while the production files are
+compared by bytes. Measured before the change with an audit hook against an
+isolated copy: 17 opens (two `mode=ro` sites, which create WAL side files, one
+plain read-write through the unredirected cost-tab loader, and twelve
+`immutable=1`); after it, zero.
 
