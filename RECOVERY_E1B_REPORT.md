@@ -1001,3 +1001,187 @@ Evidence root (this session's scratchpad):
 then `controls_e1b_v2.py all` (now `-u`), foreground. Pass criteria: clean
 71/0; every plant, C4 and C5 included, ends in a RESULTS line with recorded
 failures and no kill or traceback.
+
+### 14.11 Batch B2 -- the full control matrix against the edited test (2026-09-14)
+
+Written for: the operator and the session that runs B3. Run only. No production
+source, no test file and no controls-harness file was edited; no commit, stash,
+branch change, reset or cleanup; no paid call; no production database opened.
+`git log -1` = `0f12013` (B1-fix committed); `git status --short` clean at start.
+
+Evidence root (this session's scratchpad):
+`/private/tmp/claude-501/<project-slug>/e54c04ff-c0ed-4e3e-a393-18b4fa056c0f/scratchpad`
+-- driver `b2_run.py`, `evidence/<run>/{test.log, tw.jsonl, fault/, summary.json}`,
+`evidence/batch*.driver.out`.
+
+#### 14.11.1 Method and containment
+
+- `b2_run.py` is B1-fix's `b1fix_run.py` extended to a list of runs. Plants are
+  imported verbatim from the E1b session's `controls_e1b_v2.py` PLANTS table
+  (anchor count 1 and `ast.parse` asserted per plant); B1's `sx.sh`, `nonet.sb`,
+  `tw/`, decoys and isoroot are used unchanged. Each run launches
+  `python -u tests/test_admission_replay_and_wait.py` in the foreground
+  (`subprocess.Popen`, new session), one at a time, never under `&`.
+- Timeouts: per-run driver kill at 240 s (`killpg SIGKILL`), and an independent
+  outer `perl alarm 580` around each driver invocation. No run was killed.
+- The driver's own SIGINT disposition was `default_int_handler` in every batch.
+- Per run the summary records: launch record pid, parent tripwire marker pid,
+  every descendant marker with its ppid, the sandbox-only write probe, audit
+  hook, editable-finder strip, every non-marker tripwire record, the profile
+  sha256, the import origin against the expected copy, the live tree's touched
+  files sha256 before and after, and whether `halt_with_live_worker` printed.
+- `live` = the new test against the live `03- Code` tree (EXTRA_PP = the code
+  dir, import origin asserted); `clean` = the unplanted copy.
+
+#### 14.11.2 Results
+
+Every row below: no traceback, driver not killed unless stated, import origin
+equal to the expected copy (or the live tree), live tree's touched files
+byte-identical before and after, profile sha256 `0e78e401...`, 16 tripwire
+markers (launch pid = parent marker; 11 children + 4 grandchildren of the
+parent, none unattached), every marker `sandbox_only_write: denied`, audit hook
+installed, editable finder stripped, and no non-marker tripwire record (no
+external, loopback or sqlite-watch).
+
+- **live** (new test, live tree): exit 0, 31.1 s, **`RESULTS: 71 passed, 0
+  failed`**. Launch pid 51409; children 51421 51426 51430 51435 51437 51480
+  51485 51487 51505 51514 51521; grandchildren 51501 51510 51520 51529.
+- **clean** (unplanted copy): exit 0, 31.5 s, **71/0**. Launch 51530; children
+  51542 51544 51552 51554 51559 51590 51592 51599 51610 51616 51624;
+  grandchildren 51603 51614 51623 51631.
+- **C1 replay lookup removed**: exit 1, 41.6 s, **63/8** -- 2b 2d 2e 2g 2h 3b 3c
+  3e. Intended: 2b, 2g, 2h, 3b, 3e (a replay is declined `headroom_held`, e.g.
+  2g actual `(False, 1, ..., {'stage5:headroom_held': 1})`, 2h/3e end with the
+  row RESERVED and zero calls). 2d, 2e, 3c also fire, as a consequence the
+  plant causes rather than an unrelated failure: with no lookup the conflict
+  check is never reached, so a mismatch is declined by admission or written
+  instead of raising `BillingReservationConflict`. Launch 51694.
+- **C2 replay validation removed**: exit 1, 30.9 s, **68/3** -- 2d 2e 3c, all
+  intended (2d/2e actual `NoneType` where `BillingReservationConflict` was
+  expected; 3c replays a $5 request against a $9 row). Launch 51817.
+- **C3 no wait**: first attempt KILLED by the driver's own 240 s bound (58
+  checks, last PASS 4u, main thread in section 5's `run_child`; no hang in the
+  test, see below); evidence kept as `evidence/C3_kill240/`. Re-run alone with
+  a 560 s bound: exit 1, **247.1 s**, **50/21** -- 4a 4c-4n 4n-i 4p-4s 5a-5c.
+  Intended: 4a, the wait's non-degeneracy ("the waiter entered the wait"),
+  actual False, and every wait-dependent assertion after it (4g actual
+  `(0, 0, False)`: no wait object; 4h latches `spend_cap` instead of
+  `admission_wait`; 5b run row `FAILED` with no stop reason). Launch 52623.
+  - The 240 s bound was this driver's, not the matrix's (v2 used 600 s); the
+    pre-fix v2 run of C3 also finished (50/21). The kill left the test's temp
+    dir `oncotriage-admission-e1b-gdmugy5i` in `$TMPDIR` (a killed run cannot
+    run its own removal). Not removed: this batch does no cleanup.
+- **C4 deadline reset per recheck**: exit 1, 38.8 s, **68/4, 72 checks** -- 4f-0
+  4g 4h 4i, all intended. 4f-0 actual `'still waiting'` after the 6 s join; 4g
+  `(1, 24, False)` (one wait object, 24 distinct deadlines -- the defect); 4h
+  `Stage5ShutdownRequested`, no latch; 4i no `admission_wait` refusal. 4f-0b was
+  NOT reached: the shutdown flag ended the worker. Launch 53196.
+- **C5 cancellation ignored**: exit 1, 81.9 s, **68/3** -- 4k 4l 4m, all
+  intended: each actual `(True, False, True, '_Absent', ...)` (entered, not
+  interrupted within one poll, thread alive after 5 s, no exception); every
+  cleanup element read `(False, 0, 0)`. 4n and 4n-i pass, as in B1-fix
+  (4n-i's stop is seen by the retry policy after a positive preview). Launch
+  53321.
+- **C6 no FIFO**: exit 1, 35.7 s, **70/1** -- 4p, intended: actual
+  `(['N'], ['N', 'W1'], ...)`, the new arrival dispatched ahead of the head
+  waiter. Launch 53532.
+- **C7 timeout does not latch**: exit 1, 89.2 s, **66/5** -- 4h 4i 5a 5b 5c.
+  Intended: 4h actual `[False, None]` for the latch, 4i no refusal, 5b run row
+  `('FAILED', None)` instead of `('STOPPED', 'admission_wait')`, 5c checkpoint
+  2 where 1 was expected. 5a is the section-5 non-degeneracy
+  (`(0, 1, 3, 2)` vs `(0, 1, 2, 1)`): with no latch the runner starts a third
+  patient, so it fires as a consequence of the plant, not for an unrelated
+  reason. Launch 53647.
+- **C8 Stage 5 gate ignores wait latch**: exit 1, 31.7 s, **69/2** -- 4i 6a,
+  intended. 4i actual `('NoneType', None, 'SpendLimitReached',
+  'admission_wait')`: only the Stage 5 half of 4i fails, the non-Stage-5 gate
+  still refuses. 6a actual `(5, [], False)`: the real node issued 5 requests
+  after an admission-wait stop. Launch 53913.
+- **C9 write lock held across wait**: exit 1, 52.6 s, **69/2** -- 4c 4e,
+  intended. 4c actual `[True, False, True]` (the write lock not acquirable
+  during the wait); 4e the durable settlement could not land (rows stay
+  `reserved`). Launch 54014.
+- **C10 permit held during wait**: exit 1, 31.7 s, **68/3** -- 4b 4d 4n-i, all
+  on the intended property. The differing element is the pacer's outstanding
+  permit count in each: 4b `([], 1, 1)` vs `([], 0, 1)`; 4d element 7
+  (`_pacer.outstanding`) 1 vs 0; 4n-i last element of the waits/permit tuple
+  `(1, 1, 0, 0, 1)` vs `(1, 1, 0, 0, 0)` ("no permit outstanding"). Launch 54187.
+- **C11 runner stop reason is cap**: exit 1, 31.0 s, **70/1** -- 5b, intended:
+  run row `('STOPPED', 'spend_cap')` while the latch reads `admission_wait`.
+  Launch 54292.
+- **C12 hold-token replay doubles**: exit 1, 30.4 s, **70/1** -- 2i, intended:
+  actual `(True, False, 'NoneType', 'NoneType', 1, 9.0)`, the replay not
+  recognised and the two mismatches not refused. Launch 54398.
+- **C13 require_budget ignores wait latch**: exit 1, 31.1 s, **70/1** -- 4i,
+  intended, and on the OTHER half from C8: actual `('Stage5SpendStopped',
+  'admission_wait', 'NoneType', None)`, the non-Stage-5 gate no longer refuses.
+  Launch 54547.
+- **C14 settled attempt replayable**: exit 1, 30.6 s, **70/1** -- 2e, intended:
+  actual `('NoneType', False)`, a settled attempt replayed instead of raising
+  `BillingReservationConflict`. Launch 54657.
+- **C15 policy cancel counted failed**: exit 1, 30.4 s, **70/1** -- 4n-i,
+  intended: waits tuple `(1, 0, 1, 0, 0)` vs `(1, 1, 0, 0, 0)`, the wait counted
+  failed instead of cancelled. Launch 54758.
+
+Markers for C1-C15 (each run): launch pid = parent marker, 11 children and 4
+grandchildren of the parent, 16 total, none unattached; full pid lists in each
+`summary.json`. The C3 run killed at 240 s has 10 markers (section 5 had not
+started its later children), all attached, all denied/hooked/stripped.
+Decoys `decoy_sandbox_only` and `decoy_protected` empty after every run.
+
+#### 14.11.3 Verdict against the acceptance criteria
+
+- **Clean: 71/0**, on the live tree and on the unplanted copy.
+- **Every plant ends in a RESULTS line, with no traceback.** 15/15. One kill
+  occurred (C3 at the driver's 240 s bound); the unkilled re-run of the same
+  plant finished at 247.1 s with a RESULTS line. It is a driver-bound
+  artifact, not a hang: the killed run's main thread was in section 5's
+  `run_child` at 200 s and had just passed 4u, and the v2 pre-fix run of C3
+  also finished.
+- **Every plant makes its intended assertion fail.** 15/15. Additional failures
+  in C1 (2d 2e 3c), C3 (the whole wait block) and C7 (5a) are consequences of
+  the plant itself, each traced above; none fails for an unrelated reason.
+- **C4 reports 72 checks** (4f-0), as allowed; every other run 71.
+- **The "redundant" exception.** No plant is documented as redundant in
+  sections 1-14.10 of this report, in `controls_e1b_v2.py`, in the three
+  prior scratchpads' scripts, or in CLAUDE.md. None was needed: every plant
+  fired its own assertion. The nearest pair, C8 and C13, both fail 4i but on
+  opposite halves (Stage 5 gate vs non-Stage-5 gate), and C8 additionally
+  fails 6a.
+- Compared with v2 (14.3, pre-fix test): C1, C2, C3, C6-C15 give the same
+  failing ids; C4 moves from a 600 s hang to 68/4; C5 from an abort after 4k to
+  68/3.
+
+#### 14.11.4 Coverage limits
+
+- **`halt_with_live_worker` never executed** in any of the 18 runs (the
+  `HALT_TEXT` string appears in no log): 4f-0b, 4k-0, 4l-0, 4m-0 and 4n-0 were
+  never reached. C4's worker was ended by the shutdown flag; C5's waiters
+  exited within the cleanup join.
+- **The failure branch of the new cleanup value never executed.** Every
+  4k/4l/4m/4n detail in every run, including C3 and C5 where those checks
+  failed, reads the cleanup element `(False, 0, 0)`.
+- Both are guards verified by reading only, as in B1-fix. This limitation does
+  not by itself call for a repair session.
+- The test's own "tripwire_records: 0" weakness (14.3) does not apply here:
+  every run has its markers, and no non-marker record exists in any log.
+
+#### 14.11.5 Edits, anything unrecorded, carried
+
+- **No edit** to `tests/test_admission_replay_and_wait.py` or to
+  `controls_e1b_v2.py`: no plant hung, aborted or lacked a RESULTS line.
+  `b2_run.py` is a new scratchpad driver, not the controls harness; its per-run
+  kill bound became an environment variable (`B2_KILL_S`) after the C3 kill,
+  and C3 was re-run with 560 s. C4-C15 ran with 300 s.
+- **Unrecorded:** nothing in this batch's scope.
+- `$TMPDIR` now holds four `oncotriage-admission-e1b-*` dirs: the three from the
+  earlier session plus `gdmugy5i` from the killed C3 run. Left in place (no
+  cleanup this batch).
+- Carried unchanged: CLAUDE.md's end-state overclaims (14.9.5); the CLAUDE.md
+  run-block count `# 71` is correct for the clean file.
+
+#### 14.11.6 Next single batch
+
+**B3** (14.7 item 3): the suites not run since the D1 edit, under the same
+containment, one at a time, foreground, `test_runner_stop_switch` and
+`test_runner_sigterm_shutdown` last and sequentially.
