@@ -1205,8 +1205,8 @@ def ragas_attempt_bound(kind, model, args, kwargs):
 class _RagasAttemptRecord:
     """Per-wire admission and settlement; the retry owner calls each hook.
 
-    No failure callback charges separately. The existing run checkpointer owns
-    settled liabilities, not open requests; hard kill can still lose those.
+    No failure callback charges separately. Paid main installs a durable sink
+    before constructing either client; each wire attempt commits before send.
     """
 
     def __init__(self, tally, kind, model, args, kwargs):
@@ -3564,6 +3564,8 @@ def _parse_args(argv=None):
     p.add_argument("--output-dir", default=None,
                    help="where to write results/manifest "
                         "(default: <run-dir>/ragas/)")
+    p.add_argument("--billing-status", action="store_true",
+                   help="read durable billing status without loading a run or calling a provider")
     p.add_argument("--dry-run", action="store_true",
                    help="build both datasets, print counts, per-metric judge-"
                         "call estimates and a projected cost range; call "
@@ -3654,11 +3656,31 @@ def dispatches_billed_calls(argv=None):
     whose only side effects (``--help``, a usage error) exit.
     """
     args = _parse_args(argv)
-    return not bool(getattr(args, "dry_run", False))
+    return not (bool(getattr(args, "dry_run", False)) or args.billing_status)
 
 
 def main(argv=None):
+    from contextlib import ExitStack
+    from oncotriage.evaluation import ragas_billing
+    previous = spend.BILLING_RECORD.installed_sink()
+    try:
+        with ExitStack() as billing_stack:
+            return _main(argv, billing_stack)
+    except (ragas_billing.RecoveryRefusal, OSError) as exc:
+        console.out(f"REFUSED (ragas_billing_recovery): {exc}")
+        return 1
+    finally:
+        spend.BILLING_RECORD.install(previous)
+
+
+def _main(argv, billing_stack):
+    from oncotriage.evaluation import ragas_billing
     args = _parse_args(argv)
+    if args.billing_status:
+        report = ragas_billing.status(spend_journal.journal_path())
+        report["seed"] = report["seed"]._asdict()
+        console.out(json.dumps(report, sort_keys=True))
+        return 0
     if args.embedding_model is None:
         args.embedding_model = config.EMBEDDING_MODEL
 
@@ -3701,6 +3723,9 @@ def main(argv=None):
         print_resume_preview(run, args, active, out_dir, environment)
         return 0
 
+    # Own the accounting scope before touching paid-run output/resume files.
+    billing = billing_stack.enter_context(
+        ragas_billing.Store(spend_journal.journal_path()))
     parent = os.path.dirname(out_dir.rstrip(os.sep))
     if not os.path.isdir(parent):
         console.out(f"REFUSED (output_parent_missing): {parent!r} does not "
@@ -3817,42 +3842,15 @@ def main(argv=None):
         # responses against the same rates.
         tally = UsageTally(judge_model=args.judge_model,
                            embedding_model=args.embedding_model)
-        # ── THE SPEND GATE ────────────────────────────────────────────────
-        #
-        # ONE RESET AND ONE BANNER, before the first billed call. The ledger is
-        # process-global and this is a one-shot command, so it starts fresh;
-        # what it must NOT do is inherit a total from an earlier main() in the
-        # same interpreter.
-        #
-        # ** AND THERE IS A SEED NOW. The block that stood here said there was
-        # ** none, and it was right about the SCORE journal and wrong to stop
-        # ** there.
-        #
-        # The old reasoning: `--resume` re-scores from a partial journal that
-        # records SCORES rather than spend, so there is no persisted total to
-        # inherit and inventing one from a row count would be an estimate
-        # deciding a budget. Every word of that is still true OF THAT FILE. It
-        # simply is not the only store any more.
-        #
-        # `oncotriage/spend_journal.py` records one entry per INVOCATION of
-        # this harness, under the CAMPAIGN budget, which is where
-        # `spend.BUDGET_FOR_SOURCE` puts both ragas paths. So a second
-        # invocation -- a resume, a re-run, a second dataset -- starts under
-        # the remainder of what ragas has already spent instead of at the full
-        # cap. Two invocations were two independent budgets before this and
-        # nothing said so, which is the rater's defect one program over.
-        #
-        # WHAT IT STILL DOES NOT DO: it does not net against Stage 5's spend.
-        # A campaign seeds the same budget from its billing record
-        # (`database_logger.campaign_billing_total`); ragas seeds it from the
-        # journal. The two populations are DISJOINT -- Stage 5 writes no
-        # journal entry and ragas writes no `inferences` row -- so neither
-        # double-counts the other, and neither sees it either. That was true
-        # before this change and is unchanged by it.
+        # One durable authority across invocations. Prior liability is seeded
+        # once; this invocation's holds/settlements are mirrored by AttemptLiability.
         spend.SPEND_LEDGER.reset()
         spend.SPEND_STOP.reset()
-        spend.SPEND_LEDGER.seed(
-            spend_journal.total(spend.SPEND_BUDGET_CAMPAIGN))
+        spend.BILLING_RECORD.reset_liability()
+        spend.BILLING_RECORD.install(billing)
+        if not spend.durable_admission_applies(spend.SPEND_BUDGET_CAMPAIGN):
+            raise ragas_billing.RecoveryRefusal("Ragas requires durable campaign-budget admission")
+        spend.SPEND_LEDGER.seed(billing.initial["seed"])
         console.out(spend.describe_cap())
         console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
         console.out(spend_journal.describe(spend.SPEND_BUDGET_CAMPAIGN))
@@ -3929,46 +3927,10 @@ def main(argv=None):
     tree_before = snapshot_tree(run_dir, exclude_dir=out_dir)
 
     started = time.monotonic()
-    # Persist settled liabilities through the existing run journal. Every
-    # settlement offers a delta (min_usd=0), including a failed retry. The
-    # finalizer writes any remainder and stops the backstop. No open request
-    # is durable: a hard kill before settlement/checkpoint can still lose its
-    # liability. Reusing the existing owner avoids counting attempts twice.
-    _journal_unit = _utc_now()
-    _checkpointer = spend_journal.RunSpendCheckpointer(
-        spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
-        out_dir, _journal_unit, args.judge_model,
-        min_usd=0, accounting_basis="measured_responses_plus_unconfirmed_liability")
-    tally.checkpointer = _checkpointer
-    # Pair completion and the wall-clock backstop remain additional offers to
-    # the same locked checkpointer. They do not record open requests. A pending
-    # or conflicting write is retried/checked in the next attempt's admission.
-    _checkpointer.start_backstop(lambda: spend.SPEND_LEDGER.measured)
-    try:
-        scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
-                                       journal=journal, reuse=reuse,
-                                       spend_checkpoint=_checkpointer.checkpoint))
-    finally:
-        # STILL IN A `finally`, and it is not made redundant by the
-        # checkpoints: they fire on a threshold, so an invocation that
-        # unwinds always has a tail they did not reach, and an invocation that
-        # spent nothing has no checkpoint at all and still has to leave a
-        # terminal entry.
-        #
-        # IT VERIFIES AGAINST THE FILE and reports any residual itself, loudly.
-        # The line below is the same fact in this harness's own closing block,
-        # because the finalize's warning is emitted mid-`finally` and scrolls
-        # away above the spend report an operator actually reads.
-        _checkpointer.finalize(spend.SPEND_LEDGER.measured)
-        if (_checkpointer.residual_usd or 0.0) > 0:
-            console.out(
-                f"  NOTE: ${_checkpointer.residual_usd:.6f} of this run's "
-                f"spend is NOT in the cross-process journal -- "
-                f"{len(_checkpointer.pending)} delta(s) pending, "
-                f"{len(_checkpointer.conflicted)} in conflict. The next "
-                f"session's cumulative cap will not see it. This run's own "
-                f"cost report below is unaffected: it is computed from the "
-                f"responses, not from the journal.")
+    # SQLite is the monetary authority. Score checkpoints remain independent;
+    # also appending aggregate spend here would count each attempt twice.
+    scores = asyncio.run(score_all(run, metrics, args.max_workers, active,
+                                   journal=journal, reuse=reuse))
     wall_seconds = time.monotonic() - started
 
     summary = summarize(scores, run, active)

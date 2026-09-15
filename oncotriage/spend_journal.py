@@ -1125,6 +1125,25 @@ def _analyse_budget(entries, budget, memo=None):
 
 
 def total(budget, path=None, entries=None, unreadable=None):
+    """Authoritative total, including durable Ragas attempts after cutover.
+
+Explicit pre-read entries retain the legacy analysis API; durable readers use
+the path API so database identity and historical coverage can be verified.
+    """
+    if budget == spend.SPEND_BUDGET_CAMPAIGN and entries is None:
+        from oncotriage.evaluation import ragas_billing
+        resolved = resolved_journal_path(path)
+        if resolved is not None and ragas_billing.exists(resolved):
+            try:
+                return ragas_billing.status(resolved)["seed"]
+            except (ragas_billing.RecoveryRefusal, OSError, ValueError) as exc:
+                return spend.LedgerSeed(
+                    source=SEED_SOURCE_FOR_BUDGET[budget], unreadable=1,
+                    unreadable_reasons=(str(exc),))
+    return legacy_total(budget, path, entries, unreadable)
+
+
+def legacy_total(budget, path=None, entries=None, unreadable=None):
     """``spend.LedgerSeed`` for ``budget``: everything ever recorded for it.
 
     Duplicate ``entry_id``s are summed ONCE, first occurrence winning, and the

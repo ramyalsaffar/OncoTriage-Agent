@@ -9,7 +9,7 @@ that does not was not. A SIGKILL, an OOM kill and a power loss leave tens of
 minutes of billed judging unrecorded, and the next session's cumulative cap
 reads as though this one never ran.
 
-``spend_journal.RunSpendCheckpointer`` closes it by writing DELTAS as the run
+The legacy ``spend_journal.RunSpendCheckpointer`` reduces it by writing DELTAS as the run
 proceeds. The unit checks for it are ``tests/test_spend_journal.py`` section
 7d; THIS file is the half that cannot be written in-process:
 
@@ -398,64 +398,45 @@ print("        process adds nothing a checkpointer object does not show.")
 
 print()
 print("=" * 74)
-print("5. main() IS WIRED TO IT, WHICH THE SCENARIOS ABOVE CANNOT SEE")
+print("5. paid Ragas installs its durable authority before clients")
 print("=" * 74)
 
-# ** THIS SECTION EXISTS BECAUSE THE REVERT MATRIX REPORTED A MISS. **
-#
-# Sections 1-3 drive `score_all` directly, which is right -- it is where the
-# hook fires and where a kill can be aimed. But it means NOTHING above notices
-# if `main()` stops handing the hook over: `score_all(spend_checkpoint=None)`
-# is a perfectly good call, every scenario here still passes because each
-# builds its own checkpointer, and the shipped harness silently goes back to
-# one-entry-per-invocation. Planted, and MISSED by every check in this file
-# and in tests/test_spend_journal.py.
-#
-# IT IS STRUCTURAL AND NOT A DRIVE, deliberately. Driving the real `main()` far
-# enough to observe a second journal entry needs a run that SPENDS -- the
-# checkpointer writes on a dollar threshold -- so a behavioural version would
-# have to stub the ledger as well as the judge, and would then be asserting
-# about the stub's charges rather than about the wiring. The wiring is a
-# property of the source, so the source is what is read.
-_RH_PATH = os.path.join(_CODE_DIR, "oncotriage", "evaluation",
-                        "ragas_harness.py")
-_RH_TREE = _ast5.parse(io.open(_RH_PATH, encoding="utf-8").read())
-_MAIN5 = next((n for n in _ast5.walk(_RH_TREE)
-               if isinstance(n, _ast5.FunctionDef) and n.name == "main"), None)
-check("5a  non-degeneracy: ragas_harness.main() was found, without which "
-      "every check below passes over an empty walk", _MAIN5 is not None, True)
+# The scenarios above retain the legacy checkpointer contract for its other
+# consumers. Ragas now persists BEFORE dispatch; reconnecting aggregate writes
+# would double count. Actual wrapper crash barriers live in the recovery suite.
+_RH_PATH = os.path.join(_CODE_DIR, "oncotriage", "evaluation", "ragas_harness.py")
+_RH_SOURCE = io.open(_RH_PATH, encoding="utf-8").read()
 
-_MAIN_TXT5 = _ast5.unparse(_MAIN5) if _MAIN5 else ""
-_SCORE_CALLS = [n for n in _ast5.walk(_MAIN5 or _ast5.parse(""))
-                if isinstance(n, _ast5.Call)
-                and getattr(n.func, "id", None) == "score_all"]
-check("5b  main() calls score_all exactly once (probe, so the keyword check "
-      "below cannot pass over an absent call)", len(_SCORE_CALLS), 1)
-_KW = {k.arg for c in _SCORE_CALLS for k in c.keywords}
-check("5c  ...and it passes spend_checkpoint, so the periodic write is wired "
-      "to the run that actually spends money",
-      "spend_checkpoint" in _KW, True)
-_HOOK = [_ast5.unparse(k.value) for c in _SCORE_CALLS for k in c.keywords
-         if k.arg == "spend_checkpoint"]
-check("5d  ...and what it passes is a checkpointer's own bound method, not "
-      "None and not a lambda that swallows it",
-      [h for h in _HOOK if h.endswith(".checkpoint")], _HOOK)
-check("5e  non-degeneracy: the hook expression is non-empty, so 5d is not "
-      "comparing two empty lists", len(_HOOK), 1)
-# AND THE TERMINAL ENTRY IS STILL WRITTEN FROM A `finally`. The checkpoints
-# fire on a threshold, so an invocation that unwinds always has a tail they did
-# not reach -- and one that spent nothing has no checkpoint at all and still
-# has to leave a record that it ran.
-_FINALLY5 = [n for n in _ast5.walk(_MAIN5 or _ast5.parse(""))
-             if isinstance(n, _ast5.Try) and n.finalbody
-             and any(isinstance(c, _ast5.Call)
-                     and getattr(c.func, "attr", None) == "finalize"
-                     for stmt in n.finalbody for c in _ast5.walk(stmt))]
-check("5f  finalize is called from a `finally`, so an exception abort and a "
-      "Ctrl-C still record their tail", len(_FINALLY5), 1)
-check("5g  ...and main() no longer calls record_run directly, which would "
-      "write the WHOLE run beside the deltas and double count",
-      "spend_journal.record_run(" in _MAIN_TXT5, False)
+
+def durable_wiring(source):
+    tree = _ast5.parse(source)
+    main = next((n for n in _ast5.walk(tree) if isinstance(n, _ast5.FunctionDef)
+                 and n.name == "_main"), None)
+    wrapper = next((n for n in _ast5.walk(tree) if isinstance(n, _ast5.FunctionDef)
+                    and n.name == "main"), None)
+    calls = [n for n in _ast5.walk(main or _ast5.parse("")) if isinstance(n, _ast5.Call)]
+    owned = [n for n in calls if _ast5.unparse(n) ==
+             "billing_stack.enter_context(ragas_billing.Store(spend_journal.journal_path()))"]
+    installed = [n for n in calls if _ast5.unparse(n) == "spend.BILLING_RECORD.install(billing)"]
+    clients = [n for n in calls if getattr(n.func, "id", None) == "build_judge"]
+    scores = [n for n in calls if getattr(n.func, "id", None) == "score_all"]
+    no_aggregate = not any(getattr(n.func, "attr", None) in
+        ("RunSpendCheckpointer", "record_run", "start_backstop", "finalize") for n in calls)
+    scoped = any(isinstance(n, _ast5.With) and any(_ast5.unparse(item.context_expr) == "ExitStack()"
+                 for item in n.items) for n in _ast5.walk(wrapper or _ast5.parse("")))
+    return (len(owned) == len(installed) == len(clients) == len(scores) == 1 and scoped
+            and owned[0].lineno < installed[0].lineno < clients[0].lineno < scores[0].lineno
+            and no_aggregate and not any(k.arg == "spend_checkpoint" for k in scores[0].keywords))
+
+
+check("5a  lifetime ownership and sink installation precede clients; scoring has one monetary authority",
+      durable_wiring(_RH_SOURCE), True)
+check("5b  CONTROL: detached sink installation is detected",
+      durable_wiring(_RH_SOURCE.replace("spend.BILLING_RECORD.install(billing)", "spend.BILLING_RECORD.clear()")), False)
+check("5c  CONTROL: removed lifetime cleanup is detected",
+      durable_wiring(_RH_SOURCE.replace("with ExitStack() as billing_stack:", "with OtherStack() as billing_stack:")), False)
+check("5d  CONTROL: a second monetary checkpoint hook is detected",
+      durable_wiring(_RH_SOURCE.replace("journal=journal, reuse=reuse))", "journal=journal, reuse=reuse, spend_checkpoint=None))")), False)
 
 
 print()

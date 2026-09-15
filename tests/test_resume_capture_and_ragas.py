@@ -1962,10 +1962,10 @@ finally:
 check("9i  a campaign record with an unreadable line REFUSES the ragas run by "
       "name, before a single pair is judged",
       code == 1 and _scored_9i == 0
-      and "REFUSED (spend_record_unverified)" in txt,
+      and "REFUSED (ragas_billing_recovery)" in txt,
       (code, _scored_9i, txt[-700:]))
-check("9i  ...telling the operator the remainder is UNVERIFIED and potentially "
-      "OVERSTATED", "potentially OVERSTATED" in txt, txt[-700:])
+check("9i  ...telling the operator legacy spend is incomplete",
+      "legacy spend is incomplete" in txt, txt[-700:])
 shutil.rmtree(DRIVE_OUT, ignore_errors=True)
 code, txt = drive_ragas_main([], DRIVE_RUN)
 check("9i  CLEAN CONTROL: the same run with the line removed judges every pair",
@@ -1989,11 +1989,13 @@ check("9h  the PRODUCTION spend journal is byte-unchanged by ten driven "
 _redirected = os.path.join(DRIVE_JOURNAL_DIR, "spend_journal.jsonl")
 check("9h  ...because they went to the redirected one instead, which is what "
       "says the override REACHED the harness rather than that nothing was "
-      "recorded at all", os.path.isfile(_redirected), True)
-check("9h  ...and every entry there is a ragas run under the campaign budget",
-      sorted({(e["budget"], e["kind"]) for e in
-              spend_journal.read_entries(_redirected)}),
-      [("campaign", "run")])
+      "recorded at all", os.path.isfile(_redirected + ".ragas.sqlite3"), True)
+from oncotriage.evaluation import ragas_billing
+_durable_status = ragas_billing.status(_redirected)
+check("9h  ...durable identity exists and fake metrics create no paid attempts",
+      bool(_durable_status["store_id"]) and not _durable_status["attempts"])
+check("9h  ...no duplicate aggregate Ragas spend is appended",
+      not spend_journal.read_entries(_redirected))
 shutil.rmtree(DRIVE_JOURNAL_DIR, ignore_errors=True)
 
 shutil.rmtree(DRIVE_RUN, ignore_errors=True)

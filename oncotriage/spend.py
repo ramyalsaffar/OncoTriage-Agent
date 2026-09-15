@@ -2879,6 +2879,12 @@ class SpendStop:
             # settlement, an unverified one and an unpriced reservation.
             _what, _remedy = _BILLING_RECORD_BANNER.get(
                 _cause, _BILLING_RECORD_BANNER[None])
+            if source in (SPEND_SOURCE_RAGAS_JUDGE, SPEND_SOURCE_RAGAS_EMBEDDING):
+                _what = "THE RAGAS DURABLE BILLING RECORD REQUIRES REVIEW"
+                _remedy = ("Inspect ragas_run.py --billing-status and the SQLite store "
+                           "beside the shared spend journal. Preserve its identity and "
+                           "fault markers; unresolved attempts retain liability. "
+                           "Do not delete billing files or automatically resend requests.")
             console.out(f"[SPEND] {_what}; no further billed request may be "
                         f"dispatched.")
             console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "
@@ -3436,9 +3442,9 @@ BILLING_RECORD = BillingRecord()
 # RECOVERY_P1C_REPORT.md, item 2.
 #
 # WHAT IT DOES NOT COVER, STATED: billed paths that do not create one of these
-# -- the rater's Batch API -- keep their own ledger charges. Ragas uses this
-# settlement owner without a campaign sink, then checkpoints settled liability
-# through its existing run journal. Open Ragas requests remain a hard-kill gap.
+# -- the rater's Batch API -- keep their own ledger charges. Ragas installs a focused SQLite sink before paid work. Its reservations
+# survive process death; unresolved reservations refuse paid restart. The legacy
+# run journal is imported once and no longer receives new Ragas monetary deltas.
 
 LIABILITY_OPEN = "open"
 """The live tally's key for attempts created and not yet resolved -- the

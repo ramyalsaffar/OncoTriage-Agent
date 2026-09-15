@@ -30,9 +30,12 @@ claimed: see ``oncotriage/evaluation/judge_independence.py``, which compares
 families rather than model strings, because a Claude on Bedrock is still an
 Anthropic model.
 
-WHAT IT DOES NOT TOUCH. It re-runs no pipeline stage, opens no database, reads
-no characterization fixture and writes nothing inside this repository. It reads
-an evaluation run directory and writes two JSON files beside it.
+DATA AND OUTPUTS. It reads an evaluation run without re-running pipeline stages
+or opening the patient/pipeline database. It writes score/manifest JSON and a
+partial score journal in the output directory. Paid runs also use a dedicated
+Ragas billing SQLite store and identity/lock files beside the shared spend
+journal. ``--billing-status`` reads that billing record without loading an
+evaluation run or calling a provider; it is a free path alongside ``--dry-run``.
 
 RAGAS IS NOT A PIPELINE DEPENDENCY AND IS NOT IN pyproject.toml. Installing it
 into the project environment would drag ``openai`` from 1.x to 2.x and bump
@@ -40,8 +43,9 @@ into the project environment would drag ``openai`` from 1.x to 2.x and bump
 isolated environment that has ragas and openai installed; the harness imports
 ragas lazily, inside function bodies, so importing
 ``oncotriage.evaluation.ragas_harness`` loads no part of ragas -- which is what
-lets ``--help`` and ``--dry-run`` run in the project environment, where ragas is
-absent. ``anthropic`` is no longer needed on this path at all.
+lets ``--help``, ``--dry-run`` and ``--billing-status`` run in the project
+environment, where ragas is absent. ``anthropic`` is no longer needed on this
+path at all.
 
 THE INSTALLED RAGAS CANNOT MAP THIS MODEL'S PARAMETERS AND THE HARNESS REPAIRS
 IT. ragas 0.4.3 decides whether a model is a reasoning model by ``int()``-ing
@@ -98,6 +102,7 @@ one -- a mixture of the two under one metric name is a mean about nothing.
 USAGE
 -----
     python ragas_run.py --dry-run                # free: counts and a range
+    python ragas_run.py --billing-status         # free: durable billing status
     python ragas_run.py --limit 3                # COSTS MONEY: a smoke run
     python ragas_run.py                          # COSTS MONEY: the full run
     python ragas_run.py --output-dir <scratch>

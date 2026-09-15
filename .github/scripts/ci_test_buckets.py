@@ -833,6 +833,8 @@ BUCKETS = {
         "NOTHING and writes only inside a tempfile.mkdtemp it removes and "
         "asserts gone; every control is a different input, or a module "
         "attribute rebound inside try/finally with the restore asserted."),
+    "test_ragas_durable_recovery.py": (
+        _A, None, "Synthetic SQLite stores; subprocess crash barriers and fresh-process recovery; no paid calls."),
     "test_ragas_billing.py": (
         _A, None,
         "Both real Ragas request wrappers and the real retry owner, with fake "

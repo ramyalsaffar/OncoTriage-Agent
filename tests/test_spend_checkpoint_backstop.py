@@ -1,7 +1,7 @@
 """The spend checkpointer's wall-clock backstop.
 
 ``RunSpendCheckpointer.checkpoint`` evaluates ``RUN_CHECKPOINT_SECONDS`` only
-when it is CALLED, and the ragas harness calls it on PAIR COMPLETION -- so a
+when it is CALLED. The legacy Ragas integration called it on PAIR COMPLETION -- so a
 run whose pairs all hang, or whose event loop is blocked, offered nothing to
 the cross-process journal however long it waited. ``start_backstop`` is a
 daemon thread that runs the same threshold decision, under the same lock, on a
@@ -20,7 +20,7 @@ Sections:
      refusing journal retried by many ticks, with no double count;
   3. shutdown mid-pending, including finalization while a tick holds the lock;
   4. never raises into the judging path;
-  5. ``ragas_harness.main()`` starts it, before ``score_all``;
+  5. paid Ragas uses durable reservations instead of this legacy backstop;
   6. isolation.
 
 NO NETWORK, NO KEYS, NO SPEND: every metric is a stub that charges a local
@@ -548,29 +548,29 @@ check("4g  a malformed interval is counted and floored, not raised",
 _c4g.finalize(0.0)
 
 
-section("5. ragas_harness.main() STARTS IT, BEFORE score_all")
+section("5. paid Ragas owns durable reservations, with no aggregate backstop")
 
 _rh_src = io.open(os.path.join(_CODE_DIR, "oncotriage", "evaluation",
                                "ragas_harness.py"), encoding="utf-8").read()
-_main = next((n for n in ast.walk(ast.parse(_rh_src))
-              if isinstance(n, ast.FunctionDef) and n.name == "main"), None)
-check("5a  non-degeneracy: main() was found", _main is not None, True)
-_calls = sorted((n.lineno, n) for n in ast.walk(_main or ast.parse(""))
-                if isinstance(n, ast.Call)
-                and getattr(n.func, "attr", getattr(n.func, "id", None))
-                in ("start_backstop", "score_all", "finalize"))
-_order = [getattr(n.func, "attr", getattr(n.func, "id", None))
-          for _, n in _calls]
-check("5b  main() calls start_backstop exactly once",
-      _order.count("start_backstop"), 1)
-check("5c  ...before score_all, so the stalled run it exists for is covered",
-      (_order.index("start_backstop") < _order.index("score_all"))
-      if "start_backstop" in _order and "score_all" in _order else None, True)
-_bs = [n for _, n in _calls if getattr(n.func, "attr", None) == "start_backstop"]
-check("5d  ...on the same checkpointer whose bound checkpoint is the hook, "
-      "measuring the LEDGER (charged per response)",
-      [ast.unparse(n) for n in _bs],
-      ["_checkpointer.start_backstop(lambda: spend.SPEND_LEDGER.measured)"])
+
+
+def durable_order(source):
+    main = next((n for n in ast.walk(ast.parse(source))
+                 if isinstance(n, ast.FunctionDef) and n.name == "_main"), None)
+    calls = sorted((n.lineno, getattr(n.func, "attr", getattr(n.func, "id", None)))
+                   for n in ast.walk(main or ast.parse("")) if isinstance(n, ast.Call))
+    names = [name for _, name in calls]
+    return (main is not None and names.count("Store") == 1 and names.count("score_all") == 1
+            and names.index("Store") < names.index("score_all")
+            and "start_backstop" not in names and "RunSpendCheckpointer" not in names)
+
+
+check("5a  durable store precedes scoring and Ragas has no aggregate backstop",
+      durable_order(_rh_src), True)
+check("5b  CONTROL: removing store ownership is detected",
+      durable_order(_rh_src.replace("ragas_billing.Store(", "ragas_billing.MissingStore(")), False)
+check("5c  CONTROL: substituting the old backstop for scoring is detected",
+      durable_order(_rh_src.replace("asyncio.run(score_all(", "asyncio.run(start_backstop(")), False)
 
 
 section("6. ISOLATION")
