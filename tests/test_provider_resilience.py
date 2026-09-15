@@ -59,6 +59,7 @@ import tempfile
 import threading
 import time
 import ast
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("ONCOTRIAGE_DEFER_LOCAL_MODELS", "1")
@@ -2000,7 +2001,7 @@ class Scripted:
         return sum(1 for k, _ in self.log if k == key)
 
 
-def run_node(plan):
+def run_node(plan, *, bypass_wait=False, trial_workers=None):
     # EXPLICIT LIMITS FOR BOTH FAMILIES, because this drives the REAL Stage 5
     # node and the node reserves `estimated input + max_output` tokens per
     # attempt. `bedrock_anthropic`'s tokens row ships UNKNOWN, which REFUSES
@@ -2019,8 +2020,12 @@ def run_node(plan):
         stub = Scripted(clk, plan)
         saved = deps.set_overrides({deps.BEDROCK_ANTHROPIC_CLIENT: stub})
         try:
-            with settings(MATCHING_PROVIDER=_BEDROCK,
-                          MATCHING_PER_TRIAL_CALLS_ENABLED=True):
+            wait_control = (patch.object(pr.PACER, "wait", lambda permit, cancelled=None: None)
+                            if bypass_wait else contextlib.nullcontext())
+            with wait_control, settings(MATCHING_PROVIDER=_BEDROCK,
+                          MATCHING_PER_TRIAL_CALLS_ENABLED=True,
+                          **({"MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS": trial_workers}
+                             if trial_workers is not None else {})):
                 state = {"patient_data": PATIENT, "filtered_trials": TRIALS,
                          "llm_classifier_retries": 0,
                          "mesh_filter_applied": True,
@@ -2077,8 +2082,13 @@ check("...and a partial loss is NOT terminal",
       at(_r7b, "llm_classifier_transport_exhausted"), None)
 
 with counters_cleared():
+    # FakeClock.sleep advances ONE shared clock. With several workers it can
+    # advance between another worker's permit and its stub timestamp. Only
+    # this spacing case and its control use one trial worker; the other node
+    # cases retain configured parallelism. Section 3 separately tests concurrent
+    # scheduling. Neither proves real concurrent network-send gaps.
     _r7c, _s7c = run_node({_lost: ["throttle", "throttle", "ok"],
-                           "warmup": ["throttle", "ok"]})
+                           "warmup": ["throttle", "ok"]}, trial_workers=1)
 _by_id_c = {e.get("nct_id"): e for e in (at(_r7c, "evaluations") or [])}
 check("a trial throttled twice then answered RECOVERS its verdict",
       (_s7c.count(_lost), at(_by_id_c.get(_lost, {}), "eligible")),
@@ -2089,9 +2099,19 @@ _times_c = sorted(t for _k, t in _s7c.log)
 _int = pr.effective_limits(_BEDROCK)[0]
 check("NON-DEGENERACY: the node made several wire attempts",
       len(_times_c) >= 5, True)
-check("...and at the node level every attempt started >= one paced interval "
+check("...and with one trial worker every actual stub attempt started >= one paced interval "
       "after the one before", min(b - a for a, b in zip(_times_c, _times_c[1:]))
       >= _int - 1e-9, True)
+
+with counters_cleared():
+    _wait_control_result, _wait_control = run_node({}, bypass_wait=True, trial_workers=1)
+_control_times = sorted(t for _k, t in _wait_control.log)
+check("CONTROL: bypassing wait still dispatches the warmup and every trial",
+      (len(_control_times), bool(at(_wait_control_result, "error"))),
+      (1 + len(TRIALS), False))
+check("CONTROL: actual stub timestamps catch bypassed waits even though permits are scheduled",
+      min(b - a for a, b in zip(_control_times, _control_times[1:]))
+      >= _int - 1e-9, False)
 
 _ledger_before = spend.SPEND_LEDGER.measured
 with counters_cleared():

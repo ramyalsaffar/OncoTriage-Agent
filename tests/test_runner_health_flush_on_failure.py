@@ -135,6 +135,8 @@ _paths._RESOLVED["checkpoint_path"] = _TMP + os.sep
 _paths._RESOLVED["inferences_path"] = os.path.join(_TMP, "never-written.db")
 
 from oncotriage.batch import runner as _runner                  # noqa: E402
+from oncotriage.storage import attempt_history as _history
+from oncotriage.evaluation import cohort as _cohort
 from oncotriage.storage import database_logger as _dl           # noqa: E402
 from oncotriage.agent.evaluation import MatchingModelMismatchError  # noqa: E402
 
@@ -192,10 +194,16 @@ def _run(patient, files=("a.json", "b.json", "c.json")):
     callback's flush is the only health record that run will ever have.
     """
     run_id = silence(_dl.start_run_record, "flush-test", db_path=_DB)
+    campaign = f"flush-test-{run_id}"
+    silence(_dl.set_run_billing_campaign_id, run_id, campaign, db_path=_DB)
     _install(patient)
     try:
-        outcome = drive(silence, _runner.run_batch, list(files), object(), [],
-                        object(), set(), [], run_id=run_id, db_path=_DB)
+        with _history.open_writer(_DB, campaign, run_id,
+                _cohort.digest(os.path.splitext(f)[0] for f in files),
+                files, new_campaign=True) as history:
+            outcome = drive(silence, _runner.run_batch, list(files), object(), [],
+                            object(), set(), [], run_id=run_id, db_path=_DB,
+                            attempt_history=history)
     finally:
         _restore()
     return run_id, outcome

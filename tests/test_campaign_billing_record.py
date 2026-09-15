@@ -926,6 +926,15 @@ def dump(**kw):
 def marker(name):
     open(os.path.join(cfg["cp"], name), "w").close()
 
+def kill_at(name):
+    marker(name)
+    os.kill(os.getpid(), signal.SIGKILL)
+    # A worker can continue before the process receives SIGKILL (observed on
+    # macOS). Never return to provider settlement or commit while it is pending;
+    # raising would also run the billing cleanup being deliberately interrupted.
+    while True:
+        signal.pause()
+
 class Usage:
     def __init__(self, p, c):
         self.prompt_tokens, self.completion_tokens = p, c
@@ -1060,8 +1069,7 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
         return entry(fhir_path, "error")
     if mode == "kill_between":
         def fn(kw):
-            marker("sent")
-            os.kill(os.getpid(), signal.SIGKILL)
+            kill_at("sent")
         deps.set_override(deps.OPENAI_CLIENT, Stub(fn))
         ev.call_matching_model("system prompt", "user prompt")
         return entry(fhir_path, "error")
@@ -1070,8 +1078,7 @@ def patient(fhir_path=None, graph=None, is_resample=False, run_id=None,
             armed = False
             def commit(self):
                 if KillConn.armed:
-                    marker("settling")
-                    os.kill(os.getpid(), signal.SIGKILL)
+                    kill_at("settling")
                 return super().commit()
         orig = dl._open_connection
         def opener(db_path, read_only=False):

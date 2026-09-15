@@ -122,6 +122,8 @@ from oncotriage.agent import filtering as _filtering
 from oncotriage.batch import runner as _runner
 from oncotriage.config import MAX_WORKERS
 from oncotriage.evaluation import sampling as _sampling
+from oncotriage.storage import attempt_history as _history
+from oncotriage.evaluation import cohort as _cohort
 from oncotriage.storage import database_logger as _dl
 
 
@@ -1294,12 +1296,16 @@ for _i in range(4):
 
 _filtering.AGE_PARSE_FAILURES.clear()
 _REAL_PP = _runner.process_patient
+silence(_dl.set_run_billing_campaign_id, _RID10, "health-flush", db_path=_DB10)
+_history_cm = _history.open_writer(_DB10, "health-flush", _RID10,
+    _cohort.digest(Path(f).stem for f in _FILES), _FILES, new_campaign=True)
+_journal = _history_cm.__enter__()
 try:
     _runner.process_patient = _erroring_process_patient
     _results = []
     silence(_runner.run_batch, fhir_files=_FILES, bm25_index=None, nct_ids=[],
             graph=None, completed_ids=set(), results_list=_results,
-            run_id=_RID10)
+            run_id=_RID10, attempt_history=_journal)
 
     check("run_batch reached every patient (non-degeneracy: an empty pass "
           "would satisfy every assertion below)",
@@ -1324,7 +1330,7 @@ try:
     silence(_runner.run_resample, fhir_files=_FILES,
             completed_ids={Path(f).stem for f in _FILES},
             bm25_index=None, nct_ids=[], graph=None, results_list=_results,
-            run_id=_RID10)
+            run_id=_RID10, attempt_history=_journal)
     check("the resample pass reached at least one patient (non-degeneracy)",
           len(_SEEN) >= 1, True)
     check("...and its flushes ADD to the same run's record rather than "
@@ -1334,6 +1340,7 @@ try:
           len(_FILES) + len(_SEEN))
 finally:
     _runner.process_patient = _REAL_PP
+    _history_cm.__exit__(None, None, None)
     _filtering.AGE_PARSE_FAILURES.clear()
 
 check("the real process_patient was restored",

@@ -119,6 +119,8 @@ from oncotriage import paths as _paths
 from oncotriage import run_fingerprint as _rf
 from oncotriage import tracking as _tracking
 from oncotriage.batch import runner as _runner
+from oncotriage.storage import attempt_history as _history
+from oncotriage.evaluation import cohort as _cohort
 from oncotriage.storage import database_logger as _dl
 
 
@@ -1239,19 +1241,42 @@ else:
     check("main() finalizes on more than one path",
           len(_finals) >= 2, True)
 
-    # At least one finalize must live inside an exception handler: a run that
-    # crashed must not be left RUNNING when a handler could have said KILLED.
-    _in_handler = [f for h in ast.walk(_MAIN)
-                   if isinstance(h, ast.ExceptHandler)
-                   for f in _calls_named(h, "finalize_run_record")]
-    # TWO, AND KNOWING WHICH TWO IS WHAT MAKES THE CONTROL BELOW HONEST: the
-    # guard around tracking.start_run (which raises when tracking is
-    # unavailable, at a point where the run row is already open and no other
-    # handler exists yet) and the guard around the whole body (a crash, a
-    # Ctrl-C, a SystemExit). Removing one leaves the other, so a control that
-    # removed one and expected zero would be testing its own arithmetic.
-    check("...and exactly two of them are inside an `except` handler",
-          len(_in_handler), 2)
+    # Identify handlers by their responsibility, not the total number of
+    # exceptions main happens to catch. Admission refusal is not a crash.
+    def _crash_handlers(main):
+        found = {}
+        for handler in (n for n in ast.walk(main) if isinstance(n, ast.ExceptHandler)):
+            for call in _calls_named(handler, "print_crash_record"):
+                for kw in call.keywords:
+                    if kw.arg == "where" and isinstance(kw.value, ast.Constant):
+                        found.setdefault(kw.value.value, []).append(handler)
+        return found
+
+    def _finalizes_killed(handler):
+        calls = _calls_named(handler, "finalize_run_record")
+        return (len(calls) == 1 and len(calls[0].args) >= 2
+                and isinstance(calls[0].args[0], ast.Name)
+                and calls[0].args[0].id == _ID_NAME
+                and isinstance(calls[0].args[1], ast.Name)
+                and calls[0].args[1].id == "RUN_RECORD_STATUS_KILLED")
+
+    _crashes = _crash_handlers(_MAIN)
+    check("both named crash handlers were located once",
+          {key: len(value) for key, value in _crashes.items()},
+          {"crash/tracking": 1, "crash": 1})
+    for _where in ("crash/tracking", "crash"):
+        _handlers = _crashes.get(_where, [])
+        check(f"{_where} finalizes this run KILLED and preserves the original exception",
+              len(_handlers) == 1 and _finalizes_killed(_handlers[0])
+              and isinstance(_handlers[0].body[-1], ast.Raise)
+              and _handlers[0].body[-1].exc is None, True)
+    _admission_handlers = [h for h in ast.walk(_MAIN)
+        if isinstance(h, ast.ExceptHandler) and isinstance(h.type, ast.Attribute)
+        and h.type.attr == "HistoryRefusal"]
+    check("admission-history refusal has its own KILLED finalizer and exit 1",
+          len(_admission_handlers) == 1 and _finalizes_killed(_admission_handlers[0])
+          and isinstance(_admission_handlers[0].body[-1], ast.Raise)
+          and ast.unparse(_admission_handlers[0].body[-1].exc) == "SystemExit(1)", True)
 
     # THE SUCCESS-PATH FINALIZE MUST BE THE LAST STATEMENT BEFORE THE RETURN,
     # and this is a correctness property rather than a style one. Every other
@@ -1512,50 +1537,29 @@ else:
         check("CONTROL: with the keyword removed, the forwarding check fails",
               _found, False)
 
-    # CONTROL 4: the except-handler check must fail when BOTH handler-side
-    # finalizes are removed. Both, because there are two and the check asks
-    # whether ANY handler finalizes -- a plant that removed one would leave the
-    # property true and prove nothing.
-    # THE ANCHOR IS THE CALL AS IT IS NOW WRITTEN -- two lines, with the status
-    # as a NAMED CONSTANT rather than a literal. It was a one-line call with
-    # `"KILLED"` typed into it; when runner.py stopped writing bare literals
-    # this plant matched nothing and the control reported a working check as
-    # broken, which is exactly what the match-count assertion below exists to
-    # turn into a named failure instead of a silent one.
-    _KILL_CALL = "\n".join([
-        "            finalize_run_record(_run_record_id, "
-        "RUN_RECORD_STATUS_KILLED,",
-        "                                db_path=_reconcile_db)",
-    ])
-    _planted2 = _txt.replace(
-        _KILL_CALL + '\n            tracking.end_run(status="FAILED")\n',
-        '            tracking.end_run(status="FAILED")\n', 1)
-    _planted2 = _planted2.replace(
-        _KILL_CALL + "\n            raise\n",
-        "            raise\n", 1)
-    # THE PLANT ASSERTS ITS OWN MATCH COUNT. A plant that matched nothing
-    # produces a "control" that agrees with the shipped code and reports a
-    # working check as broken -- the failure mode this project has met before
-    # and writes down each time.
-    _removed = _txt.count(_KILL_CALL) - _planted2.count(_KILL_CALL)
-    if _removed != 2:
-        fail("CONTROL: the crash-path plant removed both handler calls",
-             f"removed {_removed}, expected 2 -- an anchor was not found in "
-             f"oncotriage/batch/runner.py, so this control would have reported "
-             f"a working check as broken")
-    else:
-        _pt2 = ast.parse(_planted2)
-        _pmain2 = next(n for n in _pt2.body
-                       if isinstance(n, ast.FunctionDef) and n.name == "main")
-        _handler_calls = [n for h in ast.walk(_pmain2)
-                          if isinstance(h, ast.ExceptHandler)
-                          for n in ast.walk(h)
-                          if isinstance(n, ast.Call)
-                          and isinstance(n.func, ast.Name)
-                          and n.func.id == "finalize_run_record"]
-        check("CONTROL: with the crash-path finalize removed, no `except` "
-              "handler finalizes",
-              len(_handler_calls), 0)
+    # Remove each semantic finalizer separately in parsed copies. Another
+    # handler's intact finalizer must never mask the removal.
+    for _where, _originals in list(_crashes.items()) + [("admission", _admission_handlers)]:
+        if len(_originals) != 1:
+            fail(f"CONTROL {_where}: handler found once", len(_originals))
+            continue
+        # Copy the whole main tree so the except node remains valid Python.
+        _copied = ast.parse(ast.unparse(_MAIN)).body[0]
+        if _where == "admission":
+            _target = next(h for h in ast.walk(_copied)
+                if isinstance(h, ast.ExceptHandler) and isinstance(h.type, ast.Attribute)
+                and h.type.attr == "HistoryRefusal")
+        else:
+            _target = _crash_handlers(_copied)[_where][0]
+        _before = len(_target.body)
+        _target.body = [statement for statement in _target.body
+            if not (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call)
+                    and isinstance(statement.value.func, ast.Name)
+                    and statement.value.func.id == "finalize_run_record")]
+        check(f"CONTROL {_where}: exactly one finalizer removed", _before - len(_target.body), 1)
+        ast.parse(ast.unparse(_copied))
+        check(f"CONTROL {_where}: its missing finalizer is detected independently",
+              _finalizes_killed(_target), False)
 
 # process_patient must forward its argument to the writer rather than reading a
 # global -- checked structurally, and driven for real in section 7.
@@ -1634,14 +1638,20 @@ for _i in range(4):
     _FILES.append(_p)
 
 _REAL_PP = _runner.process_patient
+_history_cm = None
 try:
     _runner.process_patient = _recording_process_patient
 
-    _RUN_ID_UNDER_TEST = 4242
+    _RUN_ID_UNDER_TEST = silence(_dl.start_run_record, "forwarding-test", db_path=_SCRATCH_DB)
+    silence(_dl.set_run_billing_campaign_id, _RUN_ID_UNDER_TEST, "forwarding-test", db_path=_SCRATCH_DB)
+    _history_cm = _history.open_writer(_SCRATCH_DB, "forwarding-test",
+        _RUN_ID_UNDER_TEST, _cohort.digest(Path(f).stem for f in _FILES),
+        _FILES, new_campaign=True)
+    _journal = _history_cm.__enter__()
     _results = []
     silence(_runner.run_batch, fhir_files=_FILES, bm25_index=None, nct_ids=[],
             graph=None, completed_ids=set(), results_list=_results,
-            run_id=_RUN_ID_UNDER_TEST)
+            run_id=_RUN_ID_UNDER_TEST, attempt_history=_journal)
 
     check("run_batch reached every pending patient (non-degenerate: an empty "
           "pass would satisfy every assertion below)",
@@ -1654,7 +1664,7 @@ try:
     silence(_runner.run_resample, fhir_files=_FILES,
             completed_ids={Path(f).stem for f in _FILES},
             bm25_index=None, nct_ids=[], graph=None, results_list=_results,
-            run_id=_RUN_ID_UNDER_TEST)
+            run_id=_RUN_ID_UNDER_TEST, attempt_history=_journal)
 
     check("the resample pass reached at least one patient (non-degenerate)",
           len(_SEEN) >= 1, True)
@@ -1663,6 +1673,18 @@ try:
           sorted({s["run_id"] for s in _SEEN}), [_RUN_ID_UNDER_TEST])
     check("...and is marked as a resample, so the two are still separable",
           sorted({s["is_resample"] for s in _SEEN}), [True])
+
+    # A campaign cannot bypass admission by omitting its history. This must
+    # fail before the recording worker, not merely produce an empty pass.
+    _SEEN.clear()
+    try:
+        _runner._start_patient_unless_stopped(fhir_path=_FILES[0], graph=None,
+            run_id=_RUN_ID_UNDER_TEST, db_path=_SCRATCH_DB)
+        _refusal_code = "<not refused>"
+    except _history.HistoryRefusal as _exc:
+        _refusal_code = _exc.code
+    check("CONTROL: missing campaign history refuses before the worker",
+          (_refusal_code, _SEEN), ("attempt_history_missing", []))
 
     # CONTROL 5: the recorder can see an absent id, so the two checks above are
     # not satisfied by any value at all.
@@ -1674,6 +1696,8 @@ try:
           sorted({s["run_id"] for s in _SEEN}), [None])
 finally:
     _runner.process_patient = _REAL_PP
+    if _history_cm is not None:
+        _history_cm.__exit__(None, None, None)
 
 check("the real process_patient was restored",
       _runner.process_patient is _REAL_PP, True)
