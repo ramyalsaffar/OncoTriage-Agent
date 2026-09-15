@@ -833,6 +833,12 @@ BUCKETS = {
         "NOTHING and writes only inside a tempfile.mkdtemp it removes and "
         "asserts gone; every control is a different input, or a module "
         "attribute rebound inside try/finally with the restore asserted."),
+    "test_ragas_billing.py": (
+        _A, None,
+        "Both real Ragas request wrappers and the real retry owner, with fake "
+        "provider clients and no-wait pacing. Atomic holds, failure/cancellation "
+        "liability, explicit response prices and temporary journal recovery "
+        "including a fresh interpreter. No models, network or production data."),
     "test_ragas_pacing_safeguards.py": (
         _A, None,
         # DERIVED BY RUNNING: 56 checks, green, and a four-plant revert matrix

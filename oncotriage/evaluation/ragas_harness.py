@@ -165,7 +165,7 @@ def _request_input_tokens(kwargs):
     return max(1, int(math.ceil(text_len / CHARS_PER_TOKEN)))
 
 
-def _paced(send, *, scope, reservation_tokens, label):
+def _paced(send, *, scope, reservation_tokens, label, attempt_record=None):
     """One awaitable provider call, under the pacer and the one retry policy.
 
     A THIN NAMED WRAPPER rather than the call spelled out at both sites: the
@@ -192,6 +192,7 @@ def _paced(send, *, scope, reservation_tokens, label):
         reservation_kind=provider_resilience.RESERVATION_INFERENCE,
         classify=provider_resilience.classify_openai_failure,
         sdk_attempts=1,
+        attempt_record=attempt_record,
         label=label)
 
 
@@ -1144,6 +1145,176 @@ def embedding_pricing(model):
 #------------------------------------------------------------------------------
 
 
+# OpenAI first-party limits verified 2026-09-15:
+# https://developers.openai.com/api/docs/models/gpt-5.6-terra
+# https://developers.openai.com/api/reference/resources/embeddings/methods/create
+# These are billing bounds, independent of the pacing estimate. No Bedrock aliases.
+def ragas_attempt_bound(kind, model, args, kwargs):
+    def refuse(reason):
+        raise RagasRefusal(f"Cannot bound Ragas {kind} request: {reason}",
+                           code="billing_unbounded")
+
+    if args or kwargs.get("model", model) != model:
+        refuse("positional arguments or a model override")
+    if kwargs.get("extra_body") or kwargs.get("extra_query"):
+        refuse("wire overrides")
+    if kind == "judge":
+        if model != "gpt-5.6-terra":
+            refuse("no verified OpenAI limits for this judge")
+        if (kwargs.get("n", 1) != 1 or kwargs.get("stream", False)
+                or kwargs.get("service_tier", "default") not in (None, "default")):
+            refuse("only one non-streaming standard-tier completion is bounded")
+        ceilings = [kwargs[k] for k in ("max_completion_tokens", "max_tokens")
+                    if k in kwargs]
+        if any(type(v) is not int or v <= 0 or v > 128000 for v in ceilings):
+            refuse("invalid output ceiling")
+        output = max(ceilings) if ceilings else 128000
+        rates = judge_pricing(model)
+        if (config.RATER_PRICING["models"][model].get("cache_write_multiplier") != 1.25
+                or rates.get("cache_read", rates["input"]) > rates["input"]):
+            refuse("pricing no longer matches the documented cache bound")
+        # Full context at long-context rates, all input potentially cache-written.
+        usd = 1050000 * rates["input"] * 2 * 1.25 + output * rates["output"] * 1.5
+        inputs = 1050000
+    else:
+        if model not in ("text-embedding-3-large", "text-embedding-3-small",
+                         "text-embedding-ada-002"):
+            refuse("no verified embedding limits for this model")
+        payload = kwargs.get("input")
+        if isinstance(payload, str) and payload:
+            count = 1
+        elif isinstance(payload, (list, tuple)) and payload:
+            if all(type(v) is int and v >= 0 for v in payload):
+                count = 1
+            elif all(isinstance(v, str) and v for v in payload):
+                count = len(payload)
+            elif all(isinstance(v, (list, tuple)) and v
+                     and all(type(t) is int and t >= 0 for t in v) for v in payload):
+                count = len(payload)
+            else:
+                refuse("unsupported embedding input shape")
+        else:
+            refuse("missing embedding input")
+        inputs, output = min(8192 * count, 300000), 0
+        usd = inputs * embedding_pricing(model)["input"]
+    if not spend._valid_usd(usd) or usd <= 0:
+        refuse("invalid price")
+    return inputs, output, usd
+
+
+class _RagasAttemptRecord:
+    """Per-wire admission and settlement; the retry owner calls each hook.
+
+    No failure callback charges separately. The existing run checkpointer owns
+    settled liabilities, not open requests; hard kill can still lose those.
+    """
+
+    def __init__(self, tally, kind, model, args, kwargs):
+        self.tally, self.kind, self.model = tally, kind, model
+        self.bound = ragas_attempt_bound(kind, model, args, kwargs)
+        self.source = (spend.SPEND_SOURCE_RAGAS_JUDGE if kind == "judge"
+                       else spend.SPEND_SOURCE_RAGAS_EMBEDDING)
+
+    def begin(self):
+        cp = self.tally.checkpointer
+        if cp is not None:
+            cp.checkpoint(spend.SPEND_LEDGER.measured)
+            if cp.pending or cp.conflicted or cp.unconfirmed > 1e-9:
+                raise RagasRefusal("Ragas spend checkpoint is unresolved; no request sent",
+                                   code="spend_checkpoint_unverified")
+        spend.require_budget(self.source, "a Ragas wire attempt")
+        inputs, outputs, usd = self.bound
+        return spend.begin_billed_attempt(self.source, self.model, inputs, outputs,
+                                          reserved_usd=usd, where="a Ragas wire attempt")
+
+    def _finish(self, token, outcome, usage=None):
+        if token.resolved_outcome is not None:
+            return
+        try:
+            if outcome == spend.BILLING_OUTCOME_RESPONSE:
+                record = (self.tally.record_judge if self.kind == "judge"
+                          else self.tally.record_embedding)
+                record(usage, attempt=token)
+            if token.resolved_outcome is None:
+                if outcome == spend.BILLING_OUTCOME_RESPONSE:
+                    key = f"{self.kind}:price_unavailable"
+                    self.tally.unpriced_reasons[key] = self.tally.unpriced_reasons.get(key, 0) + 1
+                token.resolve(spend.BILLING_OUTCOME_RESPONSE_UNPRICED
+                              if outcome == spend.BILLING_OUTCOME_RESPONSE else outcome)
+            if outcome == spend.BILLING_OUTCOME_RESPONSE_UNPRICED:
+                if self.kind == "judge":
+                    self.tally.judge_calls += 1
+                    self.tally.judge_usage_absent += int(usage is None)
+                else:
+                    self.tally.embedding_calls += 1
+        except Exception as exc:
+            key = f"{self.kind}:settlement_error:{type(exc).__name__}"
+            self.tally.unpriced_reasons[key] = self.tally.unpriced_reasons.get(key, 0) + 1
+            token.resolve(spend.BILLING_OUTCOME_RESPONSE_UNPRICED)
+        finally:
+            # A pricing/tally error cannot leak the hold or drop the liability.
+            if token.resolved_outcome is None:
+                token.resolve(spend.BILLING_OUTCOME_RESPONSE_UNPRICED)
+            counts = self.tally.attempt_outcomes[self.kind]
+            resolved = token.resolved_outcome
+            counts[resolved] = counts.get(resolved, 0) + 1
+            if resolved in spend.BILLING_OUTCOMES_AT_RESERVATION:
+                self.tally.unconfirmed_usd[self.kind] += token.resolved_usd
+            elif resolved == spend.BILLING_OUTCOME_RESPONSE:
+                self.tally.measured_response_usd[self.kind] += token.resolved_usd
+            if self.tally.checkpointer is not None:
+                self.tally.checkpointer.checkpoint(spend.SPEND_LEDGER.measured)
+
+    def _unpriced(self, token, usage, reason):
+        if token.resolved_outcome is not None:
+            return
+        key = f"{self.kind}:{reason}"
+        self.tally.unpriced_reasons[key] = self.tally.unpriced_reasons.get(key, 0) + 1
+        self._finish(token, spend.BILLING_OUTCOME_RESPONSE_UNPRICED, usage)
+
+    def response(self, token, response):
+        usage = None
+        try:
+            usage = getattr(response, "usage", None)
+            if getattr(response, "model", None) != self.model:
+                return self._unpriced(token, usage, "model_mismatch_or_absent")
+            if self.kind == "judge" and getattr(response, "service_tier", None) != "default":
+                return self._unpriced(token, usage, "tier_mismatch_or_absent")
+            if usage is None:
+                return self._unpriced(token, usage, "usage_absent")
+            fields = (("prompt_tokens", "completion_tokens") if self.kind == "judge"
+                      else ("total_tokens",))
+            if not all(type(getattr(usage, k, None)) is int and getattr(usage, k) >= 0
+                       for k in fields):
+                return self._unpriced(token, usage, "invalid_token_counts")
+            if self.kind == "judge":
+                total = getattr(usage, "total_tokens", None)
+                if type(total) is not int or total != usage.prompt_tokens + usage.completion_tokens:
+                    return self._unpriced(token, usage, "invalid_total_tokens")
+                details = getattr(usage, "prompt_tokens_details", None)
+                cached = getattr(details, "cached_tokens", None)
+                written = getattr(details, "cache_write_tokens", None)
+                if written is None and cached != usage.prompt_tokens:
+                    return self._unpriced(token, usage, "cache_write_count_absent")
+                if written is None:
+                    written = 0  # Entire prompt was read from cache.
+                if not (type(cached) is int and type(written) is int
+                        and cached >= 0 and written >= 0
+                        and cached + written <= usage.prompt_tokens):
+                    return self._unpriced(token, usage, "invalid_cache_counts")
+            self._finish(token, spend.BILLING_OUTCOME_RESPONSE, usage)
+        except Exception as exc:
+            self._unpriced(token, usage, f"usage_unreadable:{type(exc).__name__}")
+
+    def failure(self, token, verdict):
+        self._finish(token, spend.BILLING_OUTCOME_NOT_BILLED
+                     if verdict.billing == provider_resilience.BILLING_NOT_BILLED
+                     else spend.BILLING_OUTCOME_POSSIBLY_BILLED)
+
+    def abandoned(self, token):
+        self._finish(token, spend.BILLING_OUTCOME_ABANDONED)
+
+
 class UsageTally(object):
     """Token counts accumulated from the vendors' own usage objects.
 
@@ -1164,11 +1335,17 @@ class UsageTally(object):
         self.judge_calls = 0
         self.judge_input_tokens = 0          # UNCACHED input only
         self.judge_cached_input_tokens = 0
+        self.judge_cache_write_tokens = 0
         self.judge_output_tokens = 0
         self.judge_reasoning_tokens = 0
         self.judge_usage_absent = 0
         self.embedding_calls = 0
         self.embedding_tokens = 0
+        self.checkpointer = None
+        self.measured_response_usd = {"judge": 0.0, "embedding": 0.0}
+        self.unconfirmed_usd = {"judge": 0.0, "embedding": 0.0}
+        self.attempt_outcomes = {"judge": {}, "embedding": {}}
+        self.unpriced_reasons = {}
         # THE TWO MODEL IDS, SO THIS TALLY CAN PRICE AS IT RECORDS. They
         # default to None and a None model is a counted fault rather than a
         # guess -- a construction site that does not supply them still records
@@ -1177,7 +1354,7 @@ class UsageTally(object):
         self.judge_model = judge_model
         self.embedding_model = embedding_model
 
-    def record_judge(self, usage):
+    def record_judge(self, usage, *, attempt=None):
         """Fold one OpenAI usage object in, and charge it.
 
         **THE FIELD NAMES ARE THE VENDOR'S AND THEY CHANGED WITH THE PORT.**
@@ -1213,15 +1390,18 @@ class UsageTally(object):
         cdetails = getattr(usage, "completion_tokens_details", None)
         reasoning = ((getattr(cdetails, "reasoning_tokens", 0) or 0)
                      if cdetails else 0)
+        written = (getattr(details, "cache_write_tokens", 0) or 0) if details else 0
         uncached = max(0, prompt - cached)
+        self.judge_cache_write_tokens += written
         self.judge_input_tokens += uncached
         self.judge_cached_input_tokens += cached
         self.judge_output_tokens += completion
         self.judge_reasoning_tokens += reasoning
         self._charge(judge_pricing, self.judge_model, uncached, completion,
-                     spend.SPEND_SOURCE_RAGAS_JUDGE, cached_tokens=cached)
+                     spend.SPEND_SOURCE_RAGAS_JUDGE, cached_tokens=cached,
+                     write_tokens=written, attempt=attempt)
 
-    def record_embedding(self, usage):
+    def record_embedding(self, usage, *, attempt=None):
         self.embedding_calls += 1
         if usage is None:
             return
@@ -1234,37 +1414,28 @@ class UsageTally(object):
         # ledger and this harness's own reported figure disagree about the same
         # response.
         self._charge(embedding_pricing, self.embedding_model, _tok, 0,
-                     spend.SPEND_SOURCE_RAGAS_EMBEDDING)
+                     spend.SPEND_SOURCE_RAGAS_EMBEDDING, attempt=attempt)
 
     def _charge(self, pricing, model, input_tokens, output_tokens, source,
-                cached_tokens=0):
+                cached_tokens=0, write_tokens=0, attempt=None):
         """Add one response's measured cost to the shared run ledger.
 
-        **THE PRICING STAYS WITH THE PATH.** ``config.RAGAS_PRICING`` is this
-        harness's table and ``judge_pricing`` / ``embedding_pricing`` are its
-        one owner, so this hands ``oncotriage/spend.py`` a number they produced
-        rather than a token count it would have to price against a table that
-        does not hold these models. ``charge_batch_to_ledger`` in
-        ``oncotriage/evaluation/rater.py`` is the identical seam for the
-        identical reason.
-
-        NEVER RAISES. It runs after a response has arrived and been paid for;
-        a pricing defect that propagated out of here would abort a metric whose
-        answer is already bought. Everything that can go wrong is counted into
-        ``spend.SPEND_LEDGER_FAULTS``, whose non-zero total says the cap is
-        being enforced against a number lower than the truth.
-
-        THE MODEL IDS ARE THE ONES THIS TALLY WAS CONSTRUCTED WITH, not ones
-        read off the responses. Ragas' ``InstructorLLM`` throws the raw
-        response away -- which is the reason this class exists at all -- so
-        there is no echoed id to prefer, and ``cost()`` has always priced
-        against the configured ids for the same reason.
+        Ragas owns its standard-tier rates via judge_pricing/embedding_pricing.
+        An attempt uses the shared exact-once settlement seam; direct legacy
+        tally callers retain their ledger charge. Pricing errors are counted;
+        the attempt adapter then retains the full reservation as unconfirmed.
+        The adapter validates the echoed model before passing usage here.
         """
         if model is None:
             spend.SPEND_LEDGER_FAULTS[f"ragas_unpriced:{source}:no_model"] += 1
             return
         try:
             rates = pricing(model)
+            if (attempt is not None and source == spend.SPEND_SOURCE_RAGAS_JUDGE
+                    and input_tokens + cached_tokens > 272000):
+                rates = dict(rates, input=rates["input"] * 2,
+                             output=rates["output"] * 1.5,
+                             cache_read=rates.get("cache_read", rates["input"]) * 2)
             # `.get("output", 0.0)` AND NOT `rates["output"]`, and the reason
             # is a real defect this file's own test caught rather than a
             # defensive habit: `embedding_pricing` returns `{"input", ...}`
@@ -1283,11 +1454,22 @@ class UsageTally(object):
                    # a gate. `cached_tokens` is 0 on the embedding path, so
                    # this term vanishes there.
                    + cached_tokens * rates.get("cache_read", rates["input"]))
+            if write_tokens:
+                # Write tokens are already in uncached input: add only the premium.
+                usd += write_tokens * rates["input"] * (
+                    config.RATER_PRICING["models"][model]["cache_write_multiplier"] - 1)
         except Exception as exc:                                # noqa: BLE001
             spend.SPEND_LEDGER_FAULTS[
                 f"ragas_unpriced:{type(exc).__name__}"] += 1
             return
-        spend.SPEND_LEDGER.charge_usd(usd, source)
+        if attempt is None:
+            spend.SPEND_LEDGER.charge_usd(usd, source)
+            kind = "judge" if source == spend.SPEND_SOURCE_RAGAS_JUDGE else "embedding"
+            self.measured_response_usd[kind] += usd
+        else:
+            attempt.resolve(spend.BILLING_OUTCOME_RESPONSE, response_usd=usd,
+                            prompt_tokens=input_tokens + cached_tokens,
+                            completion_tokens=output_tokens)
 
     def cost(self, judge_model, embedding_model):
         judge = judge_pricing(judge_model)
@@ -1296,8 +1478,13 @@ class UsageTally(object):
             self.judge_input_tokens * judge["input"]
             + self.judge_cached_input_tokens * judge.get("cache_read",
                                                          judge["input"])
-            + self.judge_output_tokens * judge["output"])
+            + self.judge_output_tokens * judge["output"]
+            + self.judge_cache_write_tokens * judge["input"] * (
+                config.RATER_PRICING["models"][judge_model].get("cache_write_multiplier", 1) - 1))
         embed_usd = self.embedding_tokens * embed["input"]
+        if any(self.attempt_outcomes.values()):
+            judge_usd = self.measured_response_usd["judge"]
+            embed_usd = self.measured_response_usd["embedding"]
         return {
             "judge_calls": self.judge_calls,
             "judge_calls_with_no_usage_block": self.judge_usage_absent,
@@ -1306,6 +1493,7 @@ class UsageTally(object):
                                         "includes the cached part; this is the "
                                         "remainder after subtracting it.",
             "judge_cached_input_tokens": self.judge_cached_input_tokens,
+            "judge_cache_write_tokens": self.judge_cache_write_tokens,
             "judge_prompt_tokens_as_reported": (
                 self.judge_input_tokens + self.judge_cached_input_tokens),
             "judge_output_tokens": self.judge_output_tokens,
@@ -1321,6 +1509,16 @@ class UsageTally(object):
             "embedding_pricing_version": embed["pricing_version"],
             "rate_basis": "standard (non-batch)",
             "measured": True,
+            "unconfirmed_liability_usd": dict(self.unconfirmed_usd),
+            "budget_liability_usd": round(judge_usd + embed_usd
+                                           + sum(self.unconfirmed_usd.values()), 6),
+            "attempt_outcomes": self.attempt_outcomes,
+            "unpriced_response_reasons": dict(self.unpriced_reasons),
+            "token_counts_scope": "responses with priceable usage",
+            "liability_note": "total_usd is measured response cost only; "
+                              "budget_liability_usd includes unconfirmed attempts. "
+                              "Open requests and uncheckpointed settlements can "
+                              "be lost on hard kill.",
         }
 
 
@@ -1490,50 +1688,25 @@ def build_judge(model, temperature, max_tokens, tally, max_retries,
     seen = {"models": {}}
 
     async def recording_create(*args, **kwargs):
-        # ── THE SPEND GATE, IMMEDIATELY BEFORE THE REQUEST ────────────────
-        #
-        # THE SEAM IS ALREADY HERE, WHICH IS WHY THE GATE CAN BE. This wrapper
-        # exists so the reported cost is MEASURED rather than modelled; it is
-        # also the one point in this harness where a judge request can be
-        # declined, because ragas owns the loop that issues them.
-        #
-        # WHAT IS VERIFIED AND WHAT IS NOT, STATED. It is verified that a
-        # raise here means NO REQUEST IS ISSUED and NO MONEY IS SPENT -- that
-        # follows from the position, above `await real_create`. It is NOT
-        # verified what ragas does with the exception: it may abort the run, it
-        # may mark the sample failed and continue asking for more. Both are
-        # SAFE, because every later ask meets this same gate and is declined
-        # too, so the worst case is a run that reports a wall of failed samples
-        # having spent nothing further.
-        # ── THE GATE IS INSIDE `send`, WHICH IS A CORRECTNESS FIX AND NOT A
-        #    RELOCATION ─────────────────────────────────────────────────────
-        #
-        # `execute_async` RE-INVOKES `send` ON EVERY POLICY ATTEMPT. With the
-        # gate left above the `execute_async` call it would be asked ONCE and
-        # every retry would be UNGATED -- so a run that crossed its cap while
-        # a throttled call was being retried would go on spending on that call
-        # for the whole attempt budget. Inside `send`, every WIRE attempt is
-        # gated, which is what the bracket is for.
-        #
-        # `spend.BILLED_SITES`' `gated_here` scan walks the whole subtree of
-        # the declared qualname, so it is satisfied by either position --
-        # measured, not assumed. Correctness is what decides it.
+        if kwargs.get("service_tier", "default") != "default":
+            raise RagasRefusal("Ragas billing requires the standard service tier",
+                               code="billing_unbounded")
+        kwargs["service_tier"] = "default"
+        # Admission happens in attempt_record.begin, outside failure classification.
         async def _send():
-            spend.require_budget(spend.SPEND_SOURCE_RAGAS_JUDGE,
-                                 "the ragas judge")
             return await real_create(*args, **kwargs)
 
         # THE RESERVATION IS THIS REQUEST'S OWN, not the plan's per-metric
         # estimate: the plan is about the whole run and the pacer reserves per
-        # attempt. The input term is measured from the messages actually being
-        # sent and the output term is the ceiling the request carries, which
-        # is the one figure that cannot be an under-estimate.
+        # attempt. This token estimate is only for pacing; the attempt record
+        # separately reserves a documented-limit dollar bound.
         response = await _paced(
             _send,
             scope=config.PROVIDER_QUOTA_SCOPE_RAGAS_JUDGE,
             reservation_tokens=(_request_input_tokens(kwargs)
                                 + int(max_tokens or DEFAULT_MAX_TOKENS)),
-            label="ragas_judge")
+            label="ragas_judge",
+            attempt_record=_RagasAttemptRecord(tally, "judge", model, args, kwargs))
         # THE ANSWERING MODEL, READ OFF THE RESPONSE. This is the ONLY place on
         # the ragas path where it is reachable -- `InstructorLLM.agenerate`
         # returns the parsed Pydantic model and discards the raw response -- so
@@ -1541,7 +1714,6 @@ def build_judge(model, temperature, max_tokens, tally, max_retries,
         # nowhere.
         answered = getattr(response, "model", None) or "<absent>"
         seen["models"][answered] = seen["models"].get(answered, 0) + 1
-        tally.record_judge(getattr(response, "usage", None))
         return response
 
     client.chat.completions.create = recording_create
@@ -1690,12 +1862,7 @@ def build_embeddings(model, tally):
     real_create = client.embeddings.create
 
     async def recording_create(*args, **kwargs):
-        # THE GATE INSIDE `send`, for `build_judge`'s reason: `execute_async`
-        # re-invokes it on every policy attempt, so a gate outside would leave
-        # every retry ungated.
         async def _send():
-            spend.require_budget(spend.SPEND_SOURCE_RAGAS_EMBEDDING,
-                                 "the ragas embedder")
             return await real_create(*args, **kwargs)
 
         # AN EMBEDDING RESERVES ITS INPUT AND NOTHING ELSE: it produces no
@@ -1707,8 +1874,8 @@ def build_embeddings(model, tally):
             _send,
             scope=config.PROVIDER_QUOTA_SCOPE_RAGAS_EMBEDDING,
             reservation_tokens=_request_input_tokens(kwargs),
-            label="ragas_embedding")
-        tally.record_embedding(getattr(response, "usage", None))
+            label="ragas_embedding",
+            attempt_record=_RagasAttemptRecord(tally, "embedding", model, args, kwargs))
         return response
 
     client.embeddings.create = recording_create
@@ -2775,6 +2942,8 @@ def print_summary(summary, cost, judge_model, embedding_model, wall_seconds,
                     f"{cost['judge_output_tokens']:,} out; embeddings "
                     f"${cost['embedding_usd']:.4f} over "
                     f"{cost['embedding_calls']} calls)")
+        console.out(f"Budget liability: ${cost.get('budget_liability_usd', cost['total_usd']):.4f}; "
+                    f"unconfirmed: ${sum(cost.get('unconfirmed_liability_usd', {}).values()):.4f}")
     console.out("")
 
 
@@ -3131,6 +3300,8 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
         "judge_reasoning_effort": normalize_reasoning_effort(
             getattr(args, "reasoning_effort", None)),
         "judge_reasoning_billed_as": "output tokens",
+        "judge_service_tier": "default",
+        "billing_reservation_basis": "OpenAI documented limits, verified 2026-09-15",
         "judge_omitted_parameters": ["temperature", "top_p"],
         "judge_omitted_parameters_reason": (
             "temperature: rejected by this model (only its own default is "
@@ -3758,43 +3929,20 @@ def main(argv=None):
     tree_before = snapshot_tree(run_dir, exclude_dir=out_dir)
 
     started = time.monotonic()
-    # ── RECORDED TO THE CROSS-PROCESS JOURNAL, IN A `finally` ─────────────
-    #
-    # ONE ENTRY PER INVOCATION AND NOT ONE PER RESPONSE. This harness charges
-    # the ledger per response and would otherwise write thousands of lines and
-    # take thousands of exclusive locks for a number that is only ever read as
-    # a total. `spend_journal.record_run` is that shape and argues it there.
-    #
-    # THE `finally` IS WHY AN INTERRUPTED RUN STILL CONTRIBUTES: `score_all`
-    # raises on a spend stop and on a KeyboardInterrupt, and both are runs that
-    # have already spent money. The entry is keyed on `(out_dir, run stamp)`,
-    # so a re-run into the SAME output directory under the same stamp appends
-    # nothing and a genuinely new invocation appends its own.
+    # Persist settled liabilities through the existing run journal. Every
+    # settlement offers a delta (min_usd=0), including a failed retry. The
+    # finalizer writes any remainder and stops the backstop. No open request
+    # is durable: a hard kill before settlement/checkpoint can still lose its
+    # liability. Reusing the existing owner avoids counting attempts twice.
     _journal_unit = _utc_now()
-    # ── AND SEGMENTED, SO A HARD KILL DOES NOT LOSE THE SPEND ────────────
-    #
-    # The `finally` below covers everything that UNWINDS -- a clean return, a
-    # spend stop, a KeyboardInterrupt -- and covers nothing that does not. A
-    # SIGKILL, an OOM kill and a power loss leave tens of minutes of billed
-    # judging unrecorded, so the next session's cap reads as though this one
-    # never ran. `record_run`'s own docstring names that gap; the checkpointer
-    # closes it by writing DELTAS as the run proceeds, and `finalize` writes
-    # the remainder. The deltas sum to `measured` by construction, which is why
-    # the entry below is a remainder rather than the whole run: writing both
-    # would double count, and `total()` sums.
     _checkpointer = spend_journal.RunSpendCheckpointer(
         spend.SPEND_BUDGET_CAMPAIGN, spend.SPEND_SOURCE_RAGAS_JUDGE,
-        out_dir, _journal_unit, args.judge_model)
-    # ── AND A WALL CLOCK BESIDE THE COMPLETIONS ─────────────────────────
-    #
-    # `spend_checkpoint` fires on PAIR COMPLETION, so a run whose pairs all
-    # hang -- or whose event loop is blocked -- offers nothing further however
-    # long it waits. The backstop is a thread, not a loop callback, precisely so
-    # a stalled loop cannot stall it: every RUN_CHECKPOINT_SECONDS / 4 it reads
-    # the ledger (charged per RESPONSE, so in-flight charges are included) and
-    # runs the same threshold decision under the same lock. It bounds how long
-    # spend goes UNOFFERED; a journal that refuses the write is still pending.
-    # `finalize` in the `finally` below stops and joins it.
+        out_dir, _journal_unit, args.judge_model,
+        min_usd=0, accounting_basis="measured_responses_plus_unconfirmed_liability")
+    tally.checkpointer = _checkpointer
+    # Pair completion and the wall-clock backstop remain additional offers to
+    # the same locked checkpointer. They do not record open requests. A pending
+    # or conflicting write is retried/checked in the next attempt's admission.
     _checkpointer.start_backstop(lambda: spend.SPEND_LEDGER.measured)
     try:
         scores = asyncio.run(score_all(run, metrics, args.max_workers, active,

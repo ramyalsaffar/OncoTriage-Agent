@@ -1684,11 +1684,13 @@ class RunSpendCheckpointer(object):
     """
 
     def __init__(self, budget, source, scope, prefix, judge_model,
-                 path=None, min_usd=None, min_seconds=None, clock=None):
+                 path=None, min_usd=None, min_seconds=None, clock=None,
+                 accounting_basis=None):
         self.budget = budget
         self.source = source
         self.scope = scope
         self.prefix = str(prefix)
+        self.accounting_basis = accounting_basis
         self.judge_model = judge_model
         self.path = path
         self.min_usd = RUN_CHECKPOINT_USD if min_usd is None else float(min_usd)
@@ -1805,6 +1807,8 @@ class RunSpendCheckpointer(object):
             "kind": ENTRY_KIND_RUN, "budget": self.budget,
             "source": self.source, "scope": self.scope, "unit": item.unit,
             "usd": item.usd, "judge_model": self.judge_model,
+            **({"accounting_basis": self.accounting_basis}
+               if self.accounting_basis is not None else {}),
         }, path=self.path)
         item.last_outcome = outcome
         self._last = self._clock()

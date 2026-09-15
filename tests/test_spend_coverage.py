@@ -442,18 +442,16 @@ check("1h  *** every `gated_here` site really calls spend.require_budget in "
       sorted(s for s in _HERE if not calls_require_budget(s)), [])
 check("1h-i non-degeneracy: there are gated_here sites, and the scan can say "
       "no",
-      (len(_HERE) >= 4,
+      (len(_HERE) >= 2,
        calls_require_budget(
            "oncotriage/retrieval/indexer.py::get_embeddings_batch::_call")),
       (True, False))
 
 # THE FOUR BILLED PATHS THE CAP NOW COVERS ARE NAMED, so a path silently
 # dropped from the gate fails here as well as at 1h.
-check("1i  the four non-Stage-5 billed paths are all gated_here",
+check("1i  the two direct gates remain gated_here; Ragas uses attempt admission",
       sorted(_HERE),
       sorted(["oncotriage/agent/models.py::get_embedding",
-              "oncotriage/evaluation/ragas_harness.py::build_embeddings",
-              "oncotriage/evaluation/ragas_harness.py::build_judge",
               "oncotriage/evaluation/rater.py::submit_batches"]))
 
 check("1j  spend.SPEND_SOURCES has one member per gated path plus Stage 5",
@@ -1336,6 +1334,37 @@ def drive_ragas_seam(builder_name, over_budget):
 _RAGAS_SRC = open(os.path.abspath(_ragas.__file__), encoding="utf-8").read()
 
 
+def ragas_attempt_gate_path(tree, builder):
+    """Follow the specific adapter protocol, not arbitrary gate strings."""
+    def named(name, cls=ast.FunctionDef):
+        return next((n for n in ast.walk(tree) if isinstance(n, cls)
+                     and n.name == name), None)
+    build = named(builder)
+    paced = named("_paced")
+    record = named("_RagasAttemptRecord", ast.ClassDef)
+    if build is None or paced is None or record is None:
+        return False
+    calls = lambda n: [c for c in ast.walk(n) if isinstance(c, ast.Call)]
+    hooked = any(isinstance(c.func, ast.Name) and c.func.id == "_paced"
+                 and any(k.arg == "attempt_record" and isinstance(k.value, ast.Call)
+                         and isinstance(k.value.func, ast.Name)
+                         and k.value.func.id == "_RagasAttemptRecord"
+                         for k in c.keywords) for c in calls(build))
+    forwarded = any(ast.unparse(c.func) == "provider_resilience.execute_async"
+                    and any(k.arg == "attempt_record" and isinstance(k.value, ast.Name)
+                            and k.value.id == "attempt_record" for k in c.keywords)
+                    for c in calls(paced))
+    begin = next((n for n in record.body if isinstance(n, ast.FunctionDef)
+                  and n.name == "begin"), None)
+    if begin is None:
+        return False
+    gates = [c.lineno for c in calls(begin)
+             if ast.unparse(c.func) == "spend.require_budget"]
+    admits = [c.lineno for c in calls(begin)
+              if ast.unparse(c.func) == "spend.begin_billed_attempt"]
+    return bool(hooked and forwarded and gates and admits and max(gates) < min(admits))
+
+
 def gate_is_above_the_await(builder, src=None):
     """Is the gate above the real client call, in whatever frame issues it?
 
@@ -1363,6 +1392,8 @@ def gate_is_above_the_await(builder, src=None):
     it still answers False for a wrapper whose gate really is below its call.
     """
     tree = ast.parse(src if src is not None else _RAGAS_SRC)
+    if ragas_attempt_gate_path(tree, builder):
+        return True
     for node in ast.walk(tree):
         if not (isinstance(node, ast.FunctionDef) and node.name == builder):
             continue
@@ -1465,6 +1496,14 @@ check("7c-ii CONTROL: a `send` with NO gate at all is reported False rather "
       "than None, so a wrapper that simply dropped the gate fails here "
       "instead of being reported as unmeasurable",
       gate_is_above_the_await("build_judge", src=_GATE_MISSING_SRC), False)
+
+for _builder in ("build_judge", "build_embeddings"):
+    _tree = ast.parse(_RAGAS_SRC)
+    for _node in ast.walk(_tree):
+        if isinstance(_node, ast.Call) and isinstance(_node.func, ast.Name) and _node.func.id == "_paced":
+            _node.keywords = [k for k in _node.keywords if k.arg != "attempt_record"]
+    check(f"7c-adapter CONTROL {_builder}: removing attempt_record breaks gate path",
+          ragas_attempt_gate_path(_tree, _builder), False)
 
 check("7d  CLEAN CONTROL: with budget, the wrapper reaches the client",
       drive_ragas_seam("judge", over_budget=False), (None, 1))

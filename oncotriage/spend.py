@@ -1858,8 +1858,9 @@ def require_budget(source: str, where: str, *, latch=None) -> None:
 # WHAT IT DOES NOT CHANGE. The call-site gates above still run first, with
 # their own counters and latches; the unverified-record refusal still refuses
 # first where it applies; a reservation that cannot be persisted still latches
-# ``billing_record``. Paths that create no ``AttemptLiability`` -- the rater's
-# Batch API and the ragas harness -- are not admitted here.
+# ``billing_record``. The rater's Batch API uses its separate reservation path.
+# Ragas now uses AttemptLiability admission, with run-journal persistence of
+# settled liabilities; its open requests have no durable attempt row.
 
 
 class BudgetAdmissionDeclined(SpendLimitReached):
@@ -2442,13 +2443,16 @@ BILLED_SITES = {
         "and a measured gate therefore cannot stop the batch that broke the "
         "cap -- only the next one."),
     "oncotriage/evaluation/ragas_harness.py::build_judge": (
-        DISPOSITION_GATED_HERE, None,
-        "The ragas judge. The gate is inside the `recording_create` closure "
-        "this function installs, which is the one point where a request this "
-        "harness does not own the loop for can be declined."),
+        DISPOSITION_GATED_UPSTREAM,
+        "oncotriage/evaluation/ragas_harness.py::_RagasAttemptRecord::begin",
+        "The retry owner calls the attempt record's admission hook before each "
+        "wire send, outside provider failure classification. It atomically "
+        "holds the priced bound and refuses unresolved checkpoint writes."),
     "oncotriage/evaluation/ragas_harness.py::build_embeddings": (
-        DISPOSITION_GATED_HERE, None,
-        "The ragas embedder. See the entry above."),
+        DISPOSITION_GATED_UPSTREAM,
+        "oncotriage/evaluation/ragas_harness.py::_RagasAttemptRecord::begin",
+        "The embedding wrapper uses the same per-attempt admission protocol "
+        "as the judge, with its own source and input-only price bound."),
 
     # ── EXEMPT, EACH ARGUED ───────────────────────────────────────────────
     "oncotriage/retrieval/indexer.py::get_embeddings_batch::_call": (
@@ -3432,8 +3436,9 @@ BILLING_RECORD = BillingRecord()
 # RECOVERY_P1C_REPORT.md, item 2.
 #
 # WHAT IT DOES NOT COVER, STATED: billed paths that do not create one of these
-# -- the rater's Batch API, the ragas harness -- keep their own ledger charges
-# and have no durable record to agree with.
+# -- the rater's Batch API -- keep their own ledger charges. Ragas uses this
+# settlement owner without a campaign sink, then checkpoints settled liability
+# through its existing run journal. Open Ragas requests remain a hard-kill gap.
 
 LIABILITY_OPEN = "open"
 """The live tally's key for attempts created and not yet resolved -- the
@@ -3575,8 +3580,12 @@ class AttemptLiability:
         return float(self.reserved_usd or 0.0)
 
     def resolve(self, outcome, *, model=None, prompt_tokens=None,
-                completion_tokens=None) -> float:
+                completion_tokens=None, response_usd=None) -> float:
         """Charge the ledger and settle the durable row at ONE amount.
+
+        ``response_usd`` optionally supplies a path-owned price for a response.
+        None preserves the existing token-pricing path; invalid explicit prices
+        retain the reservation. Other outcomes ignore this argument.
 
         NEVER RAISES; idempotent -- a second call returns the first call's
         amount and charges nothing, because an attempt is billed once whatever
@@ -3592,14 +3601,26 @@ class AttemptLiability:
             if self.resolved_outcome is not None:
                 return self.resolved_usd
             return self._resolve_locked(outcome, model, prompt_tokens,
-                                        completion_tokens)
+                                        completion_tokens, response_usd)
 
     def _resolve_locked(self, outcome, model, prompt_tokens,
-                        completion_tokens) -> float:
+                        completion_tokens, response_usd=None) -> float:
         try:
-            out, usd, s_in, s_out, fault = attempt_liability(
-                outcome, self.reserved_usd, model or self.model, prompt_tokens,
-                completion_tokens)
+            # Evaluation paths own their pricing (including cache discounts).
+            # Invalid explicit prices retain the reservation, never become free.
+            if outcome == BILLING_OUTCOME_RESPONSE and response_usd is not None:
+                if _valid_usd(response_usd):
+                    out, usd, s_in, s_out, fault = (
+                        outcome, response_usd, _as_token_count(prompt_tokens),
+                        _as_token_count(completion_tokens), None)
+                else:
+                    out, usd, s_in, s_out, fault = (
+                        BILLING_OUTCOME_RESPONSE_UNPRICED, self.reserved_usd,
+                        None, None, "invalid_response_usd")
+            else:
+                out, usd, s_in, s_out, fault = attempt_liability(
+                    outcome, self.reserved_usd, model or self.model, prompt_tokens,
+                    completion_tokens)
         except Exception as exc:                                # noqa: BLE001
             # Unreachable by construction; conservative if reached.
             BILLING_RECORD_FAULTS[f"liability:raised:{type(exc).__name__}"] += 1
