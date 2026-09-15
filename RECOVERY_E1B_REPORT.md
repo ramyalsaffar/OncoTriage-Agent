@@ -2152,3 +2152,317 @@ Also carried, unchanged: U2-U8, section 10's "Unverified" list, and section
   re-run locally.
 - **If that remainder exceeds one session,** hand off the named remainder
   without expanding scope.
+
+### 15.7 Post-push batch (2026-09-15)
+
+Written for: the operator. Pushed commit `bcd9561`, branch `wip/billing-closure`
+= `origin/wip/billing-closure`, `git status` clean at start. No production
+source or test file edited; no commit, stash, branch change, reset or cleanup;
+no paid call; no SQLite connection to any production database.
+
+#### 15.7.1 Network, exactly
+
+- **Opened 2026-09-15T00:56:47Z, closed 00:57:23Z.** Run from the session
+  shell, outside any sandbox, while no test was running.
+- Fetched, all read-only, from `api.github.com`:
+  - the run list for `head_sha=bcd9561...`: one run, 34905099315, `CI`, `push`;
+  - that run's job and step list;
+  - three job logs: `tests` 137,818 B, `secret scan` 21,784 B,
+    `image` 971,300 B.
+- Unauthenticated log download returns 403 ("Must have admin rights"). The logs
+  were fetched with the operator's stored git credential (osxkeychain, via
+  `git credential fill`); the token was never printed or written to disk.
+- **No model download.** The FastEmbed `Qdrant/bm25` snapshot was COPIED from
+  the local `02- Data/07- Model Cache/fastembed` into the scratch isolated root.
+- No other egress. Every test run below is under no-egress containment.
+
+#### 15.7.2 Task 0 -- what CI run 34905099315 actually executed
+
+| check | executed? | evidence (tests job log line) | passing evidence? |
+|---|---|---|---|
+| Bucket A | **yes, with counts** | 889 `Classification consistent: 151 test files, 132 in bucket A (132 runnable in CI)`; 1206 `ran 132, failed 0, not run 0` (22:50:08Z); every preceding step `success` | **yes** |
+| `test_billing_closure.py` (incl. 7z-iii) | yes, as a bucket-A member under 4 workers | 1042 `PASS  exit=0    264.0s  test_billing_closure.py` | yes for the file; not a 7z-iii disposition (15.3) |
+| `test_agent_retrieval_observability.py` | yes, as a bucket-A member | 957 `PASS  exit=0      3.8s  test_agent_retrieval_observability.py` | yes for the file |
+| its SECTION E | **not evidenced by a log line.** The runner prints no per-section output for a passing file. The step env (lines 920-935) and `ci.yml` set no `ONCOTRIAGE_QDRANT_PROBE_URL`, so by the file's own code E records a counted SKIP | **no** (skipped by configuration) |
+| Serial bucket B | **no.** Step "Bucket B — serial tests" conclusion `skipped` | 1238 `serial_ready=false`; preconditions list 4 ABSENT (UMLS `MRCONSO*.RRF` x2, the real Synthea corpus, the `scratch_ecog` corpus), only `test_package_invariants.py` PRESENT; the report-only step ran instead | **no** |
+| `fixture_replay.py` | not in any workflow step | -- | **no** |
+| image job | Trivy gate step `failure` | job conclusion `failure` | deferred by operator ruling (one later rebuild + passing rescan) |
+
+Also green in that run: the secret-scan job, the classification check, static
+checks, the model-cache pre-warm and pip-audit.
+
+#### 15.7.3 Containment used for every test run in this batch
+
+- **B5's harness, reused unchanged:** venv `.pth` tripwire, exec shim launch
+  records, kernel exec log, B5's `tw/`, B5's decoys, `b5_inv.py`.
+- **Copied into this session's scratchpad** as `b7_run.py`, `sx2.sh` and
+  `nonet2.sb`. Only three things differ from B5:
+  - **evidence directory:** this scratchpad's `evidence/`;
+  - **profile:** B5's plus one rule, `(deny file-write* (subpath "<project>/02- Data"))`;
+  - **isolated root:** `isoroot2`, a copy of B1's isoroot plus these links:
+    - `01- Patients/fhir` and `01- Patients/scratch_ecog`, symlinks to the real
+      corpora;
+    - eight `04- MeSH` files symlinked, including `MRCONSO_2025AB.RRF` and its
+      audit cache;
+    - the FastEmbed model copied in.
+- **sha256:** `nonet2.sb` `e91f9738a7b3`, `sx2.sh` `2345679c1922`,
+  `b7_run.py` `f16162302b7f`.
+- **Validation probe** (`evidence/probe_deny`), exit 0, 1/1 processes matched.
+  Under the new profile:
+  - reading a real bundle through the link succeeds (1000 bundles visible);
+  - writing into the linked `fhir` directory is refused (`PermissionError` errno 1);
+  - appending to the linked MRCONSO is refused (errno 1);
+  - writing inside `isoroot2` succeeds;
+  - an external connect is refused by the tripwire (`getaddrinfo-REFUSED`).
+- **Per run:** driver kill timer, an independent outer `perl alarm`, foreground,
+  `python -u`, one run at a time.
+- Live tree digest (`oncotriage/` + `tests/`) at start: `2fc195543bd2`,
+  identical to B3/B5's.
+
+#### 15.7.4 Task 2 -- `fixture_replay.py`: RUN, CANNOT PASS
+
+- **Run:** `evidence/fixture_replay/` in this session's scratchpad. Exit **1**
+  in 1.5 s. 1/1 processes matched, no external tripwire record, tree unchanged.
+- **Output:** `[REFUSED] THIS GATE CANNOT RUN AT THE CONFIGURED PROVIDER.`,
+  `configured provider : 'bedrock_anthropic'`, and
+  `NOTHING WAS READ, NOTHING WAS HOOKED AND NOTHING WAS BILLED.`
+- **Why it cannot pass, and what a pass would require.** All of these hold at
+  once:
+  1. `config.MATCHING_PROVIDER` would have to be `'openai'`. That is a source
+     edit, forbidden here, and there is no environment override. The fixture
+     harness hooks only the OpenAI seam.
+  2. Behind that refusal it would need a live Qdrant whose alias resolves to
+     the fixtures' pinned collection, with a matching contents digest. The only
+     such index is the Qdrant Cloud one, and egress to it is not permitted.
+  3. The twelve fixtures are stale on their own inputs: 0/12 since the
+     de-identification and pre-diagnosis-ECOG passes. A pass needs a PAID
+     recapture, and `fixture_capture.py` refuses the shipped provider too.
+     Converse fixtures need a fixture-format change (a `SCHEMA_VERSION` bump).
+  4. `isoroot2`'s fixture directory is empty. That is moot, because the
+     refusal comes before any fixture is read.
+- **Disposition:** recorded status RUN (refused), passed status NOT PASSED,
+  unpassable in this batch by construction.
+
+#### 15.7.5 Task 3 -- retrieval observability: RUN, PASSED, SECTION E SKIPPED
+
+- **Run:** `evidence/retrieval_obs/`. Exit 0 in 1.4 s, with
+  `ONCOTRIAGE_QDRANT_PROBE_URL` explicitly unset. 1/1 processes matched, no
+  tripwire record, tree unchanged.
+- **Result:** `Passed: 104`, `Failed: 0`, `Skipped: 1`.
+  - **Sections that ran:** A, B, C, D, F, G and H. Section A measured the real
+    FastEmbed model loaded from the copied cache under `HF_HUB_OFFLINE=1`.
+  - **Skipped:** SECTION E, `ONCOTRIAGE_QDRANT_PROBE_URL is not set`.
+- **What section E actually needs,** read from its code:
+  - `ONCOTRIAGE_QDRANT_PROBE_URL` pointing at a reachable Qdrant server. With
+    the URL unset E skips; there is no fallback to the pipeline client.
+  - A collection named `ONCOTRIAGE_QDRANT_PROBE_COLLECTION`, or
+    `COLLECTION_NAME` (`trial_criteria`) by default, with a sparse vector named
+    `title-bm25`. A set URL whose query raises (unreachable server, missing
+    collection, missing vector) is also a counted SKIP, not a pass.
+  - Nothing else. E asserts nothing; it prints what an empty `SparseVector`
+    returns.
+  - The cached FastEmbed model is needed by section A, not by E.
+- **Is a local Qdrant permitted under containment?** Yes. The profile allows
+  `localhost:*` outbound, and the tripwire records loopback but does not refuse
+  it. The Qdrant Cloud index is NOT permitted, because that is egress.
+- **Is one available?** No. At 00:58Z nothing was listening on TCP 6333, the
+  Docker daemon was not running (socket absent), and no `qdrant` binary was
+  installed. Installed `qdrant-client` is 1.18.0.
+- **Smallest step to run E:** start a local Qdrant (for example the compose
+  `qdrant` service) holding a collection with a `title-bm25` sparse vector, then
+  re-run with the probe URL set. A collection created only for the probe would
+  reproduce the recorded behaviour against a synthetic index rather than the
+  real one. Not done here: it means starting a service, and loading the real
+  index would need egress.
+- **Disposition:** file recorded RUN and PASSED; SECTION E recorded
+  NOT RUN / NOT PASSED. The CI run also skipped E by configuration (15.7.2).
+
+#### 15.7.6 Task 4 -- 7z-iii: where the abort was actually observed
+
+- **Located, not in B1-B6.** The abort was observed in the **R1b** session's
+  control matrix, round 2, and recorded in `RECOVERY_R1B_REPORT.md`:
+  - lines 373-379: "F1 aborted in round 2 ... load-dependent (four copies ran
+    concurrently)";
+  - lines 419-422: the LOW finding.
+  - The finding was then carried, as text only, through R1c
+    (`RECOVERY_R1C_REPORT.md` 242-246), the E1 brief (session transcript
+    `8b42b968`, 09:45Z, and `c25539fa`, 17:16Z), `RECOVERY_E1_REPORT.md` 426
+    and this report's 11(c).
+- **The saved output.** `<scratchpad 5cbcd85e-6572-4ead-aa09-73efe43d9371>/ctl_logs/F1_old_estimate.log`
+  (622,325 B, 02:31 local, 2026-09-14):
+  - line 8048: `PASS  7z-ii *** MISSING DEFERRED ...`;
+  - lines 8049-8053: `Traceback ...`, then
+    `TypeError: '<' not supported between instances of '_Absent' and 'float'`.
+  - That log ends at the traceback.
+- **What it was a run OF.** Copy `F1_old_estimate`, a DELIBERATE PLANT on the
+  pre-E1 tree (R1b's `plants.py`): the Stage 5 attempt record built without the
+  reservation bound (`_Stage5AttemptRecord(config.matching_wire_model(), _input, _max_output)`).
+  - It ran as one of four concurrent copies (`run_controls.py`,
+    `ThreadPoolExecutor(4)`).
+  - It was never observed on shipped code.
+  - The same copy rerun alone (`F1_rerun.txt`, line 8145) gave
+    `PASS  7z-iii`, 353/35.
+- **What the saved log does and does not establish:**
+  - **Operands.** The operand order `'_Absent' and 'float'` means the left side,
+    `at(at(_d2,"seed"),"usd")`, was `_Absent` and the right side,
+    `at(_d1,"measured")`, was a float.
+  - **Process 2 wrote a dump.** `child()` prints the child's last 40 output
+    lines whenever the dump file is absent, and no such tail precedes the
+    traceback. So process 2 wrote its JSON dump without a `seed.usd` entry.
+  - **No patient ran in process 2.** In the child script, `seed` is filled only
+    inside the stand-in `process_patient` (the `elif not OBSERVED:` branch). A
+    dump with no `seed` therefore means process 2's `main()` never started a
+    patient.
+  - **Not preserved:** process 2's exit code, stdout and stderr. `child()` does
+    not print them when a dump exists. So WHY `main()` started no patient cannot
+    be recovered from that run.
+
+#### 15.7.7 Task 1 -- serial bucket B: RUN, PASSED, all five members
+
+- **Run:** `evidence/serial_bucket_b/`, via `tests/run_serial_tests.py`, which
+  runs the members one at a time in its own fixed order. Driver kill 2400 s,
+  outer `perl alarm` 2460 s; neither fired. Exit 0 in 473.8 s. Launched as a
+  background tool job so the session stayed responsive; the test process
+  itself ran in the foreground of its driver.
+- **Result:** `All 5 serial tests passed.`
+
+| member | exit | time | result |
+|---|---|---|---|
+| test_registries_cancer_code_claims_audit | 0 | 0.1 s | 197/0 (MRCONSO audit cache hit, "47 cached, 6 known-absent"; no scan needed) |
+| test_registries_cancer_code_claims_audit_control | 0 | 1.5 s | 16/0; 14 planted, 14 caught; baseline OK; File 08 sha256 `8e4c3aafc011...` before = after |
+| test_degraded_dependencies | 0 | 11.6 s | 174/0 |
+| test_config_snapshot_date_rot | 0 | 339.2 s | 10/0; config sha256 `ce83109d3919...` before = after |
+| test_package_invariants | 0 | 121.3 s | 261/0, `Skipped: 0` |
+
+- **Inputs** came through `isoroot2`'s read-only links (15.7.3): the real
+  1000-bundle corpus, `scratch_ecog`, and MRCONSO with its cache. The profile
+  refused every write into the real `02- Data`.
+- **Containment inventory:**
+  - 152 Python processes: 152 shim records, 152 kernel Python pids and 152
+    markers. UNMATCHED none; no markers without a shim record; no kernel Python
+    pid without one; no `-S` exemptions.
+  - 68 non-Python helpers, reported by the kernel.
+  - Every marker and shim record shows the sandbox write denied. 0 external
+    tripwire records, no other tripwire record, 0 inventoried pids alive after
+    the run.
+  - Decoys empty; tmp directory count 4 -> 4.
+- **After the run:** live tree digest unchanged (`2fc195543bd2`).
+  `oncotriage/config.py` (`ce83109d...`) and
+  `oncotriage/registries/cancer_code_registry.py` (`8e4c3aaf...`) are
+  byte-identical to the start of the batch. `git status` shows only this
+  report modified.
+- **Scope note.** `test_package_invariants` re-ran here as the last member of
+  the serial unit. B5's 261/0/0 on the same tree digest is not superseded; this
+  run adds its serial position.
+
+#### 15.7.8 Task 4 -- 7z-iii: reproduction on the shipped tree
+
+- **Driver:** `z7_drive.py`, scratchpad only.
+  - It rebuilds `p1b_e2e("missing_unrecordable", "settle_missing_unrecordable")`
+    from the child script EXTRACTED BY AST from the shipped
+    `tests/test_billing_closure.py` (13,232 chars, line 2172). It uses the
+    test's own `FIXED_FP`, cap, corpus, `isolate_qdrant` env, child timeout and
+    cwd.
+  - It PRESERVES every child's exit code, stdout, stderr and JSON dump in
+    `z7out_*/<drive>/p{1,2,3}.*`.
+  - No test or source file was edited.
+- **The replica is faithful, not degenerate.** All 20 drives of the first run
+  reproduced the check's full expected tuple: latch
+  `[true, "billing_record"]`, process 1 prints `failed.`, fault
+  `discrepancy:missing:failed` = 1, no markers, and process 2's seed below the
+  live ledger (example: 11.65536402 < 11.65552786). Process 2 exit 0, 0
+  provider calls.
+
+| run | drives | concurrency | burners | load avg (1 min, after) | no seed | seed below live | p2 exits | timeouts | processes matched |
+|---|---|---|---|---|---|---|---|---|---|
+| `z7_shipped_load` | 20 (5 rounds) | 4 | 4 | -- | **0** | 20 | {0} | 0 | 125/125 |
+| `z7_shipped_heavy` | 80 (10 rounds) | 8 | 8 | 31.16 | **0** | 80 | {0} | 0 | 489/489 |
+
+- **Containment,** both runs: UNMATCHED none; 0 external tripwire records; 0
+  pids alive after the run; tree unchanged.
+- **Result:** the missing seed did NOT reproduce on the shipped tree in 100
+  drives under load, consistent with CI (4 workers) and B3 (alone).
+
+#### 15.7.9 Task 4 -- 7z-iii: reproduced at the original site, cause identified
+
+- **Run:** `z7_F1_heavy`, via `z7_drive2.py`, which is `z7_drive.py` with an
+  env-selected code root and a realpath preflight.
+  - Target: R1b's `ctl/F1_old_estimate` copy. Its child script is
+    byte-identical to the shipped one (13,232 chars); the preflight shows the
+    copy's `oncotriage` and `_control_harness` imported.
+  - 80 drives, 8 concurrent, 8 burners; load average 36.34 after.
+  - 395/395 processes matched; 0 external tripwire records; tree unchanged.
+- **Result: 47 of 80 drives had NO SEED.**
+  - Every one of the 47 would abort the real check (`_Absent < float`).
+  - In all 47, process 2 exited 1 (the dump also carries `exit_code` 1) and its
+    dump lacks `seed`.
+- **The partition is exact, on process 1's provider call count:**
+
+| process 1 calls | F1 copy | shipped tree (`z7_shipped_heavy`) |
+|---|---|---|
+| 2-4 | 33 drives, all seeded, p2 exit 0 | 29 drives, all seeded |
+| 5-7 | **47 drives, all NO SEED, p2 exit 1** | **51 drives, all seeded, p2 exit 0** |
+
+- **Process 2's own output** (`z7out_F1_heavy/r0_d6/p2.stderr`, quoted):
+  `[Campaign] REFUSING TO START PAID WORK: billing_reservation_unbounded`,
+  `campaign ... holds 2 Stage 5 liabilities totalling $0.769680 whose amount is not a proven upper bound (first: ... settled/response_unpriced gpt-5.6-terra $0.3848...`,
+  `NOTHING HAS BEEN BILLED BY THIS RUN.`, `[Run] Closed run 2: KILLED`.
+- **Cause:**
+  - **How many calls process 1 issues is scheduling-dependent.** The injected
+    missing-and-unrecordable settlement latches `billing_record`, and how many
+    of the campaign's stand-in calls are dispatched before the latch depends on
+    thread scheduling. Load changes the mix; it does not change the logic.
+  - **When five or more are issued, a Stage 5 attempt settles
+    `response_unpriced` or `possibly_billed`.**
+    - Under the F1 plant, those liabilities were reserved at the OLD estimate
+      ($0.3848) rather than the documented-limit bound.
+    - Process 2's campaign preflight therefore refuses
+      (`billing_reservation_unbounded`) before starting any patient.
+    - With no patient run, the child's `OBSERVED` stays empty and the dump has
+      no `seed`.
+  - **On the shipped tree, the same schedules** carry the proven bound
+    ($5.826 per `response_unpriced` or `possibly_billed` attempt in process 1's
+    tally), so process 2 continues and seeds.
+- **So the missing seed is the planted defect's own refusal path.** It is
+  reached in a scheduling-dependent subset of runs. The rerun alone (353/35,
+  `PASS 7z-iii`) landed in the 2-4-call schedule.
+- **It is not a defect of the shipped code:** 0 no-seed in 100 shipped drives,
+  51 of them in the exact schedule class that fails under the plant.
+- **Residual, test-harness only, NOT repaired** (no test edits in this batch).
+  Under that plant, check 7z-iii ABORTS the file (`TypeError`) instead of
+  recording a failure, and `child()` does not print process 2's exit code or
+  output when a dump exists. The F1 control is still caught, before the abort.
+  - Smallest repair: guard the comparison, requiring both operands to be
+    numbers, as elsewhere in the file.
+  - And have `child()` print the child's `exit_code` and output tail when the
+    dump lacks the expected keys.
+- **Disposition: RESOLVED (cause identified and reproduced; not a shipped-code
+  defect).** The abort-shape repair above is open test work.
+
+#### 15.7.10 Acceptance, per task
+
+| task | recorded status | passed status |
+|---|---|---|
+| 0 CI logs for `bcd9561` | recorded (15.7.2) | tests job success: bucket A 132 ran / 0 failed / 0 not run; secret scan success; bucket B skipped (`serial_ready=false`); image job failure (deferred) |
+| 1 serial bucket B | RUN locally, all five | **PASSED** 5/5 (197/0, 16/0, 174/0, 10/0, 261/0/0) |
+| 2 `fixture_replay.py` | RUN locally | **NOT PASSED**: refuses at the configured provider, exit 1; cannot pass without a source edit, the Cloud index and a paid recapture |
+| 3 retrieval observability | RUN locally; also CI | **PASSED** 104/0; SECTION E **NOT RUN** (no probe URL, no local Qdrant) |
+| 4 7z-iii | reproduced on the F1 plant, not on shipped code | **RESOLVED** (15.7.9); abort-shape test repair open |
+
+**Merge readiness, assessed separately from 7z-iii.**
+
+- **Required checks with passing evidence:** bucket A (CI), serial bucket B
+  (local, contained), static checks, classification, pip-audit and the secret
+  scan (CI).
+- **Items that are not passes:**
+  - **(a) The image scan gate FAILED in CI.** Deferred by operator ruling to
+    one later rebuild plus a passing rescan. It is not closed, and it blocks
+    only if branch protection requires that job.
+  - **(b) `fixture_replay.py` cannot pass at the shipped provider.** This is
+    pre-existing (CLAUDE.md records the same refusal verified on 2026-09-03),
+    it runs in no workflow and it is not an E1b regression.
+  - **(c) Retrieval section E is informational and asserts nothing.**
+- **The working tree holds this report's uncommitted edits (section 15.7).**
+  They must be committed before a squash-merge; this batch makes no commit.
+- **Not re-measured in this batch:** the production byte inventory (15.4
+  item 6).
