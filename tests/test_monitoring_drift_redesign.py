@@ -103,6 +103,7 @@ from oncotriage.monitoring import drift_reference as _dr
 from oncotriage.monitoring import drift_states as _ds
 from oncotriage.registries import primary_cancer as _pc
 from oncotriage.storage import database_logger as _dl
+from oncotriage.storage import queries as _queries
 
 
 #------------------------------------------------------------------------------
@@ -649,15 +650,24 @@ check("an unstamped run resolves to itself alone, with the reason recorded",
       (_mns.resolved, _mns.run_ids, _mns.reason),
       (True, (_ns,), _dl.CAMPAIGN_MEMBERSHIP_NO_STAMP))
 
-# PINNED AGAINST THE OTHER WALKER. `campaign_spend_before` walks the same rule
-# BACKWARD only; a restated rule is a rule that can drift, so the two are
-# checked against each other rather than promised to agree.
-_spend = _dl.campaign_spend_before(_r3, db_path=_CHAIN_DB)
-check("the backward walker and the two-way walker agree on the chain",
-      tuple(sorted(set(_spend.run_ids) | {_r3})),
-      _dl.campaign_run_ids(_r3, db_path=_CHAIN_DB).run_ids)
-check("...and the backward walker really found something, so the agreement is "
-      "not two empty sets", len(_spend.run_ids) >= 2, True)
+# PINNED AGAINST THE OTHER WALKER. The backward-only walker
+# (`campaign_spend_before`) is deleted -- it seeded a budget from final-attempt
+# costs -- so the two-way walker is pinned against the third implementation of
+# the rule instead: `queries.campaign_summary`'s recursive CTE. A restated rule
+# is a rule that can drift, so the two are checked rather than promised.
+_conn = sqlite3.connect(_CHAIN_DB)
+try:
+    _stitched = [r["run_ids"] for r in
+                 _queries.run(_conn, "campaign_summary").to_dict("records")
+                 if str(_r3) in str(r["run_ids"]).split(" -> ")]
+finally:
+    _conn.close()
+check("the recursive-CTE stitch and the two-way walker agree on the chain",
+      [tuple(int(x) for x in str(r).split(" -> ")) for r in _stitched],
+      [_dl.campaign_run_ids(_r3, db_path=_CHAIN_DB).run_ids])
+check("...and the chain really has more than one run, so the agreement is not "
+      "two single-member sets",
+      len(_dl.campaign_run_ids(_r3, db_path=_CHAIN_DB).run_ids) >= 2, True)
 
 
 # ===========================================================================

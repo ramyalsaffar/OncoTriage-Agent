@@ -299,13 +299,20 @@ class _Stub:
     serialize them.
     """
 
-    def __init__(self, *, barrier_size=None, barrier_timeout=15.0):
+    def __init__(self, *, barrier_size=None, barrier_timeout=15.0,
+                 hold_until_declines=None):
         self.requests = []
         self._lock = threading.Lock()
         self._barrier = (threading.Barrier(barrier_size)
                          if barrier_size else None)
         self._barrier_timeout = barrier_timeout
         self.barrier_broken = False
+        # E1: hold every TRIAL call open until this many admission declines
+        # have been counted, so a check can prove a request was IN FLIGHT while
+        # its peers sought admission. `held_by_declines` records whether the
+        # condition was met or the wait timed out.
+        self._hold_until = hold_until_declines
+        self.held_by_declines = None
 
     @property
     def chat(self):
@@ -323,6 +330,14 @@ class _Stub:
             # request 0 a trial call, and a stub that DEFINED request 0 as the
             # warmup could not see that.
             return _Response("{}", *CALL_TOKENS)
+        if self._hold_until is not None:
+            import time as _time
+            deadline = _time.monotonic() + self._barrier_timeout
+            while (sum(spend.SPEND_ADMISSION_DECLINES.values())
+                   < self._hold_until and _time.monotonic() < deadline):
+                _time.sleep(0.002)
+            self.held_by_declines = (sum(spend.SPEND_ADMISSION_DECLINES
+                                         .values()) >= self._hold_until)
         if self._barrier is not None:
             try:
                 self._barrier.wait(timeout=self._barrier_timeout)
@@ -370,10 +385,24 @@ def trial(index):
 _SIX = [trial(i) for i in range(6)]
 
 
+_REAL_STAGE5_BOUND = config.stage5_attempt_bound
+
+
 def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
              parallel=1, per_trial=True, seed_usd=0.0, node=None, stub=None,
-             **stub_kw):
+             reservation_usd=CALL_COST, **stub_kw):
     """Drive Stage 5 once under a chosen budget. Returns ``(result, stub)``.
+
+    E1: THE SUPPLIED RESERVATION IS ONE CALL'S PRICE BY DEFAULT. Admission now
+    requires ``committed + held + reservation <= cap`` before every billed
+    attempt, and this file's budgets are written in whole CALLS
+    (``cap=3 * CALL_COST``). With the documented-limit bound as the reservation
+    (~$5.83 per attempt on the pinned arm) no attempt would fit any of them and
+    every scenario would measure a decline at admission instead of the gate it
+    is about. So ``reservation_usd`` supplies the amount -- admission takes the
+    amount as an input and its design does not depend on it -- and a response
+    priced at exactly that amount keeps the arithmetic in whole calls. ``None``
+    uses the real bound; ``tests/test_budget_admission.py`` drives that.
 
     THE LEDGER IS RESET PER DRIVE, deliberately, because it is process-global
     state and a scenario that inherited the previous one's spend would be
@@ -382,26 +411,41 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
     """
     node = node or _evaluation.node_llm_classifier_evaluation
     stub = stub if stub is not None else _Stub(**stub_kw)
+    # E1b: A HELD DECLINE NOW WAITS, bounded by the admission-wait timeout
+    # (600 s as shipped). Every scenario here either releases its holds within
+    # milliseconds or -- control 9h, which plants a hold that is never released
+    # -- would otherwise sit out the whole shipped timeout before timing out. A
+    # short timeout keeps the same outcome (the patient stops at the requests
+    # the leaked holds allow) and costs this file seconds instead of minutes.
     saved = (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
              config.SPEND_CALL_CEILING_ENFORCED,
              config.MATCHING_PER_TRIAL_CALLS_ENABLED,
-             config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS)
+             config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
+             config.ADMISSION_WAIT_TIMEOUT_SECONDS)
     spend.SPEND_LEDGER.reset()
     spend.SPEND_STOP.reset()
+    spend.ADMISSION_QUEUE.reset()
     spend.SPEND_GATE_SKIPS.clear()
     spend.SPEND_CEILING_TRIPS.clear()
     spend.SPEND_LEDGER_FAULTS.clear()
+    spend.SPEND_ADMISSION_DECLINES.clear()
+    spend.SPEND_ADMISSION_WAITS.clear()
     if seed_usd:
         spend.SPEND_LEDGER.seed(spend.LedgerSeed(
             usd=seed_usd, rows=1, runs=1,
             source=spend.SEED_SOURCE_CAMPAIGN))
     deps.set_override(deps.OPENAI_CLIENT, stub)
     try:
+        if reservation_usd is not None:
+            config.stage5_attempt_bound = (
+                lambda *a, **k: dict(_REAL_STAGE5_BOUND(*a, **k),
+                                     usd=reservation_usd))
         config.SPEND_CAP_USD = cap
         config.SPEND_CAP_ENFORCED = enforced
         config.SPEND_CALL_CEILING_ENFORCED = ceiling_enforced
         config.MATCHING_PER_TRIAL_CALLS_ENABLED = per_trial
         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS = parallel
+        config.ADMISSION_WAIT_TIMEOUT_SECONDS = 2.0
         state = {"patient_data": PATIENT, "filtered_trials": trials,
                  "llm_classifier_retries": 0, "mesh_filter_applied": True,
                  "mesh_filter_skip_reason": "applied", "stage_timings": {}}
@@ -410,7 +454,9 @@ def run_node(trials, *, cap=None, enforced=True, ceiling_enforced=True,
         (config.SPEND_CAP_USD, config.SPEND_CAP_ENFORCED,
          config.SPEND_CALL_CEILING_ENFORCED,
          config.MATCHING_PER_TRIAL_CALLS_ENABLED,
-         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS) = saved
+         config.MATCHING_PER_TRIAL_MAX_PARALLEL_CALLS,
+         config.ADMISSION_WAIT_TIMEOUT_SECONDS) = saved
+        config.stage5_attempt_bound = _REAL_STAGE5_BOUND
         deps.clear_override(deps.OPENAI_CLIENT)
 
 
@@ -480,10 +526,17 @@ finally:
 check("1f  ...and the cap was restored", config.SPEND_CAP_USD, _START_CONFIG[0])
 
 # THE TWO CLOSED VOCABULARIES.
-check("1g  SPEND_LIMITS is closed and its two members are distinct findings "
+# THREE MEMBERS SINCE THE CUMULATIVE-SPEND PASS, AND THE PIN MOVING IS THE CHECK
+# WORKING: `billing_record` is a third finding with a third remedy (the database
+# the durable record lives in), not a spelling of the cap or the ceiling.
+# FOUR SINCE E1b, AND THE PIN MOVING IS THE CHECK WORKING AGAIN:
+# `admission_wait` is a fourth finding with a fourth remedy (resume; the budget
+# is not spent), not a spelling of the cap.
+check("1g  SPEND_LIMITS is closed and its four members are distinct findings "
       "with distinct remedies",
       spend.SPEND_LIMITS,
-      (spend.SPEND_LIMIT_CAP, spend.SPEND_LIMIT_CALL_CEILING))
+      (spend.SPEND_LIMIT_CAP, spend.SPEND_LIMIT_CALL_CEILING,
+       spend.SPEND_LIMIT_BILLING_RECORD, spend.SPEND_LIMIT_ADMISSION_WAIT))
 check("1h  SPEND_SKIP_KEY_PREFIXES is closed",
       spend.SPEND_SKIP_KEY_PREFIXES,
       (spend.SPEND_SKIP_WARMUP_KEY_PREFIX, spend.SPEND_SKIP_WAVE_KEY_PREFIX,
@@ -530,7 +583,8 @@ check("1j  SEED_SOURCES is closed and `fresh` is a VALUE rather than an "
       spend.SEED_SOURCES,
       (spend.SEED_SOURCE_NONE, spend.SEED_SOURCE_CAMPAIGN,
        spend.SEED_SOURCE_RATER_STATE,
-       spend.SEED_SOURCE_JOURNAL_RATER, spend.SEED_SOURCE_JOURNAL_CAMPAIGN))
+       spend.SEED_SOURCE_JOURNAL_RATER, spend.SEED_SOURCE_JOURNAL_CAMPAIGN,
+       spend.SEED_SOURCE_BILLING_RECORD))
 check("1j-ii ...and every one of them except `fresh` is assigned a budget, "
       "so a resumed baseline can never be added to the wrong program's spend",
       sorted(set(spend.SEED_SOURCES) - {spend.SEED_SOURCE_NONE}
@@ -550,7 +604,8 @@ check("1k  RUN_STOP_REASONS is closed and has no duplicate -- a duplicated "
       "mechanisms as one",
       (_dl.RUN_STOP_REASONS,
        len(set(_dl.RUN_STOP_REASONS)) == len(_dl.RUN_STOP_REASONS)),
-      (("operator", "spend_cap", "call_ceiling"), True))
+      (("operator", "spend_cap", "call_ceiling", "billing_record",
+        "admission_wait"), True))
 check("1k-i ...and the two spend members are named by the SAME strings the "
       "gate's own limit vocabulary uses, so a row and a counter key can be "
       "joined without a translation table",
@@ -560,11 +615,16 @@ check("1k-i ...and the two spend members are named by the SAME strings the "
 # THE THREE COUNTERS REACH THE RUN-END REPORT. A counter with no reader is the
 # shape oncotriage/degradation.py exists to remove.
 from oncotriage import degradation as _degradation              # noqa: E402
-check("1l  all three spend counters are in the degradation registry, so a "
+# E1 ADDED A FOURTH: SPEND_ADMISSION_DECLINES, the attempts atomic budget
+# admission declined after the call-site gate passed. The pin stays EXACT.
+# E1b ADDED A FIFTH: SPEND_ADMISSION_WAITS, how each bounded wait for held
+# headroom ended. The pin stays EXACT.
+check("1l  all five spend counters are in the degradation registry, so a "
       "gated run says so on its own report",
       sorted(n for n in _degradation.registered_names()
              if n.startswith("SPEND_")),
-      ["SPEND_CEILING_TRIPS", "SPEND_GATE_SKIPS", "SPEND_LEDGER_FAULTS"])
+      ["SPEND_ADMISSION_DECLINES", "SPEND_ADMISSION_WAITS",
+       "SPEND_CEILING_TRIPS", "SPEND_GATE_SKIPS", "SPEND_LEDGER_FAULTS"])
 
 
 # ===========================================================================
@@ -965,33 +1025,45 @@ check("4f-ii ...while an ordinary grouped patient is untouched: one packed "
 # SECTION 5 -- THE OVERSHOOT BOUND
 # ===========================================================================
 
-section("SECTION 5 -- the cap is honoured to within the requests in flight")
+section("SECTION 5 -- no overshoot: requests in flight hold their headroom (E1)")
 
-# EVERY REQUEST ALREADY PAST THE GATE IS ISSUED AND NO MORE. Driven with a
-# BARRIER of `parallel` on the trial calls, so the workers are provably past the
-# gate together rather than having been serialized by a scheduler that happened
-# to be idle -- which is the difference between measuring the bound and
-# measuring this machine.
+# THIS SECTION USED TO MEASURE AN OVERSHOOT, AND E1 REMOVED IT. Before atomic
+# admission every worker past the call-site gate was issued, so the ledger
+# ended at the warmup plus `parallel` trial calls against a two-call cap -- the
+# "requests in flight" bound config.SPEND_CAP_USD stated. Admission now counts
+# each in-flight request's reservation, so a request in flight HOLDS its
+# headroom and its peers are declined before dispatch.
+#
+# THE EXPECTATION, RE-DERIVED: cap 2C, reservation C (one call's price). The
+# warmup is admitted (C <= 2C) and settles at C. The first trial call is
+# admitted (C committed + C = 2C, equality) and is held open by the stub; each
+# peer then finds C committed + C held + C = 3C > 2C and is declined
+# `headroom_held`. When the held call settles the budget reads 2C, so every
+# later trial meets the call-site gate. Issued: the warmup and ONE trial call.
+# The stub holds the trial call open until PARALLEL - 1 declines are counted,
+# which is what proves the declines happened with a request in flight rather
+# than after it had settled.
 _PARALLEL = 4
 _boundary, _b_stub = run_node(
-    _SIX, cap=2 * CALL_COST, parallel=_PARALLEL, barrier_size=_PARALLEL)
-check("5a  the barrier was reached, so the requests really were in flight "
-      "together (non-degeneracy: a broken barrier means the run was "
-      "serialized and 5b would be measuring nothing)",
-      _b_stub.barrier_broken, False)
-check("5b  *** the overshoot is EXACTLY the in-flight bound: the warmup plus "
-      "`parallel` trial calls, and not one more ***",
-      (len(_b_stub.warmups), len(_b_stub.trial_requests)), (1, _PARALLEL))
-check("5b-i ...which is what config.SPEND_CAP_USD's overshoot block states, "
-      "per patient: MAX_WORKERS x per_trial_parallel_bound() requests, of "
-      "which this is the per_trial_parallel_bound() half",
-      len(_b_stub.trial_requests) <= config.per_trial_parallel_bound(), True)
-check("5c  the remaining trials were declined rather than issued",
-      sum(spend.SPEND_GATE_SKIPS.values()), len(_SIX) - _PARALLEL)
-check("5d  and the ledger's own total exceeds the cap by exactly what those "
-      "in-flight requests cost -- the overshoot is measured, not asserted",
-      round(spend.SPEND_LEDGER.total - 2 * CALL_COST, 10),
-      round((1 + _PARALLEL - 2) * CALL_COST, 10))
+    _SIX, cap=2 * CALL_COST, parallel=_PARALLEL,
+    hold_until_declines=_PARALLEL - 1)
+_b_declines = dict(spend.SPEND_ADMISSION_DECLINES)
+check("5a  non-degeneracy: the admitted trial call was still IN FLIGHT when "
+      "its peers sought admission -- the stub held it open until three "
+      "admission declines had been counted",
+      _b_stub.held_by_declines, True)
+check("5b  *** NO OVERSHOOT: exactly what the budget allows is issued -- the "
+      "warmup plus ONE trial call, not `parallel` of them ***",
+      (len(_b_stub.warmups), len(_b_stub.trial_requests)), (1, 1))
+check("5b-i ...the peers were declined headroom_held: the in-flight call's "
+      "reservation is what blocked them",
+      _b_declines.get(f"{spend.SPEND_SOURCE_STAGE5}:"
+                      f"{spend.ADMISSION_DECLINE_HELD}", 0) >= _PARALLEL - 1,
+      True)
+check("5c  and the patient fails rather than completing with holes",
+      bool(at(_boundary, "error")), True)
+check("5d  *** the ledger ends EXACTLY at the cap: overshoot $0 ***",
+      round(spend.SPEND_LEDGER.total - 2 * CALL_COST, 10), 0.0)
 
 
 # ===========================================================================
@@ -1073,7 +1145,16 @@ check("6b  with SPEND_CALL_CEILING_ENFORCED False the same invocation is not "
 # SECTION 7 -- THE RESUME: WHAT THE PRIOR RUNS ALREADY SPENT
 # ===========================================================================
 
-section("SECTION 7 -- the resumed baseline, derived from the rows")
+section("SECTION 7 -- the resumed baseline, read from the cumulative billing "
+        "record")
+
+# THIS SECTION READ `campaign_spend_before`, WHICH IS DELETED. That function
+# summed `inferences.estimated_cost_usd` over the runs chain, and that column
+# describes a patient's FINAL Stage 5 attempt only, so a resumed campaign's
+# budget omitted every earlier billed attempt. The budget is now read from
+# `inferences.billing_attempts` by `campaign_billing_total`; the stitch it walked
+# survives in `campaign_run_ids` and is still pinned against `campaign_summary`.
+# tests/test_campaign_billing_record.py carries the cross-process proofs.
 
 _RESUME_DB = os.path.join(_TMP, "resume.db")
 
@@ -1088,11 +1169,9 @@ _FP = {"fingerprint_version": 3,
 
 
 def _open_run(db, *, resumed, status, fingerprint=None, costs=()):
-    """Open a run row, give it inference rows, and finalize it.
-
-    ``costs`` is one entry per row: a float, or ``None`` for a row whose cost
-    was never recorded -- which is what makes a seeded baseline a FLOOR.
-    """
+    """Open a run row, give it inference rows carrying final-attempt costs, and
+    finalize it. The costs are a CONTROL: nothing that seeds a budget reads
+    them."""
     rid = _dl.start_run_record("batch", db_path=db, resumed=resumed,
                                fingerprint=fingerprint or _FP)
     conn = sqlite3.connect(db)
@@ -1110,70 +1189,70 @@ def _open_run(db, *, resumed, status, fingerprint=None, costs=()):
     return rid
 
 
+def _bill(db, campaign, run_id, aid, usd, settle=None):
+    _dl.reserve_billing_attempt(db, attempt_id=aid, campaign_id=campaign,
+                                run_id=run_id, source="stage5",
+                                model="gpt-5.6-terra", input_tokens=1,
+                                output_tokens=1, reserved_usd=usd)
+    if settle is not None:
+        _dl.settle_billing_attempt(db, aid, outcome="response",
+                                   settled_usd=settle)
+
+
 # A CHAIN OF THREE: a crash, a resume that also crashed, and the run asking.
-_r1 = _open_run(_RESUME_DB, resumed=False, status="KILLED", costs=(1.00, 2.00))
-_r2 = _open_run(_RESUME_DB, resumed=True, status="STOPPED", costs=(4.00,))
+_r1 = _open_run(_RESUME_DB, resumed=False, status="KILLED", costs=(0.10, 0.10))
+_r2 = _open_run(_RESUME_DB, resumed=True, status="STOPPED", costs=(0.10,))
 _r3 = _dl.start_run_record("batch", db_path=_RESUME_DB, resumed=True,
                            fingerprint=_FP)
+_CAMP7 = "campaign-seven"
+_bill(_RESUME_DB, _CAMP7, _r1, "b1", 1.50, settle=1.00)
+_bill(_RESUME_DB, _CAMP7, _r1, "b2", 2.00, settle=2.00)
+_bill(_RESUME_DB, _CAMP7, _r2, "b3", 4.00)                     # never settled
 
-_spent = _dl.campaign_spend_before(_r3, db_path=_RESUME_DB)
-check("7a  *** a resumed run's baseline is what its predecessors actually "
-      "spent, read out of the rows ***",
-      (round(_spent.usd, 2), _spent.rows, _spent.runs), (7.00, 3, 2))
-check("7a-i ...and the chain is walked TRANSITIVELY, oldest first, so a "
-      "campaign that crashed twice is one budget and not two",
-      _spent.run_ids, (_r1, _r2))
-check("7a-ii ...with nothing unpriced, so the figure is a total rather than a "
-      "floor",
-      (_spent.unpriced, spend.LedgerSeed(**{
-          "usd": _spent.usd, "rows": _spent.rows,
-          "unpriced": _spent.unpriced, "runs": _spent.runs}).is_floor),
-      (0, False))
+_spent = _dl.campaign_billing_total(_CAMP7, db_path=_RESUME_DB)
+check("7a  *** a resumed run's baseline is what its predecessors were BILLED, "
+      "read out of the cumulative record ***",
+      (round(_spent.usd, 2), _spent.attempts, _spent.run_ids), (7.00, 3, (_r1, _r2)))
+check("7a-i ...and an attempt interrupted before settlement is charged at its "
+      "reservation and counted unresolved",
+      (_spent.unresolved, round(_spent.unresolved_usd, 2)), (1, 4.00))
+_conn = sqlite3.connect(_RESUME_DB)
+_row_sum = _conn.execute("SELECT SUM(estimated_cost_usd) FROM inferences "
+                         "WHERE run_id IN (?, ?)", (_r1, _r2)).fetchone()[0]
+_conn.close()
+check("7a-ii CONTROL: the final-attempt row costs sum to a DIFFERENT number, "
+      "and the budget did not read them",
+      (round(_row_sum, 2), round(_row_sum, 2) != round(_spent.usd, 2)),
+      (0.30, True))
 
-# *** PINNED AGAINST campaign_summary, WHICH OWNS THE STITCH RULE. ***
-# A restated rule is a rule that can drift, so it is checked rather than
-# promised -- RUN_RECORD_TERMINAL_STATUSES' precedent, one module over.
+# *** THE STITCH IS STILL PINNED AGAINST campaign_summary. ***
 _conn = sqlite3.connect(_RESUME_DB)
 try:
     _camp = _queries.run(_conn, "campaign_summary")
 finally:
     _conn.close()
 _rows = _camp.to_dict("records")
-check("7b  *** campaign_summary stitches the SAME chain this walk does: one "
-      "campaign, and its run_ids are the two predecessors plus the run that "
-      "is asking ***",
-      ([r["run_ids"] for r in _rows],
-       [r["runs"] for r in _rows]),
-      ([f"{_r1} -> {_r2} -> {_r3}"], [3]))
-check("7b-i non-degeneracy: the query returned a campaign at all, so 7b is "
-      "not comparing two empty lists",
+check("7b  *** campaign_summary stitches the SAME chain campaign_run_ids walks: "
+      "one campaign, the two predecessors plus the run that is asking ***",
+      ([r["run_ids"] for r in _rows], [r["runs"] for r in _rows],
+       _dl.campaign_run_ids(_r3, db_path=_RESUME_DB).run_ids),
+      ([f"{_r1} -> {_r2} -> {_r3}"], [3], (_r1, _r2, _r3)))
+check("7b-i non-degeneracy: the query returned a campaign at all",
       len(_rows), 1)
 
-# A ROW WITH NO COST MAKES THE BASELINE A FLOOR, AND IT SAYS SO.
-_FLOOR_DB = os.path.join(_TMP, "floor.db")
-_f1 = _open_run(_FLOOR_DB, resumed=False, status="KILLED",
-                costs=(1.50, None, None))
-_f2 = _dl.start_run_record("batch", db_path=_FLOOR_DB, resumed=True,
-                           fingerprint=_FP)
-_floor = _dl.campaign_spend_before(_f2, db_path=_FLOOR_DB)
-check("7c  *** a row whose cost was never recorded contributes NOTHING and is "
-      "COUNTED, so the baseline is a FLOOR -- which under-counts, so the gate "
-      "lets the campaign spend more than it should ***",
-      (round(_floor.usd, 2), _floor.rows, _floor.unpriced),
-      (1.50, 3, 2))
-check("7c-i ...and every consumer says so rather than presenting it as a "
-      "total: print_cost_by_model's '<- A FLOOR, NOT A TOTAL' precedent",
-      "A FLOOR, NOT A TOTAL" in spend.describe_seed(spend.LedgerSeed(
-          usd=_floor.usd, rows=_floor.rows, unpriced=_floor.unpriced,
-          runs=_floor.runs, source=spend.SEED_SOURCE_CAMPAIGN)), True)
+check("7c  the seed says an unresolved reservation is charged at its upper "
+      "bound rather than presenting it as measured",
+      "RESERVED upper bound" in spend.describe_seed(spend.LedgerSeed(
+          usd=_spent.usd, rows=_spent.attempts, runs=2,
+          source=spend.SEED_SOURCE_BILLING_RECORD,
+          unresolved=_spent.unresolved)), True)
 
-# A FRESH RUN INHERITS NOTHING.
-_fresh = _dl.start_run_record("batch", db_path=_RESUME_DB, resumed=False,
-                              fingerprint=_FP)
-check("7d  a run that is resuming nothing inherits nothing, however many "
+# A FRESH CAMPAIGN INHERITS NOTHING.
+check("7d  a campaign with no billed attempt inherits nothing, however many "
       "prior runs share its configuration",
-      (_dl.campaign_spend_before(_fresh, db_path=_RESUME_DB).usd,
-       _dl.campaign_spend_before(_fresh, db_path=_RESUME_DB).runs), (0.0, 0))
+      (_dl.campaign_billing_total("campaign-fresh", db_path=_RESUME_DB).usd,
+       _dl.campaign_billing_total("campaign-fresh",
+                                  db_path=_RESUME_DB).attempts), (0.0, 0))
 
 # A CONFIGURATION CHANGE BREAKS THE CHAIN.
 _CFG_DB = os.path.join(_TMP, "config_change.db")
@@ -1182,44 +1261,32 @@ _other = dict(_FP, llm_classifier_prompt_version="2.0.0")
 _c2r = _dl.start_run_record("batch", db_path=_CFG_DB, resumed=True,
                             fingerprint=_other)
 check("7e  *** a prompt bump between the crash and the resume BREAKS the "
-      "chain: a re-configured run is a new campaign, so it does not inherit "
-      "the old one's budget -- campaign_summary's own rule ***",
-      (_dl.campaign_spend_before(_c2r, db_path=_CFG_DB).usd,
-       _dl.campaign_spend_before(_c2r, db_path=_CFG_DB).runs), (0.0, 0))
+      "chain -- campaign_summary's own rule ***",
+      _dl.campaign_run_ids(_c2r, db_path=_CFG_DB).run_ids, (_c2r,))
 
 # AN UNSTAMPED RUN STITCHES TO NOTHING.
 _NOSTAMP_DB = os.path.join(_TMP, "nostamp.db")
 _n1 = _open_run(_NOSTAMP_DB, resumed=False, status="KILLED", costs=(3.00,),
                 fingerprint=None)
+_n2 = _dl.start_run_record("batch", db_path=_NOSTAMP_DB, resumed=True)
 _conn = sqlite3.connect(_NOSTAMP_DB)
 try:
     _conn.execute("UPDATE runs SET fingerprint_version = NULL")
     _conn.commit()
 finally:
     _conn.close()
-_n2 = _dl.start_run_record("batch", db_path=_NOSTAMP_DB, resumed=True)
-_conn = sqlite3.connect(_NOSTAMP_DB)
-try:
-    _conn.execute("UPDATE runs SET fingerprint_version = NULL WHERE id = ?",
-                  (_n2,))
-    _conn.commit()
-finally:
-    _conn.close()
-check("7f  two runs with NO STAMP AT ALL are not one campaign, even though "
-      "SQLite's null-safe IS makes every one of their fingerprint columns "
-      "compare equal -- the guard is fingerprint_version IS NOT NULL, which "
-      "is campaign_summary's own",
-      (_dl.campaign_spend_before(_n2, db_path=_NOSTAMP_DB).usd,
-       _dl.campaign_spend_before(_n2, db_path=_NOSTAMP_DB).runs), (0.0, 0))
+check("7f  two runs with NO STAMP AT ALL are not one campaign",
+      (_dl.campaign_run_ids(_n2, db_path=_NOSTAMP_DB).run_ids,
+       _dl.campaign_run_ids(_n2, db_path=_NOSTAMP_DB).reason),
+      ((_n2,), _dl.CAMPAIGN_MEMBERSHIP_NO_STAMP))
 
 # A FINISHED PREDECESSOR IS NOT RESUMED ONTO.
 _FIN_DB = os.path.join(_TMP, "finished.db")
 _x1 = _open_run(_FIN_DB, resumed=False, status="FINISHED", costs=(5.00,))
 _x2 = _dl.start_run_record("batch", db_path=_FIN_DB, resumed=True,
                            fingerprint=_FP)
-check("7g  a FINISHED campaign has nothing left to resume, so gluing a later "
-      "invocation onto it would turn a re-run into a continuation",
-      _dl.campaign_spend_before(_x2, db_path=_FIN_DB).runs, 0)
+check("7g  a FINISHED campaign has nothing left to resume",
+      _dl.campaign_run_ids(_x2, db_path=_FIN_DB).run_ids, (_x2,))
 check("7g-i ...and that is the STATUS list deciding it, read from the one "
       "owner rather than retyped -- so STOPPED, which the spend gate writes, "
       "IS resumable",
@@ -1230,25 +1297,32 @@ check("7g-ii ...and queries.py reads that SAME tuple rather than a second copy",
       _queries.CAMPAIGN_RESUMABLE_STATUSES
       is _dl.CAMPAIGN_RESUMABLE_STATUSES, True)
 
-# IT NEVER RAISES.
-check("7h  a run id that is not in the table returns an EMPTY seed rather "
-      "than raising -- a read-only bookkeeping query must not be able to stop "
-      "a campaign",
-      _dl.campaign_spend_before(999999, db_path=_RESUME_DB), _dl.CampaignSpend())
-check("7h-i ...and so does None, which is what a caller with no run row has",
-      _dl.campaign_spend_before(None, db_path=_RESUME_DB), _dl.CampaignSpend())
-check("7h-ii ...and an unreadable database is COUNTED rather than silent",
-      (_dl.campaign_spend_before(1, db_path=os.path.join(_TMP, "no", "x.db")),
-       any(k.startswith("campaign_spend:")
-           for k in _dl.RUN_RECORD_FAILURES)),
-      (_dl.CampaignSpend(), True))
+
+def _raised_name(fn, *args, **kwargs):
+    try:
+        fn(*args, **kwargs)
+        return None
+    except BaseException as exc:                              # noqa: BLE001
+        return type(exc).__name__
+
+
+# IT REFUSES RATHER THAN READING ZERO -- the direction the deleted reader got
+# wrong.
+check("7h  *** an unreadable record RAISES rather than starting the budget at "
+      "zero ***",
+      _raised_name(_dl.campaign_billing_total, "c",
+                   db_path=os.path.join(_TMP, "no", "x.db")),
+      "BillingRecordUnreadable")
+check("7h-i ...and so does a missing campaign id",
+      _raised_name(_dl.campaign_billing_total, None, db_path=_RESUME_DB),
+      "BillingRecordUnreadable")
 
 # THE END-TO-END PROPERTY: A RESUMED RUN CONTINUES UNDER THE REMAINING BUDGET.
-_seed = _dl.campaign_spend_before(_r3, db_path=_RESUME_DB)
+_seed = _dl.campaign_billing_total(_CAMP7, db_path=_RESUME_DB)
 _resumed_result, _resumed_stub = run_node(
     _SIX, cap=_seed.usd + 2 * CALL_COST, parallel=1, seed_usd=_seed.usd)
 check("7i  *** a resumed run gets the REMAINING budget, not a fresh cap: with "
-      "$7.00 already spent and a $7.00-plus-two-calls cap it sends exactly "
+      "$7.00 already billed and a $7.00-plus-two-calls cap it sends exactly "
       "two requests ***",
       len(_resumed_stub.requests), 2)
 check("7i-i ...and without the seed the same cap would have bought the whole "
@@ -1491,7 +1565,11 @@ _reason_names = sorted({n.id for a in _reason_assigns for n in ast.walk(a)
 check("8d-i ...from the named constants rather than from literals: "
       "finalize_run_record REFUSES a value outside the vocabulary, so a typo "
       "would lose the reason silently at the one line whose job is to record it",
-      _reason_names, ["RUN_STOP_REASON_CALL_CEILING",
+      # E1b: the admission-wait timeout is a FIFTH reason. It stays EXACT, so a
+      # sixth reason written as a literal (or not written at all) still fails.
+      _reason_names, ["RUN_STOP_REASON_ADMISSION_WAIT",
+                      "RUN_STOP_REASON_BILLING_RECORD",
+                      "RUN_STOP_REASON_CALL_CEILING",
                       "RUN_STOP_REASON_OPERATOR", "RUN_STOP_REASON_SPEND_CAP"])
 _finalize_calls = [] if _MAIN is None else [
     n for n in ast.walk(_MAIN) if isinstance(n, ast.Call)
@@ -1569,20 +1647,58 @@ def _enclosing(tree, qualname):
     return node
 
 
-# EVERY ONE OF THEM IS BRACKETED. The gate is called in the same function the
-# request goes out of, and so is the charge -- which is what bounds the
-# overshoot at the requests in flight rather than at a patient's whole wave.
+# EVERY ONE OF THEM IS GATED in the same function the request goes out of.
+#
+# THE CHARGE MOVED AND THIS CHECK FOLLOWED IT (the billing closure pass). It
+# used to require `_charge_spend` at each of these three sites too. That call
+# charged the ledger for a response while the durable billing record was
+# settled inside the retry policy's attempt hook -- two writers pricing one
+# attempt, which disagreed on an unpriceable response. The ledger is now
+# charged by `_Stage5AttemptRecord.response`, which runs inside
+# `provider_resilience.execute` immediately after `send()` returns -- earlier
+# than the call-site charge, so the overshoot bound is unchanged or tighter.
+# 9b-i..9b-iii pin that path structurally; 9h below is the behavioural control.
 _bracketed = {}
 for _qual, _entry in billed_sites(_EVAL_TREE):
     _fn = _enclosing(_EVAL_TREE, _qual)
     _calls = [n for n in ast.walk(_fn) if isinstance(n, ast.Call)]
     _names = {n.func.id for n in _calls if isinstance(n.func, ast.Name)}
-    _bracketed[(_qual, _entry)] = ("_spend_gate" in _names,
-                                   "_charge_spend" in _names)
-check("9b  *** every billed call site calls the gate BEFORE and the ledger "
-      "AFTER, in the same function the request goes out of ***",
+    _bracketed[(_qual, _entry)] = ("_spend_gate" in _names,)
+check("9b  *** every billed call site calls the gate BEFORE, in the same "
+      "function the request goes out of ***",
       sorted((k, v) for k, v in _bracketed.items()),
-      sorted((k, (True, True)) for k in _bracketed))
+      sorted((k, (True,)) for k in _bracketed))
+
+_rec_cls = next((n for n in _EVAL_TREE.body if isinstance(n, ast.ClassDef)
+                 and n.name == "_Stage5AttemptRecord"), None)
+_rec_methods = ({} if _rec_cls is None else
+                {f.name: f for f in _rec_cls.body
+                 if isinstance(f, ast.FunctionDef)})
+check("9b-i  ...the attempt record's three resolutions each call "
+      "`.resolve` -- the ONE place the ledger is charged",
+      sorted(name for name in ("response", "failure", "abandoned")
+             if name in _rec_methods and any(
+                 isinstance(c, ast.Call) and isinstance(c.func, ast.Attribute)
+                 and c.func.attr == "resolve"
+                 for c in ast.walk(_rec_methods[name]))),
+      ["abandoned", "failure", "response"])
+_exec_fn = next((n for n in _EVAL_TREE.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_execute_matching_call"), None)
+_attempt_kw = [k for c in (ast.walk(_exec_fn) if _exec_fn else ())
+               if isinstance(c, ast.Call) for k in c.keywords
+               if k.arg == "attempt_record"]
+check("9b-ii ...and `_execute_matching_call` hands the policy exactly that "
+      "record",
+      [isinstance(k.value, ast.Call) and getattr(k.value.func, "id", None)
+       == "_Stage5AttemptRecord" for k in _attempt_kw], [True])
+check("9b-iii ...and both billed entry points go through "
+      "`_execute_matching_call`",
+      sorted(n.name for n in _EVAL_TREE.body if isinstance(n, ast.FunctionDef)
+             and n.name in _BILLED_ENTRY_POINTS and any(
+                 isinstance(c, ast.Call)
+                 and getattr(c.func, "id", None) == "_execute_matching_call"
+                 for c in ast.walk(n))),
+      sorted(_BILLED_ENTRY_POINTS))
 
 # THE GATE'S OWN PHASES COVER THE THREE SITES AND NOTHING ELSE.
 _phase_args = sorted({
@@ -1650,19 +1766,17 @@ plant("9d  CLEAN CONTROL: the UNPLANTED module sends nothing when the budget "
 # one -- the plant would be masked by the gate one site over and reported as
 # caught while measuring nothing. The first version of this control did exactly
 # that.
-# THE OBSERVABLE IS THE RESERVATION COUNT, NOT THE REQUEST COUNT, AND THAT IS A
-# MEASURED CORRECTION RATHER THAN A WEAKENING. This control used to count
-# `stub.requests` and expect 7. It got 3 -- the same number the CLEAN module
-# sends -- so the plant was reported as uncaught while the safeguard's removal
-# was in fact perfectly visible. The cause is the pacer, not the gate: see the
-# `_pr` import above. `reserve` counts an attempt BEFORE it waits, so every
-# queued call that reached the wire path is counted whether the pacer then
-# cancelled it or the provider answered it -- which is exactly "the queued trial
-# calls go out after the budget has been crossed", and it is invariant to how
-# fast this machine happens to be. The WAVE-PHASE DECLINE COUNT is asserted
-# beside it, because that is the accounting the removed lines own: a gate that
-# is gone declines nothing and records nothing, and 9f/9g would still pass on a
-# module whose wave phase had silently stopped being counted.
+# THE OBSERVABLE CHANGED AT E1, AND THE OLD ONE IS RECORDED. This control used
+# to count the pacer's reservations and expect 7, because each queued call
+# acquired a pacer slot before being cancelled. With the supplied reservation
+# now one call's price, the requests issued are the SAME for the plant and the
+# clean module: each queued call is stopped by the policy's cancellation
+# predicate or by atomic admission, depending on whether the pacer made it wait
+# (timing; both were measured). What the plant deterministically removes is the
+# accounting the deleted lines own -- the wave phase declines nothing and
+# records nothing -- and that is what is asserted beside the requests. A probe
+# that read requests alone would now report the plant as uncaught while its
+# removal is perfectly visible.
 #
 # DRIVEN ON A BUDGET THAT CROSSES **MID-WAVE**, NOT ONE ALREADY SPENT, AND THAT
 # IS THE MEASUREMENT RATHER THAN A CONVENIENCE: with the budget spent before
@@ -1681,55 +1795,93 @@ declines the remaining trials at the `wave:` phase."""
 
 
 def _mid_wave_reach(module):
-    """``(wire attempts RESERVED, wave-phase declines)`` under a mid-wave cap.
+    """``(requests issued, wave-phase gate declines)`` under a mid-wave cap.
 
-    The reservation count is read as a DELTA around the drive: the pacer's
-    counters are process-global and this file drives the node dozens of times,
-    so an absolute reading would be every earlier scenario's total as well.
+    WHICH LATER CHECK STOPS A QUEUED CALL IN THIS PLANT IS A TIMING FACT, AND
+    TWO RUNS MEASURED BOTH. With the wave gate removed, a queued trial call
+    reaches the retry policy. If the pacer makes it wait, the policy's
+    cancellation predicate (``_stage5_cancellation``) reads ``cap_exceeded`` --
+    three calls committed against a three-call cap -- and cancels it before its
+    liability exists; if no wait happens, the call reaches atomic admission,
+    which declines it (committed plus its reservation exceeds the cap). Either
+    way it never reaches the wire, so the requests issued are the SAME for the
+    plant and the clean module. What the plant deterministically removes is the
+    wave phase's own accounting -- it declines nothing and records nothing --
+    and that is the observable. (Two earlier drafts asserted which check fired,
+    once each way; consecutive suite runs contradicted both.)
     """
-    _scope = config.matching_quota_scope()
-    _before = _pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"]
-    run_node(_SIX, cap=_MID_WAVE_ALLOWED * CALL_COST, parallel=1,
-             node=module.node_llm_classifier_evaluation)
-    return (_pr.PROVIDER_PACING_WAITS[f"{_scope}:acquired"] - _before,
+    _res, _stub = run_node(_SIX, cap=_MID_WAVE_ALLOWED * CALL_COST, parallel=1,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests),
             sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
                 if k.startswith(spend.SPEND_SKIP_WAVE_KEY_PREFIX)))
 
 
-plant("9e  *** a BYPASS at the wave's call site is CAUGHT [9b/4c]: the queued "
-      "trial calls reach the wire after the budget has been crossed, and the "
-      "wave phase stops counting the declines it no longer makes ***",
+plant("9e  *** a BYPASS at the wave's call site is CAUGHT [9b/4c]: the wave "
+      "phase stops counting the declines it no longer makes (a later check -- "
+      "the policy's cancellation or admission -- still keeps the queued calls "
+      "off the wire) ***",
       [("            _refusal = _spend_gate(spend.SPEND_SKIP_WAVE_KEY_PREFIX,\n"
         "                                   _call_counter, where=\"a Stage 5 wave\",\n"
         "                                   count=len(chunk_))\n"
         "            if _refusal is not None:\n"
         "                return (\"error\", _refusal)\n",
         "")],
-      _mid_wave_reach, (1 + len(_SIX), 0))
-check("9e-i CLEAN CONTROL for 9e: the unplanted module reserves only what the "
+      _mid_wave_reach, (_MID_WAVE_ALLOWED, 0))
+check("9e-i CLEAN CONTROL for 9e: the unplanted module issues only what the "
       "budget allows and declines the rest at the wave phase, so the plant is "
       "measured against a probe that can tell the difference",
       _mid_wave_reach(_evaluation),
       (_MID_WAVE_ALLOWED, len(_SIX) - (_MID_WAVE_ALLOWED - 1)))
 
 # --- 9f: the warmup's gate is removed --------------------------------------
-plant("9f  *** a BYPASS at the WARMUP is CAUGHT: the patient sends the one "
-      "request that costs the most input tokens of any in the wave ***",
-      [("            elif _spend_gate(spend.SPEND_SKIP_WARMUP_KEY_PREFIX,\n"
-        "                             _call_counter,\n"
-        "                             where=\"a Stage 5 cache warmup\") is not None:",
+def _warmup_reach(module):
+    """``(requests, warmup-phase gate declines, admission declined any)`` with
+    the budget already spent. E1: the bypassed warmup is now declined at
+    admission (committed $1 plus its reservation exceeds the $1 cap), so the
+    plant sends nothing either -- it is caught by the warmup phase's missing
+    decline and the admission decline that replaced it."""
+    _res, _stub = run_node(_SIX, cap=1.0, seed_usd=1.0, parallel=1,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests),
+            sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
+                if k.startswith(spend.SPEND_SKIP_WARMUP_KEY_PREFIX)),
+            sum(spend.SPEND_ADMISSION_DECLINES.values()) > 0)
+
+
+check("9f-i CLEAN CONTROL for 9f: the unplanted module declines at the warmup "
+      "phase and admission is never asked", _warmup_reach(_evaluation),
+      (0, 1, False))
+plant("9f  *** a BYPASS at the WARMUP is CAUGHT: the warmup phase stops "
+      "counting its decline -- and, since E1, admission still keeps the "
+      "warmup off the wire ***",
+      # RE-ANCHORED AT THE CUMULATIVE-SPEND PASS, which binds the gate's
+      # refusal so the floor can name WHICH limit declined the warmup. The
+      # defect planted is unchanged: the warmup's gate is not asked at all.
+      [("            elif (_gate_refusal := _spend_gate(\n"
+        "                    spend.SPEND_SKIP_WARMUP_KEY_PREFIX, _call_counter,\n"
+        "                    where=\"a Stage 5 cache warmup\")) is not None:",
         "            elif False:")],
-      _requests_under_cap, 1)
+      _warmup_reach, (0, 0, True))
 
 # --- 9g: the send loop's gate is removed (the GROUPED arm's only gate) ------
 def _grouped_requests_under_cap(module):
-    return len(run_node(_SIX, cap=1.0, seed_usd=1.0, per_trial=False,
-                        node=module.node_llm_classifier_evaluation)[1].requests)
+    """``(requests, send-phase gate declines, admission declined any)``. E1:
+    the bypassed send loop is declined at admission, as 9f's warmup is."""
+    _res, _stub = run_node(_SIX, cap=1.0, seed_usd=1.0, per_trial=False,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests),
+            sum(v for k, v in spend.SPEND_GATE_SKIPS.items()
+                if k.startswith(spend.SPEND_SKIP_SEND_KEY_PREFIX)),
+            sum(spend.SPEND_ADMISSION_DECLINES.values()) > 0)
 
 
+check("9g-i CLEAN CONTROL for 9g: the unplanted grouped module declines at the "
+      "send phase and admission is never asked",
+      _grouped_requests_under_cap(_evaluation), (0, 1, False))
 plant("9g  *** a BYPASS at the SEND LOOP is CAUGHT, which is the RETAINED "
-      "GROUPED arm's only gate -- the one a per-trial-only fix would have left "
-      "open ***",
+      "GROUPED arm's only call-site gate: the send phase stops counting -- and, "
+      "since E1, admission still keeps the request off the wire ***",
       [("        _refusal = _spend_gate(spend.SPEND_SKIP_SEND_KEY_PREFIX, "
         "_call_counter,\n"
         "                               where=\"a Stage 5 send loop\", "
@@ -1737,24 +1889,40 @@ plant("9g  *** a BYPASS at the SEND LOOP is CAUGHT, which is the RETAINED "
         "        if _refusal is not None:\n"
         "            raise _refusal\n",
         "")],
-      _grouped_requests_under_cap, 1)
+      _grouped_requests_under_cap, (0, 0, True))
 
 # --- 9h: the LEDGER stops being charged ------------------------------------
 # A gate reading a ledger nothing charges never fires, which is the silent half
 # of a bypass: every request passes because the total never moves.
 def _requests_crossing_mid_wave(module):
-    return len(run_node(_SIX, cap=3 * CALL_COST, parallel=1,
-                        node=module.node_llm_classifier_evaluation)[1].requests)
+    """``(requests, the ledger moved, holds left open)`` under a three-call cap.
+
+    E1: an attempt issued and never resolved still HOLDS its reservation, so
+    three leaked holds fill the three-call cap and the fourth attempt is
+    declined `headroom_held` -- the patient no longer goes out whole. The plant
+    is now caught by what it leaves behind: a ledger that never moved and three
+    holds that were never released."""
+    _res, _stub = run_node(_SIX, cap=3 * CALL_COST, parallel=1,
+                           node=module.node_llm_classifier_evaluation)
+    return (len(_stub.requests), spend.SPEND_LEDGER.measured > 0,
+            spend.SPEND_LEDGER.held_count())
 
 
+# RE-ANCHORED (the billing closure pass): the charge now lives in the attempt
+# record's `response`, so that is where "issued and never charged" is planted.
+# The call is replaced by a no-op of the same arity, so the copy still parses
+# and every other line of the record is untouched.
 plant("9h  *** a wave call that is ISSUED and never CHARGED is CAUGHT: the "
-      "ledger stops moving, so the gate never fires and the whole patient goes "
-      "out under a three-call budget ***",
-      [("            _charge_spend(_response)\n            return (\"ok\", _response)",
-        "            return (\"ok\", _response)")],
-      _requests_crossing_mid_wave, 7)
-check("9h-i CLEAN CONTROL for 9h: the unplanted module stops at three",
-      _requests_crossing_mid_wave(_evaluation), 3)
+      "ledger stops moving and three holds are never released -- and, since "
+      "E1, those holds still stop the patient at three requests ***",
+      [("        usage = getattr(result, \"usage\", None)\n"
+        "        token.resolve(spend.BILLING_OUTCOME_RESPONSE,",
+        "        usage = getattr(result, \"usage\", None)\n"
+        "        (lambda *_a, **_k: None)(spend.BILLING_OUTCOME_RESPONSE,")],
+      _requests_crossing_mid_wave, (3, False, 3))
+check("9h-i CLEAN CONTROL for 9h: the unplanted module stops at three, "
+      "charges them and releases every hold",
+      _requests_crossing_mid_wave(_evaluation), (3, True, 0))
 
 # --- 9i: the exception stops being a shutdown ------------------------------
 # `Stage5SpendStopped` subclasses `Stage5ShutdownRequested` precisely so the

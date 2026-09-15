@@ -1191,11 +1191,12 @@ def _probe_bedrock_anthropic(args):
               f"disjointness formula)")
         print(f"  priced against {model_key!r}: ${cost:.6f}")
         if not model_key.startswith("global."):
-            print("  *** THIS ROW IS INFERRED, NOT MEASURED. *** The AWS "
-                  "Marketplace listing publishes GLOBAL dimensions only; the "
-                  "+10% geo premium is carried over from the GPT-5.6 Terra "
-                  "pattern. RECONCILE AGAINST THE CONSOLE BILL before any "
-                  "campaign number rests on it.")
+            print("  This is the published Geo/In-region row (AWS Bedrock "
+                  "pricing page, verified 2026-09-14), 1.1x the Global row. "
+                  "It has NOT been reconciled against a console bill, and no "
+                  "AWS document states a long-context price for this model. "
+                  "RECONCILE AGAINST THE CONSOLE BILL before any campaign "
+                  "number rests on it.")
         print("  CACHED INPUT IS NOT DISCOUNTED IN THIS FIGURE — "
               "PRICING_CONFIG has no cached term, so a cache hit makes this an "
               "OVER-estimate. At $0.30 against $3.00 that gap is ~10x on the "
@@ -1784,7 +1785,10 @@ _GEO_PREMIUM = 1.10
 
 
 def _cache_rates_for(wire_model):
-    """The documented rates, with the geo premium applied when it applies."""
+    """The published rates for `wire_model`: the Global row, times the
+    published Geo/In-region ratio (exactly 1.1 on every class, AWS Bedrock
+    pricing page, verified 2026-09-14) off `global.`. The second member is True
+    for a non-global profile; its name predates that verification."""
     inferred = not wire_model.startswith("global.")
     factor = _GEO_PREMIUM if inferred else 1.0
     return ({k: v * factor for k, v in _CACHE_RATES_GLOBAL_USD_PER_1M.items()},
@@ -1989,9 +1993,10 @@ def _report_cache_economics(pt_usages, prefix_tokens, latencies, config,
     """(A2)(A13) What the cache measured, and what it is worth. ARITHMETIC.
 
     EVERY TOKEN COUNT HERE IS MEASURED from a real usage block. Every PRICE is
-    DOCUMENTED (the Marketplace listing) and, off `global.`, carries an
-    INFERRED +10% geo premium. The two are kept apart in the printout, because
-    a figure that mixes a measured quantity with an inferred rate is only as
+    PUBLISHED by AWS (the Bedrock pricing page, verified 2026-09-14; the Geo and
+    In-region rows are 1.1x the Global row) and none has been reconciled
+    against a console bill. The two are kept apart in the printout, because a
+    figure that mixes a measured quantity with an unreconciled rate is only as
     good as the rate and must say so.
     """
     section("(A2)(A13)(item 6) CACHE ECONOMICS — measured tokens, documented "
@@ -2004,9 +2009,9 @@ def _report_cache_economics(pt_usages, prefix_tokens, latencies, config,
           f"cache write 5m {rates['cache_write_5m']:.2f}, "
           f"cache write 1h {rates['cache_write_1h']:.2f}")
     if inferred:
-        print("  *** THE +10% GEO PREMIUM ON THESE IS INFERRED, NOT MEASURED. "
-              "The Marketplace listing publishes GLOBAL dimensions only. "
-              "Reconcile against the console bill. ***")
+        print("  These are the published Geo/In-region rates (AWS Bedrock "
+              "pricing page, verified 2026-09-14), 1.1x the Global rates. Not "
+              "yet reconciled against a console bill.")
 
     if len(pt_usages) < 3:
         print("  (no per-trial sequence was captured; nothing to price)")

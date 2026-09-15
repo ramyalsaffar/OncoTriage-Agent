@@ -27,11 +27,17 @@ Sections 1-5 are pure functions over literal frames. Sections 6-9 render the
 real dashboard through streamlit's ``AppTest`` against DISPOSABLE databases
 built by ``initialize_database()`` inside a ``tempfile.mkdtemp`` that is removed
 at the end; ``paths._RESOLVED`` is repointed and restored. Section 10 renders
-against the SMOKE database at its recorded location -- the production
-``inferences.db`` path -- with every ``sqlite3.connect`` rewritten to
-``mode=ro&immutable=1`` and every other connect REFUSED, and its sha256 compared
-before and after. On a checkout without that database section 10 records SKIPS,
-never passes.
+the SMOKE database found at its recorded location -- the production
+``inferences.db`` path -- through a VERIFIED FROZEN COPY: the file and its
+``-wal`` are copied as bytes, proven consistent, and checkpointed into a single
+file in the scratch directory (``tests/_db_snapshot.py``). Every
+``sqlite3.connect`` is rewritten to ``mode=ro&immutable=1`` on that copy, every
+other connect is REFUSED, and a connect to the recorded production path is
+refused and recorded wherever it comes from. ``immutable=1`` is valid only
+there: on the live file it turns off locking and change detection and does not
+read the ``-wal`` (the P4b recovery). The production files are compared by
+their BYTES before and after; the copy's digest is compared too. On a checkout
+without that database section 10 records SKIPS, never passes.
 
 No network (every render runs under a socket guard that RAISES, fired once as a
 control), no keys, no spend, no live Qdrant, no model load, no corpus, no git
@@ -76,6 +82,7 @@ from oncotriage.dashboard.tabs import patient_explorer as _pe
 from oncotriage.dashboard.tabs import reproducibility as _repro
 from oncotriage.storage import queries as _queries
 from oncotriage.storage.database_logger import initialize_database
+import _db_snapshot
 
 
 #------------------------------------------------------------------------------
@@ -143,6 +150,10 @@ def section(title):
 
 _SAVED_RESOLVED = _paths._RESOLVED.get("inferences_path")
 _SMOKE_DB = os.path.abspath(_paths.inferences_path)
+# THE RECORDED PRODUCTION PATH IS REFUSED BEFORE OPEN FOR THE WHOLE FILE, and the
+# refusal recorded (the P4b recovery). Installed ABOVE `_REAL_CONNECT` below, so
+# even this harness's own direct opens go through it.
+_PRODUCTION_GUARD = _db_snapshot.ProductionConnectGuard(_SMOKE_DB).install()
 _SMOKE_DIGEST_BEFORE = digest_file(_SMOKE_DB)
 
 _WATCHED = {name: os.path.abspath(mod.__file__) for name, mod in (
@@ -153,6 +164,20 @@ _WATCHED = {name: os.path.abspath(mod.__file__) for name, mod in (
 _DIGESTS_BEFORE = {k: digest_file(v) for k, v in _WATCHED.items()}
 
 _TMP = tempfile.mkdtemp(prefix="oncotriage-dash-truth-")
+
+# THE SMOKE DATABASE IS READ ONLY THROUGH A VERIFIED FROZEN COPY (the P4b
+# recovery). This file used to open the recorded production path with
+# ``immutable=1``, which disables locking and change detection and ignores the
+# ``-wal`` -- valid only on a copy known not to change.
+_SMOKE_DIGESTS_BEFORE = _db_snapshot.file_digests(_SMOKE_DB)
+try:
+    _SMOKE_FROZEN = _db_snapshot.frozen_copy(
+        _SMOKE_DB, os.path.join(_TMP, "smoke-snapshot"))
+    _SMOKE_SNAPSHOT_ERROR = None
+except (_db_snapshot.SnapshotInconsistent, sqlite3.Error, OSError) as _snap_exc:
+    _SMOKE_FROZEN = None
+    _SMOKE_SNAPSHOT_ERROR = f"{type(_snap_exc).__name__}: {_snap_exc}"
+_SMOKE_COPY, _SMOKE_COPY_DIGEST = _SMOKE_FROZEN or (None, None)
 _PLANT_DIR = os.path.join(_TMP, "plants")
 os.makedirs(_PLANT_DIR, exist_ok=True)
 _SEQ = [0]
@@ -318,16 +343,17 @@ def _recording_connect(database, *args, **kwargs):
 
 
 def _smoke_connect(database, *args, **kwargs):
-    """Read-only, immutable, and only the smoke database."""
+    """Read-only, immutable, and only the verified frozen COPY of the smoke
+    database -- never the file at the recorded production path."""
     target = str(database)
     path = (urllib.parse.unquote(target[5:].split("?")[0])
             if target.startswith("file:") else target)
-    if os.path.realpath(path) != os.path.realpath(_SMOKE_DB):
+    if _SMOKE_COPY is None or os.path.realpath(path) != os.path.realpath(_SMOKE_COPY):
         _CONNECTS.append("REFUSED:" + target)
         raise sqlite3.OperationalError(f"truthfulness harness refused {target}")
     _CONNECTS.append("smoke-ro")
     kwargs.pop("uri", None)
-    return _REAL_CONNECT("file:" + urllib.parse.quote(_SMOKE_DB)
+    return _REAL_CONNECT("file:" + urllib.parse.quote(_SMOKE_COPY)
                          + "?mode=ro&immutable=1", *args, uri=True, **kwargs)
 
 
@@ -1650,12 +1676,16 @@ check("9a  every watched package file is byte-identical",
 
 section("Section 10: the smoke database, read-only")
 
+if os.path.isfile(_SMOKE_DB) and _SMOKE_COPY is None:
+    fail("10- a verified frozen snapshot of the smoke database was taken",
+         f"no consistent snapshot of {_SMOKE_DB}: {_SMOKE_SNAPSHOT_ERROR}")
 if not os.path.isfile(_SMOKE_DB) or _SMOKE_DIGEST_BEFORE in ("absent",) \
-        or _SMOKE_DIGEST_BEFORE.startswith("unreadable"):
+        or _SMOKE_DIGEST_BEFORE.startswith("unreadable") or _SMOKE_COPY is None:
     skip("10  smoke-database figures",
-         f"no readable database at the recorded location {_SMOKE_DB}")
+         f"no readable database at the recorded location {_SMOKE_DB}, or no "
+         f"verified snapshot of it")
 else:
-    _ro = _REAL_CONNECT("file:" + urllib.parse.quote(_SMOKE_DB)
+    _ro = _REAL_CONNECT("file:" + urllib.parse.quote(_SMOKE_COPY)
                         + "?mode=ro&immutable=1", uri=True)
     _sql_error = None
     try:
@@ -1728,7 +1758,8 @@ else:
           "not an abort)", _sql_error, None)
 
 if os.path.isfile(_SMOKE_DB) and _SMOKE_DIGEST_BEFORE != "absent" \
-        and not _SMOKE_DIGEST_BEFORE.startswith("unreadable") and _sql_error is None:
+        and not _SMOKE_DIGEST_BEFORE.startswith("unreadable") \
+        and _SMOKE_COPY is not None and _sql_error is None:
     def _smoke_actions(at, capture):
         if _probe_nct is None:
             return
@@ -1739,15 +1770,19 @@ if os.path.isfile(_SMOKE_DB) and _SMOKE_DIGEST_BEFORE != "absent" \
         capture("probe_trial")
 
     _smoke, _smoke_connects, _smoke_net = render_app(
-        _SMOKE_DB, actions=_smoke_actions, connect=_smoke_connect)
+        _SMOKE_COPY, actions=_smoke_actions, connect=_smoke_connect)
     _si = _smoke["initial"]
     _smoke_csv = _last_download("Export Patient Report")
     check("10a the smoke render raises nothing", _smoke["exception"], [])
-    check("10b every connect was the read-only immutable smoke database; none "
-          "refused", sorted(set(_smoke_connects)), ["smoke-ro"])
+    check("10b every connect was the read-only immutable FROZEN COPY of the "
+          "smoke database; none refused", sorted(set(_smoke_connects)),
+          ["smoke-ro"])
     check("10c no network attempt", _smoke_net, [])
     check("10d the smoke database is byte-identical after the render",
           digest_file(_SMOKE_DB), _SMOKE_DIGEST_BEFORE)
+    check("10d-i ...and the frozen copy the render read is unchanged too, so "
+          "immutable=1 was pointed at a file nothing wrote",
+          digest_file(_SMOKE_COPY), _SMOKE_COPY_DIGEST)
 
     _sov = tab(_si, "Overview")
     check("10e F1: rows and DISTINCT patients",
@@ -1832,7 +1867,7 @@ if os.path.isfile(_SMOKE_DB) and _SMOKE_DIGEST_BEFORE != "absent" \
                f"{_pf_fail} with no usable verdict (for example a failed call), "
                f"{_pf_unc} declared clinically uncertain"
                in joined(tab(_si, "Performance")))
-    _smoke_conn = _REAL_CONNECT("file:" + urllib.parse.quote(_SMOKE_DB)
+    _smoke_conn = _REAL_CONNECT("file:" + urllib.parse.quote(_SMOKE_COPY)
                                 + "?mode=ro&immutable=1", uri=True)
     try:
         _default_patient = _smoke_conn.execute(
@@ -1872,6 +1907,14 @@ check("T1  paths._RESOLVED is restored",
       _paths._RESOLVED.get("inferences_path"), _SAVED_RESOLVED)
 check("T2  the database at the recorded location is unchanged by the whole file",
       digest_file(_SMOKE_DB), _SMOKE_DIGEST_BEFORE)
+check("T2-i ...its main file AND -wal, read as bytes: the recorded production "
+      "path was never opened through sqlite by this file",
+      _db_snapshot.file_digests(_SMOKE_DB), _SMOKE_DIGESTS_BEFORE)
+check("T2-ii no connect anywhere in this file resolved to the production path "
+      "(each would have been refused before open and recorded)",
+      _PRODUCTION_GUARD.attempts, [])
+check("T2-iii ...and the production guard is uninstalled",
+      _PRODUCTION_GUARD.uninstall(), True)
 if _PLANT_DIR in sys.path:
     sys.path.remove(_PLANT_DIR)
 shutil.rmtree(_TMP, ignore_errors=True)

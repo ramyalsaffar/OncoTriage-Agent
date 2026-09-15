@@ -187,8 +187,10 @@ from oncotriage.config import (MATCHING_CALL_MODE_GROUPED,
                                MATCHING_CALL_MODE_PER_TRIAL,
                                MATCHING_CALL_MODES,
                                RRF_POOL_SIZE, TOP_K_CANDIDATES)
+from oncotriage import paths as _paths
 from oncotriage.storage import queries
 from oncotriage.storage import database_logger as dblog
+import _db_snapshot
 from oncotriage.storage.database_logger import initialize_database
 from oncotriage.utils import UnknownModelPricingError, get_model_cost
 
@@ -634,28 +636,51 @@ _EMPTY_DB_PATH = os.path.join(_TMP_DIR, "empty.db")
 _PRODUCTION_DB = queries.resolve_query_db_path(None)
 
 
-def _production_inference_rows():
-    """Count production rows through a mode=ro URI, or None if absent.
+def _production_inference_rows(label):
+    """Count production rows in a VERIFIED BYTE SNAPSHOT, or None if absent.
 
-    ``mode=ro`` rather than a plain connect, on File 41's precedent: a plain
-    ``sqlite3.connect`` on a missing path CREATES the file, so a guard written
-    that way would bring its own database into existence, count 0 twice, and
-    report success.
+    THE PRODUCTION FILE IS NEVER OPENED THROUGH SQLITE (the P4b recovery). This
+    used a ``mode=ro`` URI on the recorded path, and on a WAL database that open
+    CREATES the ``-wal`` and ``-shm`` side files in the production directory --
+    measured, and traced to this function by an audit hook. The count is now a
+    count of a COPY taken as bytes and proven consistent
+    (``tests/_db_snapshot.py``), so section 9's row comparison MEASURES TWO
+    SNAPSHOTS; that the production FILES did not change is asserted there
+    separately, from their bytes. A missing file is still None, never a created
+    one: the snapshot copies bytes and connects to nothing at that path.
     """
-    if not os.path.isfile(_PRODUCTION_DB):
+    try:
+        copy = _db_snapshot.snapshot(
+            _PRODUCTION_DB, os.path.join(_TMP_DIR, f"production-snapshot-{label}"))
+    except _db_snapshot.SnapshotInconsistent as exc:
+        print(f"  [production] no consistent snapshot: {exc}")
         return None
-    uri = "file:" + os.path.abspath(_PRODUCTION_DB).replace("?", "%3f") + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True)
+    if copy is None:
+        return None
+    # THE CONNECT IS INSIDE THE `try`: a refusal by the production guard -- the
+    # defect a snapshot that is not a snapshot produces -- must reach section 9
+    # as a recorded failure, not abort the file.
+    try:
+        conn = sqlite3.connect(copy)
+    except sqlite3.Error as exc:
+        print(f"  [production] the snapshot could not be opened: {exc}")
+        return None
     try:
         return conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0]
     except sqlite3.Error as exc:
-        print(f"  [production] could not be counted: {exc}")
+        print(f"  [production] the snapshot could not be counted: {exc}")
         return None
     finally:
         conn.close()
 
 
-_PRODUCTION_ROWS_BEFORE = _production_inference_rows()
+# EVERY CONNECT TO THE PRODUCTION PATH IS REFUSED BEFORE OPEN FROM HERE TO THE
+# END OF THIS FILE, AND RECORDED -- installed ABOVE the first reading, so a
+# reading that reached the file instead of its snapshot is refused too. Section 9
+# asserts the record is empty.
+_PRODUCTION_GUARD = _db_snapshot.ProductionConnectGuard(_PRODUCTION_DB).install()
+_PRODUCTION_DIGESTS_BEFORE = _db_snapshot.file_digests(_PRODUCTION_DB)
+_PRODUCTION_ROWS_BEFORE = _production_inference_rows("before")
 
 # THE SCHEMA IS THE REAL ONE, produced by the writer rather than retyped here.
 # A hand-written CREATE TABLE would let this file pass against a schema the
@@ -4061,6 +4086,20 @@ if _tab_module is not None:
     _st_logger = _logging.getLogger("streamlit")
     _st_level = _st_logger.level
     _st_logger.setLevel(_logging.CRITICAL)
+    # THE TAB'S OWN LOADER READS ``paths.inferences_path`` AND THIS RENDER LEFT
+    # IT UNREDIRECTED (the P4b recovery). ``dashboard/data.py:
+    # load_trial_matches_data`` therefore opened the RECORDED PRODUCTION
+    # database with a plain read-write connect -- traced by an audit hook -- and
+    # a read-write close of a WAL database deletes and re-creates its side
+    # files, and checkpoints any uncheckpointed frames into the production file.
+    # Both renders below read this file's seeded database instead; the redirect
+    # is restored in the ``finally``, and the guard installed in section 1
+    # would refuse the production path even if it were not.
+    import streamlit as _st
+    _saved_inferences_path = _paths._RESOLVED.get("inferences_path")
+    _paths._RESOLVED["inferences_path"] = _DB_PATH
+    _st.cache_data.clear()
+    _guard_attempts_before_render = len(_PRODUCTION_GUARD.attempts)
     try:
         _tab_frame = _full_frame.copy()
         _tab_frame["timestamp"] = pd.to_datetime(_tab_frame["timestamp"])
@@ -4098,6 +4137,16 @@ if _tab_module is not None:
                    isinstance(_control, ValueError))
     finally:
         _st_logger.setLevel(_st_level)
+        if _saved_inferences_path is None:
+            _paths._RESOLVED.pop("inferences_path", None)
+        else:
+            _paths._RESOLVED["inferences_path"] = _saved_inferences_path
+        _st.cache_data.clear()
+    check("...the cost-tab renders attempted NO connect to the production "
+          "database: its loader read this file's seeded database",
+          _PRODUCTION_GUARD.attempts[_guard_attempts_before_render:], [])
+    check("...and paths._RESOLVED['inferences_path'] is restored",
+          _paths._RESOLVED.get("inferences_path"), _saved_inferences_path)
 
 
 # ===========================================================================
@@ -4942,7 +4991,7 @@ check_true("resolve_query_db_path(None) is the production database and is NOT "
            "discriminating rather than vacuous",
            _PRODUCTION_DB != _DB_PATH and _PRODUCTION_DB != _EMPTY_DB_PATH)
 
-_PRODUCTION_ROWS_AFTER = _production_inference_rows()
+_PRODUCTION_ROWS_AFTER = _production_inference_rows("after")
 if _PRODUCTION_ROWS_BEFORE is None:
     print("  NOTE  the production database is absent or unreadable on this "
           "machine, so there was nothing to compare. Nothing here could have "
@@ -4959,6 +5008,18 @@ else:
     check("...and the same comparison reports a difference as a difference "
           "(negative control)",
           _PRODUCTION_ROWS_AFTER == _PRODUCTION_ROWS_BEFORE + 1, False)
+
+# THE PRODUCTION FILES BY BYTES, AND THE GUARD'S RECORD (the P4b recovery). The
+# row counts above were taken on verified SNAPSHOTS; these two are about the
+# production path itself, which nothing in this file opened through sqlite.
+check("the production database's main file and -wal are byte-identical to "
+      "before this run (read as bytes, never opened)",
+      _db_snapshot.file_digests(_PRODUCTION_DB), _PRODUCTION_DIGESTS_BEFORE)
+check("no sqlite connection to the production database was attempted anywhere "
+      "in this file (each would have been refused before open and recorded)",
+      _PRODUCTION_GUARD.attempts, [])
+check("...and the production guard is uninstalled, restoring sqlite3.connect",
+      _PRODUCTION_GUARD.uninstall(), True)
 
 
 # ===========================================================================

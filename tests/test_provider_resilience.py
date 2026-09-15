@@ -1203,8 +1203,28 @@ _SYS5B = "system prompt for the billing-retention probe"
 _USR5B = "user prompt naming nct_id=NCT99999999 and nothing else"
 _MAXOUT5B = 321
 _INPUT5B = ev._reservation_input_tokens(_SYS5B, _USR5B)
-_EXPECTED5B = get_model_cost(config.matching_wire_model(),
-                             _INPUT5B, _MAXOUT5B)
+_WIRE5B = config.matching_wire_model()
+
+
+def _documented_bound_5b(model, requested_out):
+    """One Stage 5 attempt's reservation, derived independently of
+    config.STAGE5_ATTEMPT_LIMITS (R1). Limits TYPED from the Claude Sonnet 4.6
+    model card (read 2026-09-14): a 1,000,000-token context and 64,000 max
+    output; the long-context premium is the assumed ceiling (2.0x input, 1.5x
+    output). Input is priced at the dearest class the request can bill --
+    base, cache read, or the cache write at the request's TTL."""
+    window, max_out, long_in, long_out = {
+        "us.anthropic.claude-sonnet-4-6": (1_000_000, 64_000, 2.0, 1.5)}[model]
+    row = config.PRICING_CONFIG["models"][model]
+    in_rate = max(row["input"], row.get("cache_read", 0.0),
+                  row["cache_write"][config.BEDROCK_ANTHROPIC_CACHE_TTL])
+    return (window * in_rate * long_in
+            + min(requested_out, max_out) * row["output"] * long_out) / 1e6
+
+
+# R1: the upper bound is the documented-limit bound, not the chars/3 input
+# estimate plus max_output it used to be ($0.0068 on this probe).
+_EXPECTED5B = _documented_bound_5b(_WIRE5B, _MAXOUT5B)
 
 
 def _stage5_ledger_delta(**kw):
@@ -1245,9 +1265,10 @@ with quotas(requests={_BEDROCK: _NO_SPACING}, tokens={_BEDROCK: 100_000_000}), \
         spend.SPEND_SOURCE_STAGE5, 0.0) - _before_ctl
 
 check("NON-DEGENERACY: one attempt's conservative upper bound is a real, "
-      "positive amount -- priced at the WIRE model over the estimated input "
-      "plus the request's own max_output",
-      (_INPUT5B > 0, _EXPECTED5B > 0), (True, True))
+      "positive amount -- the WIRE model's documented context window at its "
+      "dearest input class, plus the request's own max_output: $8.25794475",
+      (_INPUT5B > 0, _WIRE5B, round(_EXPECTED5B, 8)),
+      (True, "us.anthropic.claude-sonnet-4-6", 8.25794475))
 check("*** a possibly-billed FAILURE adds exactly that upper bound to the "
       "number the spend gate reads -- `budget_spend`'s per-source total, not a "
       "separate counter ***",

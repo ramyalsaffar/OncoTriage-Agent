@@ -1883,8 +1883,10 @@ check("8k-iii non-degeneracy: both really refused rather than returning",
 check("8h  the stop-reason vocabulary is closed and NULL is the fourth "
       "reading rather than a fourth member",
       _study.RUN_STOP_REASONS,
+      # E1b added the fourth: an admission-wait timeout is not the cap.
       (_study.RUN_STOP_REASON_OPERATOR, _study.RUN_STOP_REASON_SPEND_CAP,
-       _study.RUN_STOP_REASON_CALL_CEILING))
+       _study.RUN_STOP_REASON_CALL_CEILING,
+       _study.RUN_STOP_REASON_ADMISSION_WAIT))
 
 
 # ===========================================================================

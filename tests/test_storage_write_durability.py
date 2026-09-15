@@ -125,6 +125,7 @@ from oncotriage import observability as _obs
 from oncotriage import paths as _paths
 from oncotriage.batch import runner as _runner
 from oncotriage.storage import database_logger as _dl
+import _db_snapshot
 
 
 #------------------------------------------------------------------------------
@@ -398,9 +399,30 @@ _RUNNER_DIGEST_BEFORE = digest(_RUNNER_PY)
 # what `production_probe_disposition` reads, and reading it at the same instant
 # as the count is what makes "the file was there and the count came back None"
 # a state the probe can report rather than a race between two readings.
+#
+# THE COUNT IS OF A VERIFIED BYTE SNAPSHOT, NEVER OF THE FILE (the P4b recovery).
+# `rows()` opens a `mode=ro` URI, and on a WAL database that open CREATES the
+# `-wal` and `-shm` side files in the production directory -- measured, and
+# traced to this file by an audit hook. So 9c compares two SNAPSHOTS, and the
+# production FILES are compared by their bytes beside it.
+def production_rows(label):
+    """``rows()`` of a verified byte snapshot of the production database."""
+    try:
+        copy = _db_snapshot.snapshot(
+            _PRODUCTION_DB, os.path.join(_TMP, f"production-snapshot-{label}"))
+    except _db_snapshot.SnapshotInconsistent as exc:
+        print(f"  [production] no consistent snapshot: {exc}")
+        return None
+    return None if copy is None else rows(copy)
+
+
 _PRODUCTION_DB = _paths.inferences_path
 _PRODUCTION_EXISTED_BEFORE = os.path.exists(_PRODUCTION_DB)
-_PRODUCTION_ROWS_BEFORE = rows(_PRODUCTION_DB)
+# REFUSED BEFORE OPEN FROM HERE ON, installed ABOVE the first reading so a
+# reading that reached the file rather than its snapshot is refused and recorded.
+_PRODUCTION_GUARD = _db_snapshot.ProductionConnectGuard(_PRODUCTION_DB).install()
+_PRODUCTION_DIGESTS_BEFORE = _db_snapshot.file_digests(_PRODUCTION_DB)
+_PRODUCTION_ROWS_BEFORE = production_rows("before")
 
 
 def result_dict(patient_id, **extra):
@@ -1099,7 +1121,13 @@ check("9b  SQLITE_BUSY_TIMEOUT_SECONDS was restored on the module",
 # database gives before=None, after=<n> and fails here on any machine,
 # including a CI runner that has no such file.
 check("9c  the production database was not written to by this run",
-      rows(_PRODUCTION_DB), _PRODUCTION_ROWS_BEFORE)
+      production_rows("after"), _PRODUCTION_ROWS_BEFORE)
+check("9c  ...that count is of a verified snapshot; the production main file "
+      "and -wal themselves are byte-identical to before this run",
+      _db_snapshot.file_digests(_PRODUCTION_DB), _PRODUCTION_DIGESTS_BEFORE)
+check("9c  ...and no sqlite connection to the production database was attempted "
+      "by this file (refused before open and recorded)",
+      _PRODUCTION_GUARD.attempts, [])
 check("9c  ...and no scratch path resolved to it",
       _PRODUCTION_DB.startswith(_TMP), False)
 
@@ -1184,6 +1212,78 @@ else:
          f"would still have caught this run creating one. Expected on a CI "
          f"runner: provision_ci_paths.py creates the parent directory and "
          f"deliberately not the file.")
+
+# ---------------------------------------------------------------------------
+# 9e: THE SNAPSHOT AND THE GUARD, EACH SHOWN ABLE TO FAIL (the P4b recovery)
+# ---------------------------------------------------------------------------
+_snap_live = os.path.join(_TMP, "snap-live.db")
+_live = sqlite3.connect(_snap_live)
+_live.execute("PRAGMA journal_mode = WAL").fetchall()
+_live.execute("PRAGMA wal_autocheckpoint = 0").fetchall()
+_live.execute("CREATE TABLE inferences (id INTEGER PRIMARY KEY)")
+_live.executemany("INSERT INTO inferences (id) VALUES (?)",
+                  [(i,) for i in range(1, 6)])
+_live.commit()
+check("9e  control: the live database's committed rows sit in its -wal "
+      "(non-degeneracy: an empty -wal would make every check below trivial)",
+      os.path.getsize(_snap_live + "-wal") > 0, True)
+_snap_copy = guarded(lambda: _db_snapshot.snapshot(
+    _snap_live, os.path.join(_TMP, "snap-out")))
+check("9e  a snapshot of a LIVE WAL database carries its committed frames",
+      rows(_snap_copy) if isinstance(_snap_copy, str) else _snap_copy, 5)
+def _immutable_rows(path):
+    conn = sqlite3.connect(f"file:{path}?mode=ro&immutable=1", uri=True)
+    try:
+        return conn.execute("SELECT COUNT(*) FROM inferences").fetchone()[0]
+    finally:
+        conn.close()
+
+
+_live_immutable = guarded(lambda: _immutable_rows(_snap_live))
+check("9e  control: immutable=1 on the LIVE file does NOT see those frames -- "
+      "which is why it is valid only on a frozen copy",
+      _live_immutable == 5, False)
+_frozen = guarded(lambda: _db_snapshot.frozen_copy(
+    _snap_live, os.path.join(_TMP, "snap-frozen")))
+_frozen_path = _frozen[0] if isinstance(_frozen, tuple) else None
+check("9e  a FROZEN copy is one file with no side files, and immutable=1 on it "
+      "sees all five rows",
+      (_frozen_path is not None
+       and not os.path.exists(_frozen_path + "-wal")
+       and not os.path.exists(_frozen_path + "-shm"),
+       guarded(lambda: _immutable_rows(_frozen_path))), (True, 5))
+
+
+def _write_during_copy():
+    _live.execute("INSERT INTO inferences (id) VALUES (NULL)")
+    _live.commit()
+
+
+_torn = guarded(lambda: _db_snapshot.snapshot(
+    _snap_live, os.path.join(_TMP, "snap-torn"), _between_copies=_write_during_copy))
+check("9e  control: a source written DURING every copy raises "
+      "SnapshotInconsistent rather than returning a torn copy",
+      str(_torn.get("raised", "") if isinstance(_torn, dict) else _torn)
+      .startswith("SnapshotInconsistent"), True)
+_live.close()
+
+_guard_target = os.path.join(_TMP, "guard-target.db")
+Path(_guard_target).write_bytes(Path(_STANDIN_DB).read_bytes())
+_probe_guard = _db_snapshot.ProductionConnectGuard(_guard_target).install()
+try:
+    _refused_open = guarded(lambda: sqlite3.connect(
+        f"file:{_guard_target}?mode=ro", uri=True))
+    _other_open = guarded(lambda: sqlite3.connect(_STANDIN_DB).close() or "opened")
+finally:
+    _probe_restored = _probe_guard.uninstall()
+check("9e  the guard REFUSES a connect to its target (URI form) before open, "
+      "and records it", (isinstance(_refused_open, dict), _probe_guard.attempts),
+      (True, [f"file:{_guard_target}?mode=ro"]))
+check("9e  ...allows any other database", _other_open, "opened")
+check("9e  ...and uninstalls, restoring the connect it replaced", _probe_restored,
+      True)
+check("9e  the production guard installed at the top of this file is "
+      "uninstalled", _PRODUCTION_GUARD.uninstall(), True)
 
 shutil.rmtree(_TMP, ignore_errors=True)
 

@@ -1546,7 +1546,18 @@ _EXEC_ALLOWLIST = {"tests/test_storage_query_layer.py",
                    # verdicts. An exec'd copy of evaluation.py also binds the
                    # LIVE observability module, which is what lets the log-event
                    # controls observe a plant in evaluation.py alone.
-                   "tests/test_agent_temporal_conflict_flag.py"}
+                   "tests/test_agent_temporal_conflict_flag.py",
+                   "tests/test_agent_stage5_attempt_provenance.py",
+                   # TWO execs, each an in-memory copy of
+                   # oncotriage/agent/evaluation.py with the attempt-provenance
+                   # fix reverted in ONE helper: `_billed_so_far` given back its
+                   # absent-when-zero guard, and the four mid-loop exits
+                   # stripped of their explicit None census. Both helpers are
+                   # NESTED inside node_llm_classifier_evaluation, so no
+                   # attribute rebind can reach them, and the fixed module is at
+                   # HEAD, so a git blob would compare the fix with itself --
+                   # the patched-copy shape this allowlist admits.
+                   }
 
 
 # What is not this project's source: caches, build artifacts, the VCS
@@ -4465,9 +4476,10 @@ _DECORATOR_INVENTORY = {
     # a read-modify-write nothing serialises, which is the defect the ledger's
     # own lock exists to remove.
     #
-    # `LedgerSeed.is_floor` and `CampaignSpend.runs` are NamedTuple properties:
-    # derived readings over fields already present, so they cannot disagree with
-    # the tuple the way a second stored field could.
+    # `LedgerSeed.is_floor` is a NamedTuple property: a derived reading over
+    # fields already present, so it cannot disagree with the tuple the way a
+    # second stored field could. (`CampaignSpend.runs` stood beside it and went
+    # with `campaign_spend_before`, deleted by the cumulative-spend pass.)
     "oncotriage/spend.py::LedgerSeed.is_floor": ["property"],
     # ── THE CHECKPOINTER'S READ-ONLY VIEWS, and none of them has a setter
     #    deliberately: the only thing allowed to move any of these is a
@@ -4495,7 +4507,6 @@ _DECORATOR_INVENTORY = {
     "oncotriage/spend.py::Stage5CallCounter.call_mode": ["property"],
     "oncotriage/spend.py::Stage5CallCounter.issued": ["property"],
     "oncotriage/spend.py::Stage5CallCounter.refusals": ["property"],
-    "oncotriage/storage/database_logger.py::CampaignSpend.runs": ["property"],
     # ---- The drift redesign ------------------------------------------------
     # Seven read-only properties over three NamedTuples and two small classes.
     # Every one is a DERIVED reading of fields already on the object -- a
@@ -5778,8 +5789,15 @@ else:
     # module and the invariant covers it. It deliberately does NOT go through
     # run_with_write_retry, which is a different question: the retry exists so a
     # ROW is not lost and there is no row here.
-    check("the control actually removed the lock (all seven sites)",
-          _payload.get("locks_stripped"), 7)
+    # NINE SINCE THE CUMULATIVE-SPEND PASS: `reserve_billing_attempt` and
+    # `settle_billing_attempt` write `billing_attempts` under the same lock, on
+    # this module's own invariant that every database statement in it is issued
+    # under `_WRITE_LOCK`. The pin moving is the check working.
+    # 9 -> 10 AT THE BILLING CLOSURE PASS: `set_run_billing_campaign_id` stamps
+    # `runs.billing_campaign_id` before a run's first billed call, a database
+    # statement in this module, so it is under the lock by the same invariant.
+    check("the control actually removed the lock (all ten sites)",
+          _payload.get("locks_stripped"), 10)
 
     # SCENARIO A, reported honestly: the lock does NOT change this path.
     check("steady state, WITH the lock: every row lands",

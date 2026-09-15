@@ -812,8 +812,21 @@ check("7i  ...and 'tunables = ?' is not among them, so no UPDATE anywhere can "
 _UPDATES = sorted({n.value for n in ast.walk(_DL_TREE)
                    if isinstance(n, ast.Constant) and isinstance(n.value, str)
                    and "UPDATE runs" in n.value})
-check("7j  ...and there is exactly ONE UPDATE against `runs` in the module, so "
-      "7g covers every writer of an existing row", len(_UPDATES), 1)
+# TWO SINCE THE BILLING CLOSURE PASS. `set_run_billing_campaign_id` stamps
+# `runs.billing_campaign_id` before a run's first billed call, and it is the
+# second writer of an EXISTING row -- so 7g alone no longer covers every writer,
+# and 7j-i checks the new one's SET list directly rather than the count being
+# raised and the property left unasserted.
+check("7j  ...and there are exactly TWO UPDATEs against `runs` in the module: "
+      "finalize_run_record's and the billing campaign stamp", len(_UPDATES), 2)
+_STAMP_UPDATES = [u for u in _UPDATES if "billing_campaign_id" in u]
+check("7j-i ...and the billing campaign stamp's UPDATE sets that one column and "
+      "never `tunables`",
+      ([re.findall(r"SET\s+(.*?)\s+WHERE", u)[0].strip()
+        if re.findall(r"SET\s+(.*?)\s+WHERE", u) else "(no SET)"
+        for u in _STAMP_UPDATES],
+       any("tunables" in u for u in _STAMP_UPDATES)),
+      (["billing_campaign_id = ?"], False))
 
 
 # ===========================================================================

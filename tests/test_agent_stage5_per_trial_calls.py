@@ -1766,12 +1766,18 @@ check("3w(d) ...it carries the provenance every failure return carries, so "
        isinstance(at(_R3w, "llm_classifier_prompt_sha256"), str),
        at(_R3w, "llm_classifier_output_ceiling")
        == config.MATCHING_MAX_TOKENS), (True, True, True))
-check("3w(e) ...and it reports NO tokens and an EMPTY ledger, because the "
-      "warmup raised before any usage object existed -- absent rather than a "
-      "zero nobody measured",
-      ("llm_classifier_input_tokens" in _R3w
-       if isinstance(_R3w, dict) else _Absent("no result"),
-       at(_R3w, "llm_classifier_call_details")), (False, []))
+# THE TOKEN KEYS ARE WRITTEN AS THIS ATTEMPT'S ZEROS, NOT LEFT ABSENT. This
+# check pinned their ABSENCE, and the absence was the defect: Stage 5 re-enters
+# itself and LangGraph keeps a channel's last written value, so an absent key
+# published an EARLIER attempt's figure beside this attempt's empty ledger. The
+# zero is the attempt's own accumulators, never an estimate -- see
+# `_billed_so_far` and tests/test_agent_stage5_attempt_provenance.py.
+check("3w(e) ...and it reports ZERO tokens, WRITTEN, and an EMPTY ledger, "
+      "because the warmup raised before any usage object existed",
+      (tuple(at(_R3w, k) for k in ("llm_classifier_input_tokens",
+                                   "llm_classifier_output_tokens",
+                                   "llm_classifier_calls")),
+       at(_R3w, "llm_classifier_call_details")), ((0, 0, 0), []))
 check("3w(f) FAILURE IS NOT SILENCE: the counter moved by exactly one, under "
       "a key that names the exception type and separates a transport failure "
       "from a refusal of the request shape",
@@ -1978,12 +1984,14 @@ check("3fw(f) ...and the writer is NOT also counted as a per-trial call "
       "failure or folded as an abandoned response: one request, one finding",
       (sum(_after_fb_calls.values()) - sum(_before_fb_calls.values()),
        at(_R3f, "llm_classifier_call_details")), (0, []))
+# WRITTEN AS ZERO RATHER THAN LEFT ABSENT, for 3w(e)'s reason: an absent key
+# keeps an earlier attempt's figure across Stage 5's re-entry. Still no figure is
+# INVENTED -- zero is what this attempt's accumulators hold.
 check("3fw(g) ...and no token figure is invented for it: the writer raised, so "
-      "no usage object ever existed and the keys are ABSENT rather than zero",
-      ("llm_classifier_input_tokens" in _R3f
-       if isinstance(_R3f, dict) else _Absent("no result"),
-       "llm_classifier_calls" in _R3f
-       if isinstance(_R3f, dict) else _Absent("no result")), (False, False))
+      "no usage object ever existed and the keys are WRITTEN as this attempt's "
+      "zeros",
+      (at(_R3f, "llm_classifier_input_tokens"),
+       at(_R3f, "llm_classifier_calls")), (0, 0))
 
 # THE HEALTHY FALLBACK IS UNCHANGED, which is the other half of the claim: the
 # inspection must not turn a working degraded schedule into a failed patient.

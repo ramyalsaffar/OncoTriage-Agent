@@ -366,7 +366,11 @@ print("\n=== 1. requires_columns: declared == derived, for all of them ===")
 _MISMATCHED = []
 for _query in _q.QUERIES:
     _derived = set(guarded(_q.derive_requires_columns, _query.sql))
-    _declared = set(_query.requires_columns)
+    # OPTIONAL COLUMNS ARE DECLARATIONS TOO (the billing closure pass): a column
+    # the SQL names must be declared EITHER as required (skip when absent) OR
+    # as optional (rendered NULL when absent). Undeclared is still the failure.
+    _declared = (set(_query.requires_columns)
+                 | set(getattr(_query, "optional_columns", ())))
     if _derived != _declared:
         _MISMATCHED.append((_query.key, sorted(_derived - _declared),
                             sorted(_declared - _derived)))
@@ -378,6 +382,11 @@ if _MISMATCHED:
 else:
     check("1a every registered query declares exactly the additive columns "
           "its own SQL names", len(_MISMATCHED), 0)
+check("1a-i no column is declared BOTH required and optional -- the two "
+      "answers to its absence are opposites",
+      sorted(q.key for q in _q.QUERIES
+             if set(q.requires_columns)
+             & set(getattr(q, "optional_columns", ()))), [])
 
 # NON-DEGENERACY. The line above passes for free against a registry in which
 # nothing declares anything and nothing derives anything, which is precisely the
@@ -878,9 +887,18 @@ check("4b-2 ...and the three access paths `inferences` is actually read by",
 # classes TERMINAL, which is the argument `run_metrics` already makes.
 check("4c ...and NO index on nct_id, which is a measured ruling and not an "
       "oversight (32% slower; see the comment at the CREATE INDEX)",
-      _FRESH_INDEXES, ["idx_drift_reference_active",
+      # THE TWO billing_attempts INDEXES JOINED AT ERA 17 (the cumulative-spend
+      # pass): the campaign total and the historical-evidence check each read
+      # by one of them. The pin moving is the exact pin working.
+      # `idx_run_counter_registry_run_id` JOINED AT ERA 18 (the billing
+      # closure pass): historical evidence reads a run's registry by run id.
+      _FRESH_INDEXES, ["idx_billing_attempts_campaign_id",
+                       "idx_billing_attempts_run_id",
+                       "idx_drift_reference_active",
                        "idx_inferences_patient_id", "idx_inferences_run_id",
-                       "idx_inferences_timestamp", "idx_run_metrics_run_id",
+                       "idx_inferences_timestamp",
+                       "idx_run_counter_registry_run_id",
+                       "idx_run_metrics_run_id",
                        "idx_trial_matches_inference_id"])
 # Re-open the SAME database through the real initialize_database. Written as
 # two statements rather than one expression: the first version buried the

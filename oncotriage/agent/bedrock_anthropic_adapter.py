@@ -650,14 +650,16 @@ did not run it.
       expected -- but the two have never been documented together.
       PROBE: a second call with BEDROCK_ANTHROPIC_EFFORT set.
 
- (A6) PRICING. PRICING_CONFIG's ``global.`` row is MEASURED from the AWS
-      Marketplace listing the model card names (prod-ffvjxvh4ltq64, read
-      2026-08-30): $3.00 in / $15.00 out / $0.30 cache read / $3.75 cache
-      write (5m) / $6.00 cache write (1h) per 1M tokens. **THE ``us.`` / ``eu.``
-      / IN-REGION ROWS ARE INFERRED, NOT MEASURED** -- that listing publishes
-      Global dimensions only, and the +10% geo premium is carried over from the
-      pattern this project already recorded for GPT-5.6 Terra. PROBE: prints
-      its own cost from those rows; compare against the console bill.
+ (A6) PRICING. Every Claude Sonnet 4.6 row in PRICING_CONFIG (``global.``,
+      ``us.``, ``eu.``, ``au.``, ``jp.``, In-Region) was VERIFIED on 2026-09-14
+      against AWS's Amazon Bedrock pricing page: Global $3.00 in / $15.00 out /
+      $0.30 cache read / $3.75 cache write (5m) / $6.00 (1h); Geo and In-region
+      $3.30 / $16.50 / $0.33 / $4.125 / $6.60, per 1M tokens. The earlier
+      provenance (global from the Marketplace listing prod-ffvjxvh4ltq64 on
+      2026-08-30, geo inferred at +10%) is superseded. STILL OPEN: no console
+      bill has been compared, and no AWS document states a long-context price
+      for this model (config.STAGE5_ATTEMPT_LIMITS, assumption (4)). PROBE:
+      prints its own cost from those rows; compare against the console bill.
       IF THEY DIFFER: edit PRICING_CONFIG, which is the loud-failure mechanism
       working as designed.
 

@@ -130,6 +130,84 @@ def score_pairs(query: str, trial_texts: List[str]):
 # Embedding Helper (self-contained, no dependency on RAG Indexer)
 # ---------------------------------------------------------------------------
 
+# THE EMBEDDING RESERVATION'S UPPER BOUND (P1b). Facts about the provider's API,
+# inline as named constants per the project rule, with their source.
+#
+# THE SOURCE. The OpenAI Python SDK installed here (openai 1.99.9), whose request
+# docstrings are generated from OpenAI's API specification, documents ``input``
+# of ``embeddings.create`` as: "The input must not exceed the max input tokens
+# for the model (8192 tokens for all embedding models), cannot be an empty
+# string ... In addition to the per-input token limit, all embedding models
+# enforce a maximum of 300,000 tokens summed across all inputs in a single
+# request." OpenAI's embeddings guide lists "Max input 8192" for
+# text-embedding-3-small (read 2026-09-13).
+#
+# WHY A PROVIDER LIMIT AND NOT THE TEXT. The previous reservation was
+# ``len(text) / PROVIDER_RESERVATION_CHARS_PER_TOKEN + 1``, an ESTIMATE: a
+# tokenizer can emit more tokens than characters / 3 (digits, rare scripts,
+# byte-fallback), so a response could be priced above its reservation, and a
+# settlement that then failed left the durable row -- read at the reservation --
+# below what the live ledger charged. The documented limit is a bound on the
+# provider's OWN token count, so it holds whatever the tokenizer, the Unicode
+# content or any per-request overhead is: a successful response to one string
+# input reports at most 8,192 prompt tokens, and any input the endpoint accepts
+# at most 300,000. A UTF-8 byte count would also bound a byte-level BPE's token
+# count, but only on the unverified premise that the endpoint adds no tokens of
+# its own; the documented limit needs no such premise.
+#
+# WHAT IT DOES NOT COVER, STATED. (1) A provider that bills beyond its own
+# documented limit. (2) Pricing: the reservation is priced at the REQUESTED
+# model, and a response is priced at the model it ECHOES; an echo naming a
+# model with a higher rate can exceed the reservation. Both are caught by
+# ``spend.AttemptLiability``'s settlement-discrepancy rule rather than by this
+# bound. (3) The token count is not the whole cost only if the price table
+# grows an output rate for embeddings; ``get_embedding`` passes 0 output.
+#
+# THE COST OF THE BOUND: 8,192 tokens at $0.02 per 1M is $0.00016384 per
+# reservation, charged only while an attempt is unresolved or when it fails.
+# This reservation feeds no pacer.
+
+EMBEDDING_MAX_INPUT_TOKENS_PER_INPUT = {"text-embedding-3-small": 8192}
+"""Documented maximum tokens of ONE input string, per embedding model. A model
+absent here has no established bound and is refused before dispatch."""
+
+EMBEDDING_MAX_INPUT_TOKENS_PER_REQUEST = 300_000
+"""Documented maximum tokens summed across all inputs of one request, for all
+embedding models. The bound for any input that is not a single string."""
+
+
+class EmbeddingReservationUnbounded(RuntimeError):
+    """No sound upper bound on an embedding request's billed tokens could be
+    established, so it was NOT dispatched (P1b). A ``RuntimeError`` and not a
+    ``ValueError``, on ``UnknownModelPricingError``'s footing; Stage 2's dense
+    channel records it and degrades to BM25-only, as for any channel failure."""
+
+
+def embedding_reservation_input_tokens(text, model) -> int:
+    """The input-token upper bound to reserve for one embedding request. RAISES
+    ``EmbeddingReservationUnbounded`` when the model has no documented bound.
+
+    One ``str`` input: the model's documented per-input maximum, independent of
+    the string's length or content. Anything else the request may carry (a list
+    of strings, token arrays): the documented per-request maximum. The request
+    itself is never altered here -- this decides only what is reserved.
+    """
+    try:
+        per_input = EMBEDDING_MAX_INPUT_TOKENS_PER_INPUT.get(model)
+    except TypeError:
+        per_input = None
+    if (isinstance(per_input, bool) or not isinstance(per_input, int)
+            or per_input <= 0):
+        raise EmbeddingReservationUnbounded(
+            f"embedding model {model!r} has no documented maximum input token "
+            f"count in EMBEDDING_MAX_INPUT_TOKENS_PER_INPUT, so no upper bound "
+            f"on what the request is billed can be reserved; it was not "
+            f"dispatched")
+    if isinstance(text, str):
+        return per_input
+    return max(per_input, EMBEDDING_MAX_INPUT_TOKENS_PER_REQUEST)
+
+
 def get_embedding(text: str) -> List[float]:
     """Generate embedding for text using OpenAI.
 
@@ -192,21 +270,54 @@ def get_embedding(text: str) -> List[float]:
     # accounting an unreachable endpoint produces. That is the right shape: a
     # patient whose budget ran out mid-run gets a recorded degradation rather
     # than a silent full-price dense search.
+    # THE RESERVATION'S BOUND IS DECIDED BEFORE ANYTHING ELSE, because a model
+    # with no documented bound is refused before the budget gate, the durable
+    # reservation or the request (P1b). See embedding_reservation_input_tokens.
+    _reserved_tokens = embedding_reservation_input_tokens(
+        text, config.EMBEDDING_MODEL)
     spend.require_budget(spend.SPEND_SOURCE_EMBEDDING,
                          "Stage 2's dense retrieval channel")
-    response = deps.get_openai_client().embeddings.create(
-        model=config.EMBEDDING_MODEL,
-        input=text,
-        # The STRUCTURED Timeout, so an unreachable host still fails on the
-        # SDK's 5s connect phase rather than waiting out the 30s read budget.
-        #
-        # CALLED, not imported. In the package the structured timeouts are lazy,
-        # because building one constructs a throwaway OpenAI client to read the
-        # SDK's own default connect phase -- so importing the value would need
-        # credentials at import, which is exactly what pass 20c-1 removed from
-        # File 03.
-        timeout=config.get_embedding_request_timeout(),
-    )
+    # ── THE DURABLE RESERVATION, BEFORE THE REQUEST ────────────────────────
+    #
+    # A campaign's cumulative billing record (spend.BILLING_RECORD) counts this
+    # call too: the embedding is billed in the same budget as Stage 5 and is on
+    # no inference row, so a resumed campaign could not otherwise see it. The
+    # reservation is the PROVIDER'S DOCUMENTED MAXIMUM for one request of this
+    # shape (P1b) -- not an estimate from the text's length, which a tokenizer
+    # can exceed -- and a response settles at its real usage. With no sink
+    # installed this is a no-op. A reservation that cannot be persisted RAISES,
+    # and Stage 2's channel handler degrades to BM25-only exactly as for an
+    # unreachable endpoint -- nothing is dispatched.
+    #
+    # A FAILED REQUEST IS CHARGED AT THE RESERVATION IN BOTH LEDGERS (the
+    # billing closure pass), because nothing here can say the provider did not
+    # bill it. It used to settle at the reservation DURABLY while the in-process
+    # ledger charged nothing, so a live process admitted spending a resume would
+    # refuse. `AttemptLiability.resolve` charges the ledger and settles the row
+    # from one number; see spend.attempt_liability.
+    _reservation = spend.begin_billed_attempt(
+        spend.SPEND_SOURCE_EMBEDDING, config.EMBEDDING_MODEL, _reserved_tokens,
+        0, where="Stage 2's dense retrieval channel")
+    try:
+        response = deps.get_openai_client().embeddings.create(
+            model=config.EMBEDDING_MODEL,
+            input=text,
+            # The STRUCTURED Timeout, so an unreachable host still fails on the
+            # SDK's 5s connect phase rather than waiting out the 30s read budget.
+            #
+            # CALLED, not imported. In the package the structured timeouts are
+            # lazy, because building one constructs a throwaway OpenAI client to
+            # read the SDK's own default connect phase -- so importing the value
+            # would need credentials at import, which is exactly what pass 20c-1
+            # removed from File 03.
+            timeout=config.get_embedding_request_timeout(),
+        )
+    except Exception:
+        _reservation.resolve(spend.BILLING_OUTCOME_POSSIBLY_BILLED)
+        raise
+    except BaseException:
+        _reservation.resolve(spend.BILLING_OUTCOME_ABANDONED)
+        raise
     # ── THE CHARGE, IMMEDIATELY AFTER THE RESPONSE ────────────────────────
     #
     # `usage.completion_tokens` DOES NOT EXIST ON AN EMBEDDING RESPONSE and is
@@ -219,13 +330,14 @@ def get_embedding(text: str) -> List[float]:
     # input rate against a figure that already includes it.
     #
     # THE MODEL IS THE ECHOED ONE, falling back to the configured id, which is
-    # `_charge_spend`'s rule one module over: the provider bills what it
-    # answered with.
+    # `_Stage5AttemptRecord.response`'s rule one module over: the provider bills
+    # what it answered with.
     _usage = getattr(response, "usage", None)
-    spend.SPEND_LEDGER.charge(
-        getattr(response, "model", None) or config.EMBEDDING_MODEL,
-        getattr(_usage, "prompt_tokens", None), 0,
-        source=spend.SPEND_SOURCE_EMBEDDING)
+    _reservation.resolve(
+        spend.BILLING_OUTCOME_RESPONSE,
+        model=getattr(response, "model", None) or config.EMBEDDING_MODEL,
+        prompt_tokens=getattr(_usage, "prompt_tokens", None),
+        completion_tokens=0)
     return response.data[0].embedding
 
 

@@ -586,7 +586,7 @@ python tests/test_registries_cancer_code_claims_audit_control.py   #  16; 14 pla
 python tests/test_config_snapshot_date_rot.py                      #  10; 6 subprocess runs, ~6 min
 python tests/test_package_invariants.py                            # 261/0/0 on macOS (was 247 before section 2f(iii)); 245/2/2 on Linux was measured at 247 and has not been re-measured there (was 234/6 there before commit ec2033a gave it a SKIP mechanism). No network, no keys, no corpus. NOT in CI — see below
 python tests/test_degraded_dependencies.py                         # 174 (was 172 in this note, and 170 before pass 20e; the 172 was never true of the file). Item 11a
-python tests/test_storage_query_layer.py                           # 498 (this line said 434 and was stale by 64 -- the reason-coverage pass recorded 487 -> 498 five hundred lines below and this line never moved; MEASURED 2026-09-03. Before that 434, was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
+python tests/test_storage_query_layer.py                           # 503 (MEASURED 2026-09-13 by the P4b recovery session; was 498 -- the production row counts are taken on verified byte snapshots, the production files compared by bytes, a guard refuses and records any production connect, and the cost-tab render is redirected to the seeded database. Before that 498 (this line said 434 and was stale by 64 -- the reason-coverage pass recorded 487 -> 498 five hundred lines below and this line never moved; MEASURED 2026-09-03. Before that 434, was 427; the pre-migration pass added section 8b-l over campaign_summary's patient/row split and the resample-bearing fragment its seed needed); item 38, temp SQLite only
 
 # The four added by pass 20f-1. Same shape, same directory, no network, no keys,
 # no spend, and none of them writes anything in the repository.
@@ -674,7 +674,7 @@ python tests/test_dashboard_app_integration.py                     # 113 (MEASUR
 # st.download_button call, never rebuilt. It EXECS NOTHING: every plant is a
 # COPY imported by name from the temp directory. NOT in the collision matrix.
 # Bucket A.
-python tests/test_dashboard_truthfulness.py                        # 157 (MEASURED 2026-09-13 against the developer tree; 131 before the closing pass added the two population labels, the CSV export and the demographics chart checks)
+python tests/test_dashboard_truthfulness.py                        # 161 (MEASURED 2026-09-13 by the P4b recovery session; was 157 -- section 10 reads a verified FROZEN COPY, immutable=1 only there, and the production path is guarded for the whole file. Before that 157 (MEASURED 2026-09-13 against the developer tree; 131 before the closing pass added the two population labels, the CSV export and the demographics chart checks)
 
 # The call-mode-labelling pass. Same shape, same directory. No network, no
 # keys, NO SPEND -- the API sections install a stub Qdrant client and a stub
@@ -775,7 +775,7 @@ python tests/test_agent_emission_provenance.py                      # 186 (was 1
 # nothing -- every control is driven through the real shipped module by creating
 # the failing condition for real (an exclusive lock from a second connection, an
 # unwritable path, a deleted row). ~4 s, most of it deliberate lock contention.
-python tests/test_storage_write_durability.py                       # 111 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton, and 111/0/0 against the developer tree. BUCKET E -> BUCKET A (the signal-safe-restore pass): its single production-database non-degeneracy probe was keeping a hundred checks that need nothing at all out of CI, and that probe is GATED now on tests/test_dashboard_run_health.py's pattern -- nine controls, an AST pin on the gate's call site, and the 9c COMPARISON never gated, so a run that CREATED a production database still fails on a runner. THE SAME PASS FIXED 9c, WHICH COULD NOT FAIL: its BEFORE reading was captured on the line above the comparison, after every driver had run, so it was rows(db) == rows(db) microseconds apart -- measured, a planted mid-run write left it GREEN. The capture is at module scope now and the same plant makes it FAIL. (was 100; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
+python tests/test_storage_write_durability.py                       # 122 on the developer tree (MEASURED 2026-09-13 by the P4b recovery session; was 111 -- 9c compares verified snapshots plus byte digests, and 9e shows the snapshot, the frozen copy and the production guard each able to fail). Before that: 111 passed / 0 failed / 1 SKIPPED against ONLY the CI directory skeleton, and 111/0/0 against the developer tree. BUCKET E -> BUCKET A (the signal-safe-restore pass): its single production-database non-degeneracy probe was keeping a hundred checks that need nothing at all out of CI, and that probe is GATED now on tests/test_dashboard_run_health.py's pattern -- nine controls, an AST pin on the gate's call site, and the 9c COMPARISON never gated, so a run that CREATED a production database still fails on a runner. THE SAME PASS FIXED 9c, WHICH COULD NOT FAIL: its BEFORE reading was captured on the line above the comparison, after every driver had run, so it was rows(db) == rows(db) microseconds apart -- measured, a planted mid-run write left it GREEN. The capture is at module scope now and the same plant makes it FAIL. (was 100; the run-identity pass split section 5c's lock-site pin into the comparison and its own non-degeneracy probe when the expected number stopped being retyped there)
 
 # The reproducibility-hash pass. Same shape, same directory. No network, no
 # keys, no spend, no git history, not in the collision matrix, and it execs
@@ -1200,7 +1200,8 @@ python bedrock_probe.py --i-understand-this-bills --provider bedrock_anthropic \
 #     config.MEDCPT_SCORE_FLOOR           -11.6265
 #     agent.prompts.PROMPT_VERSION        '1.11.0'
 #     run_fingerprint.FINGERPRINT_VERSION 8   (13 gated fields)
-#     database_logger.SCHEMA_USER_VERSION 15
+#     database_logger.SCHEMA_USER_VERSION 17  (was 15 when measured; era 17 is
+#                                         the cumulative-spend pass's billing_attempts)
 #     fixtures.capture.SCHEMA_VERSION     8
 #     boto3 / botocore pin                1.42.42 / 1.42.42
 #
@@ -9824,9 +9825,11 @@ six such rows are in the production database, each with
 and a non-list body now carry the accumulators, which are exact for that
 invocation because usage is read *before* the fence strip and the parse; so does
 an API error on a **later** chunk of a packed batch, where the earlier chunks'
-tokens are known. An API error on the **first** call carries nothing: no usage
-object was obtained, and an estimate from prompt length would put a number no
-provider reported into a measurement column. `llm_classifier_calls` is written
+tokens are known. An API error on the **first** call writes explicit ZEROS -- this
+attempt's own accumulators, never an estimate from prompt length. (It
+used to leave the keys absent, which on a re-entry published an EARLIER
+attempt's figure; see "A stored Stage 5 row describes one attempt" at
+the end of this file.) `llm_classifier_calls` is written
 on every return for the same reason, and it is what separates the two — `calls =
 0` with `llm_classifier_prompt_sha256 IS NOT NULL` is "Stage 5 ran and counted
 no usage", while a NULL hash is "Stage 5 never ran", where 0 is a measurement.
@@ -16653,7 +16656,7 @@ population disagrees. The patient CSV export is recorded from the tab's own
 columns compared with SQL on the synthetic and smoke databases.
 
 ```bash
-python tests/test_dashboard_truthfulness.py      # 157
+python tests/test_dashboard_truthfulness.py      # 161
 ```
 
 **PINS THAT MOVED, EACH THE CHECK WORKING.** `test_package_invariants.py`
@@ -16688,3 +16691,771 @@ argued in place: FALLBACK_MAIN_PATH in oncotriage/settings.py.
 
 When you finish, state which parts you verified by running
 something, and which parts you only read.
+
+### A stored Stage 5 row describes one attempt (the attempt-provenance pass)
+
+**TWO PREMISES, BOTH CONFIRMED BEFORE ANYTHING WAS EDITED, BY READING AND THEN
+BY DRIVING.** No paid call, no schema change, no migration, no commit. Every
+run was under the OS network sandbox (`sandbox-exec`, deny network) AND the
+socket tripwire. The production `inferences.db` was opened `mode=ro&immutable=1`
+only. The renderer digest (`5ea2c6cc...`), `PROMPT_VERSION` 1.11.0 and
+`FINGERPRINT_VERSION` 8 are **byte-identical to a clean HEAD worktree**, because
+none of the six hashed renderer modules was touched.
+
+**P1 -- A LATER ATTEMPT PUBLISHED AN EARLIER ATTEMPT'S TOKENS.** LangGraph keeps
+a state channel's last written value until a node writes it again, and Stage 5
+re-enters itself. `_billed_so_far()` returned `{}` whenever the attempt obtained
+no usage object, on the argument that `_pipeline_provenance()`'s
+`state.get(..., 0)` would supply the zero. That is true of a first attempt and
+false of every later one. The smoke database's row 7 has the shape:
+`llm_classifier_calls = 1` and 12,101 input tokens, which is exactly that
+patient's warmup prompt (row 4), stored beside `llm_classifier_call_details =
+'[]'` and an error saying attempt 3 issued nothing. Driven against the
+unmodified code through the real graph and writer, the stored row carried
+attempt 1's 4 / 4,000 / 400 beside an empty ledger.
+
+**A SECOND FIELD FAMILY HAD THE SAME DEFECT, AND IT WAS NOT IN THE BRIEF.**
+`_per_trial_call_census()` was spread on the floor and the success return only.
+So a floor followed by a mid-loop failure (API error, refusal, parse error or
+non-list body) published the FLOOR's `0/0/0` beside the later attempt's four
+calls. Found by enumerating every key each return writes, by AST.
+
+**REACHABLE TODAY, AND BY WHICH PATHS.** A transport failure the retry policy
+handled is terminal (`llm_classifier_transport_exhausted`), so the leak needs an
+untagged re-entry:
+
+* a spend-cap, shutdown or drain decline at the warmup (zero calls) after a
+  billed parse failure;
+* a serving-window decline that clears before the next attempt;
+* on the SHIPPED Converse arm, `PerTrialCacheUnconfirmedError`.
+
+Row 7 predates the provider-resilience pass, when throttling was not yet
+terminal.
+
+**THE FIX IS AT THE TWO SHARED OWNERS.** `_billed_so_far()` writes all three
+keys on every call, zeros included. `calls_made` is incremented at every site
+that folds tokens, so the zero is the attempt's own accumulators and never an
+estimate.
+
+`_per_trial_call_census(*, wave_final)` takes a REQUIRED keyword with no default:
+
+* `True` on the two exits that read their whole wave (floor, success);
+* `False` on the four part-read exits, which now WRITE the None triple instead
+  of leaving the keys absent.
+
+No default, because a new exit that skipped the question would publish a
+part-read prefix as a total.
+
+**WHICH FIELDS DESCRIBE WHICH SCOPE, verified from the code that writes them.**
+
+| scope | fields |
+|---|---|
+| FINAL ATTEMPT (reset per attempt, now written on every exit a re-entry can follow) | `llm_classifier_calls`, `_input_tokens`, `_output_tokens`, `_call_details`, the three `_per_trial_calls_*`, `llm_classifier_raw_response`, `matching_model`, `_truncation_splits`, the four guard estimates, and `inferences.estimated_cost_usd`, which is DERIVED from the row's tokens. The success-only keys (`_cached_input_tokens`, `_reasoning_tokens`, `_cache_write_tokens`, packing, `hallucinated_trials`) cannot go stale because success is terminal |
+| WHOLE INVOCATION (cumulative by contract, untouched) | `llm_classifier_retries`; `stage_timings.llm_classifier_evaluation` (stored as `llm_classifier_evaluation_time`, `prior + elapsed`); `spend.SPEND_LEDGER`, charged per response at the three call sites inside every attempt, plus the upper bound for a possibly-billed failure, and what the cap enforces; the module-level degradation counters |
+
+**CUMULATIVE SPEND IS PRESERVED AND TESTED.** In scenario A the ledger still
+holds attempt 1's four billed responses. That earlier charge is what the cap
+enforced: both later warmups were declined against it (`SPEND_GATE_SKIPS` 2). In
+B and C the ledger holds both billed attempts while the row reports only the
+last.
+
+**P2 -- THE `PER_TRIAL_CALL_FAILURES` DESCRIPTION WAS FALSE.** It said a patient
+whose calls all failed "is NOT here". The increment is in the send loop on every
+raising request, before the floor and before any retry decision. The description
+now states the counter's actual scope:
+
+* failed per-trial requests across all attempts, including attempts later
+  discarded;
+* the `abandoned:{Type}` key;
+* why it is not the sum of the per-patient column;
+* that gate-declined requests and cache-writer failures are counted elsewhere.
+
+Only the description text changed; the counter, its keys and its increment sites
+did not. Driven: a failure in a discarded attempt is counted while the stored
+result reports 0 failed, and an all-failed patient is counted.
+
+```bash
+# The attempt-provenance pass. Same shape, same directory. No network, no
+# keys, NO SPEND -- the Stage 5 client is a stand-in installed through
+# oncotriage/agent/deps.py and the patient-level backoff is a zero-delay hook
+# through provider_resilience's own module attribute, restored by identity. No
+# live Qdrant, no model load, no corpus, no git history. It drives the REAL
+# Stage 5 node, the REAL router and the REAL terminal nodes on a StateGraph over
+# the REAL TrialMatchState, then the REAL log_inference into a scratch database.
+# NOT in the collision matrix. It DOES exec: two in-memory copies of
+# agent/evaluation.py, argued at _EXEC_ALLOWLIST. Bucket A, ~2 s.
+python tests/test_agent_stage5_attempt_provenance.py                #  55
+```
+
+**FIVE TREE-LEVEL REVERTS, ALL FIVE CAUGHT, NONE ABORTING.** Each ran in a
+copied tree with a realpath preflight asserting the copy is what imports, under
+the sandbox:
+
+| revert | result | failing checks |
+|---|---|---|
+| clean control | 55 / 0 | none |
+| guard restored | 6 fail | A1 A2 A3 A5 C0 S1 |
+| mid-loop spreads removed | 6 fail | C1 C2 S1 S2 S4 X2a |
+| `wave_final` branch removed | 2 fail | C1 C2 |
+| description reverted | 3 fail | P1 P1b P2 |
+
+**ONE DEFECT IN THIS PASS'S OWN TEST WAS FOUND BY RUNNING.** P1 first searched
+the lowercased description for "is not here". It failed against the corrected
+text, which says, truly, that a gate-declined request "is not here". It now
+searches for the retired SENTENCE, and P1b requires the replacement to say the
+opposite about that patient.
+
+**THREE EXISTING PINS INVERTED, EACH ARGUED IN PLACE.** Each had pinned the
+ABSENCE that was the defect:
+
+* `tests/test_storage_packing_and_cache_columns.py` section 3's first-call
+  branch (now **126**);
+* `tests/test_agent_stage5_per_trial_calls.py` 3w(e) and 3fw(g) (**372**);
+* `tests/test_harness_lost_trial_call_visibility.py` P1's plant anchor
+  (**102**).
+
+**VERIFIED BY RUNNING, UNDER CONTAINMENT.**
+
+* CI bucket A: **128 ran, 0 failed**.
+* The tripwire recorded 39 attempts, ALL loopback to `('127.0.0.1', 1)` (the
+  closed-port probe) and **zero external**.
+* `tests/test_package_invariants.py` **261/0/0**.
+* `ci_test_buckets.py --check` consistent at 147 files.
+* `static_checks.py` compiles 314.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE CROSS-PROCESS RESUME SEED IS STILL A FLOOR, AND FOR ROW-7-SHAPED ROWS
+   IT IS NOW A LOWER ONE.** `campaign_spend_before` sums
+   `inferences.estimated_cost_usd`, which describes the final attempt. The leak
+   happened to carry a real earlier charge into row 7 ($0.024214), and that row
+   would now store $0.00. The in-process ledger is unaffected. A cumulative
+   per-invocation billed column is the fix, and it is a schema change.
+2. **THE DE-IDENTIFICATION REFUSAL RETURN IS OUTSIDE THE STRUCTURAL RULE.** It
+   writes zeros literally and no ledger. It is reachable only as a first
+   attempt, because the render is deterministic. That argument is reasoned, not
+   enforced.
+3. **`llm_classifier_transport_exhausted` IS STILL WRITTEN ON TWO EXITS ONLY.**
+   A stale value can only be None, because non-None is terminal, and it is not
+   persisted.
+4. **No Converse-arm drive of the leak.** The helpers are shared by every arm,
+   and `PerTrialCacheUnconfirmedError` is named above rather than driven.
+
+### A resumed campaign's budget includes every charge of every earlier process (the cumulative-spend pass)
+
+**TWO DEFECTS, BOTH VERIFIED IN CODE BEFORE ANYTHING WAS EDITED, AND THE SECOND
+WAS NOT IN THE BRIEF.** No paid call, no AWS call, no commit. Every run was
+under the OS network sandbox (`sandbox-exec`, outbound denied except loopback)
+AND an import-time socket tripwire. The production `inferences.db` was only ever
+opened `mode=ro` and its sha256 is unchanged. `PROMPT_VERSION`, `FINGERPRINT_VERSION`
+and `llm_classifier_renderer_digest` are unchanged: none of the six renderer
+modules was touched.
+
+**P1 (CONFIRMED).** `database_logger.campaign_spend_before` seeded a resumed
+batch campaign's budget from `SUM(inferences.estimated_cost_usd)` over the
+`runs` chain. Since the attempt-provenance pass that column describes a patient's
+FINAL Stage 5 attempt, so the seed omitted every earlier billed attempt, every
+billed attempt of a patient whose row was never written, every possibly-billed
+transport failure, and every Stage 2 dense embedding. The in-process ledger was
+exact and died with the process.
+
+**THE HOLE BEHIND IT.** `_resumed = bool(completed_ids)`, and the checkpoint is
+written only when a patient SUCCEEDS. A first process whose patients all failed
+-- a Converse cache write that could not be confirmed, a parse failure on every
+retry -- left no checkpoint, so the restart was a FRESH campaign with a FRESH
+budget, whatever that seed had summed. Measured in the new test: after a billed
+attempt and a zero-usage failure the deleted reader's figure is **$0.00** and no
+checkpoint exists.
+
+**THE RECORD: `inferences.billing_attempts`, SCHEMA ERA 17.** One row per billed
+WIRE attempt -- Stage 5 warmups, trial calls, retries inside the one retry
+policy, and Stage 2's dense embedding -- **reserved before dispatch and settled
+after**:
+
+| step | where | amount |
+|---|---|---|
+| reserve | `provider_resilience.execute`'s new `attempt_record.begin()`, after the pacing wait and BEFORE `send()`; `models.get_embedding` before `embeddings.create` | the request's estimated input plus its full output ceiling, priced at the wire model -- the SAME upper bound the ledger already charges a possibly-billed failure |
+| settle `response` | after `send()` returns | `spend.price_usage` over the echoed usage -- the SAME function `SpendLedger.charge` now calls |
+| settle `not_billed` | a failure the policy classes provably unbilled | 0 |
+| settle `possibly_billed` / `abandoned` / `response_unpriced` | anything whose billing cannot be observed | the reservation |
+
+**EVERY READER CHARGES A RESERVED ROW AT ITS RESERVATION**, so a process killed
+between reservation and settlement leaves an upper bound, and a process killed
+before the reservation commit sent nothing: there is no window in which money
+leaves without a row. A settlement that could not be written leaves the row
+reserved -- a resume charges MORE than was billed, never less.
+
+**THE IDENTITIES.** `attempt_id` (uuid4 at reservation, the PRIMARY KEY, the only
+key a settlement is addressed by); `run_id` (the invocation); `campaign_id`
+(below); `correlation_id` (the patient scope). Settlement is
+`UPDATE ... WHERE attempt_id = ? AND state = 'reserved'`, so a repeat is
+`duplicate` and moves nothing, a different amount is `conflict` and the first
+stands, and nothing already summed is ever overwritten. A reservation is
+`INSERT OR IGNORE` then READ BACK, on `run_environment`'s precedent, so
+`IntegrityError` -- terminal to `_is_retryable` -- is never how a duplicate is
+found.
+
+**THE CAMPAIGN IS A FILE BESIDE THE CHECKPOINT, WRITTEN BEFORE THE FIRST BILLED
+CALL.** `08- Checkpoint/batch_runner_campaign.json` (`runner.CAMPAIGN_RECORD_FILENAME`),
+written with fsync + `os.replace` + a directory fsync. Every later invocation
+inherits its `campaign_id` whether or not a patient ever succeeded; `--fresh`
+and a clean finish end it, both through `clear_checkpoint()`. It is NOT derived
+from the `runs` stitch: two concurrent campaigns sharing one database and one
+configuration are indistinguishable to that rule and distinct here.
+`establish_billing_campaign` decides one of four closed `CAMPAIGN_DECISIONS`:
+`new`, `continued`, `new_after_reconfiguration` (a record with no checkpoint
+whose stamp no longer matches -- a new campaign, as `--fresh` and the stitch rule
+would give), and `historical_evidence`.
+
+**`runs.resumed` IS UNCHANGED** and still means "the checkpoint handed this run
+completed patients", so a zero-success restart reads `resumed = 0` while
+continuing the same billing campaign. Stated rather than folded in: changing it
+changes what `campaign_summary` stitches.
+
+**THE READER RAISES, WHERE THE ONE IT REPLACES DEGRADED TO ZERO.**
+`campaign_billing_total` sums in Python over validated rows (SQLite's `SUM`
+coerces text to 0) and raises `BillingRecordUnreadable` on an unreadable file or
+an unsummable row. `main()` refuses before paid work -- run row finalized KILLED
+with the reason as its note, exit 1 -- on any of six closed
+`CAMPAIGN_REFUSAL_REASONS`.
+
+**A RESERVATION THAT CANNOT BE PERSISTED REFUSES THE DISPATCH AND LATCHES THE
+RUN.** `spend.BILLING_RECORD.reserve` raises `BillingRecordUnavailable` and trips
+`SPEND_STOP` under the new `SPEND_LIMIT_BILLING_RECORD`; Stage 5 raises it as a
+`Stage5SpendStopped` so the patient fails rather than completing with a hole;
+`_spend_gate` declines every later request at the gate; the runner stops starting
+patients and records `runs.stop_reason = 'billing_record'`. The retry policy
+refunds the permit and marks the refusal pre-send, so it is never classified as a
+possibly-billed provider failure. `BILLING_RECORD_FAULTS` is registered.
+
+**`campaign_spend_before` AND `CampaignSpend` ARE DELETED**, not narrowed: a
+function named "spend before" that sums final-attempt figures is a standing
+invitation to the regression. `campaign_run_ids` keeps the stitch. **Existing
+readers of `estimated_cost_usd` keep their meaning**; no query, dashboard tab or
+column changed.
+
+**HISTORICAL CAMPAIGNS: DEMONSTRATED COVERAGE OR A NAMED REFUSAL.** A checkpoint
+with no campaign record predates the record. `historical_campaign_evidence`
+admits its prior spend -- `SUM(estimated_cost_usd)` of the chain's rows, recorded
+ONCE as a `historical_evidence` row BEFORE the identity file, so a crash between
+them orphans a row rather than a history -- only when every one of ten closed
+`HISTORICAL_COVERAGE_REASONS` is absent: identified by the stitch AND the cohort
+digest, no predecessor already billed (no overlap), every predecessor STOPPED or
+FAILED with `finished_at`, a health record present, six unrecorded-billing
+counters zero, every row priced, no Stage 5 retries on any row, and no dense
+channel on any row. **Measured on the production database, read-only, against a
+scratch copy: its one historical campaign is NOT covered** -- not covered, for three reasons at once: `unrecorded_billing_signal` (PER_TRIAL_CALL_FAILURES=73),
+`attempt_history_not_on_rows` and `embedding_spend_not_on_rows`. Its sha256 was
+identical before and after (`47bab774...`). The stated residual: a counter a historical build had not yet
+registered reads as zero in its health record.
+
+```bash
+# The cumulative-spend pass. Same shape, same directory. No network, no keys,
+# NO SPEND -- every provider client is a stand-in installed through
+# oncotriage/agent/deps.py, children get a closed Qdrant port and the same
+# stand-ins. NO MODEL LOAD. It uses REAL CHILD PROCESSES and a REAL SIGKILL,
+# because a kill a process can observe is not the kill under test: the children
+# run the real main(). NOT in the collision matrix; every database and
+# checkpoint directory is inside a tempfile.mkdtemp removed and asserted gone,
+# and the production inferences.db digest is compared at the end. It EXECS
+# NOTHING: children are scripts written into the temp tree. Bucket A.
+python tests/test_campaign_billing_record.py                        # 127 (MEASURED 2026-09-13 by the P4c recovery session under the same containment; was 115. The +12 are 6zb..6ze through the REAL entry point in fresh processes: the restored older database recovered with both charge classes and repeated recovery, a legacy marker refused with no patient started and --fresh over it, an unreadable marker refused, an unwritable marker leaving the checkpoint and record byte-unchanged, and the crash between marker and checkpoint removal. Before that 115, MEASURED 2026-09-13 by the P4b recovery session under the same containment; was 111. The +4 are 6za..6za-iii: a deleted identity record through the REAL entry point, recovered without a flag, and a NEW campaign under --fresh. Before that 111, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 97. The +14 are 6f-i..6f-v, the summary surface over the zero-success restart's database, and 6u..6z, --fresh through the REAL entry point read back at the summary surface. Before that 97, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 91. The +6 are section 6F, 6t: the counter registry refused through the REAL main() for a build lacking one counter and for a pre-era-18 database, each naming exactly its unproven counters)
+```
+
+**SEVENTEEN PLANTED REVERTS, SEVENTEEN CAUGHT, NONE ABORTING** -- each on a
+copy of `oncotriage/` and `tests/` under the network sandbox, the editable-install
+finder stripped, a realpath preflight asserting the copy is what imports, every
+plant asserting its own occurrence count and parsing; clean control 91/0; the real
+tree byte-unchanged afterwards:
+
+| revert | caught by |
+|---|---|
+| the total reads no rows | 13 checks, incl. the fresh-process proof 6e/6f |
+| unresolved reservations excluded | 2b, 6i, 6l |
+| no reservation before dispatch (hook bypassed) | 28 checks, incl. 6h kill-between |
+| persistence failure swallowed (reserve returns None) | 14 checks, incl. 3e / 4a -- the provider WAS called |
+| settlement idempotency guard removed | 2e, 2f (conflict overwrites), 6h-6i |
+| campaign filter removed from the total | 6n, 6o (concurrent isolation) |
+| historical coverage always admitted | all six 6s refusals |
+| a zero-success restart not continued | 6d-6f, 6i, 6o |
+| embedding not reserved | 3k, 3l |
+| Stage 5 hook not passed | 28 checks, incl. P2's 5c-5e |
+| abandoned attempt not resolved | 3d |
+| latched gate removed | 4e |
+| historical evidence row not written | 6q, 6r |
+| stop-reason branch removed | 1k |
+| warmup gate's limit dropped | 4c-i |
+| reservation not read back | 2i |
+| unsummable row read as zero | 2q |
+
+**FOUR EXISTING SUITES FAILED ON THE FIRST BUCKET-A RUN AND EVERY FAILURE WAS A
+PIN WORKING OR A DEFECT IN THIS PASS'S OWN CODE.** Two were structural pins in
+`tests/test_storage_run_identity.py` (finalize must be the last statement before
+the return; only crash handlers finalize inside an `except`) -- fixed by
+restructuring the runner, not by moving the pins. One was
+`tests/test_storage_criteria_split_and_run_note.py`'s CONTROL 5, which caught this
+pass writing a machine refusal reason into `runs.note`, the operator's column --
+the note was removed. One was `tests/test_runner_preflight_and_state_faults.py`
+6e, which caught `clear_campaign_record()` raising in a read-only checkpoint
+directory -- it never raises now. And `tests/test_runner_crash_record_and_db_unification.py`
+section 6 faked a resume with no evidence behind it, which the new code correctly
+refuses; that one arm gets a campaign stand-in, argued in place. Pins moved with
+arguments: SPEND_LIMITS 2 -> 3, SEED_SOURCES +1, RUN_STOP_REASONS +1, the
+table-set pins +1 (three files), the index pin +2, `_WRITE_LOCK` sites 7 -> 9,
+and `tests/test_spend_gate.py` 9f re-anchored and section 7 rewritten onto the
+record (162 checks; the deleted reader's own floor/unpriced checks went with it).
+
+**VERIFIED BY RUNNING, UNDER THE SANDBOX AND THE TRIPWIRE.** CI bucket A on the
+final tree **129 ran, 0 failed, 0 not run** (78 tripwire records, all loopback);
+`tests/test_package_invariants.py` **261/0/0**; `static_checks.py` compiles 315;
+`ci_test_buckets.py --check` consistent at 148 files / 129 in bucket A; renderer
+digest `5ea2c6cc...`, `PROMPT_VERSION` 1.11.0 and `FINGERPRINT_VERSION` 8 unchanged
+(zero diff lines in the six renderer modules).
+
+`tests/run_serial_tests.py` **5/5 in 465.8 s** under the same containment, with
+`oncotriage/config.py` and `oncotriage/registries/cancer_code_registry.py`
+sha256-identical before and after; the production `inferences.db` sha256
+(`47bab774...`) unchanged at session end.
+
+**WHAT IS NOT DONE, NAMED RATHER THAN LEFT TO BE DISCOVERED.**
+
+1. **THE ABLATION STUDY, THE API AND THE MCP SERVER INSTALL NO SINK.** The API and
+   MCP server have no campaign by design. The ablation study DOES resume a budget
+   (`ablation_spend_before`, over its own database's final-attempt row costs) and
+   inherits exactly the P1 defect this pass closed for the batch runner.
+2. **A POWER LOSS IS NOT COVERED THE WAY A PROCESS KILL IS.** A reservation is
+   durable once SQLite commits; under WAL with the project's synchronous setting a
+   host crash can lose the last commits. The kill tests are process kills.
+3. **UNRESOLVED RESERVATIONS ARE NEVER RECONCILED.** They stay charged at their
+   upper bound forever; nothing re-prices them against a provider bill.
+4. **ONE WRITE PER RESERVATION AND ONE PER SETTLEMENT, UNDER THE PROCESS-WIDE
+   `_WRITE_LOCK`.** About 32 small commits per per-trial patient; not measured
+   under a 12-worker campaign.
+5. **`runs.resumed` AND THE BILLING CAMPAIGN CAN DISAGREE** on a zero-success
+   restart (resumed = 0, campaign continued), so `campaign_summary` reports two
+   campaigns where the budget sees one.
+6. **THE HISTORICAL COUNTER RESIDUAL**: a counter a historical build had not yet
+   registered reads as zero in its health record.
+7. **THE IN-PROCESS LEDGER CHARGES A FAILED EMBEDDING NOTHING while the record
+   charges its reservation**, so within one process the cap sees slightly less
+   than a resumed process will.
+8. **`execute_async` carries the hook but nothing async passes one**; the ragas
+   harness is unchanged.
+
+### One liability, one campaign, one synced record (the billing closure pass)
+
+**FOUR PREMISES FROM THE CUMULATIVE-SPEND PASS'S OWN WEAKNESSES LIST, ALL FOUR
+CONFIRMED IN CODE BEFORE ANYTHING WAS EDITED.** No paid call, no commit. Every
+run was under the OS network sandbox and the import-time tripwire (zero
+external records across every run); the production `inferences.db` was only
+read. `PROMPT_VERSION`, `FINGERPRINT_VERSION` and
+`llm_classifier_renderer_digest` are unchanged: no renderer module was touched.
+
+**P1 -- THE ASYMMETRY WAS WIDER THAN EMBEDDINGS.** Three writers priced one
+attempt: `_charge_spend` at the Stage 5 call sites (a response),
+`_charge_upper_bound` inside `on_possibly_billed` (a possibly-billed failure),
+and the durable settlement in the attempt hook. The classes where the two
+ledgers disagreed:
+
+| class | ledger (before) | durable (before) |
+|---|---|---|
+| failed embedding (possibly billed) | $0 | reservation |
+| interrupted embedding (abandoned) | $0 | reservation |
+| unpriceable embedding response | $0 | reservation |
+| unpriceable Stage 5 response (unknown echoed model, unreadable usage) | $0 | reservation |
+| settlement that did not land | priced response | reservation (row stays reserved) |
+
+`spend.attempt_liability` is the one rule and `spend.AttemptLiability` applies
+it: created before dispatch (persisting the durable reservation when a sink is
+installed), resolved exactly once, charging the ledger and settling the row
+from ONE number, and topping the ledger up to the reservation when a settlement
+does not land. `_charge_spend` and the charging half of `_charge_upper_bound`
+are DELETED; the Stage 5 ledger charge now happens inside the retry policy
+immediately after `send()`, which is earlier than the call-site charge it
+replaces. `BILLING_RECORD.liability_snapshot()` is the live per-outcome tally a
+reconciliation compares with the durable split. **The rater and ragas paths are
+unchanged**: they create no `AttemptLiability` and have no durable record.
+
+**THE RECOVERY SESSION FOUND ONE MORE ASYMMETRY, ON THE RETRY POLICY'S FAILURE
+PATH.** In both `execute` twins the `except Exception` branch ran
+`classify(exc)` and `pacer.settle(...)` BEFORE resolving the attempt's
+liability, and an exception raised inside that handler is not caught by the
+`except BaseException` beside it. So a raising classifier or pacer settlement
+left the liability OPEN: $0 in the ledger, the reservation durably. Measured
+before the fix, in containment against a disposable database: live remaining
+10.000000 against resumed remaining 9.615158. The classifier now runs under its
+own guard (`_settle_unclassifiable` resolves the attempt as `unclassified`,
+possibly billed, and counts `classify_failed:{scope}:{Type}`), and the
+liability is resolved before the pacer is settled. The exception that
+propagates is unchanged. `tests/test_billing_closure.py` 1o..1w-ii also drive a
+retry inside one logical call, the per-trial warmup and the async twin, none of
+which had been driven. The full account is `RECOVERY_P1_REPORT.md`.
+
+**P2 -- AN ABSENT COUNTER NO LONGER READS AS ZERO.** `run_counter_registry`
+(era 18) records which counters each health flush consulted, written with the
+`run_metrics` rows in one transaction by `flush_run_metrics(...,
+registered_names=)`; a names list that disagrees with the count, repeats, holds
+a non-identifier or omits a non-zero total refuses the whole flush.
+`historical_campaign_evidence` refuses under `counter_registration_unproven`
+when a predecessor has no registry, omits a required counter (named), or
+disagrees with its own meta count. **Consequence, stated: no database written
+before era 18 can be reused through the historical path.**
+
+**THE P2 RECOVERY FOUND THREE DEFECTS, DROVE EACH, AND FIXED THEM.**
+(i) **The refusal could fail to name its counter.** `detail` was `notes[:10]`, so
+a chain whose predecessors each carried a cohort and a finalization note filled
+the cap first and printed `counter_registration_unproven` naming nothing (six
+predecessors). `HistoricalEvidence.unproven_counters` now carries the names, and
+they lead the untruncated part of `detail`. (ii) **A flush without names left
+the previous flush's registry in place** beside a replaced health record. The
+registry rows are now deleted on every flush and inserted only when names are
+given. (iii) **The reader took any registry as the health record's own.** A
+registry now counts only when its rows carry the meta row's `written_at`, no
+name repeats, its distinct count equals the meta count, and every counter the
+health record values is registered. Failing any of those leaves EVERY required
+counter unproven; a consistent registry that lacks a counter names exactly that
+counter. The production database's one campaign, probed on a backup copy with
+the source opened `mode=ro`, is refused naming all six. See
+`RECOVERY_P2_REPORT.md`.
+
+**P3 -- ONE CAMPAIGN IDENTITY.** `runs.billing_campaign_id` (era 18) is stamped
+durably by `set_run_billing_campaign_id` before the first billed call.
+`queries._CAMPAIGN_EDGE_SQL` stitches on it first; only a run without one falls
+back to the resume rule, which now attaches only to runs without one either.
+`database_logger.campaign_parent_map` is the same rule in Python and replaces
+`campaign_run_ids`' two-directional walk; a test pins the two on every run.
+`campaign_summary` and `run_summary` project `billing_campaign_id` and the Run
+Health tables show it. `runs.resumed` keeps its meaning (a zero-success restart
+still reads 0).
+
+**THE P3 RECOVERY FOUND THE CODE CORRECT AND THE SURFACE'S PROSE STALE.** A
+zero-success restart, a `--fresh` start, a checkpoint resume and two checkpoint
+directories sharing one database were driven through the REAL
+`25- Batch Runner.py` and read back from `campaign_summary`, `run_summary` and
+the Run Health tables. Each budget is exactly one summary row, and no run,
+billing row or charge is duplicated or omitted. What was wrong was the Run
+Health campaign caption, its one-run statement and the Campaigns metric help:
+all three still described the `resumed` flag as the only way runs are stitched.
+They now name the billing-campaign rule. `tests/test_campaign_billing_record.py`
+6f-i..6f-v and 6u..6z pin the surface through real processes, including `--fresh`
+through the entry point. `tests/test_billing_closure.py` 3h/3h-i pins the legacy
+rule's billing-id filter (a refused resume stands alone), and 3f-i pins the
+caption. The residual (a legacy root continued by TWO billing campaigns shows
+one id) is unreachable through the runner, because the historical path refuses a
+billed predecessor. A revert matrix of nine plants caught all nine. Three were
+uncaught before this recovery: the resume rule's filter in SQL, the same filter
+in Python, and `--fresh` keeping the campaign record. One more aborted the file
+instead of failing: 3f's bare subscript, now guarded. See
+`RECOVERY_P3_REPORT.md`.
+
+**THE FIRST VERSION OF P3 HID THE RUN HEALTH TAB ON EVERY OLDER DATABASE, AND
+BUCKET A FOUND IT.** Declaring `runs.billing_campaign_id` in both queries'
+`requires_columns` made them SKIP on a pre-era-18 database, and
+`tests/test_dashboard_truthfulness.py` 10u/10v -- which renders the era-17
+production smoke database read-only -- lost the run table. Skipping was the
+wrong answer: on an older database no run carries an id, so NULL is the true
+reading and the stitch rule already falls back to the resume rule. `Query` now
+has `optional_columns`, and `queries.render_sql` (the SQL `run()` executes)
+rewrites every reference to an absent optional column, qualified by an alias
+bound to its table, as `NULL`. `tests/test_storage_schema_guards.py` 1a accepts
+a column declared required OR optional, and 1a-i refuses one declared both --
+the two are opposite answers to its absence. `tests/test_billing_closure.py` 3g
+drops the column from a real database and requires both queries to still
+answer, stitch by the older rule and report nothing missing.
+
+**P4 -- DURABILITY TO THE FILESYSTEM'S GUARANTEE.** Every connection that writes
+a reservation, a settlement or a run's billing campaign id sets `PRAGMA
+synchronous = FULL` (and `fullfsync = ON` on darwin) and READS BOTH BACK before
+its transaction (`_open_billing_connection`; refusal is
+`BillingDurabilityUnavailable`, terminal to the retry helper, and a refused
+reservation is an attempt not dispatched). MEASURED on this APFS volume:
+`fsync` returned in 0.018 ms and `F_FULLFSYNC` in 9.4 ms -- plain fsync does not
+reach the drive here, which is why darwin needs the second pragma. The identity
+file is synced (and `F_FULLFSYNC`'d) before its rename and through its directory
+after; a cleared record's removal is synced too. **A DIRECTORY whose
+`F_FULLFSYNC` is refused now REFUSES the campaign** (`campaign_record_unwritable`,
+naming the failed stage) -- the first version counted it and carried on, so a
+campaign could start with its rename only fsync-durable (the P4 recovery).
+**A READ-BACK IS NOT A SYNC**: SQLite's unix VFS falls back to fsync without
+reporting it when F_FULLFSYNC fails, so the evidence the call is issued on this
+machine is MEASURED, re-measured 2026-09-13 by the P4 recovery: a reservation
+commit is 14.5 ms p50 with fullfsync ON and 0.57 ms with it OFF (raw F_FULLFSYNC
+4.7 ms, plain fsync 0.13 ms, after a 4 KiB write). **FAILURE INJECTION THROUGH
+THE REAL `main()`** (`tests/test_billing_closure.py` 4s / 4t): a failed commit
+of the run's campaign stamp, a stamp connection reading back synchronous OFF, a
+failed fsync of the identity temp file, a failed fsync of its directory and a
+refused directory F_FULLFSYNC each exit 1 with ZERO provider calls, a printed
+refusal naming its reason, the run row KILLED with NO billing campaign id and no
+billing row -- and an ordinary restart then bills under one campaign with
+nothing reserved or counted twice. A reservation commit that raises mid-run
+dispatches nothing, latches `billing_record` and records it as the run's
+`stop_reason`. A genuinely FULL disk (a 4 MiB HFS+ image, scratch only) failed
+the reservation at connection open ("unable to open database file") rather than
+at commit: no dispatch, the latch set, `integrity_check` ok. **A missing record on resume,
+or any unreadable record, is RECOVERED** by `recover_campaign_identity` only when
+the rows establish exactly ONE open campaign for this configuration and cohort,
+and refused by name (`campaign_identity_unestablished`) when they are ambiguous,
+reach another configuration, or show a run that recorded billed work with no
+billing row. The bound is what the filesystem and hardware guarantee; a drive
+that acknowledges a flush it did not perform can still lose a synced commit.
+
+**WHAT DURABILITY COSTS, MEASURED, AND IT IS MATERIAL.** The real reserve/settle
+path, 12 patients x 16 attempts at a per-patient bound of 4:
+**32 billing commits per per-trial patient, measured** (the estimate held).
+
+| setting | serial reserve p50 | burst (no provider latency) lock wait p50 / p95 | 1-3 s provider latency, added per attempt p50 / p95 / max |
+|---|---|---|---|
+| FULL, no fullfsync (this Mac's default) | 0.45 ms | 21 / 64 ms | 5 / 25 / 30 ms |
+| shipped (FULL + fullfsync) | 14.8 ms | 700 / 860-1,440 ms | 146 / 614 / 720 ms |
+
+RE-MEASURED 2026-09-13 by the P4 recovery (the table above is the closure
+pass's, kept as written; the script and JSON are in that session's report). Same
+shape, plus a patient-end inference write under the same lock:
+
+| setting | serial reserve p50 | burst lock wait p50 / p95 | 1-3 s latency, added per attempt p50 / p95 / max |
+|---|---|---|---|
+| NORMAL, no fullfsync | 0.55 ms | 31 / 96 ms | 5.0 / 23.8 / 27.7 ms |
+| FULL, no fullfsync | 0.57 ms | 28 / 105 ms | 4.5 / 25.6 / 31.9 ms |
+| shipped (FULL + fullfsync) | 14.5 ms | 724 / 817 ms | 243 / 642 / 761 ms |
+
+FULL costs nothing over NORMAL here because plain fsync is ~0.1 ms on this
+volume; the whole cost is F_FULLFSYNC, serialized by the lock.
+
+The commit is serialized under `_WRITE_LOCK`, which `log_inference` and the
+health flush share. Against real Stage 5 latencies (seconds to tens of seconds)
+the added delay is a few percent; it is recorded rather than tuned. Options, not
+chosen here: group-commit reservations, a billing-only lock, or fullfsync off
+on darwin (which re-opens the drive-cache window). Linux containers ignore
+`fullfsync`; their fsync cost was not measured.
+
+```bash
+# The billing closure pass. Same shape, same directory. No network, no keys, NO
+# SPEND, no model load, no corpus. Children run the real main() with stand-in
+# clients and a closed Qdrant port. NOT in the collision matrix; the production
+# digest is compared at the end. It EXECS NOTHING. Bucket A.
+python tests/test_billing_closure.py                                # 274 (MEASURED 2026-09-13 by the P4c recovery session under the network sandbox with production reads denied, the audit-hook tripwire and an isolated root; was 256. The +18 are 4y..4zd: the restored older database with both charge classes, the crash between marker and checkpoint removal, (id, started_at) identity, malformed closures, legacy version-1 markers refused or moot, and --fresh over a legacy or unreadable marker; 4q-iii/vi/viii were rewritten for identity closures. Before that 256, MEASURED 2026-09-13 by the P4b recovery session under the network sandbox with production reads denied, the audit-hook tripwire and an isolated root; was 231. The +25 are 4q..4q-x (a missing record with no checkpoint recovered, repeated recovery, the --fresh watermark, an unreadable marker, ambiguity, the entry-point ordering), 4w-* (an identity-write failure while recovering a billed campaign, and the corrected refusal) and 4u..4u-iii (the same through the REAL main() in fresh processes). Before that 231, MEASURED 2026-09-13 by the P4 recovery session under the network sandbox, an audit-hook tripwire and an isolated project root; was 193. The +38 are 4f-i, 4f-ii, 4r..4r-ii and the section-4 continuation's failure injections through the REAL main(), 4s-* and 4t. Before that 193, MEASURED 2026-09-13 by the P3 recovery session under the network sandbox and tripwire; was 190. The +3 are 3h, 3h-i and 3f-i. Before that 190, MEASURED by the P2 recovery session under the network sandbox and tripwire; was 178 -- the +12 are section 2i..2o, the P2 recovery. Before that 178, MEASURED by the P1 recovery session under the network sandbox and tripwire; this line said 132 and the inherited file already reported 135. The +43 are section 1's 1o..1w-ii: a raising classifier, a raising pacer settlement, a retry inside one call, the warmup and the async twin)
+```
+
+**NINETEEN REVERTS, NINETEEN CAUGHT**, each in a copied tree with the editable
+finder stripped, a realpath preflight, the plant anchor-counted and ast-parsed,
+under the sandbox; the real tree byte-unchanged afterwards. One plant (identity
+recovery removed) ABORTED the file on an unguarded read in 4h-i; the read is
+guarded now. Pins moved with arguments: era 17 -> 18, the table pins (+1, three
+files), the index pin (+1), `_WRITE_LOCK` sites 9 -> 10, `test_spend_gate.py`
+9b re-pointed at the attempt record (165 checks) and 9h re-anchored,
+`test_campaign_billing_record.py`'s legacy fixture nulls `billing_campaign_id`.
+
+**WHAT IS NOT DONE.**
+
+1. ~~**A MISSING identity record with NO checkpoint is a NEW campaign**~~ --
+   CLOSED by the P4b recovery. It was not a residual but the defect: a campaign
+   whose every patient failed, with its record deleted, restarted at $0 while its
+   settled charges and unresolved reservations sat in the billing record
+   (measured in two fresh processes: $1.65, seed $0.00). Recovery now runs
+   whenever the record is missing, and `--fresh` stays separate through a
+   durable per-directory marker (`batch_runner_fresh_start.json`,
+   `runner.record_fresh_start`), written BEFORE the checkpoint is cleared.
+   **P4c replaced its run-number cutoff with campaign IDENTITIES**: the P4b
+   marker skipped every campaign at or below a run number, and a restored older
+   database reuses run numbers, so a campaign billed after the restore was
+   skipped and the restart began at $0 (measured in fresh processes: $1.25
+   settled + $0.40 reserved at run 21 under a marker written at run 100, seed
+   $0.00). A version-2 marker names each campaign it closed with the runs it had
+   touched as `(id, started_at)`; recovery skips a campaign only while every run
+   it touches is one of those, so a campaign that bills again after a closure (a
+   `--fresh` that died before clearing, or another directory's adoption) is
+   judged as open. A version-1 marker is never converted: with the record
+   missing, recovery is asked with and without its cutoff, and where the two
+   disagree ordinary paid startup is refused as `fresh_marker_unverifiable`.
+2. **Recovery can adopt ANOTHER checkpoint directory's campaign** when that is
+   the only open campaign sharing the configuration and cohort in one database.
+   The direction is over-counting, but the two campaigns would then share a
+   budget. **Since P4b this also reaches a new checkpoint directory's FIRST
+   run**, not only a resume: a second directory started on the identical
+   configuration and cohort continues the first directory's open campaign unless
+   it is started with `--fresh`.
+3. **No pre-era-18 database can use the historical path** (P2's consequence).
+4. **The durability cost above is accepted, not optimised.**
+5. **A response priced ABOVE its reservation whose settlement fails** leaves the
+   durable row at the lower reservation while the ledger holds the priced
+   amount -- resumed remaining is then higher than live. Reachable only when the
+   input estimate under-counts tokens.
+6. **The ablation study, API and MCP server still install no sink**, unchanged.
+7. **A clean finish that dies between clearing its checkpoint and finalizing its
+   run FINISHED** leaves an unfinished campaign with no record; the next run
+   recovers and continues it (over-counting). Found by the P4b review; not
+   driven.
+
+**TESTS NEVER OPEN THE PRODUCTION DATABASE (the P4b recovery).**
+`tests/_db_snapshot.py` is the one owner: `snapshot()` copies the file and its
+`-wal` as BYTES and proves the copy consistent (source digests equal before and
+after, copy equal to both, else `SnapshotInconsistent`); `frozen_copy()`
+checkpoints that COPY into one file, which is the only thing `immutable=1` may
+be pointed at; `ProductionConnectGuard` refuses and records any
+`sqlite3.connect` resolving to the production path, before open.
+`test_storage_query_layer.py`, `test_storage_write_durability.py` and
+`test_dashboard_truthfulness.py` use it, and each says its "production
+untouched" row comparison measures snapshots while the production files are
+compared by bytes. Measured before the change with an audit hook against an
+isolated copy: 17 opens (two `mode=ro` sites, which create WAL side files, one
+plain read-write through the unredirected cost-tab loader, and twelve
+`immutable=1`); after it, zero.
+
+
+### Budget admission is atomic (E1)
+
+**THE SPEND GATE'S OVERSHOOT STATEMENTS ABOVE ARE SUPERSEDED, NOT REWRITTEN.**
+The spend-gate pass stated the cap was honoured "to within the requests in
+flight" at their measured price. Under the liability rule a possibly-billed
+failure is charged its WHOLE reservation, so the real gap was the sum of the
+reservations in flight -- measured on the unchanged code, two $9 reservations
+both admitted against a $10 cap and $18 charged (`RECOVERY_E1_REPORT.md`).
+
+Every billed attempt created through `spend.AttemptLiability` is now ADMITTED
+only when committed spend plus every open reservation plus its own reservation
+fits under the cap, as ONE step: `SPEND_LEDGER.admit_hold` under the ledger's
+lock (the process authority), or one `BEGIN IMMEDIATE` transaction in
+`database_logger.reserve_billing_attempt` that reads
+`campaign_liabilities` and inserts only when it fits (the durable authority, used
+for the campaign budget when the shipped sink is installed; shared by every
+process on the database). Equality is admitted. A decline is
+`spend.BudgetAdmissionDeclined` (a `SpendLimitReached`), counted in
+`SPEND_ADMISSION_DECLINES`; `budget_exhausted` latches the run under the
+campaign policy, `headroom_held` never latches. Settlement replaces the hold
+with the charge in one critical section; resolution is exactly once under a
+per-liability lock. The reservation amount is SUPPLIED; admission does not
+depend on the Stage 5 bound's multipliers.
+
+**THE COST IS THROUGHPUT AND IT IS NOT SOLVED.** At the assumed Stage 5 bound
+($9.042) full parallelism needs $217 of headroom, so throttling begins at $83
+committed ($188 at the no-premium $4.653), and a held decline FAILS the patient
+rather than waiting -- near the cap a campaign churns through its cohort without
+latching. The durable authority's SQL aggregate is linear in the campaign's
+rows (~23 ms at 20k) and runs under the write lock per reservation. Both are in
+the report as open items.
+
+> **SUPERSEDED BY E1b -- the sentence above about a held decline is kept as
+> written.** On the Stage 5 path a `headroom_held` decline now WAITS, bounded
+> and cancellable, and a timeout stops the run cleanly (`stop_reason =
+> admission_wait`) with its unfinished patients left to a resume. See "A held
+> decline waits, and a replayed reservation is recognised (E1b)" at the end of
+> this file. The durable aggregate's linear cost is unchanged and still open.
+
+```bash
+python tests/test_budget_admission.py                               #  67
+```
+
+Counts that moved, each re-derived in place: `tests/test_spend_gate.py` 164 ->
+**167** (sections 4-9 now supply one call's price as the reservation; section 5
+measures ZERO overshoot; 9e-9h are caught by their accounting, since a bypassed
+call-site gate no longer reaches the wire). `test_billing_closure.py` **388**,
+`test_campaign_billing_record.py` **128** and
+`test_agent_stage5_attempt_provenance.py` **55** did not move; their caps were
+re-derived (1v needs two reservations; 6A and scenario A need 4.5 responses).
+
+
+### A held decline waits, and a replayed reservation is recognised (E1b)
+
+**TWO FOLLOW-UPS TO E1, BOTH CONFIRMED ON THE UNCHANGED CODE BEFORE ANYTHING WAS
+EDITED.**
+- **Spend and commits.** No paid call. The work exists only as WIP commits on
+  `wip/billing-closure`, each marked NOT FOR PUSH.
+- **Containment.** The original session's runs claimed the OS network sandbox
+  and the audit-hook tripwire against an isolated project root, but for several
+  of them no wrapper or tripwire evidence survived. Recovery batches B1-B6
+  re-ran the evidence on the final tree, with a sandbox launch record and a
+  tripwire marker for every Python process. No external network attempt was
+  recorded. The residual coverage gaps are in the report's section 15.4.
+- **Production files.** The E1b session's only byte comparison (12:06:57) was
+  taken before its final production edit (12:12:19). Batch B6 compared the 40
+  production files by bytes, outside the sandbox and without SQLite, at
+  22:19:44Z and 22:21:43Z. They were unchanged against the start-of-session
+  inventory (11:16-11:20). That cannot exclude a change made and reverted in
+  between.
+- **Digests.** `PROMPT_VERSION`, `FINGERPRINT_VERSION` and
+  `llm_classifier_renderer_digest` are unchanged, recomputed on the final tree
+  by B6.
+- **Full account.** `RECOVERY_E1B_REPORT.md`. Its section 15 records what E1b
+  did not establish, the CI coverage of the remaining checks, and the open
+  limits.
+
+**1. A REPLAYED RESERVATION WAS COUNTED AS ITS OWN HOLD.**
+`reserve_billing_attempt` decided admission before it asked whether the attempt's
+row already existed. Its own write retry re-runs a transaction whose commit
+landed and whose acknowledgement was lost, so the retry found its committed row,
+counted it as held, and declined `headroom_held`. Measured on the unchanged code:
+a $9 reservation under a $10 cap was declined, zero provider calls were made, and
+a RESERVED $9 row was left for every later reader to charge.
+
+The fix is `reserve_billing_attempt_outcome`. Inside ONE `BEGIN IMMEDIATE` it
+looks the attempt id up first:
+- **no row**: admission, then the insert (`written`);
+- **an identical row**: nothing inserted, no admission (`replayed`);
+- **a row that disagrees**: `BillingReservationConflict`, naming the fields that
+  disagree. A settled attempt cannot be replayed.
+
+**A REPLAY IS ACCOUNTING, NOT PERMISSION TO SEND.** Every dispatch creates a new
+attempt id, so a new wire attempt always reserves anew.
+
+`SpendLedger.admit_hold` applies the same rule to a hold token. The same token
+with the same source and amount is admitted without doubling; anything else
+raises.
+
+**2. A HELD DECLINE NOW WAITS, BOUNDED AND CANCELLABLE.** On the Stage 5 path,
+`provider_resilience.execute` handles a `headroom_held` decline in four steps:
+1. It refunds the pacer permit.
+2. It asks the attempt record to wait (`spend.HeadroomWait`).
+3. The wait ends in one of three verdicts:
+   - `recheck`: take a new paced slot and run the whole atomic admission again;
+   - `cancelled`: stop;
+   - timeout: `Stage5SpendStopped` with `limit = admission_wait`.
+4. Nothing is held while waiting: not the database transaction, not
+   `_WRITE_LOCK`, not the ledger lock, not the pacer permit.
+
+| | |
+|---|---|
+| timeout | `config.admission_wait_timeout_seconds()` = `ADMISSION_WAIT_RELEASE_ROUNDS (2) x MATCHING_REQUEST_TIMEOUT_SECONDS (300) x SDK attempts (1)` = **600 s**, overridable. Uncalibrated |
+| deadline | ONE monotonic deadline per wait, set on entry, never reset by a recheck |
+| cancellation interval | `PROVIDER_WAIT_POLL_SECONDS` = **0.25 s**, through Stage 5's existing predicate (shutdown flag, drain, spend stop, cap exceeded) |
+| wake-ups | a settling liability notifies the queue; the head waiter asks a READ-ONLY preview, and also rechecks every `ADMISSION_WAIT_RECHECK_SECONDS` (1.0 s) because releases by another process notify nothing |
+| fairness | first-in, first-out within the process; queue entries expire, so a dead waiter cannot block the queue |
+| timeout outcome | campaign policy: `SPEND_STOP` latches `admission_wait`, the run is STOPPED with `stop_reason = admission_wait`, unfinished patients are not checkpointed and a fresh process resumes them. Serving window: that request only |
+| exhaustion | `budget_exhausted` does not wait and still latches `spend_cap` |
+
+`SPEND_ADMISSION_WAITS` is registered and keyed `{source}:{outcome}`. Once no
+wait is open, `entered` equals admitted + timed_out + cancelled + exhausted +
+failed.
+A stop the retry policy sees itself -- after a positive preview, or while
+waiting for the paced slot -- also ends the wait `cancelled`, never `failed`
+(`end_admission_wait(cancelled=True)`; the self-review fix, check 4n-i).
+
+**THE 48-PATIENT SIMULATION, RE-RUN.** The session's own run was taken before
+its final production edit. B6 ran the simulation twice more on the final tree,
+under containment. It covers 28 scenarios: the assumed and the no-premium
+reservations, with the cache working and absent. Both post-fix runs showed:
+- **held failures: 0 at every baseline**;
+- no wait timed out, and nothing is held or queued at the end;
+- 48/48 complete from $0 to $250;
+- at $285, three of the four arms latch `spend_cap` with work stopped or not
+  started; the no-premium, cache-working arm completes 48/48.
+
+Every outcome column is identical across the two runs. The wait and decline
+tallies are not: "waits entered" differs by up to 79 between the two identical
+runs, so each tally is one sample rather than a stable value.
+
+**NOT COVERED:** Stage 2's embedding, the rater, and any direct
+`begin_billed_attempt` caller keep E1's immediate decline and are not queued.
+`execute_async` does not wait.
+
+```bash
+# E1b. No network, no keys, NO SPEND, no model load, no corpus. Real threads,
+# fresh child processes and a real runner main(); every database is a temp
+# file. NOT in the collision matrix. It EXECS NOTHING. Bucket A.
+python tests/test_admission_replay_and_wait.py                      #  71
+```
+
+Counts that moved, each argued in place: `tests/test_spend_gate.py` **167**
+(`SPEND_LIMITS` 4 members, the `SPEND_` counter set, and the stop-reason
+vocabulary pin 8d-i); `tests/test_spend_coverage.py` **169**;
+`tests/test_campaign_billing_record.py` 2i checks the conflict class by
+`isinstance`, still **128**.

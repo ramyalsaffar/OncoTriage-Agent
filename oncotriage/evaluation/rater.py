@@ -3670,8 +3670,8 @@ STATE_SPEND_KEY = "spend_usd"
 """Where a rater session records what it has spent, inside its state file.
 
 **THIS IS THE RATER'S CAMPAIGN CHAIN AND IT IS ITS OWN, NOT THE BATCH
-RUNNER'S.** ``oncotriage/storage/database_logger.py:campaign_spend_before``
-walks the ``runs`` table backwards over identical fingerprint columns; a rater
+RUNNER'S.** ``oncotriage/storage/database_logger.py:campaign_billing_total``
+reads the batch campaign's cumulative ``billing_attempts`` record; a rater
 session has no ``runs`` row, writes no ``inferences``, and its own resume
 gesture is ``--resume <batch id>`` against a state file that already persists
 across invocations. So the state file IS the chain, and the running total goes
@@ -3686,7 +3686,7 @@ that did not need covering.
 **WHAT IT DOES NOT DO, STATED PLAINLY: it does not net the judge's spend
 against the batch runner's.** They are separate processes with separate
 ledgers, and no shared store exists that both could read -- the rater writes
-none of the columns ``campaign_spend_before`` sums.
+no row of the ``billing_attempts`` record ``campaign_billing_total`` sums.
 
 **AND THE TWO ARE NOT ONE BUDGET EITHER, WHICH IS NOW THE DESIGN RATHER THAN AN
 ACCIDENT.** ``config.RATER_SPEND_CAP_USD`` binds a judge session across its

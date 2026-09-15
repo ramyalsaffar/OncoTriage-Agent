@@ -1031,6 +1031,81 @@ BUCKETS = {
         "controls each exec an in-memory copy of "
         "oncotriage/agent/evaluation.py with one part of the mechanism "
         "broken"),
+    "test_billing_closure.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire: the "
+        "in-process ledger and the durable billing record charge ONE amount "
+        "per billed attempt for every outcome class (live remaining equals "
+        "resumed remaining), the counter registry proves a historical zero or "
+        "refuses by name, a zero-success restart is one campaign in "
+        "campaign_summary, every billing write reads back synchronous FULL "
+        "(and fullfsync on darwin) before its transaction, the identity file "
+        "is synced before its rename and recovered only where the billing "
+        "rows establish it, and CHILD PROCESSES running the real main() "
+        "reconcile a synthetic campaign live versus resumed per outcome. "
+        "Every provider client is a stand-in, every child gets a closed "
+        "Qdrant port, every database is a temp file and the production digest "
+        "is compared at the end"),
+    "test_campaign_billing_record.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire: a "
+        "resumed batch campaign's budget includes every billed attempt of "
+        "every earlier process. Drives the durable billing record's reserve "
+        "and settle arithmetic, the retry policy's attempt hook beside the "
+        "in-process ledger, a persistence failure through the real Stage 5 "
+        "node, the Converse arm's cache-unconfirmed path through the real "
+        "graph and writer, and CHILD PROCESSES running the real main() -- a "
+        "billed attempt then a zero-usage failure then a fresh process, "
+        "SIGKILLs between reservation and settlement and mid-settlement, two "
+        "concurrent campaigns in one database, and covered and uncoverable "
+        "historical campaigns. Every provider client is a stand-in, every "
+        "child gets a closed Qdrant port, every database is a temp file and "
+        "the production digest is compared at the end"),
+    "test_budget_admission.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire (E1): "
+        "atomic budget admission. Real threads race for the last headroom "
+        "under the in-process and the durable (BEGIN IMMEDIATE) authority and "
+        "exactly one is admitted; child processes sharing one database race "
+        "the same way; a full wave is admitted and released; a resumed balance "
+        "plus live holds is counted once; the boundary is driven through Stage "
+        "5's public entry and through CHILD PROCESSES running the real main(); "
+        "settle and release happen once under duplicate and out-of-order "
+        "completion; a SIGKILL before the reservation commit leaves nothing "
+        "and one after it leaves the reservation counted. Every provider "
+        "client is a stand-in, every database is a temp file, and the "
+        "production database is never opened"),
+    "test_admission_replay_and_wait.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire (E1b): a "
+        "replayed reservation is recognised inside its transaction and a "
+        "mismatch is refused by name, in process and in FRESH PROCESSES after "
+        "a commit whose acknowledgement was lost; a headroom_held decline "
+        "waits with real workers -- released by another worker's settlement "
+        "under both authorities with no lock or pacer permit held, one "
+        "deadline across rechecks, prompt cancellation by the shutdown flag, "
+        "a spend stop and the drain, first-in first-out -- and a timeout stops "
+        "the REAL main() STOPPED with its unfinished patients resumed by a "
+        "fresh process. Every provider client is a stand-in, every database is "
+        "a temp file, and the production database is never opened"),
+    "test_agent_stage5_attempt_provenance.py": (
+        _A, None,
+        "ran green under an OS network sandbox and a socket tripwire that "
+        "recorded zero attempts: a stored Stage 5 row describes ONE attempt. "
+        "Drives the real Stage 5 node, the real router and the real terminal "
+        "nodes on a StateGraph over the real TrialMatchState, then the real "
+        "log_inference into a scratch database, through both orders -- a "
+        "billed attempt followed by attempts that issue nothing, and a billed "
+        "failure followed by a success -- and a floor followed by mid-loop "
+        "failures; checks each row against the final attempt and the spend "
+        "ledger against every attempt. Stage 5 stand-in installed through "
+        "oncotriage.agent.deps; no network, no keys, no spend, no live "
+        "Qdrant, no model load, no corpus, no git history. Every database is "
+        "inside a tempfile.mkdtemp removed and asserted gone, and the five "
+        "source files it reads are sha256-compared at the end, so it is NOT "
+        "in the collision matrix. An _EXEC_ALLOWLIST member: two controls "
+        "exec an in-memory copy of oncotriage/agent/evaluation.py with the "
+        "leak restored"),
     "test_agent_state_channel_coverage.py": (
         _A, None,
         "ran green in 2.1s, 73 checks, against ONLY the directory skeleton, "

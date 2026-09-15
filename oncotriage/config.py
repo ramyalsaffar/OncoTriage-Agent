@@ -1752,8 +1752,9 @@ configuration the bare id is a 400 waiting to happen.
 
 PRICING: whichever value is set here is the key `get_model_cost()` looks up,
 because `inferences.matching_model` records the model that answered. See
-PRICING_CONFIG, and read A6 in the adapter's VERIFY-AT-GO-LIVE list before
-trusting the geo rows -- they are INFERRED, not measured."""
+PRICING_CONFIG. Its Sonnet 4.6 rows were verified against AWS's Amazon Bedrock
+pricing page on 2026-09-14; A6 in the adapter's VERIFY-AT-GO-LIVE list is where
+a console bill is compared against them."""
 
 BEDROCK_ANTHROPIC_CONNECT_TIMEOUT_SECONDS = 5.0
 """Connect-phase budget for the boto3 client, in seconds.
@@ -2583,7 +2584,59 @@ PROVIDER_WAIT_POLL_SECONDS = 0.25
 """How promptly a pacing or backoff wait notices a shutdown, a spend stop or
 the operator's STOP. The waits are POLLED rather than event-driven because the
 Stage 5 shutdown flag is a plain module boolean set from a signal handler, and
-`threading.Event.set()` takes a lock a handler must not take."""
+`threading.Event.set()` takes a lock a handler must not take.
+
+IT IS ALSO THE CANCELLATION-CHECK INTERVAL OF AN ADMISSION WAIT (E1b): a billed
+attempt waiting for held budget headroom asks its cancellation predicate at
+least this often, so a shutdown is not delayed by that wait either."""
+
+ADMISSION_WAIT_TIMEOUT_SECONDS = None
+"""How long ONE billed attempt may wait for headroom held by this process's own
+open reservations before the run is stopped (E1b). None derives it; see
+`admission_wait_timeout_seconds()`. A number overrides the derivation (tests set
+a few seconds); it must be positive and finite.
+
+WHAT THE DERIVATION BOUNDS. Held headroom belongs to attempts already on the
+wire, and one Stage 5 wire attempt lives at most its read budget,
+`MATCHING_REQUEST_TIMEOUT_SECONDS`, per SDK attempt. So every hold that existed
+when a waiter entered the queue is released within ONE such lifetime, and the
+attempts admitted ahead of it in that first release round finish within a
+SECOND. `ADMISSION_WAIT_RELEASE_ROUNDS` is that two. A waiter still not admitted
+after both rounds is behind more work than two rounds release, and the run
+STOPS with its unfinished patients left to a resume rather than crawling at a
+concurrency the cap no longer supports. As shipped: 2 x 300 s x 1 = 600 s.
+UNCALIBRATED beyond that argument: no real campaign has measured how long held
+headroom takes to release near the cap."""
+
+ADMISSION_WAIT_RELEASE_ROUNDS = 2
+"""Release rounds an admission wait covers. See `ADMISSION_WAIT_TIMEOUT_SECONDS`."""
+
+ADMISSION_WAIT_RECHECK_SECONDS = 1.0
+"""How often the attempt at the head of the admission queue re-asks, READ-ONLY,
+whether it would fit when no in-process release has woken it (E1b). A release
+inside this process wakes waiters at once; releases by ANOTHER process sharing
+a durable campaign notify nothing, and this is how they are noticed. One
+read-only query per second per waiting budget, not per waiter: only the head
+asks."""
+
+
+def admission_wait_timeout_seconds() -> float:
+    """The admission wait's timeout, in seconds (E1b). RAISES ``ValueError`` for
+    an override that is not a positive finite number -- a configuration defect,
+    surfaced by name rather than read as zero (no wait) or as infinity (an
+    unbounded one)."""
+    override = ADMISSION_WAIT_TIMEOUT_SECONDS
+    if override is not None:
+        if (isinstance(override, bool) or not isinstance(override, (int, float))
+                or override != override or override <= 0
+                or override == float("inf")):
+            raise ValueError(
+                f"config.ADMISSION_WAIT_TIMEOUT_SECONDS must be None or a "
+                f"positive finite number of seconds, not {override!r}")
+        return float(override)
+    return float(ADMISSION_WAIT_RELEASE_ROUNDS
+                 * MATCHING_REQUEST_TIMEOUT_SECONDS
+                 * matching_sdk_attempts_per_call())
 
 PROVIDER_QUOTA_LOOKUP_CODES = {
     MATCHING_PROVIDER_OPENAI: None,
@@ -3353,9 +3406,9 @@ def _validate_bedrock_anthropic_config():
             f"PRICING_CONFIG. get_model_cost() RAISES on an unpriced model by "
             f"design, so this configuration would spend a live Stage 5 call "
             f"and then fail to write the row it paid for. Add a row for it in "
-            f"oncotriage/config.py -- and read VERIFY-AT-GO-LIVE (A6) first: "
-            f"only the 'global.' row is measured, the rest are inferred at a "
-            f"+10% geo premium.")
+            f"oncotriage/config.py, taken from AWS's Amazon Bedrock pricing "
+            f"page (the Global and the Geo/In-region tables differ), and see "
+            f"VERIFY-AT-GO-LIVE (A6).")
 
     if BEDROCK_ANTHROPIC_CACHE_TTL not in BEDROCK_ANTHROPIC_CACHE_TTLS:
         raise RuntimeError(
@@ -6040,17 +6093,31 @@ PRICING_CONFIG = {
         # absent from this table raises UnknownModelPricingError before a row
         # is written.
         #
-        # READ THIS BEFORE TRUSTING A COST ON THIS BRANCH: ONE ROW IS MEASURED
-        # AND THE OTHERS ARE INFERRED, and they are labelled individually
-        # rather than as a block.
+        # EVERY RATE IN THE SIX ROWS BELOW IS VERIFIED against AWS's Amazon
+        # Bedrock pricing page (the R1b recovery, retrieved 2026-09-14). The
+        # page renders its Claude price cells from its own data endpoint,
+        # b0.p.awsstatic.com/pricing/2.0/meteredUnitMaps/bedrockfoundationmodels/
+        # USD/current/bedrockfoundationmodels.json (publication 2026-09-11), and
+        # each "Claude Sonnet 4.6" cell was mapped to its entry. Per 1M tokens:
         #
-        # MEASURED, 2026-08-30, from the AWS Marketplace listing the Claude
-        # Sonnet 4.6 model card names as its own product (prod-ffvjxvh4ltq64),
-        # per 1M tokens, all dimensions published as GLOBAL:
-        #
+        #   Global Cross-region Inference (identical in all 33 regions):
         #     Input                $3.00      Response            $15.00
         #     Cache read           $0.30      Cache write (5m)     $3.75
         #     Cache write (1h)     $6.00      Batch in/out   $1.50 / $7.50
+        #
+        #   Geo and In-region Cross-region Inference (identical in all 19
+        #   regions, including US East (N. Virginia) and EU (London)):
+        #     Input                $3.30      Response            $16.50
+        #     Cache read           $0.33      Cache write (5m)     $4.125
+        #     Cache write (1h)     $6.60      Batch in/out   $1.65 / $8.25
+        #
+        # EARLIER PROVENANCE, KEPT AS HISTORY: the global row was first read from
+        # the AWS Marketplace listing (prod-ffvjxvh4ltq64, 2026-08-30) and the geo
+        # rows were INFERRED at +10%. The page confirms both. AWS publishes the geo
+        # prices as their own row, not as a stated multiplier, so a geo row is
+        # already the geo price and applying a geo factor on top of it would
+        # double count. The page states NO long-context price for this model:
+        # see STAGE5_ATTEMPT_LIMITS, assumption (4).
         #
         # THE CACHE DIMENSIONS ARE MODELLED NOW, ADDITIVELY, AND
         # `get_model_cost()` STILL IS NOT. That function reads "input" and
@@ -6091,95 +6158,70 @@ PRICING_CONFIG = {
         # raises UnknownCachePricingError and stores NULL, which is
         # get_model_cost()'s own refusal applied to the second figure.
         #
-        # INFERRED, NOT MEASURED -- the geo and In-Region rows below. That
-        # listing publishes Global dimensions only. The +10% premium is carried
-        # over from the pattern this project already recorded for GPT-5.6 Terra
-        # (geo $2.20/$13.20 against global $2.00/$12.00 on a $2.00/$12.00 base)
-        # and is corroborated only by secondary sources. It is here rather than
-        # absent because an absent row makes get_model_cost() raise and the
-        # branch unable to write a row at all; it is labelled because a number
-        # nobody measured must not read like one somebody did. VERIFY-AT-GO-LIVE
-        # (A6) is the item that settles it against a console bill.
+        # THE GEO AND IN-REGION ROWS WERE INFERRED UNTIL 2026-09-14 and are now
+        # verified (above). VERIFY-AT-GO-LIVE (A6) remains where a console bill
+        # is compared against them; no bill has been reconciled yet.
         #
-        # bedrock-runtime, global cross-Region profile. MEASURED.
+        # bedrock-runtime, global cross-Region profile. VERIFIED 2026-09-14.
         "global.anthropic.claude-sonnet-4-6": {
             "input": 3.00,
             "output": 15.00,
-            # MEASURED, from the same 2026-08-30 listing as the two rates
-            # above: "Cache read $0.30", "Cache write (5m) $3.75", "Cache
-            # write (1h) $6.00". They are 0.10x, 1.25x and 2.00x this row's
-            # own input rate, which is the multiplier set the five INFERRED
-            # rows below apply to their own inferred base.
+            # VERIFIED 2026-09-14 against the pricing page (above): cache read
+            # $0.30, cache write $3.75 (5m) / $6.00 (1h) -- 0.10x, 1.25x and
+            # 2.00x this row's own input rate. The five geo rows below carry the
+            # same multipliers on their own published base.
             "cache_read": 0.30,
             "cache_write": {"5m": 3.75, "1h": 6.00}
         },
-        # bedrock-runtime, US geographic profile. THE SHIPPED DEFAULT. INFERRED.
+        # bedrock-runtime, US geographic profile. THE SHIPPED DEFAULT. VERIFIED
+        # 2026-09-14.
         "us.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, EU geographic profile. INFERRED.
+        # bedrock-runtime, EU geographic profile. VERIFIED 2026-09-14.
         "eu.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, AU geographic profile. INFERRED.
+        # bedrock-runtime, AU geographic profile. VERIFIED 2026-09-14.
         "au.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, JP geographic profile. INFERRED.
+        # bedrock-runtime, JP geographic profile. VERIFIED 2026-09-14.
         "jp.anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
-        # bedrock-runtime, In-Region. Reachable in eu-west-2 alone. INFERRED.
+        # bedrock-runtime, In-Region. Reachable in eu-west-2 alone. VERIFIED
+        # 2026-09-14.
         "anthropic.claude-sonnet-4-6": {
             "input": 3.30,
             "output": 16.50,
-            # INFERRED, exactly as this row's input and output are, and by the
-            # SAME arithmetic rather than by a second guess: the measured
-            # global row's cache rates are 0.10x / 1.25x / 2.00x its own input
-            # rate, and those multipliers are applied to the inferred 3.30
-            # base here. So a correction to the geo premium moves all five
-            # numbers in this row together and cannot leave the cache rates
-            # describing a base nobody uses. A6 settles the premium.
+            # VERIFIED 2026-09-14: the published Geo and In-region rates, 0.10x
+            # / 1.25x / 2.00x of this row's own $3.30 input. They were once
+            # inferred from the global row; the pricing page confirmed them.
             "cache_read": 0.33,
             "cache_write": {"5m": 4.125, "1h": 6.60}
         },
@@ -6193,6 +6235,284 @@ PRICING_CONFIG = {
         }
     }
 }
+
+
+# ===========================================================================
+# STAGE 5 BILLED-ATTEMPT UPPER BOUND (the R1 recovery)
+# ===========================================================================
+#
+# WHAT THIS REPLACES. A Stage 5 attempt used to reserve ``(characters /
+# PROVIDER_RESERVATION_CHARS_PER_TOKEN) + 1`` input tokens plus its output
+# ceiling, priced at the base input rate. That is an ESTIMATE: a tokenizer can
+# emit more tokens than characters / 3, a cache WRITE bills above the base input
+# rate, and a long-context request bills above both. So a response could be
+# priced above its reservation, and when every durable write after dispatch
+# failed (P1c item 2), a fresh process read the reservation -- below the charge.
+#
+# THE BOUND IS DERIVED FROM DOCUMENTED PROVIDER LIMITS, NEVER FROM THE TEXT, on
+# P1b's embedding precedent (oncotriage/agent/models.py). For ONE wire request:
+#
+#   billed input tokens  <= context_window_tokens
+#       The provider refuses, and does not bill, a prompt longer than its
+#       context window. Anthropic ("Context windows", read 2026-09-14): "If the
+#       input alone already exceeds the model's context window, the API returns
+#       a 400 invalid_request_error ('prompt is too long') on every model." A
+#       400 is classified CATEGORY_CLIENT -> not billed.
+#   billed output tokens <= min(the request's own output ceiling,
+#                               max_output_tokens)
+#       The ceiling the adapter puts in the request. Reasoning/thinking tokens are
+#       INSIDE it: Anthropic, "Thinking tokens are a subset of your max_tokens
+#       parameter, are billed as output tokens"; the installed OpenAI SDK
+#       (1.99.9) documents max_completion_tokens and max_output_tokens as "An
+#       upper bound for the number of tokens that can be generated ...,
+#       including visible output tokens and reasoning tokens".
+#
+# PRICED AT THE DEAREST CLASS EACH HALF CAN BILL, whatever the request looks
+# like: input at max(base input, cache read, cache write) x the long-context
+# input multiplier; output at the output rate x the long-context output
+# multiplier. The two halves are bounded INDEPENDENTLY (no "input + output <=
+# window" coupling is assumed), so a long-context price that applies "for the
+# full request" is covered too.
+#
+# EVERY WIRE REQUEST IS COVERED. One reservation per policy attempt (see
+# provider_resilience.execute); an SDK that retries INSIDE one send multiplies
+# the bound by matching_sdk_attempts_per_call(), which is 1 on all three arms as
+# shipped.
+#
+# THE DOCUMENTED ASSUMPTIONS, STATED RATHER THAN IMPLIED:
+#   (1) the provider enforces its own documented context window and output
+#       ceiling on the tokens it bills;
+#   (2) Bedrock bills the model the request NAMED (the wire id); a response that
+#       echoes a pricier model is priced above the reservation and is caught by
+#       spend.AttemptLiability's discrepancy rule, not by this bound;
+#   (3) the rates in PRICING_CONFIG and the multipliers below are the provider's;
+#   (4) SONNET 4.6 ON BEDROCK: NO AWS DOCUMENT STATES WHETHER A LONG-CONTEXT
+#       PREMIUM APPLIES, SO THE MULTIPLIERS BELOW ARE ASSUMED AND THE SHIPPED
+#       ARM'S BOUND IS CONDITIONAL ON THEM, NOT PROVEN. Checked 2026-09-14 (the
+#       R1b recovery). The AWS model card states "Context window: 1M tokens" and
+#       no price. The AWS pricing page, and the data endpoint it renders from,
+#       publishes one on-demand rate per class for Claude Sonnet 4.6 (input,
+#       output, batch, 5m and 1h cache write, cache read) with no long-context
+#       row or column, and the page contains no "long context", "200K" or
+#       "context window" text. It shows no long-context column for ANY Claude
+#       model, so that absence is not evidence the page would show a premium if
+#       one existed, and missing documentation does not prove the premium is
+#       zero. Anthropic's own terms for its API do not establish Bedrock's.
+#       So the Sonnet rows carry an ASSUMED CEILING of 2.0x input / 1.5x output
+#       -- the long-context class R1 recorded for GPT-5.6 Terra (not re-read in
+#       R1b). A Bedrock premium ABOVE that would break the bound. The RATES are
+#       verified (PRICING_CONFIG); the multipliers are not.
+#       THE AWS PRICE LIST DOES NOT SETTLE IT EITHER (the R1c recovery, offer
+#       files publication 2026-09-11T12:44Z, retrieved 2026-09-14; hashes in
+#       RECOVERY_R1C_REPORT.md). AmazonBedrockFoundationModels lists 620 Sonnet
+#       4.6 SKUs over 22 usage types, one price each, ranges 0-Inf, and no
+#       attribute, usage type or description that distinguishes input size;
+#       AmazonBedrock and AmazonBedrockService list no Sonnet 4.6 SKU. Absence
+#       there is NOT proof of no premium: the same offers omit commercial-region
+#       GPT-5.6 Terra entirely, whose long-context premium the AWS model card
+#       documents (only a GovCloud listing exists, with its long-ctx SKUs). The
+#       only Claude long-context tier the Price List does publish is Claude
+#       Sonnet 4's (AmazonBedrockService, global CRIS, 5 regions): exactly 2.0x
+#       input, cache read and cache write, and 1.5x output -- the structure
+#       assumed here, for a sibling model, not for Sonnet 4.6. What would settle
+#       it: a first-party AWS statement of how Sonnet 4.6 requests above any
+#       input size are priced on Bedrock (documentation, or a written AWS
+#       billing/support answer). One request's bill would verify that request
+#       only. If Bedrock applies no premium, both multipliers become 1.0; rows
+#       reserved at the higher bound still cover the lower recomputed one.
+#
+# A MODEL ABSENT FROM THIS TABLE HAS NO ESTABLISHED BOUND AND IS REFUSED BEFORE
+# DISPATCH (Stage5ReservationUnbounded). Priced is not bounded: gpt-4o has a
+# PRICING_CONFIG row and no entry here.
+#
+# THE PACER IS NOT CHANGED. provider_resilience's token-quota reservation keeps
+# its ESTIMATE (evaluation._reservation_input_tokens), because it paces against a
+# tokens-per-minute quota and is corrected to actual usage on completion;
+# reserving a whole context window there would throttle every run to a few
+# requests a minute. The bound governs MONEY only.
+
+_SONNET_46_BEDROCK_LIMITS = {
+    # AWS model card, docs.aws.amazon.com/bedrock/latest/userguide/
+    # model-card-anthropic-claude-sonnet-4-6.html (read 2026-09-14):
+    # "Context window: 1M tokens", "Max output tokens: 64K", Standard tier only.
+    "context_window_tokens": 1_000_000,
+    "max_output_tokens": 64_000,
+    # ASSUMED CEILING -- see (4) above.
+    "long_context_input_multiplier": 2.0,
+    "long_context_output_multiplier": 1.5,
+    # The PRICING_CONFIG row carries its cache-write rates per TTL.
+    "cache_write_multiplier": None,
+    "basis": ("AWS model card 2026-09-14: 1M context, 64K output; long-context "
+              "multipliers ASSUMED (unverified on Bedrock)"),
+}
+
+_TERRA_BEDROCK_LIMITS = {
+    # AWS model card, docs.aws.amazon.com/bedrock/latest/userguide/
+    # model-card-openai-gpt-56-terra.html (read 2026-09-14): "Context window: 1M
+    # tokens"; long context (more than 272K input tokens) Geo CRIS $4.40 input /
+    # $5.50 30m cache write / $19.80 output against short $2.20 / $2.75 / $13.20
+    # -- exactly 2.0x input, 1.5x output, and a cache write of 1.25x input. The
+    # card states no max output; OpenAI's model page states 128,000.
+    "context_window_tokens": 1_000_000,
+    "max_output_tokens": 128_000,
+    "long_context_input_multiplier": 2.0,
+    "long_context_output_multiplier": 1.5,
+    "cache_write_multiplier": 1.25,
+    "basis": ("AWS model card 2026-09-14: 1M context, long-context 2x input / "
+              "1.5x output, cache write 1.25x; OpenAI: 128K output"),
+}
+
+STAGE5_ATTEMPT_LIMITS = {
+    "global.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "us.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "eu.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "au.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "jp.anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "anthropic.claude-sonnet-4-6": _SONNET_46_BEDROCK_LIMITS,
+    "openai.gpt-5.6-terra": _TERRA_BEDROCK_LIMITS,
+    "us.openai.gpt-5.6-terra": _TERRA_BEDROCK_LIMITS,
+    "global.openai.gpt-5.6-terra": _TERRA_BEDROCK_LIMITS,
+    "gpt-5.6-terra": {
+        # OpenAI model page, developers.openai.com/api/docs/models/gpt-5.6-terra
+        # (read 2026-09-14): "1,050,000 context window", "128,000 max output
+        # tokens"; "Prompts with >272K input tokens are priced at 2x input and
+        # 1.5x output for the full request"; cache writes "billed at 1.25x the
+        # uncached input token rate".
+        "context_window_tokens": 1_050_000,
+        "max_output_tokens": 128_000,
+        "long_context_input_multiplier": 2.0,
+        "long_context_output_multiplier": 1.5,
+        "cache_write_multiplier": 1.25,
+        "basis": ("OpenAI model page 2026-09-14: 1.05M context, 128K output, "
+                  ">272K 2x input / 1.5x output, cache write 1.25x"),
+    },
+}
+"""Documented per-request limits of every Stage 5 wire model this project can
+dispatch to. CLOSED: a wire model absent here is refused before dispatch."""
+
+STAGE5_RESERVATION_BASIS = "stage5_documented_limit"
+"""The ``reservation_basis`` a bounded Stage 5 reservation records in its billing
+row's ``note``. A resume trusts an unresolved Stage 5 reservation only when its
+note carries this basis at ``STAGE5_RESERVATION_BASIS_VERSION`` and its amount
+still covers the bound recomputed from the note."""
+
+STAGE5_RESERVATION_BASIS_VERSION = 1
+"""Bump when the bound's derivation changes, so rows reserved under the old
+derivation are re-examined by a resume rather than trusted."""
+
+
+class Stage5ReservationUnbounded(RuntimeError):
+    """No sound upper bound on a Stage 5 attempt's billed cost could be
+    established, so the request was NOT dispatched (R1). A ``RuntimeError`` and
+    not a ``ValueError``, on ``UnknownModelPricingError``'s footing."""
+
+
+def _positive_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value > 0
+
+
+def stage5_attempt_bound(model, requested_output_tokens, wire_attempts):
+    """The upper bound one Stage 5 policy attempt may be billed. PURE. RAISES
+    ``Stage5ReservationUnbounded`` when no sound bound can be established.
+
+    Returns a dict: ``input_tokens``, ``output_tokens``, ``usd``,
+    ``input_rate_per_mtok``, ``output_rate_per_mtok``, ``model``,
+    ``requested_output_tokens``, ``wire_attempts``, ``basis``.
+
+    ``requested_output_tokens`` is the ceiling the request carries (never a
+    smaller one); ``wire_attempts`` is how many wire requests one send may make
+    inside its SDK. The text of the prompt is deliberately NOT an argument: the
+    bound holds whatever the text is.
+    """
+    def refuse(why):
+        raise Stage5ReservationUnbounded(
+            f"Stage 5 wire model {model!r}: {why}; no upper bound on what the "
+            f"attempt is billed can be reserved, so it was not dispatched")
+
+    try:
+        limits = STAGE5_ATTEMPT_LIMITS.get(model)
+    except TypeError:
+        limits = None
+    if not isinstance(limits, dict):
+        refuse("no documented limits in config.STAGE5_ATTEMPT_LIMITS")
+    window = limits.get("context_window_tokens")
+    max_out = limits.get("max_output_tokens")
+    if not _positive_int(window) or not _positive_int(max_out):
+        refuse("its documented context window or output limit is not a "
+               "positive integer")
+    long_in = limits.get("long_context_input_multiplier")
+    long_out = limits.get("long_context_output_multiplier")
+    if not (_is_number(long_in) and _is_number(long_out)
+            and long_in >= 1.0 and long_out >= 1.0):
+        refuse("its long-context multipliers are not numbers >= 1.0")
+    cw_mult = limits.get("cache_write_multiplier")
+    if cw_mult is not None and not (_is_number(cw_mult) and cw_mult >= 1.0):
+        refuse("its cache_write_multiplier is not None or a number >= 1.0")
+    if not _positive_int(requested_output_tokens):
+        refuse(f"the request's output ceiling {requested_output_tokens!r} is "
+               f"not a positive integer")
+    if not _positive_int(wire_attempts):
+        refuse(f"wire attempts per send {wire_attempts!r} is not a positive "
+               f"integer")
+
+    row = PRICING_CONFIG.get("models", {}).get(model)
+    if not isinstance(row, dict):
+        refuse("it has no PRICING_CONFIG row")
+    base_in, base_out = row.get("input"), row.get("output")
+    if not (_is_number(base_in) and _is_number(base_out)
+            and base_in > 0 and base_out > 0):
+        refuse("its PRICING_CONFIG input or output rate is not a positive "
+               "number")
+    input_rates = [base_in]
+    cache_read = row.get("cache_read")
+    if cache_read is not None:
+        if not (_is_number(cache_read) and cache_read >= 0):
+            refuse("its PRICING_CONFIG cache_read rate is not a number")
+        input_rates.append(cache_read)
+    cache_write = row.get("cache_write")
+    if cache_write is not None:
+        if (not isinstance(cache_write, dict) or not cache_write
+                or not all(_is_number(v) and v >= 0
+                           for v in cache_write.values())):
+            refuse("its PRICING_CONFIG cache_write map is not a map of numbers")
+        # THE TTL THE REQUEST ACTUALLY SENDS, when the row prices it; every TTL
+        # otherwise (a request with no cache point, or a TTL the row does not
+        # name), because the dearest write it could be billed at is then the
+        # only rate that is a bound.
+        ttl = BEDROCK_ANTHROPIC_CACHE_TTL
+        input_rates.append(cache_write[ttl] if ttl in cache_write
+                           else max(cache_write.values()))
+    elif cw_mult is None:
+        refuse("neither its PRICING_CONFIG row nor its documented limits say "
+               "what a cache write bills")
+    if cw_mult is not None:
+        input_rates.append(base_in * cw_mult)
+
+    in_rate = max(input_rates) * long_in
+    out_rate = base_out * long_out
+    in_tokens = window * wire_attempts
+    out_tokens = min(requested_output_tokens, max_out) * wire_attempts
+    return {
+        "model": model,
+        "input_tokens": in_tokens,
+        "output_tokens": out_tokens,
+        "input_rate_per_mtok": in_rate,
+        "output_rate_per_mtok": out_rate,
+        "usd": (in_tokens * in_rate + out_tokens * out_rate) / 1_000_000.0,
+        "requested_output_tokens": requested_output_tokens,
+        "wire_attempts": wire_attempts,
+        "basis": limits.get("basis"),
+    }
+
+
+def stage5_reservation_note(bound) -> str:
+    """The JSON a bounded reservation stores in its billing row's ``note``."""
+    return json.dumps({"reservation_basis": STAGE5_RESERVATION_BASIS,
+                       "basis_version": STAGE5_RESERVATION_BASIS_VERSION,
+                       "requested_output_tokens":
+                           bound["requested_output_tokens"],
+                       "wire_attempts": bound["wire_attempts"]},
+                      sort_keys=True)
 
 
 # Pricing for the independent LLM rater (oncotriage/evaluation/rater.py), which
@@ -6536,9 +6856,11 @@ MAX_WORKERS = 12
 # REMAINING budget.
 #
 # THE CAP IS A CAMPAIGN BUDGET AND NOT A PER-INVOCATION ALLOWANCE, which is the
-# whole reason `oncotriage/storage/database_logger.py:campaign_spend_before`
+# whole reason `oncotriage/storage/database_logger.py:campaign_billing_total`
 # exists: a resumed run seeds its ledger with what its predecessors already
-# spent, read out of `inferences.estimated_cost_usd`. Without that, a run that
+# spent, read out of the campaign's cumulative `inferences.billing_attempts`
+# record (it read `inferences.estimated_cost_usd` until the cumulative-spend
+# pass, which describes final attempts only). Without that, a run that
 # tripped the cap and was restarted by a supervisor would get a fresh $300 every
 # time, which is the failure mode a per-run cap has and a campaign cap does not.
 
@@ -6678,30 +7000,30 @@ before its first billed call, which is a legitimate thing to ask for (a dry
 rehearsal of the whole pipeline's non-billed path). `spend.spend_cap()` refuses
 a negative value at import rather than reading it as unlimited.
 
-THE WORST-CASE OVERSHOOT IS BOUNDED AND IS STATED HERE, because a cap with an
-unstated edge is a promise nobody can rely on.
+THE OVERSHOOT, AND WHAT CHANGED IT (E1). The paragraph that stood here said the
+cap was honoured "to within about a dollar and a half": the gate compared
+MEASURED spend before a request and the ledger was charged after the response,
+so the requests in flight -- up to MAX_WORKERS x per_trial_parallel_bound() --
+could overshoot at their measured price. That was false under the liability
+rule: a possibly-billed failure is charged its WHOLE reservation, so the gap was
+the sum of the reservations in flight (measured on the unchanged code: two $9
+reservations admitted against a $10 cap, $18 charged; RECOVERY_E1_REPORT.md).
 
-    Every billed call is bracketed: the gate is checked immediately BEFORE the
-    request and the ledger is charged immediately AFTER the response. So the
-    only spend a trip cannot prevent is what is already past the gate and not
-    yet charged, which is exactly the set of requests in flight:
+Billed attempts are now ADMITTED atomically (``spend.ADMISSION_AUTHORITIES``):
+committed spend plus every open reservation plus this attempt's reservation
+must fit under the cap, and the check and the reservation are one step. So for
+every attempt created through ``spend.AttemptLiability`` the budget's
+liabilities never exceed the cap at admission. What can still exceed it, stated:
+a response priced ABOVE its reservation (the bound broken, counted under
+``BILLING_RECORD_FAULTS['bound_exceeded:...']``); a settlement whose durable
+reading is unverified (live is topped up and the run latches); and billed paths
+that create no liability -- the rater's Batch API and the ragas harness.
 
-        overshoot_requests  <=  MAX_WORKERS x per_trial_parallel_bound()
-                            =   12 x 4  =  48                (per-trial mode)
-        overshoot_requests  <=  MAX_WORKERS x 1  =  12       (grouped mode:
-                                the send loop is sequential per patient)
-
-    At the per-request costs derived above:
-
-        per-trial, cache working   48 x $0.010811 = $0.52
-        per-trial, cache absent    48 x $0.026246 = $1.26
-        grouped                    12 x one packed chunk
-
-    So the cap is honoured to within about a dollar and a half, on a $300 cap.
-    THIS IS THE BOUND THE DESIGN BUYS BY CHARGING AT THE RESPONSE RATHER THAN
-    AT THE PATIENT. Charging only where the node folds its accumulators would
-    make the bound MAX_WORKERS whole patients (~$5), because per-trial mode
-    dispatches a patient's entire wave before the node reads any of it.
+THE PRICE OF ADMISSION IS THROUGHPUT, AND IT IS RECORDED RATHER THAN HIDDEN.
+Each Stage 5 attempt reserves its documented-limit bound, so with N attempts in
+flight the cap must hold N reservations before the next is admitted. See
+RECOVERY_E1_REPORT.md for the measured range at the assumed and the no-premium
+bound.
 """
 
 RATER_SPEND_CAP_USD = 50.00
@@ -6756,7 +7078,7 @@ argument is about what the two bound rather than about tidiness:
     number over two tables is a number whose meaning depends on which of them
     moved.
   * THEY RESUME FROM DIFFERENT STORES. A campaign seeds its ledger from the
-    `runs` chain (`database_logger.campaign_spend_before`); the judge seeds
+    cumulative billing record (`database_logger.campaign_billing_total`); the judge seeds
     from `oncotriage/spend_journal.py`. Two chains were already being compared
     against one cap, which is the conflation `spend.SPEND_BUDGETS` removes.
 

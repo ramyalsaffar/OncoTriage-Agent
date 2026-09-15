@@ -406,11 +406,21 @@ _REGISTRY_SPEC = (
      "so the cap may stop a run early rather than late; the dollar figure is "
      "in the PROVIDER PACING AND RETRIES block"),
     ("PER_TRIAL_CALL_FAILURES", _agent_evaluation.PER_TRIAL_CALL_FAILURES,
-     "a Stage 5 PER-TRIAL request raised and was isolated to its own trial, "
-     "which is recorded as not evaluable while the rest of the patient "
-     "completed; keyed by exception type. A patient whose calls ALL failed is "
-     "NOT here -- it returns the API-error result and is covered by "
-     "MAX_LLM_CLASSIFIER_RETRIES instead. LIVE ON AN ORDINARY CAMPAIGN, "
+     "failed Stage 5 PER-TRIAL trial requests ACROSS ALL ATTEMPTS, INCLUDING "
+     "ATTEMPTS LATER DISCARDED. Keyed by exception type, or `abandoned:{Type}` "
+     "for a failed request whose attempt ended before the node read it. The "
+     "increment happens in the send loop on every raising request, before the "
+     "all-failed floor and before any retry decision, so a patient whose calls "
+     "ALL failed IS counted (it also returns the API-error result "
+     "MAX_LLM_CLASSIFIER_RETRIES covers), and a failure in an attempt that was "
+     "then retried and succeeded is counted even though that patient's row "
+     "reports none. It is therefore NOT the sum of the per-patient "
+     "llm_classifier_per_trial_calls_failed, which describes each patient's "
+     "final attempt only. A request a shutdown or spend gate declined was "
+     "never sent and is not here, and a cache writer's failure -- the "
+     "dedicated warmup or the fallback's held-back first trial call -- is "
+     "counted in PER_TRIAL_WARMUP_DEGRADATIONS instead. LIVE ON AN ORDINARY "
+     "CAMPAIGN, "
      "because per-trial is the SHIPPED arm; it stays at zero only in the "
      "retained GROUPED arm (MATCHING_PER_TRIAL_CALLS_ENABLED False), where "
      "nothing reaches the branch that increments it"),
@@ -501,6 +511,25 @@ _REGISTRY_SPEC = (
      "deliberately and is NOT checkpointed, so a resume runs it. The total is "
      "a FLOOR -- incremented from worker threads without a lock; the LEDGER, "
      "which decisions are made on, is locked"),
+    ("SPEND_ADMISSION_DECLINES", _spend.SPEND_ADMISSION_DECLINES,
+     "billed attempts NOT dispatched because budget ADMISSION declined them "
+     "after the call-site gate passed (E1). Keyed {source}:{reason}: "
+     "`budget_exhausted` (committed spend plus the reservation exceeds the cap; "
+     "latches the run under the campaign policy), `headroom_held` (it fits "
+     "against committed spend but this process's own open reservations hold "
+     "the rest; never latches -- on Stage 5 the attempt then WAITS for the "
+     "headroom, see SPEND_ADMISSION_WAITS, and on other paths it is refused "
+     "as before), `reservation_unpriced`. IT NAMES MONEY NOT SPENT. A large "
+     "`headroom_held` total is the throughput cost of reserving each attempt "
+     "at its upper bound"),
+    ("SPEND_ADMISSION_WAITS", _spend.SPEND_ADMISSION_WAITS,
+     "bounded waits for released budget headroom (E1b). Keyed "
+     "{source}:{outcome}: `entered` counts waits and each ends `admitted`, "
+     "`timed_out` (the run was STOPPED, stop_reason admission_wait, with its "
+     "unfinished patients left to a resume), `cancelled` (a shutdown, a spend "
+     "stop or the operator's drain), `exhausted` or `failed`. A non-zero "
+     "`timed_out` means held headroom did not release within "
+     "config.admission_wait_timeout_seconds()"),
     ("SPEND_LEDGER_FAULTS", _spend.SPEND_LEDGER_FAULTS,
      "a billed response could not be priced, so its cost is MISSING from the "
      "spend ledger. EVERY KEY HERE IS SPEND THE GATE CANNOT SEE, which means "
@@ -509,6 +538,15 @@ _REGISTRY_SPEC = (
      "key is a model absent from PRICING_CONFIG and is the same configuration "
      "defect that aborts the row write one layer down; a `bad_usage:` key is a "
      "response whose usage block could not be read"),
+    ("BILLING_RECORD_FAULTS", _spend.BILLING_RECORD_FAULTS,
+     "the campaign's DURABLE billing record could not do something. A "
+     "`reserve:` key is a billed attempt whose reservation could not be "
+     "persisted -- it was NOT dispatched and the run was latched with "
+     "stop_reason `billing_record`; `refused_latched` counts later attempts "
+     "declined without trying. A `settle:` key is a settlement that did not "
+     "land cleanly: the row stays RESERVED and every reader charges it at its "
+     "upper bound, so a resume will count MORE than was billed, never less. "
+     "The remedy for either is the database the record lives in"),
     ("JOURNAL_FAULTS", _spend_journal.JOURNAL_FAULTS,
      "the CROSS-PROCESS spend journal could not be read, written or "
      "understood. EVERY KEY HERE IS MONEY THE NEXT JUDGE SESSION'S CAP WILL "

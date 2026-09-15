@@ -828,14 +828,21 @@ for _label, _bodies, _billed in _FAILURE_SCENARIOS:
         check(f"{_label}: a matching_model key is present beside the tokens",
               "matching_model" in _out, True)
     else:
-        # NO USAGE OBJECT WAS EVER OBTAINED. The keys are left ABSENT rather
-        # than written as 0: the tokens that request may have been billed are
-        # unknown to this process, and an estimate from prompt length would put
-        # a number no provider reported into a measurement column.
-        check(f"{_label}: input tokens ABSENT, not zero",
-              _out.get("llm_classifier_input_tokens", "<absent>"), "<absent>")
-        check(f"{_label}: output tokens ABSENT, not zero",
-              _out.get("llm_classifier_output_tokens", "<absent>"), "<absent>")
+        # NO USAGE OBJECT WAS EVER OBTAINED, AND THE KEYS ARE WRITTEN AS 0.
+        # They were left ABSENT, on the argument that _pipeline_provenance()
+        # would supply the zero -- true of a first attempt and false of every
+        # later one, because Stage 5 re-enters itself and LangGraph keeps a
+        # channel's last written value: an absent key published an EARLIER
+        # attempt's figure (tests/test_agent_stage5_attempt_provenance.py). The
+        # zero is this attempt's own accumulators, not an estimate; the request
+        # that raised may still have been billed, which is what
+        # llm_classifier_calls = 0 beside a non-NULL prompt hash says.
+        check(f"{_label}: input tokens WRITTEN as this attempt's zero",
+              _out.get("llm_classifier_input_tokens", "<absent>"), 0)
+        check(f"{_label}: output tokens WRITTEN as this attempt's zero",
+              _out.get("llm_classifier_output_tokens", "<absent>"), 0)
+        check(f"{_label}: the call count is WRITTEN as zero too",
+              _out.get("llm_classifier_calls", "<absent>"), 0)
 
 print("\n  3e. the split batch: call 1 answers, call 2 raises")
 #

@@ -1,9 +1,9 @@
 """The CROSS-PROCESS spend record: one append-only file, one owner.
 
 ``oncotriage/spend.py``'s ledger is PROCESS-LOCAL by design and says so. That
-is right for the campaign budget, which has a cross-process chain of its own --
-``database_logger.campaign_spend_before`` walks the ``runs`` table backwards
-over identical fingerprint columns -- and it was WRONG for the judge, which has
+is right for the campaign budget, which has a cross-process record of its own --
+``database_logger.campaign_billing_total`` reads the batch campaign's cumulative
+``billing_attempts`` record -- and it was WRONG for the judge, which has
 no ``runs`` row, writes no ``inferences``, and whose only memory was the state
 file of the session that happened to be running.
 
