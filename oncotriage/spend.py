@@ -2885,6 +2885,12 @@ class SpendStop:
                            "beside the shared spend journal. Preserve its identity and "
                            "fault markers; unresolved attempts retain liability. "
                            "Do not delete billing files or automatically resend requests.")
+            elif getattr(BILLING_RECORD.installed_sink(), "scope", None) == "ablation":
+                _sink = BILLING_RECORD.installed_sink()
+                _remedy = (f"Inspect billing_attempts in {_sink.db_path} and its "
+                           "billing-discrepancies directory. Preserve the database "
+                           "and .billing-identity.json witness. Repair accounting "
+                           "before resuming; --fresh-start does not reset this budget.")
             console.out(f"[SPEND] {_what}; no further billed request may be "
                         f"dispatched.")
             console.out(f"[SPEND] {_budget or 'campaign'} spend so far: "

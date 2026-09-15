@@ -1977,7 +1977,7 @@ def _fn(tree, name):
     return None
 
 
-_main = _fn(_TREE, "main")
+_main = _fn(_TREE, "_run_study")
 check_true("7a  study.main() was found (non-degeneracy)", _main is not None)
 
 _GUARD_HANDLERS = sorted({

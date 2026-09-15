@@ -1620,8 +1620,11 @@ def drive_study(db_path, *, cap, per_pair_usd, sample_size, configs,
             # THE ONLY MONEY IN THIS TEST, and it moves no request. Charging
             # here is what makes the study's own gate reachable at the grain
             # the shipped code polls it.
-            spend.SPEND_LEDGER.charge_usd(per_pair_usd,
-                                          spend.SPEND_SOURCE_STAGE5)
+            attempt = spend.begin_billed_attempt(
+                spend.SPEND_SOURCE_STAGE5, config.MATCHING_MODEL, 1, 1,
+                where="synthetic ablation", reserved_usd=per_pair_usd)
+            attempt.resolve(spend.BILLING_OUTCOME_RESPONSE,
+                            response_usd=per_pair_usd)
             charged.append((flags_key(flags), patient_data["patient_id"]))
             return {"error": "", "matches": [], "near_misses": [],
                     "not_evaluable": [], "stage_timings": {},
@@ -1638,23 +1641,18 @@ def drive_study(db_path, *, cap, per_pair_usd, sample_size, configs,
         _study.match_patient_ablation = _stand_in
         def _write_row(run_id, config_name, patient_data, result,
                        ablation_flags, db_path=None):
-            """A stand-in writer that stores the ONE column the seed reads.
+            """Store result metrics and errors independently of durable billing.
 
-            THE REAL `log_ablation_result` IS NOT USED, because it prices the
-            result against `PRICING_CONFIG` and writes thirty columns this
-            harness has no honest values for. What it is replaced BY is not a
-            no-op: `ablation_spend_before` sums `estimated_cost_usd` over
-            `ablation_results`, so a writer that wrote nothing would make the
-            resume seed read FRESH -- and check 8d would then be measuring the
-            stub rather than the seed.
+            Refused requests keep error rows but no completion checkpoint. The
+            successful-row count must still equal the intended sample exactly.
             """
             conn = sqlite3.connect(_study.ablation_db(db_path))
             try:
                 conn.execute(
                     "INSERT INTO ablation_results (run_id, config_name, "
-                    "patient_id, estimated_cost_usd) VALUES (?, ?, ?, ?)",
+                    "patient_id, estimated_cost_usd, error) VALUES (?, ?, ?, ?, ?)",
                     (run_id, config_name, patient_data["patient_id"],
-                     result.get("estimated_cost_usd", 0.0)))
+                     result.get("estimated_cost_usd", 0.0), result.get("error", "")))
                 conn.commit()
             finally:
                 conn.close()
@@ -1694,7 +1692,7 @@ def run_rows(db_path):
 def result_count(db_path):
     conn = sqlite3.connect(db_path)
     try:
-        return conn.execute("SELECT COUNT(*) FROM ablation_results").fetchone()[0]
+        return conn.execute("SELECT COUNT(*) FROM ablation_results WHERE COALESCE(error, '') = ''").fetchone()[0]
     finally:
         conn.close()
 
@@ -1758,7 +1756,7 @@ _seed = _study.ablation_spend_before(_STUDY_DB)
 check("8d  *** the resume seeds from THIS database's own rows, which is what "
       "makes the cap a budget for the STUDY rather than for one invocation of "
       "it ***", (_seed.source, _seed.rows > 0),
-      (spend.SEED_SOURCE_CAMPAIGN, True))
+      (spend.SEED_SOURCE_BILLING_RECORD, True))
 
 _resume_out, _resume_charged = drive_study(
     _STUDY_DB, cap=1000.0, per_pair_usd=1.0, sample_size=_SAMPLE,
@@ -1770,7 +1768,7 @@ check("8e-i ...and no (config, patient) pair is run twice across the two "
       "invocations",
       len(set(_stop_charged) | set(_resume_charged)),
       len(_stop_charged) + len(_resume_charged))
-check("8e-ii ...so the database holds the whole sample and no duplicate",
+check("8e-ii ...so successful result rows cover the whole sample without duplicates; refused attempts remain error rows",
       result_count(_STUDY_DB), _TOTAL_PAIRS)
 
 # --- (d) A STOP THAT LANDS AFTER THE COHORT IS COVERED IS NOT A STOPPED RUN ---
@@ -1823,18 +1821,14 @@ finally:
 # stop the next study before it bills anything.
 _SEEDED_DB = os.path.join(_TMP, "study-seeded", "ablation_results.db")
 os.makedirs(os.path.dirname(_SEEDED_DB), exist_ok=True)
-_study.init_ablation_db(db_path=_SEEDED_DB)
-_conn = sqlite3.connect(_SEEDED_DB)
-try:
-    _conn.execute("INSERT INTO ablation_runs (run_timestamp, config_name, "
-                  "config_description, sample_size) "
-                  "VALUES ('2026-01-01', 'full_pipeline', 'd', 4)")
-    _conn.execute("INSERT INTO ablation_results (run_id, config_name, "
-                  "patient_id, estimated_cost_usd) VALUES (1, 'prior', "
-                  "'prior_patient', 50.0)")
-    _conn.commit()
-finally:
-    _conn.close()
+from oncotriage.ablation.billing import Session as _BillingSession
+with _BillingSession(_SEEDED_DB, _study._ablation_checkpoint_path(_SEEDED_DB)) as _session:
+    _session.install()
+    # Seed a settled charge through the shared store; no legacy result import.
+    _sink = spend.BILLING_RECORD.installed_sink()
+    _sink.reserve(attempt_id="prior", source="stage5", model=config.MATCHING_MODEL,
+                  input_tokens=1, output_tokens=1, reserved_usd=50.0)
+    _sink.settle("prior", outcome="response", settled_usd=50.0)
 
 _seeded_out, _seeded_charged = drive_study(
     _SEEDED_DB, cap=10.0, per_pair_usd=1.0, sample_size=4,
@@ -1925,7 +1919,7 @@ check("8h  the stop-reason vocabulary is closed and NULL is the fourth "
       # E1b added the fourth: an admission-wait timeout is not the cap.
       (_study.RUN_STOP_REASON_OPERATOR, _study.RUN_STOP_REASON_SPEND_CAP,
        _study.RUN_STOP_REASON_CALL_CEILING,
-       _study.RUN_STOP_REASON_ADMISSION_WAIT))
+       _study.RUN_STOP_REASON_ADMISSION_WAIT, _study.RUN_STOP_REASON_BILLING_RECORD))
 
 
 # ===========================================================================

@@ -150,6 +150,8 @@ _A = "A"; _B = "B"; _C = "C"; _D = "D"; _E = "E"
 
 BUCKETS = {
     # ---- A: verified green with only the directory skeleton ---------------
+    "test_ablation_billing.py": (
+        _A, None, "synthetic ablation identity, shared billing adapters, and process-crash recovery"),
     "test_ablation_write_durability.py": (
         _A, None,
         "ran green in 1.3s, 33 checks, against ONLY the directory skeleton: "

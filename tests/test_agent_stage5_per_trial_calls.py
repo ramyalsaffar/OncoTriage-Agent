@@ -3354,6 +3354,34 @@ check("7b-g  ...and the shutdown flag was cleared, so no later scenario in "
       "this file inherits it",
       _evaluation.stage5_shutdown_requested(), False)
 
+# Ablation completion provenance: required refusals remain pending, whereas
+# declining only the optional retry preserves the already-valid first response.
+for _limit in (_spend.SPEND_LIMIT_CAP, _spend.SPEND_LIMIT_BILLING_RECORD):
+    for _required in (True, False):
+        _begin_before = _evaluation._Stage5AttemptRecord.begin
+        _begin_count = [0]
+        _begin_lock = threading.Lock()
+        def _refuse_one_begin(self):
+            with _begin_lock:
+                _begin_count[0] += 1
+                number = _begin_count[0]
+            if number == (2 if _required else 8):
+                raise _evaluation.Stage5SpendStopped("synthetic admission refusal", limit=_limit)
+            return _begin_before(self)
+        try:
+            _evaluation._Stage5AttemptRecord.begin = _refuse_one_begin
+            _refused_result, _refused_stub = run_node(
+                _SIX, per_trial=True, parallel=4,
+                stub=_EmptyStub(empty_for=[] if _required else [_TARGET], empty_attempts=1))
+        finally:
+            _evaluation._Stage5AttemptRecord.begin = _begin_before
+        check(f"7b-g billing provenance {_limit} required={_required}",
+              (_refused_result.get("billing_required_work_refused", False),
+               bool(_refused_result.get("error"))), (_required, _required))
+        if not _required:
+            check(f"7b-g optional {_limit} refusal preserves every first response",
+                  (len(_refused_stub.wave_requests()), len(_refused_result["evaluations"])), (6, 6))
+
 # --- 7b-h: the derived call ceiling covers the retry -------------------------
 #
 # WITHOUT THE RETRY TERM IN `_spend.stage5_call_ceiling` THE FIRST EMPTY VERDICT

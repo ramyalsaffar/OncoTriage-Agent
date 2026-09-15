@@ -7601,6 +7601,9 @@ CLINICAL TRIALS:
                       retry=retry_count + 1, error_type=type(e).__name__,
                       error_message=str(e))
             return {
+                "billing_required_work_refused": (
+                    state.get("billing_required_work_refused", False)
+                    or isinstance(e, Stage5SpendStopped)),
                 # THE ROUTING FACT. Non-None -- the one policy already spent its
                 # budget on this call -- sends the patient to the error handler
                 # rather than re-entering Stage 5 for a second full budget.
@@ -8644,6 +8647,9 @@ CLINICAL TRIALS:
                       error_type=type(per_trial_last_error).__name__,
                       error_message=str(per_trial_last_error))
         return {
+            "billing_required_work_refused": (
+                state.get("billing_required_work_refused", False)
+                or isinstance(_warmup_error, Stage5SpendStopped)),
             "llm_classifier_call_details": call_details,
             "evaluations": [],
             "llm_classifier_retries": retry_count + 1,

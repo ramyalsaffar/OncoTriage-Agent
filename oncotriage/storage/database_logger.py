@@ -4464,33 +4464,7 @@ CREATE TABLE IF NOT EXISTS run_metrics (
     # attempt id. `reserved_usd` is NOT NULL because a row exists only once a
     # reservation has been priced; `settled_usd` is NULL exactly while the row
     # is reserved.
-    cursor.execute('''
-CREATE TABLE IF NOT EXISTS billing_attempts (
-    attempt_id TEXT PRIMARY KEY,
-    campaign_id TEXT NOT NULL,
-    run_id INTEGER NOT NULL REFERENCES runs(id),
-    kind TEXT NOT NULL,
-    source TEXT NOT NULL,
-    model TEXT,
-    correlation_id TEXT,
-    state TEXT NOT NULL,
-    reserved_usd REAL NOT NULL,
-    settled_usd REAL,
-    outcome TEXT,
-    reserved_input_tokens INTEGER,
-    reserved_output_tokens INTEGER,
-    settled_input_tokens INTEGER,
-    settled_output_tokens INTEGER,
-    reserved_at TEXT NOT NULL,
-    settled_at TEXT,
-    note TEXT
-)
-''')
-
-    _ensure_index(cursor, "idx_billing_attempts_campaign_id",
-                  "billing_attempts", ("campaign_id",))
-    _ensure_index(cursor, "idx_billing_attempts_run_id", "billing_attempts",
-                  ("run_id",))
+    initialize_billing_table(cursor)
 
     # WHICH COUNTERS A RUN'S HEALTH FLUSH CONSULTED (era 18). One row per
     # registered counter NAME, rewritten with the run's `run_metrics` rows in
@@ -5368,6 +5342,49 @@ BILLING_SYNCHRONOUS_MINIMUM = 2
 
 BILLING_FULLFSYNC_PLATFORMS = ("darwin",)
 """Platforms on which ``PRAGMA fullfsync`` must read back ON."""
+
+
+def _billing_table_sql(run_owner):
+    # Keep the complete inference DDL literal visible to dashboard.data's
+    # source-derived schema inventory. Only the closed owner reference varies.
+    return '''
+CREATE TABLE IF NOT EXISTS billing_attempts (
+    attempt_id TEXT PRIMARY KEY,
+    campaign_id TEXT NOT NULL,
+    run_id INTEGER NOT NULL REFERENCES runs(id),
+    kind TEXT NOT NULL,
+    source TEXT NOT NULL,
+    model TEXT,
+    correlation_id TEXT,
+    state TEXT NOT NULL,
+    reserved_usd REAL NOT NULL,
+    settled_usd REAL,
+    outcome TEXT,
+    reserved_input_tokens INTEGER,
+    reserved_output_tokens INTEGER,
+    settled_input_tokens INTEGER,
+    settled_output_tokens INTEGER,
+    reserved_at TEXT NOT NULL,
+    settled_at TEXT,
+    note TEXT
+)
+'''.replace("REFERENCES runs(id)", f"REFERENCES {run_owner}(id)")
+
+
+def initialize_billing_table(cursor, *, run_owner="runs"):
+    """One attempt schema for inference campaigns and ablation invocations.
+
+    Only the foreign-key target varies; identifiers are a closed vocabulary.
+    The caller owns the durable transaction and creates the referenced table.
+    """
+    if run_owner not in ("runs", "ablation_billing_invocations"):
+        raise ValueError(f"unsupported billing run owner: {run_owner!r}")
+    cursor.execute(_billing_table_sql(run_owner))
+
+    _ensure_index(cursor, "idx_billing_attempts_campaign_id",
+                  "billing_attempts", ("campaign_id",))
+    _ensure_index(cursor, "idx_billing_attempts_run_id", "billing_attempts",
+                  ("run_id",))
 
 
 def _open_billing_connection(db_path):
@@ -6456,7 +6473,11 @@ class BillingRecordSink:
     """It takes ``admission_cap`` and admits in the reservation's own
     transaction (E1), so ``spend`` makes it the campaign budget's authority."""
 
-    def __init__(self, db_path, campaign_id, run_id, discrepancy_dir=None):
+    def __init__(self, db_path, campaign_id, run_id, discrepancy_dir=None, *,
+                 scope="campaign"):
+        if scope not in ("campaign", "ablation"):
+            raise ValueError(f"unsupported billing scope: {scope!r}")
+        self.scope = scope  # Presentation only; both scopes share one engine.
         if not isinstance(campaign_id, str) or not campaign_id:
             raise ValueError(f"campaign_id must be a non-empty string, not "
                              f"{campaign_id!r}")

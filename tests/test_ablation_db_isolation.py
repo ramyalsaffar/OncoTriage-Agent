@@ -94,6 +94,7 @@ from pathlib import Path
 from oncotriage.agent import deps as _deps
 from oncotriage import run_fingerprint as _run_fingerprint
 from oncotriage.ablation import study as _study
+from oncotriage.ablation import common as _common
 
 
 #------------------------------------------------------------------------------
@@ -246,6 +247,17 @@ print("=" * 70)
 print("Section 1: the default resolves to the production database")
 print("=" * 70)
 
+# The default is a synthetic third database. Never read/hash a real study.
+_saved_study_paths = dict(_study._RESOLVED)
+_saved_common_paths = dict(_common._RESOLVED)
+_default_dir = Path(_TMP) / "default"
+_default_dir.mkdir()
+_default_db = _default_dir / "ablation_results.db"
+_study.init_ablation_db(db_path=_default_db)
+_study._RESOLVED["ablation_db"] = _default_db
+_study._RESOLVED["ablation_summary_json"] = _default_dir / "ablation_summary.json"
+_common._RESOLVED["ablation_db"] = _default_db
+
 _PRODUCTION_DB = str(_study.ablation_db())
 _PRODUCTION_SUMMARY = str(_study.ablation_summary_json())
 _PRODUCTION_DIGEST_BEFORE = _digest(_PRODUCTION_DB)
@@ -310,6 +322,7 @@ check("every function that opens the database takes db_path",
 # view of the project tree moves.
 
 _study._RESOLVED["ablation_db"] = Path(_DECOY_DB)
+_common._RESOLVED["ablation_db"] = Path(_DECOY_DB)
 _study._RESOLVED["ablation_summary_json"] = Path(_DECOY_DIR) / "ablation_summary.json"
 
 _registry_saved = _deps.set_override(_deps.CANCER_REGISTRY, _StubRegistry())
@@ -438,7 +451,7 @@ def _writer_calls_missing_db_path(tree, function_name):
 
 
 check("main() reaches every writer with db_path",
-      _writer_calls_missing_db_path(_STUDY_TREE, "main"), [])
+      _writer_calls_missing_db_path(_STUDY_TREE, "_run_study"), [])
 
 # NEGATIVE CONTROL. The check above is "the list is empty", which a scan that
 # has stopped finding calls also satisfies. One keyword is removed from an AST
@@ -456,7 +469,7 @@ for _node in ast.walk(_MUTATED):
 check("a db_path keyword was found to remove (non-degeneracy)",
       _removed in _WRITERS, True)
 check("...and the scan reports the call it was removed from",
-      len(_writer_calls_missing_db_path(_MUTATED, "main")), 1)
+      len(_writer_calls_missing_db_path(_MUTATED, "_run_study")), 1)
 
 
 # ===========================================================================
@@ -626,7 +639,7 @@ def _ckpt_calls_missing_db_path(tree, function_name):
 
 
 check("main() reaches all three checkpoint functions with db_path",
-      _ckpt_calls_missing_db_path(_STUDY_TREE, "main"), [])
+      _ckpt_calls_missing_db_path(_STUDY_TREE, "_run_study"), [])
 
 _MUTATED_CKPT = ast.parse(_STUDY_SRC)
 _removed_ckpt = None
@@ -640,7 +653,7 @@ for _node in ast.walk(_MUTATED_CKPT):
 check("a db_path keyword was found to remove (non-degeneracy)",
       _removed_ckpt in _CKPT_FNS, True)
 check("...and the scan reports the call it was removed from",
-      len(_ckpt_calls_missing_db_path(_MUTATED_CKPT, "main")), 1)
+      len(_ckpt_calls_missing_db_path(_MUTATED_CKPT, "_run_study")), 1)
 
 
 # ===========================================================================
@@ -739,6 +752,10 @@ check("...and the digest is a real one, not 'absent' on both sides "
       or _PRODUCTION_SUMMARY_DIGEST_BEFORE != "absent",
       True)
 
+_study._RESOLVED.clear()
+_study._RESOLVED.update(_saved_study_paths)
+_common._RESOLVED.clear()
+_common._RESOLVED.update(_saved_common_paths)
 shutil.rmtree(_TMP, ignore_errors=True)
 
 

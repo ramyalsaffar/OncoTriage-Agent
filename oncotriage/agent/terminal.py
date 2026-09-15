@@ -188,6 +188,7 @@ def _pipeline_provenance(state) -> Dict:
     _ecog = ((state.get("patient_data") or {}).get("ecog_performance_status") or {})
 
     return {
+        "billing_required_work_refused": state.get("billing_required_work_refused", False),
         # Retries actually spent in Stage 5. Stage 5 writes the count back into
         # state on its success return and on every failure return, so this is
         # the observed number of API / JSON-parse retries, not a ceiling.

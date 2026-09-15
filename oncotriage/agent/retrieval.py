@@ -42,6 +42,7 @@ from concurrent.futures import ThreadPoolExecutor
 from qdrant_client.models import SparseVector
 from rank_bm25 import BM25Okapi
 
+from oncotriage import spend
 from oncotriage.agent import deps, models
 from oncotriage.agent.mesh_expansion import (
     expand_query_from_mesh,
@@ -533,6 +534,7 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
     # out and which one, not a place to store a stack trace.
     _CHANNEL_ERROR_MAX_CHARS = 200
 
+    billing_required_work_refused = False
     for channel_name, future in futures.items():
         try:
             results = future.result(timeout=30)
@@ -563,6 +565,8 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
                         "BM25 terms", stage=2, channel=channel_name,
                         status=CHANNEL_EMPTY_QUERY, error_message=str(e))
         except Exception as e:
+            if isinstance(e, (spend.BillingRecordUnavailable, spend.SpendLimitReached)):
+                billing_required_work_refused = True
             retrieval_channels[channel_name] = {
                 "status": CHANNEL_FAILED,
                 "count": 0,
@@ -751,6 +755,7 @@ def node_hybrid_retrieval(state: TrialMatchState) -> dict:
              lost=trials_lost)
 
     return {
+        "billing_required_work_refused": billing_required_work_refused,
         "hybrid_results": trials,
         "bm25_retrieved": bm25_retrieved,
         "vector_retrieved": vector_retrieved,

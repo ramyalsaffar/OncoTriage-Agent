@@ -201,6 +201,7 @@ from oncotriage.utils import (
 from oncotriage import run_fingerprint
 from oncotriage import provider_resilience
 from oncotriage import spend
+from oncotriage.ablation import billing as ablation_billing
 from oncotriage import tracking
 from oncotriage.observability import console, correlation_scope, get_logger
 
@@ -1274,6 +1275,8 @@ def _stop_reason_now():
     # study never reached.
     if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT:
         return RUN_STOP_REASON_ADMISSION_WAIT
+    if spend.SPEND_STOP.limit == spend.SPEND_LIMIT_BILLING_RECORD:
+        return RUN_STOP_REASON_BILLING_RECORD
     return RUN_STOP_REASON_SPEND_CAP
 
 
@@ -1706,12 +1709,13 @@ RUN_STOP_REASON_OPERATOR = "operator"
 RUN_STOP_REASON_SPEND_CAP = "spend_cap"
 RUN_STOP_REASON_CALL_CEILING = "call_ceiling"
 RUN_STOP_REASON_ADMISSION_WAIT = "admission_wait"
+RUN_STOP_REASON_BILLING_RECORD = "billing_record"
 
 RUN_STOP_REASONS = (RUN_STOP_REASON_OPERATOR, RUN_STOP_REASON_SPEND_CAP,
                     RUN_STOP_REASON_CALL_CEILING,
-                    RUN_STOP_REASON_ADMISSION_WAIT)
+                    RUN_STOP_REASON_ADMISSION_WAIT, RUN_STOP_REASON_BILLING_RECORD)
 """Why a configuration was cut short, stored in `ablation_runs.stop_reason`.
-CLOSED, and NULL is the fourth reading rather than a fourth member.
+CLOSED; NULL means no recorded reason, rather than another stop reason.
 
 **A COLUMN AND NOT TWO MORE STATUSES**, which is the ruling
 `oncotriage/storage/database_logger.py:RUN_STOP_REASONS` already made for the
@@ -2092,67 +2096,8 @@ def _create_run(config_name, config_description, sample_size, db_path=None):
 
 
 def ablation_spend_before(db_path=None):
-    """What prior studies against THIS database already spent. Never raises.
-
-    Returns a ``spend.LedgerSeed``.
-
-    **THIS IS THE STUDY'S CAMPAIGN, AND THE DATABASE IS WHAT DEFINES IT.** The
-    batch runner walks the ``runs`` chain backwards over identical fingerprint
-    columns because several PROCESSES contribute to one campaign there. A study
-    has no such chain and needs none: pass 20f-3 made the checkpoint follow
-    ``--db``, so "the work this database already holds" and "the work this
-    resume will skip" are the same set by construction -- which is exactly the
-    quantity a resumed study's budget must not be charged for again, and
-    exactly the quantity it must not be handed for free.
-
-    IT SUMS EVERY ROW RATHER THAN THE CHECKPOINTED ONES. A row exists because a
-    pair was run and BILLED; the checkpoint is a record of what was written,
-    and the two can differ by a pair whose write failed. Summing the rows counts
-    money that was spent, which is the question; summing the checkpoint would
-    count money that was spent AND recorded, which is a smaller number and the
-    under-enforcing direction.
-
-    A NULL COST MAKES THE ANSWER A FLOOR and ``LedgerSeed.is_floor`` says so --
-    ``estimated_cost_usd`` is ``REAL DEFAULT 0``, so a row written before
-    pricing existed reads 0 and is indistinguishable from a pair that genuinely
-    cost nothing. That ambiguity is inherited from the column's own DEFAULT and
-    is reported rather than papered over: the NULL count below is exact, and the
-    zeros are not separable.
-
-    NEVER RAISES. It runs before the first billed call of the study, where a
-    fresh database, an absent table and an unreadable file are all ordinary --
-    and a study refusing to start because its own resume history could not be
-    read would be a brake stopping a run it has nothing to say about. An
-    unreadable history yields a FRESH seed, which is the OVER-spending
-    direction, and that is stated rather than hidden: it is the same direction
-    `LedgerSeed`'s floor already fails in, and the alternative -- refusing --
-    turns a missing file into a stopped campaign.
-    """
-    try:
-        conn = open_connection(str(ablation_db(db_path)))
-    except Exception:                                           # noqa: BLE001
-        return spend.LedgerSeed()
-    try:
-        names = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'")}
-        if "ablation_results" not in names:
-            return spend.LedgerSeed()
-        row = conn.execute(
-            "SELECT COALESCE(SUM(estimated_cost_usd), 0.0), COUNT(*), "
-            "       SUM(CASE WHEN estimated_cost_usd IS NULL THEN 1 ELSE 0 END)"
-            "  FROM ablation_results").fetchone()
-        runs = conn.execute(
-            "SELECT COUNT(*) FROM ablation_runs").fetchone()[0] \
-            if "ablation_runs" in names else 0
-    except Exception:                                           # noqa: BLE001
-        return spend.LedgerSeed()
-    finally:
-        conn.close()
-    if not row or not row[1]:
-        return spend.LedgerSeed()
-    return spend.LedgerSeed(usd=float(row[0] or 0.0), rows=int(row[1]),
-                            unpriced=int(row[2] or 0), runs=int(runs or 0),
-                            source=spend.SEED_SOURCE_CAMPAIGN)
+    """Verified database-lifetime billing total, independent of result rows."""
+    return ablation_billing.read_seed(ablation_db(db_path))
 
 
 def _finalize_run(run_id, elapsed_seconds, status, db_path=None,
@@ -3069,6 +3014,10 @@ def print_study_close(status, study_elapsed, run_success, run_error,
                  "than its")
             emit("                   configuration can produce. Raising the "
                  "cap will not help.")
+        elif spend.SPEND_STOP.limit == spend.SPEND_LIMIT_BILLING_RECORD:
+            emit("                   Repair this ablation database's billing record and")
+            emit("                   billing-discrepancies directory before resuming.")
+            emit("                   Raising the cap or --fresh-start cannot repair accounting.")
         elif spend.SPEND_STOP.limit == spend.SPEND_LIMIT_ADMISSION_WAIT:
             emit("                   NOT THE CAP: a billed attempt waited its "
                  "full admission")
@@ -3188,9 +3137,22 @@ def parse_args():
 
 
 def main():
-    """Run the ablation study."""
-
+    """Own durable billing even when called directly instead of through the shim."""
     args = parse_args()
+    if args.summary_only:
+        return _run_study(args)
+    try:
+        with ablation_billing.Session(ablation_db(args.db), _ablation_checkpoint_path(args.db)) as billing:
+            return _run_study(args, billing)
+    except ablation_billing.BillingRefusal as exc:
+        console.out(f"[Billing] Ablation accounting refused for {ablation_db(args.db)}: {exc}")
+        console.out("Repair/preserve the selected database and its billing witness; "
+                    "--fresh-start does not reset accounting.")
+        raise SystemExit(1) from exc
+
+
+def _run_study(args, billing=None):
+    """Run the study within main's billing ownership boundary."""
 
     # One local, read by every writer call below. None is the production
     # database; --db is the only thing that changes it, and it is threaded
@@ -3383,6 +3345,7 @@ def main():
         # this study's own pool.
         console.out(provider_resilience.describe_pacing(
             concurrency=provider_resilience.stage5_concurrency(MAX_WORKERS)))
+        billing.install()
         spend.SPEND_LEDGER.seed(ablation_spend_before(db_path))
         console.out(spend.describe_seed(spend.SPEND_LEDGER.seeded))
 
@@ -3659,6 +3622,8 @@ def main():
                     traceback.print_exc()
                     result = {
                         "error": str(e),
+                        "billing_required_work_refused": isinstance(
+                            e, (spend.BillingRecordUnavailable, spend.SpendLimitReached)),
                         "matches": [],
                         "near_misses": [],
                         "not_evaluable": [],
@@ -3676,6 +3641,9 @@ def main():
                         "llm_classifier_output_tokens": 0,
                     }
 
+                if result.get("billing_required_work_refused"):
+                    result["error"] = result.get("error") or (
+                        "Required work was refused by durable billing; pair remains pending")
                 log_ablation_result(run_id, config_name, patient_data, result,
                                     ablation_flags, db_path=db_path)
                 return pid, result
@@ -3767,9 +3735,11 @@ def main():
                     # mark a fully-covered configuration as a prefix because a
                     # LATER one was cut short.
                     config_cancelled = [0]
+                    config_refused = [0]
 
                     def _on_done(future, _config_name=config_name,
-                                 _futures=futures, _cxl=config_cancelled):
+                                 _futures=futures, _cxl=config_cancelled,
+                                 _refused=config_refused):
                         nonlocal run_success, run_error, run_cancelled
                         try:
                             pid, result = future.result()
@@ -3809,8 +3779,12 @@ def main():
                         else:
                             run_success += 1
 
-                        completed.add((_config_name, pid))
-                        save_ablation_checkpoint(completed, db_path=db_path)
+                        if result.get("billing_required_work_refused"):
+                            # Explicit per-pair provenance, not another worker's latch.
+                            _refused[0] += 1
+                        else:
+                            completed.add((_config_name, pid))
+                            save_ablation_checkpoint(completed, db_path=db_path)
 
                         # ── THE SWITCH, BETWEEN PAIRS ─────────────────────
                         #
@@ -3945,7 +3919,8 @@ def main():
                     # checkpointed, that row would stay the latest for its
                     # config_name forever. See `study_covered`.
                     _config_covered = (pairs_unsubmitted == 0
-                                       and config_cancelled[0] == 0)
+                                       and config_cancelled[0] == 0
+                                       and config_refused[0] == 0)
                     if not _config_covered:
                         study_covered = False
                     _config_status = (RUN_STATUS_COMPLETE if _config_covered

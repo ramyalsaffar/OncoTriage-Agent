@@ -724,6 +724,7 @@ class TrialMatchState(TypedDict):
     result: Dict                                # Complete pipeline output
     
     # --- Pipeline Metadata ---
+    billing_required_work_refused: bool  # Required request refused by durable billing
     error: str                                  # Error message (empty = no error)
     stage_timings: Dict                         # Latency per stage (seconds)
     
