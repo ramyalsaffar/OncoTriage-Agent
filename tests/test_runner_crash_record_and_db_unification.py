@@ -793,6 +793,15 @@ _RESUME_DB = os.path.join(_TMP, "resumed_run.db")
 _RESUME_CP = os.path.join(_TMP, "resume_cp")
 os.makedirs(_RESUME_CP, exist_ok=True)
 _resume_corpus = _make_corpus(os.path.join(_TMP, "resume_fhir"), 3)
+def _stand_in_campaign(*args, **kwargs):
+    # The checkpoint is synthetic; initialize real admission coverage for this
+    # fixture's new run before attaching it, as the production owner does.
+    kwargs["before_attach"]("stand-in-campaign", _runner.CAMPAIGN_DECISION_NEW)
+    _runner.set_run_billing_campaign_id(args[3], "stand-in-campaign", db_path=args[4])
+    return _runner.CampaignBudget(
+        "stand-in-campaign", _runner.CAMPAIGN_DECISION_CONTINUED,
+        _runner.spend.LedgerSeed(source=_runner.spend.SEED_SOURCE_BILLING_RECORD))
+
 _resume_text, _resume_exc, _resume_tracking = drive_main(
     _RESUME_DB, _resume_corpus, checkpoint_dir=_RESUME_CP,
     process_patient=erroring_patient,
@@ -805,10 +814,7 @@ _resume_text, _resume_exc, _resume_tracking = drive_main(
     # section's subject is the `resumed` column and tag, so it gets the
     # smallest object that satisfies the caller: a continued campaign with an
     # empty billing-record seed.
-    establish_billing_campaign=lambda *a, **k: _runner.CampaignBudget(
-        "stand-in-campaign", _runner.CAMPAIGN_DECISION_CONTINUED,
-        _runner.spend.LedgerSeed(
-            source=_runner.spend.SEED_SOURCE_BILLING_RECORD)))
+    establish_billing_campaign=_stand_in_campaign)
 
 
 def _tag(tracking):
@@ -847,6 +853,21 @@ check("6f ...so the column and the tag AGREE, which is the property one "
       [(0, "false"), (1, "true")])
 check("6g ...and the two runs really differed, so 6f is not one value compared "
       "with itself", _column(_FRESH_DB) != _column(_RESUME_DB), True)
+
+# A changed cohort with no successful checkpoint is a NEW identity, even
+# though an earlier campaign record exists. Exercise main's journal hook.
+_reconfigured_text, _reconfigured_exc, _ = drive_main(
+    _FRESH_DB, _make_corpus(os.path.join(_TMP, "reconfigured_fhir"), 3),
+    checkpoint_dir=_FRESH_CP, process_patient=erroring_patient)
+check("6g-reconfigured main initializes history for a newly reconfigured campaign",
+      (_reconfigured_exc, "(new_after_reconfiguration)" in _reconfigured_text),
+      (None, True))
+_campaign_ids = sqlite3.connect(_FRESH_DB).execute(
+    "SELECT billing_campaign_id FROM runs ORDER BY id").fetchall()
+check("6g-reconfigured-identities the two campaigns are distinct and both have history",
+      (len(_campaign_ids), len(set(_campaign_ids)),
+       all(_runner.patient_attempt_history.history_path(_FRESH_DB, c[0]).exists()
+           for c in _campaign_ids)), (2, 2, True))
 
 # THE ONE BOOLEAN, BY ast. Both records must read the SAME name -- a second
 # read of `completed_ids` would agree today (both sit above run_batch, which

@@ -421,9 +421,15 @@ def _pipeline_provenance(state) -> Dict:
         # The HASH has no fallback and is None when no prompt was rendered.
         # NULL is the honest value for the hash of a prompt that never existed;
         # rendering one here to hash it would record an event that did not
-        # happen, which is the defect class this project exists to remove. A
-        # reader therefore separates "Stage 5 ran" from "Stage 5 never ran" by
-        # llm_classifier_prompt_sha256 IS NULL, never by the version.
+        # happen, which is the defect class this project exists to remove.
+        #
+        # IT IS NOT A STAGE 5 PROGRESS MARKER, and this comment used to say it
+        # was ("Stage 5 ran" vs "never ran" by IS NULL). Stage 5's
+        # de-identification refusal returns before a prompt exists, so a row
+        # that entered Stage 5 can carry NULL; and a failure return can carry
+        # the hash beside an empty llm_classifier_prompt. Classify a row on
+        # `error`, prompt emptiness and `candidates_evaluated`, never on the
+        # version and never on this hash alone.
         "llm_classifier_prompt_version": (state.get("llm_classifier_prompt_version")
                                           or PROMPT_VERSION),
         "llm_classifier_prompt_sha256": state.get("llm_classifier_prompt_sha256"),

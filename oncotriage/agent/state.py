@@ -561,9 +561,12 @@ class TrialMatchState(TypedDict):
     # exact rendered bytes. Both come from oncotriage/agent/prompts.py; the
     # version is hand-maintained and says what a human intended, the hash is
     # computed per call and says what was actually sent. Note the hash covers
-    # the SYSTEM message only -- llm_classifier_prompt above is system + user,
-    # and the user half varies per patient, so hashing it would identify the
-    # patient rather than the template.
+    # the SYSTEM message only -- llm_classifier_prompt above is system + user.
+    # SINCE PROMPT_VERSION 1.6.0 THE PATIENT RECORD IS IN THE SYSTEM MESSAGE, so
+    # this hash identifies the patient as well as the template. (This comment
+    # used to say the user half carried the patient and the system hash
+    # identified the template; that was the pre-1.6.0 layout.) Group by the
+    # version for the template.
     #
     # The version is present on every terminal path; the hash is None when no
     # prompt was ever rendered (node_no_candidates, or a failure upstream of

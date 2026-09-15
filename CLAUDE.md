@@ -148,6 +148,9 @@ Verified rather than assumed. It is the same object as
 | `oncotriage/evaluation/sampling.py` | File 28 whole — the seeded, PROPORTIONALLY STRATIFIED draw into a second database. **It was a fixed ten each from breast, colon and lung and the three-group vocabulary is deleted**; it is `sample_total` patients allocated across every cancer group the source holds, minimum one per non-empty group, through the one allocator `cohort.allocate_proportional` and the one grouper `registries/primary_cancer.py:cancer_group_key` | `paths` |
 | `oncotriage/evaluation/cohort.py` | **WHICH patients a campaign runs** — the ruled **500**-patient cohort, **stratified by primary cancer group** (`stratified_draw`, `allocate_proportional`, `MINIMUM_PER_GROUP`), plus the 50-patient k=2 stability sample and the 100-patient judge sample, which are still plain sha256-rank draws over the filename stem. The cohort section far below argues for a SIMPLE RANDOM draw of 300 and is a past-tense account; see the CURRENT STATE note on it. `DRAW_ALGORITHM`, `draw`, `digest`, `CohortSelection`, `select`. The ONE reader of the six `CAMPAIGN_*` constants, which is what keeps the batch runner cohort-blind. Resolves no path and opens no file | `config` |
 | `oncotriage/evaluation/cohort_diff.py` | File 34 whole — LEGACY vs CURRENT cohort selector, read only | `paths`, `config`, `fhir.{clean,parser}`, `registries.cancer_code_registry` |
+| `oncotriage/evaluation/campaign_export.py` | **one NAMED campaign's first main admissions, as an evaluation run directory the rater and Ragas already read** -- `export_campaign`, `read_campaign_snapshot` (campaign membership, fingerprint columns, inference rows and trial rows in ONE read transaction on a `mode=ro` connection, closed before any write), `require_runs_agree` (every `RUN_FINGERPRINT_COLUMNS` value plus the cohort digest and judge seed/size), `recompute_cohort` (the runner's stratified draw with every size and seed passed from the RUN ROW, never today's defaults), `map_judge_stems`, `identify_judged` (`compute_patient_hash` must equal the stored hash), the parse rules `split_stored_prompt` (R1) / `recover_patient_summary` (R2) / `partition_trial_blocks` (R3), `build_patient_record`, the closed `OUTCOMES` and `REFUSAL_CODES`. Selection is the earliest durable MAIN admission per bundle across the campaign resume chain, BEFORE outcome filtering, using its exact completion inference ID. Missing history refuses; unknown and lost-write outcomes remain in the denominator. Entry point: `campaign_export.py` | `agent.{patient,prompts}`, `evaluation.{cohort,cohort_groups,faithfulness_filter}`, `fhir.parser`, `observability`, `storage.database_logger` |
+| `oncotriage/storage/attempt_history.py` | Durable campaign sidecar: synced, checksummed admission/completion history; campaign/cohort/run identity; main/resample kind; exact inference links; process lock shared by writer and exporter. START precedes parsing and is admission, not proof of model execution. Persistence faults stop new admissions. Missing historical coverage refuses. | Python standard library only |
+| `oncotriage/evaluation/faithfulness_filter.py` | **which recorded assessments Ragas faithfulness must not score, decided from `not_evaluable_reason` and provenance, never from the text** -- `classify(verdict, response_field)`, `exclusion_counts`, `FILTER_IDENTITY` (a Ragas resume key), the three RESTATED reason classes `REASONS_CONSTRUCTED` (excluded under both fields, corroborated by None `emission_index`/`call_index`/`verdict_source`), `REASONS_FIXED_CORRECTION_TEXT` (excluded under `assessment`, kept under `assessment_draft`) and `REASONS_KEPT_MODEL_TEXT`. `tests/test_campaign_export.py` pins the restatement against `agent/evaluation.py` | nothing from the project |
 | `oncotriage/evaluation/criterion_windows.py` | **Does a criterion state a TIME WINDOW** — RULE 4's window vocabulary, one owner. `is_window_criterion` (item 9's own two-line disjunction; `None` and `""` are False rather than a raise, so an absent criterion is not a different KIND of event from an unwindowed one), `window_hits` (which alternation fired, so a decision is auditable), `WINDOW_BASE_RE` (item 8's classifier carried verbatim), `WINDOW_EXTRA_RE` (this project's declared widening, kept apart from the base so `window_hits` can say which one fired) and `PAST_TENSE_RE` — RULE 4's OTHER temporal branch, deliberately **not** a window ("history of …" is False under the predicate and True under it). **ANALYSIS-SIDE ONLY: nothing in `oncotriage/agent/` imports it and nothing may** — a predicate deciding what the judge SEES would be an input change, and this is a reading OF the text after the fact. Deliberately **not** installed as a default for `criterion_clauses`'s required `is_window` argument | nothing from the project |
 | `oncotriage/fixtures/capture.py` | File 45 whole — the schema, the sink, the four proxies, `build_deterministic_prefix`, the fixture I/O, the three recipes, the cohort scan | `paths`, `config`, `agent.*`, `extraction.stage`, `fhir.parser`, `storage.database_logger`, `utils` |
 | `oncotriage/fixtures/replay.py` | File 46 whole — the replay stand-ins, the OpenAI tripwire, the field diff, the five refusals | `config`, `paths`, `agent.{deps,graph,patient}`, `fhir.parser`, `fixtures.capture`, `utils` |
@@ -5284,6 +5287,22 @@ refuse every record already written. The stamp carries its own
 `fingerprint_version`, which is the right granularity.
 
 ```bash
+# The campaign-export pass. Same shape, same directory. No network (a socket
+# guard raises on every outbound attempt, with a firing control), no keys, NO
+# SPEND, no live Qdrant, no model load, no corpus (every bundle is FABRICATED),
+# no git history. Every database is built by the package's own writers inside a
+# tempfile.mkdtemp it removes and asserts gone. The recorded production
+# inferences.db is refused before open for the whole file and read only as a
+# verified frozen byte copy (section 9 SKIPS without it). It runs the
+# campaign_export.py entry point twice as a subprocess. Every plant is a COPY
+# imported by name from the temp tree; it EXECS NOTHING. Not in the collision
+# matrix. Bucket A, ~4 s.
+python tests/test_campaign_export.py                                #  210 + optional smoke section
+# Real patient worker and inference writer, matching stubbed; disposable corpus
+# and databases only. OS network sandbox plus import-time tripwire required.
+# Includes child hard exits, resume, exact links and cross-process exclusion.
+python tests/test_attempt_history.py                                #  20
+
 # The fingerprint pass. Same shape, same directory. No network, no keys, no
 # spend, no live Qdrant, no live server, no corpus, no git history, no
 # database, and NOT in the collision matrix. It EXECS NOTHING -- every control
@@ -9831,8 +9850,12 @@ used to leave the keys absent, which on a re-entry published an EARLIER
 attempt's figure; see "A stored Stage 5 row describes one attempt" at
 the end of this file.) `llm_classifier_calls` is written
 on every return for the same reason, and it is what separates the two — `calls =
-0` with `llm_classifier_prompt_sha256 IS NOT NULL` is "Stage 5 ran and counted
-no usage", while a NULL hash is "Stage 5 never ran", where 0 is a measurement.
+0` with `llm_classifier_prompt_sha256 IS NOT NULL` is "Stage 5 rendered a prompt and
+counted no usage". **A NULL hash is NOT "Stage 5 never ran"** (corrected by the
+campaign-export pass): Stage 5's de-identification refusal returns before a prompt
+or hash exists, and a failure return can carry the hash beside an empty
+`llm_classifier_prompt`, so classify a row on `error`, prompt emptiness and
+`candidates_evaluated`, never on the hash alone.
 
 **WHAT THE FLOOR STILL EXCLUDES, and neither term is recoverable from a stored
 row.** The accumulators are local to one invocation of the node and start at
@@ -17459,3 +17482,37 @@ Counts that moved, each argued in place: `tests/test_spend_gate.py` **167**
 vocabulary pin 8d-i); `tests/test_spend_coverage.py` **169**;
 `tests/test_campaign_billing_record.py` 2i checks the conflict class by
 `isinstance`, still **128**.
+
+## W-build durable admission evidence
+
+The batch runner initializes history before campaign identity publication and
+records each admission after cancellation checks, before parsing/matching. Its
+completion names the exact inference ID returned by the writer. All resumed
+runs must retain this sidecar; fresh or reconfigured campaigns get a new one.
+Checkpoint cleanup does not delete history. The canonical location is
+`<real database path>.attempt-history/<sha256(campaign_id)>.json`, with a
+persistent `.lock` file. Preserve the directory and database together in backups.
+Do not delete/recreate a lock while a writer/exporter is active.
+
+The exporter holds that lock while taking one SQLite snapshot, checks campaign
+run coverage, recorded cohort identity and every explicit inference link, then
+selects the earliest main admission. An unmatched START is
+`first_attempt_interrupted`; a completed success without a stored inference is
+`first_attempt_result_unavailable`; exceptions remain `first_attempt_failed`.
+No main admission means `never_attempted` only with complete history coverage.
+A resample without an earlier main admission refuses. All judged patients stay
+in outcome accounting; later successes (including resamples and no-candidate
+successes) are reported, never substituted. Errored rows undergo count/prompt/
+duplicate-trial validation before their failure branch, including full stored
+prompt/hash/fence/block and criteria integrity for prompt-bearing failures.
+
+History proves admission, not that a model call ran. The start/completion gap is
+conservatively unknown. Checksums detect damage, not rollback to an older valid
+file; guarantees require intact history, consistent restores, and all campaign
+workers using the admission wrapper. No backfill of historical unknown outcomes.
+Historical billing coverage alone cannot authorize a campaign lacking admission
+history. A persistence failure stops further admissions; already-admitted
+workers may still record their completions. A campaign can be exported with
+interrupted/never-attempted patients accounted for; run FINISHED is not a
+completeness certificate. Directory publication atomicity and reducing the
+snapshot's memory use remain deferred.

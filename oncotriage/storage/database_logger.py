@@ -1180,12 +1180,25 @@ INFERENCE_COLUMN_ADDITIONS = {
     #
     # llm_classifier_prompt_sha256 IS NOT sha256(llm_classifier_prompt). The
     # prompt column holds the SYSTEM message and the USER message concatenated
-    # ("[SYSTEM]\n...\n\n[USER]\n..."), and the user half carries this
-    # patient's record, so its hash identifies the PATIENT. This column hashes
-    # the SYSTEM message alone, which is what identifies the TEMPLATE and is
-    # therefore the thing that can be grouped on across patients. The two
-    # cannot be reconciled by re-hashing the stored text and must not be
-    # compared with each other.
+    # ("[SYSTEM]\n...\n\n[USER]\n..."), and this column hashes the SYSTEM
+    # message alone.
+    #
+    # THE SYSTEM MESSAGE CARRIES THE PATIENT, AND HAS SINCE PROMPT_VERSION
+    # 1.6.0. This note used to say the USER half carried the patient's record
+    # and that this hash therefore identified the TEMPLATE and could be grouped
+    # on across patients. That was true before 1.6.0 and is false since: the
+    # record moved into the system message, fenced between <<<PATIENT_RECORD>>>
+    # and <<<END_PATIENT_RECORD>>>, and the reference date and the Section 2
+    # variant are rendered there too. So this hash identifies the PATIENT (and
+    # the snapshot date and filter variant) as well as the template, and two
+    # patients under one template almost never share it. Group by
+    # llm_classifier_prompt_version for the template; group by this column
+    # only to find byte-identical renders.
+    #
+    # It CAN be recomputed from the stored text: split the prompt at the one
+    # "\n\n[USER]\n" whose system half hashes to this value, which is what
+    # oncotriage/evaluation/campaign_export.py does. Hashing the whole column
+    # never reproduces it.
     #
     # llm_classifier_prompt_version is hand-maintained in
     # oncotriage/agent/prompts.py and says what a human intended; the hash is
@@ -1202,16 +1215,26 @@ INFERENCE_COLUMN_ADDITIONS = {
     #   version SET    this build's template version. Set on EVERY terminal
     #                  path, including the ones where Stage 5 never ran, because
     #                  it is a property of the code rather than of the run.
-    #   hash NULL      no system prompt was ever rendered for this row --
-    #                  node_no_candidates, or a failure upstream of Stage 5.
-    #                  It is NOT "the hash was not recorded".
-    #   hash SET       these are the exact bytes the model was sent. One value
-    #                  per inference even when the batch split into chunks: the
-    #                  system message is rendered once and reused for every
-    #                  chunk, and only the user message differs.
+    #   hash NULL      no system prompt was rendered for this row --
+    #                  node_no_candidates, a failure upstream of Stage 5, OR
+    #                  Stage 5's de-identification refusal, which returns
+    #                  before the prompt is rendered. It is NOT "the hash was
+    #                  not recorded".
+    #   hash SET       the system prompt was rendered. One value per inference
+    #                  even when the batch split into chunks: the system message
+    #                  is rendered once and reused for every chunk, and only the
+    #                  user message differs. It does NOT mean the prompt column
+    #                  holds that prompt or that a request went out: a Stage 5
+    #                  failure return (a warmup that could not be issued, for
+    #                  one) carries the hash beside an empty
+    #                  llm_classifier_prompt.
     #
-    # So "did Stage 5 run" is `llm_classifier_prompt_sha256 IS NOT NULL`, never
-    # a test on the version.
+    # So NEITHER `IS NULL` NOR `IS NOT NULL` marks Stage 5 progress. This note
+    # used to say "did Stage 5 run" is `llm_classifier_prompt_sha256 IS NOT
+    # NULL`; the de-identification refusal entered Stage 5 with a NULL hash and
+    # the failed-warmup row stored a hash with no prompt. Classify a row on
+    # `error`, on whether `llm_classifier_prompt` is empty, and on
+    # `candidates_evaluated`.
     "llm_classifier_prompt_version":         "TEXT",
     "llm_classifier_prompt_sha256":          "TEXT",
 

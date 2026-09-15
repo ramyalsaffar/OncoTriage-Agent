@@ -153,6 +153,8 @@ from tqdm import tqdm
 # not four hours in -- and because this import is at module scope, that holds
 # transitively without a second `import fcntl` here to keep in step.
 from oncotriage import control
+from contextlib import ExitStack
+from oncotriage.storage import attempt_history as patient_attempt_history
 from oncotriage import paths
 from oncotriage.agent.graph import build_matching_graph, match_patient_to_trials
 from oncotriage.agent.retrieval import build_bm25_index_from_qdrant
@@ -1359,7 +1361,7 @@ def _recover_under_fresh_marker(run_id, cohort_digest, db_path):
 
 
 def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
-                               db_path) -> CampaignBudget:
+                               db_path, before_attach=None) -> CampaignBudget:
     """Decide this invocation's billing campaign and read its cumulative record.
     RAISES ``CampaignBillingRefusal``; returns the campaign and the ledger seed.
 
@@ -1481,12 +1483,6 @@ def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
                 f"reason(s): {', '.join(evidence.reasons)}"
                 + (f" -- {evidence.detail}" if evidence.detail else ""))
         campaign_id, decision = uuid.uuid4().hex, CAMPAIGN_DECISION_HISTORICAL
-        try:
-            record_historical_evidence(db_path, campaign_id=campaign_id,
-                                       run_id=run_id, evidence=evidence)
-        except BillingRecordWriteError as exc:
-            raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
-                                         str(exc)) from exc
     else:
         campaign_id, decision = uuid.uuid4().hex, CAMPAIGN_DECISION_NEW
 
@@ -1496,6 +1492,17 @@ def establish_billing_campaign(resumed, fingerprint, cohort_digest, run_id,
         # and it is about to decide whether the identity record is written.
         raise RuntimeError(f"establish_billing_campaign reached an unnamed "
                            f"decision {decision!r}")
+    # History must exist before identity/membership publication. Only a fresh
+    # identity may initialize it; a recovered/historical campaign cannot.
+    if before_attach is not None:
+        before_attach(campaign_id, decision)
+    if decision == CAMPAIGN_DECISION_HISTORICAL:
+        try:
+            record_historical_evidence(db_path, campaign_id=campaign_id,
+                                       run_id=run_id, evidence=evidence)
+        except BillingRecordWriteError as exc:
+            raise CampaignBillingRefusal(CAMPAIGN_REFUSAL_BILLING_UNWRITABLE,
+                                         str(exc)) from exc
     if decision != CAMPAIGN_DECISION_CONTINUED:
         write_campaign_record(campaign_id, fingerprint, cohort_digest)
     # THE RUN ROW CARRIES THE CAMPAIGN, DURABLY, BEFORE THE FIRST BILLED CALL,
@@ -2214,7 +2221,7 @@ def assert_no_stale_stop_switch() -> None:
          "        python \"25- Batch Runner.py\" --clear-stop"]))
 
 
-def _start_patient_unless_stopped(**kwargs):
+def _start_patient_unless_stopped(attempt_history=None, **kwargs):
     """The submitted callable. Refuses to begin work once the switch has tripped.
 
     WHY THIS EXISTS WHEN ``_cancel_queued`` ALREADY DOES THE JOB. Cancellation
@@ -2263,7 +2270,28 @@ def _start_patient_unless_stopped(**kwargs):
     if spend.SPEND_STOP.requested:
         raise CancelledError(
             "a spend limit was reached before this patient started")
-    return process_patient(**kwargs)
+    if attempt_history is None:
+        if kwargs.get("run_id") is not None:
+            raise patient_attempt_history.HistoryRefusal(
+                "attempt_history_missing", "campaign worker has no admission history")
+        return process_patient(**kwargs)
+    aid = attempt_history.start(kwargs["fhir_path"],
+                                "resample" if kwargs.get("is_resample") else "main",
+                                kwargs.get("run_id"))
+    try:
+        entry = process_patient(**kwargs)
+    except BaseException:
+        try:
+            attempt_history.complete(aid, outcome="exception")
+        except patient_attempt_history.HistoryRefusal as exc:
+            console.out(f"[Attempts] {exc}; original worker exception preserved")
+        raise
+    attempt_history.complete(
+        aid, outcome=("success" if entry.get("status") == "success" else
+                      "exception" if entry.get("status") == "exception" else "failure"),
+        patient_id=(None if entry.get("patient_id_is_bundle_hint") else entry.get("patient_id")),
+        write_ok=entry.get("db_row_written"), inference_id=entry.get("inference_id"))
+    return entry
 
 
 # ===========================================================================
@@ -2708,6 +2736,7 @@ def process_patient(
         if not patient_data or not patient_data.get("patient_id"):
             return {
                 "patient_id": patient_id_hint,
+                "patient_id_is_bundle_hint": True,
                 "status": "error",
                 "eligible_matches": 0,
                 "near_misses": 0,
@@ -2795,6 +2824,7 @@ def process_patient(
             # its row landed, which is otherwise only in the ledger and dies
             # with the process.
             "db_row_written": db_row_written,
+            "inference_id": getattr(write_result, "inference_id", None),
         }
 
     except MatchingModelMismatchError:
@@ -2826,6 +2856,7 @@ def process_patient(
         console.out(f"  {run_label} {patient_id_hint} | EXCEPTION: {error_msg}")
         return {
             "patient_id": patient_id_hint,
+                "patient_id_is_bundle_hint": True,
             "status": "exception",
             "eligible_matches": 0,
             "near_misses": 0,
@@ -2929,7 +2960,7 @@ class _DriftAnnouncer:
 # ===========================================================================
 
 
-def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None, db_path=None, cohort_digest=None,) -> tuple:
+def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object, completed_ids: set, results_list: list, run_id=None, db_path=None, cohort_digest=None, attempt_history=None,) -> tuple:
     """
     Process all patients not already in completed_ids using concurrent threads.
 
@@ -3265,6 +3296,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
                 break
             future = executor.submit(
                 _start_patient_unless_stopped,
+                attempt_history=attempt_history,
                 fhir_path=fhir_path,
                 graph=graph,
                 is_resample=False,
@@ -3439,7 +3471,7 @@ def run_batch(fhir_files: list, bm25_index: object, nct_ids: list, graph: object
 # ===========================================================================
 
 
-def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None, db_path=None, resample_stems=None,) -> None:
+def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_ids: list, graph: object, results_list: list, run_id=None, db_path=None, resample_stems=None, attempt_history=None,) -> None:
     """
     Re-run a random subset of already-processed patients using concurrent threads.
 
@@ -3695,6 +3727,7 @@ def run_resample(fhir_files: list, completed_ids: set, bm25_index: object, nct_i
                 break
             future = executor.submit(
                 _start_patient_unless_stopped,
+                attempt_history=attempt_history,
                 fhir_path=fhir_path,
                 graph=graph,
                 is_resample=True,
@@ -4472,7 +4505,7 @@ def main():
     spend.BILLING_RECORD.clear()
     spend.BILLING_RECORD.reset_liability()
 
-    with CaffeinateSession("Batch Runner"):
+    with ExitStack() as _attempt_scope, CaffeinateSession("Batch Runner"):
 
         run_start = time.time()
 
@@ -4801,11 +4834,24 @@ def main():
         # finalize is OUTSIDE the `except`, deliberately: the handlers in this
         # function that finalize are the CRASH paths, and a refusal is a
         # decision, not a crash.
+        _attempt_holder = []
+        def _open_attempt_record(campaign_id, decision):
+            _attempt_holder.append(_attempt_scope.enter_context(
+                patient_attempt_history.open_writer(
+                    _reconcile_db, campaign_id, _run_record_id, _cohort.digest,
+                    fhir_files, new_campaign=(decision in (
+                        CAMPAIGN_DECISION_NEW, CAMPAIGN_DECISION_RECONFIGURED)))))
+
         _campaign_refusal = None
         try:
             _campaign = establish_billing_campaign(
                 _resumed, _fingerprint, _cohort.digest, _run_record_id,
-                _reconcile_db)
+                _reconcile_db, before_attach=_open_attempt_record)
+        except patient_attempt_history.HistoryRefusal as exc:
+            console.out(f"REFUSED ({exc.code}): {exc}")
+            finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
+                                db_path=_reconcile_db)
+            raise SystemExit(1)
         except CampaignBillingRefusal as exc:
             _campaign_refusal = exc
         if _campaign_refusal is not None:
@@ -4815,6 +4861,7 @@ def main():
             finalize_run_record(_run_record_id, RUN_RECORD_STATUS_KILLED,
                                 db_path=_reconcile_db)
             raise SystemExit(1)
+        _attempt_history = _attempt_holder[0]
         spend.SPEND_LEDGER.seed(_campaign.seed)
         console.out(f"[Campaign] {_campaign.campaign_id} "
                     f"({_campaign.decision})")
@@ -4955,9 +5002,14 @@ def main():
                 run_id=_run_record_id,
                 db_path=_reconcile_db,
                 cohort_digest=_cohort.digest,
+                attempt_history=_attempt_history,
             )
 
             # ------------------------------------------------------------------
+            if _attempt_history.failed:
+                raise patient_attempt_history.HistoryRefusal(
+                    "attempt_history_write_failed", "admission history failed; campaign cannot finish cleanly")
+
             # 5. Resample pass
             #    run_batch always returns main_pass_complete=True when it returns
             #    at all (a mid-loop crash exits the process before any return).
@@ -4994,9 +5046,14 @@ def main():
                     # one mechanism, two questions, and the sample is what makes
                     # them different questions.
                     resample_stems=_cohort.stability_stems,
+                    attempt_history=_attempt_history,
                 )
             else:
                 console.out("[Resample] Skipped: no successfully completed patients.")
+
+            if _attempt_history.failed:
+                raise patient_attempt_history.HistoryRefusal(
+                    "attempt_history_write_failed", "admission history failed; campaign cannot finish cleanly")
 
             # ── WHAT A STOP ACTUALLY COST THIS CAMPAIGN ────────────────────
             #

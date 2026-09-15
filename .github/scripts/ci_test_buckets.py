@@ -1437,6 +1437,32 @@ BUCKETS = {
         "location: every control is a different INPUT to a function, or a "
         "module attribute rebound inside try/finally with the restore "
         "asserted"),
+    "test_attempt_history.py": (
+        _A, None,
+        "ran green under OS network containment and import-time tripwire; "
+        "disposable FHIR and package-created databases, real patient worker "
+        "and inference writer with matching stubbed. Child hard exits verify "
+        "admission/commit gaps, cross-process locking, resume coverage, exact "
+        "links, persistence faults and main/resample accounting. No production "
+        "data, provider calls or repository writes"),
+    "test_campaign_export.py": (
+        _A, None,
+        "ran green under an OS network sandbox and an import-time socket "
+        "tripwire, zero outbound attempts: the campaign database export and the "
+        "Ragas faithfulness placeholder filter. Every database is built by the "
+        "package's own writers (initialize_database, start_run_record, "
+        "set_run_billing_campaign_id, log_inference, finalize_run_record) inside "
+        "a tempfile.mkdtemp it removes and asserts gone, over a FABRICATED FHIR "
+        "corpus in the same tree, so no corpus, no key, no spend, no live Qdrant "
+        "and no model load. It reads the recorded production inferences.db only "
+        "as a verified frozen byte copy through tests/_db_snapshot.py, with every "
+        "sqlite3.connect to the production path refused before open; on a "
+        "checkout without that file section 9 records SKIPS. It runs the "
+        "campaign_export.py entry point twice as a subprocess. Every plant is a "
+        "COPY imported by name from the temp tree; it EXECS NOTHING and loads no "
+        "module by location. Not in the collision matrix: the six package files "
+        "it reads are sha256-compared at the end and neither suite writer "
+        "rewrites them"),
     "test_evaluation_rater.py": (
         _A, None,
         # RE-MEASURED against a provision_ci_paths.py skeleton (the # resume-provenance and state-model passes). The string it replaces said # "522 checks" and was stale by 42 before the model guard was added: the # file reported 534 at the previous commit, measured by running it.

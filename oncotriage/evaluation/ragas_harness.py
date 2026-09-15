@@ -59,7 +59,7 @@ import sys
 import time
 
 from oncotriage import config, paths, provider_resilience, spend, spend_journal
-from oncotriage.evaluation import judge_independence
+from oncotriage.evaluation import faithfulness_filter, judge_independence
 from oncotriage.observability import console, get_logger
 
 log = get_logger(__name__)
@@ -705,11 +705,13 @@ class GenerationSample(object):
     """One verdicted trial: the fixed question, two contexts, the assessment."""
 
     __slots__ = ("patient_id", "nct_id", "user_input", "retrieved_contexts",
-                 "response", "eligible", "verdict_group", "response_field")
+                 "response", "eligible", "verdict_group", "response_field",
+                 "faithfulness_exclusion")
 
     def __init__(self, patient_id, nct_id, user_input, retrieved_contexts,
                  response, eligible, verdict_group,
-                 response_field=DEFAULT_RESPONSE_FIELD):
+                 response_field=DEFAULT_RESPONSE_FIELD,
+                 faithfulness_exclusion=None):
         self.patient_id = patient_id
         self.nct_id = nct_id
         self.user_input = user_input
@@ -718,6 +720,11 @@ class GenerationSample(object):
         self.eligible = eligible
         self.verdict_group = verdict_group
         self.response_field = response_field
+        # None means faithfulness scores this sample; otherwise the
+        # `faithfulness_filter` exclusion that removes it from that ONE metric.
+        # Response relevancy and the retrieval dataset are unaffected, and the
+        # trial's context stays in every retrieval sample.
+        self.faithfulness_exclusion = faithfulness_exclusion
 
     @property
     def key(self):
@@ -968,7 +975,16 @@ def load_run(run_dir, response_field=DEFAULT_RESPONSE_FIELD):
                                 f"no context text in this record; no "
                                 f"generation sample built")
                 continue
+            # WHETHER FAITHFULNESS MAY SCORE THIS TEXT, decided from the
+            # verdict's stored reason and provenance and never from the text.
+            # The same function reads an evaluation-run record and a campaign
+            # export, because both carry the verdict's fields verbatim.
+            _exclusion, _filter_note = faithfulness_filter.classify(
+                verdict, response_field)
+            if _filter_note:
+                problems.append(f"{patient_id}/{nct_id}: {_filter_note}")
             generation.append(GenerationSample(
+                faithfulness_exclusion=_exclusion,
                 patient_id=patient_id,
                 nct_id=nct_id,
                 user_input=GENERATION_QUESTION_TEMPLATE.format(nct_id=nct_id),
@@ -1035,6 +1051,22 @@ def load_run(run_dir, response_field=DEFAULT_RESPONSE_FIELD):
     generation.sort(key=lambda s: s.key)
     return RunInput(run_dir, manifest, retrieval, generation, problems,
                     response_field, census)
+
+
+def metric_samples(run, dataset, metric_name):
+    """The samples ``metric_name`` is scored over.
+
+    ONE OWNER FOR THE PAIR SET, read by the plan, the pricing, the resume
+    comparison, the scoring loop and the post-check, so none of them can plan,
+    price or expect a faithfulness pair the scoring loop never issues.
+    Faithfulness drops the samples ``faithfulness_filter`` excludes; every other
+    metric reads its whole dataset.
+    """
+    if dataset == DATASET_RETRIEVAL:
+        return run.retrieval
+    if metric_name == METRIC_FAITHFULNESS:
+        return [s for s in run.generation if s.faithfulness_exclusion is None]
+    return run.generation
 
 
 def apply_limit(run, limit):
@@ -1852,6 +1884,7 @@ def plan_calls(run, active):
     """
     contexts = sum(len(s.retrieved_contexts) for s in run.retrieval)
     n_gen = len(run.generation)
+    n_faith = len(metric_samples(run, DATASET_GENERATION, METRIC_FAITHFULNESS))
     selected = {m for metrics in active.values() for m in metrics}
     whole = {
         METRIC_CONTEXT_PRECISION: {
@@ -1861,8 +1894,8 @@ def plan_calls(run, active):
             "basis": "one judge call per retrieved context",
         },
         METRIC_FAITHFULNESS: {
-            "samples": n_gen,
-            "judge_calls": n_gen * 2,
+            "samples": n_faith,
+            "judge_calls": n_faith * 2,
             "embedding_calls": 0,
             "basis": "two judge calls per sample (statements, then NLI)",
         },
@@ -1902,7 +1935,7 @@ def estimate_tokens(run, active):
     per_metric[METRIC_FAITHFULNESS] = sum(
         (len(s.user_input) + len(s.response))
         + sum(len(c) for c in s.retrieved_contexts)
-        for s in run.generation)
+        for s in metric_samples(run, DATASET_GENERATION, METRIC_FAITHFULNESS))
 
     # Relevancy's prompt carries the response only; contexts are not sent.
     per_metric[METRIC_RESPONSE_RELEVANCY] = sum(
@@ -1932,7 +1965,9 @@ def estimate_output_tokens(metric, judge_calls, run):
     """
     per_response = ESTIMATED_OUTPUT_PER_RESPONSE_TOKEN.get(metric)
     if per_response is not None:
-        response_chars = sum(len(s.response) for s in run.generation)
+        response_chars = sum(
+            len(s.response)
+            for s in metric_samples(run, DATASET_GENERATION, metric))
         return int(per_response * response_chars / CHARS_PER_TOKEN)
     return judge_calls * ESTIMATED_OUTPUT_TOKENS[metric]
 
@@ -2093,9 +2128,17 @@ PARTIAL_KIND = "ragas_partial_scores"
 # so a run that sent no effort at all and a run that sent one are not made to
 # look alike by a sentinel string. The two spellings are the same fact and this
 # list compares facts.
+#
+# ``faithfulness_filter`` DECIDES WHICH FAITHFULNESS PAIRS EXIST. A partial file
+# scored before the filter holds faithfulness scores for placeholder text the
+# current plan no longer contains, and a resume that merged the two would report
+# one mean over two different sample sets. A partial file written before the key
+# existed records no value, which ``identity_disagreement`` reports by name, so
+# the resume refuses rather than mixing.
 RESUME_IDENTITY_KEYS = ("packages", "judge_model", "judge_temperature",
                         "judge_max_tokens", "judge_reasoning_effort",
-                        "embedding_model", "response_field", "run_dir")
+                        "embedding_model", "response_field", "run_dir",
+                        "faithfulness_filter")
 
 
 def partial_path(out_dir, response_field=DEFAULT_RESPONSE_FIELD):
@@ -2141,6 +2184,7 @@ def resume_identity(run, args, environment):
         "embedding_model": args.embedding_model,
         "response_field": run.response_field,
         "run_dir": os.path.realpath(run.run_dir),
+        "faithfulness_filter": faithfulness_filter.FILTER_IDENTITY,
     }
 
 
@@ -2343,13 +2387,11 @@ def reusable_scores(payload, run, active, identity):
     holds. A user who believes an unscored pair was a transient fault deletes
     the partial file, or the row, and re-runs.
     """
-    samples_for = {DATASET_RETRIEVAL: run.retrieval,
-                   DATASET_GENERATION: run.generation}
     planned = {}
     plan_duplicates = 0
     for dataset, metric_names in active.items():
         for metric_name in metric_names:
-            for sample in samples_for[dataset]:
+            for sample in metric_samples(run, dataset, metric_name):
                 key = pair_key(dataset, metric_name, sample.as_join())
                 # TWO SAMPLES CAN SHARE A PAIR KEY, and ``load_run`` does not
                 # dedupe: a run artifact carrying two verdicts for one
@@ -2533,11 +2575,9 @@ async def score_all(run, metrics, max_workers, active, progress=True,
     remaining = dict(reuse)
     pending = []
     carried = []
-    samples_for = {DATASET_RETRIEVAL: run.retrieval,
-                   DATASET_GENERATION: run.generation}
     for dataset, metric_names in active.items():
         for metric_name in metric_names:
-            for sample in samples_for[dataset]:
+            for sample in metric_samples(run, dataset, metric_name):
                 key = pair_key(dataset, metric_name, sample.as_join())
                 if key in remaining:
                     # POPPED, not read. Two samples sharing a pair key would
@@ -2649,6 +2689,9 @@ def summarize(scores, run, active):
                                "metrics": list(metric_names)}
                      for dataset, metric_names in active.items()},
         "metrics": by_metric,
+        "faithfulness_filter": faithfulness_filter.FILTER_IDENTITY,
+        "faithfulness_exclusions": faithfulness_filter.exclusion_counts(
+            run.generation),
         "total_pairs": len(scores),
         "total_scored": sum(1 for s in scores if s.status == "scored"),
         "total_unscored": sum(1 for s in scores if s.status != "scored"),
@@ -2769,6 +2812,13 @@ def print_plan(plan, run, out_dir, active, environment):
         console.out(f"{DATASET_GENERATION:<11} {len(run.generation):>5} "
                     f"samples (one per verdicted trial with a non-empty "
                     f"assessment)")
+        _excluded = faithfulness_filter.exclusion_counts(run.generation)
+        console.out(f"{'':<11} faithfulness scores "
+                    f"{len(metric_samples(run, DATASET_GENERATION, METRIC_FAITHFULNESS))}"
+                    f" of them; {sum(_excluded.values())} placeholder "
+                    f"assessment(s) excluded"
+                    + ("" if not _excluded else ": " + ", ".join(
+                        f"{k} {v}" for k, v in _excluded.items())))
     console.out("")
     if DATASET_RETRIEVAL in active:
         print_retrieval_response_shape(run)
@@ -2835,10 +2885,9 @@ def print_resume_preview(run, args, active, out_dir, environment):
             console.out(f"        {line}")
         return
     _, report = reusable_scores(payload, run, active, identity)
-    total = sum(len(metric_names)
-                * (len(run.retrieval) if dataset == DATASET_RETRIEVAL
-                   else len(run.generation))
-                for dataset, metric_names in active.items())
+    total = sum(len(metric_samples(run, dataset, metric_name))
+                for dataset, metric_names in active.items()
+                for metric_name in metric_names)
     console.out(f"    environment matches; {report['reused']} of "
                 f"{report['rows']} recorded pair(s) are current")
     console.out(f"    --resume would judge {total - report['reused']} of "
@@ -3089,6 +3138,7 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
             "by ragas' InstructorModelArgs defaults and are popped by "
             "build_judge, which then asserts they are gone."),
         "judge_independence": independence,
+        "faithfulness_filter": faithfulness_filter.FILTER_IDENTITY,
         "judge_max_completion_tokens": args.max_tokens,
         "embeddings_model": args.embedding_model,
         "embeddings_provider": "openai",
@@ -3106,6 +3156,13 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
                                 if DATASET_RETRIEVAL in active else 0),
             DATASET_GENERATION: (len(run.generation)
                                  if DATASET_GENERATION in active else 0),
+            # THE FAITHFULNESS POPULATION IS SMALLER THAN THE GENERATION
+            # DATASET, and the exclusions are counted by reason beside it so a
+            # reader can see what was not scored and why.
+            "faithfulness_samples": len(metric_samples(
+                run, DATASET_GENERATION, METRIC_FAITHFULNESS)),
+            "faithfulness_exclusions": faithfulness_filter.exclusion_counts(
+                run.generation),
             "total_pairs": summary["total_pairs"],
             "scored": summary["total_scored"],
             "unscored": summary["total_unscored"],
@@ -3163,7 +3220,11 @@ def build_manifest(run, summary, cost, args, wall_seconds, ragas_version,
                 "faithfulness checks every statement against the contexts and "
                 "an assessment citing patient facts would otherwise be "
                 f"unsupported by construction; response = the recorded "
-                f"{run.response_field!r} verbatim."),
+                f"{run.response_field!r} verbatim. Faithfulness skips a "
+                "not_evaluable verdict whose stored reason marks the text as "
+                "a pipeline placeholder (oncotriage/evaluation/"
+                "faithfulness_filter.py); response relevancy scores every "
+                "sample."),
         },
         "problems": run.problems,
     }
@@ -3251,10 +3312,9 @@ def post_checks(run, scores, results_path, manifest_path, out_dir, active,
     """
     failures = []
 
-    samples_for = {DATASET_RETRIEVAL: len(run.retrieval),
-                   DATASET_GENERATION: len(run.generation)}
-    expected = sum(len(metric_names) * samples_for[dataset]
-                   for dataset, metric_names in active.items())
+    expected = sum(len(metric_samples(run, dataset, metric_name))
+                   for dataset, metric_names in active.items()
+                   for metric_name in metric_names)
     if len(scores) != expected:
         failures.append(f"accounting: expected {expected} (sample, metric) "
                         f"pairs, got {len(scores)}")

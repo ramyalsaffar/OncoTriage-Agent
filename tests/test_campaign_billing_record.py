@@ -1456,15 +1456,15 @@ _DBc, _CPc = _make_legacy("covered")
 _phc, _phcd = child("observe", db=_DBc, cp=_CPc, corpus=_CORP_H, cap=100.0)
 if _phcd is None:
     print(tail(_phc, 60))
-check("6q *** a COVERED historical campaign resumes with the EVIDENCE-seeded "
-      "figure ***",
-      (_phc.returncode, near(at(at(_phcd, "seed"), "usd"), 0.50),
-       at(at(_phcd, "seed"), "source")), (0, True, "billing_record"))
+check("6q billing coverage alone cannot establish first patient admissions: "
+      "historical resume refuses before work",
+      (_phc.returncode, _phcd is None,
+       "REFUSED (attempt_history_missing)" in (_phc.stdout + _phc.stderr)),
+      (1, True, True))
 _hrows = billing_rows(_DBc)
-check("6r ...recorded ONCE as a historical_evidence row, so the next resume "
-      "carries it without re-deciding",
+check("6r ...the admission refusal precedes historical billing publication",
       ([r["kind"] for r in _hrows], [r["settled_usd"] for r in _hrows]),
-      (["historical_evidence"], [0.50]))
+      ([], []))
 
 for _tag, _sql, _reason in (
         ("retries", "UPDATE inferences SET llm_classifier_retries = 2 "
@@ -1777,7 +1777,19 @@ check("6zb non-degeneracy: the REAL entry point's --fresh closed the old "
        len(at(at(_mj, "closed_campaigns"), _R_OLD) or []),
        isinstance(_R_FRESH, str) and _R_FRESH != _R_OLD),
       (_RAN, 2, [_R_OLD], 2, True))
+_CURRENT_R = os.path.join(_TMP, "p4c_current.db")
+db_copy(_DB_R, _CURRENT_R)
 restore_copy(_OLDER_R, _DB_R)
+_rollback, _rollback_data = entry_point("billed_then_zero", db=_DB_R, cp=_CP_R,
+                                      corpus=_CORP_F, cap=100.0)
+check("6zb-rollback a database restored without matching admission history "
+      "refuses before work; billing identity cannot certify that history",
+      (_rollback.returncode, _rollback_data is None,
+       "REFUSED (attempt_history_mismatch)" in (_rollback.stdout + _rollback.stderr)),
+      (1, True, True))
+# Restore the database matching the retained history for the billing recovery
+# checks below. Reusing row numbers from an inconsistent restore is now refused.
+restore_copy(_CURRENT_R, _DB_R)
 _r3, _r3d = entry_point("billed_then_zero", db=_DB_R, cp=_CP_R, corpus=_CORP_F,
                         cap=100.0)
 _run_fresh_r = [r[0] for r in sqlite3.connect(f"file:{_DB_R}?mode=ro", uri=True)
@@ -1785,11 +1797,10 @@ _run_fresh_r = [r[0] for r in sqlite3.connect(f"file:{_DB_R}?mode=ro", uri=True)
                          (_R_FRESH,))]
 _open_s5(_DB_R, "p4c-open", _R_FRESH, at(_run_fresh_r, 0))
 _liab_r = campaign_liability(_DB_R, _R_FRESH)
-check("6zb-i non-degeneracy: in the RESTORED copy the fresh campaign billed at "
-      "run(s) whose NUMBER the newer database had already used, and now holds "
+check("6zb-i non-degeneracy: with consistent database/history the fresh campaign holds "
       "settled charges and one unresolved reservation",
       (ran_to_end(_r3), at(_r3d, "campaign_id") == _R_FRESH,
-       bool(_run_fresh_r) and max(_run_fresh_r) <= _latest_r,
+       bool(_run_fresh_r),
        _liab_r[0] > 0.40, _liab_r[1]),
       (_RAN, True, True, True, 1))
 os.remove(_REC_R)
